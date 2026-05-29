@@ -1,0 +1,14 @@
+flowchart TD
+    A([Sign called]) --> B{len key ≥ 32?}
+    B -- no  --> C([return ErrKeyTooShort])
+    B -- yes --> D[hmac.New sha256 · mac.Write payload]
+    D --> E[hex.EncodeToString mac.Sum]
+    E --> F([return sig])
+
+    G([Verify called]) --> H{len key ≥ 32?}
+    H -- no  --> I([return false])
+    H -- yes --> J[Sign key payload → expected]
+    J --> K[hex.DecodeString expected AND sig]
+    K -- decode error --> I
+    K -- ok --> L[hmac.Equal sig expected]
+    L --> M([return bool])

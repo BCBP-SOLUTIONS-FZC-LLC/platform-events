@@ -1,0 +1,356 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What This Repo Is
+
+`platform-events` is a **private Go shared library** (module: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26.3) that provides reusable SNS publisher and SQS consumer primitives for platform services. It lives in a **private GitHub repository** and is consumed as a Go module dependency by internal platform services — it is never deployed as a standalone server.
+
+Core capabilities:
+- `Publisher` interface + AWS SNS implementation
+- `Consumer` interface + AWS SQS implementation (long-poll loop, parallel dispatch)
+- **Outbox runner** — transactional outbox pattern over a Postgres table; guarantees at-least-once delivery without 2PC
+- **Event-envelope types** — versioned, typed `Envelope[T]` carrying metadata (event ID, type, source, tenant, trace ID, timestamp) plus JSON-serialised payload
+- **HMAC helpers** — SHA-256 HMAC signing and verification for webhook and cross-service event authentication
+
+**Consuming services** must set `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (or `GONOSUMDB`/`GOFLAGS` equivalents) to fetch private module versions.
+
+### Shared Library Dependencies
+
+This library builds on two other BCBP platform libraries:
+
+| Library | Module | Role in platform-events |
+|---------|--------|--------------------------|
+| [`platform-gincommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon) | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon` | OTel tracing initialisation (`InitTracingFromEnv`, `EnsureTracing`); `port.Logger` interface (compatible — gincommon's `ZapLogger` can be injected directly); `RequestContext` carries `TraceID` / `TenantID` / `UserID` that populate `Envelope` fields |
+| [`platform-pgcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon) | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` | Connection pool (`pgcommon.Pool`) used by the outbox store; `pgcommon.RunInTx` composes business logic + `outbox.Enqueue` atomically; `migrate.Runner` applies the outbox schema (`outbox_events`, `outbox_dead_letters`); `SlowQueryTracer` surfaces slow outbox queries |
+
+See [`ARCHITECTURE.md`](../ARCHITECTURE.md) for detailed flow diagrams and invariant tables.
+
+## Common Commands
+
+```bash
+make setup           # Copy .env-example → .env (run once before anything else)
+make tidy            # go mod tidy
+make fmt             # go fmt ./...
+make vet             # go vet ./...
+make lint            # golangci-lint
+make test            # All tests (unit + integration), excludes smoke
+make test-ci         # All tests with race detector (used in CI)
+make test-unit       # Unit tests only
+make test-int        # Integration tests (requires LocalStack via testcontainers)
+make test-smoke      # Smoke tests (requires live AWS resources at SNS_TOPIC_ARN / SQS_QUEUE_URL)
+make race            # All tests with -race flag
+make build           # Compile reference CLI to bin/platform-events
+make cover           # Coverage HTML report (measures ./internal/... ./pkg/...)
+make cover-func      # Coverage summary by function (terminal)
+make ci              # tidy + vet + lint + test-ci + build (full CI pipeline)
+make docker-up       # Start LocalStack (SNS + SQS + Postgres for outbox)
+make docker-down     # Stop LocalStack
+make clean           # Remove bin/ artefacts
+```
+
+To run a single test:
+```bash
+go test ./test/unit/envelope/...   -run TestEnvelopeSign -v
+go test ./test/integration/...     -run TestSNSPublishRoundTrip -v
+```
+
+**Coverage note:** tests live under `test/` (a separate package tree from sources). Always use `-coverpkg=./internal/...,./pkg/...` to get meaningful numbers; running `go test ./...` without it shows 0% for source packages. `make cover` and `make cover-func` handle this correctly.
+
+**Testcontainers note:** integration tests spin up LocalStack (SNS + SQS) and Postgres via `testcontainers-go`. Docker must be running locally. Pass `-short` to skip integration tests without a Docker daemon.
+
+## Architecture
+
+The library follows **Clean Architecture** — dependencies point inward; outer layers depend on inner layers, never the reverse.
+
+```
+pkg/               ← public API surface (consumers import these)
+  events/          ← Envelope types, Publisher/Consumer interfaces, HMAC helpers
+  outbox/          ← Outbox runner (Postgres-backed, uses platform-pgcommon pool)
+internal/
+  core/
+    domain/        ← Entities: Envelope, OutboxRecord, domain errors (no external deps)
+    port/          ← Interfaces: Publisher, Consumer, Logger, Clock (owned by use-case layer)
+                      port.Logger is interface-compatible with platform-gincommon's ZapLogger
+    service/       ← Use Cases: OutboxService, HMACService
+  adapter/
+    outbound/
+      sns/         ← SNS Publisher implementation (aws-sdk-go-v2)
+      sqs/         ← SQS Consumer implementation (long-poll loop)
+      outboxstore/ ← Postgres outbox store (pgx via platform-pgcommon Pool + RunInTx)
+      metrics/     ← Prometheus counters + OTel spans
+      logger/      ← Zap logger adapter (same as platform-gincommon's adapter)
+  config/          ← Environment variable loading
+test/
+  unit/            ← Isolated unit tests per package
+  integration/     ← Tests against LocalStack + Postgres containers
+  fixtures/        ← Shared helpers (MockPublisher, MockConsumer, MockLogger, fake clock)
+  testenv/         ← Loads .env-example for tests
+
+External dependencies (private modules):
+  platform-gincommon → OTel init, port.Logger interface, RequestContext (TraceID/TenantID source)
+  platform-pgcommon  → Pool, RunInTx, migrate.Runner (outbox schema), SlowQueryTracer
+```
+
+**Dependency rule:** `domain` ← `port` ← `service` ← `adapter` ← `pkg`. The `core/` layers never import `adapter/` or AWS SDK packages. Interfaces in `core/port/` are implemented in `adapter/outbound/` and injected inward.
+
+### Public API (`pkg/`)
+
+**`pkg/events`** — what consuming services import:
+
+- **Envelope**
+  - `Envelope[T any]` — typed event wrapper: `ID`, `Type`, `Source`, `TenantID`, `TraceID`, `Timestamp`, `Payload T`
+  - `NewEnvelope[T](eventType, source string, payload T, opts ...EnvelopeOption) Envelope[T]` — generates `ID` (UUID v7), sets `Timestamp` to `time.Now()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`. When publishing from an HTTP handler, pass `WithTenantID(rc.TenantID)` and `WithTraceID(rc.TraceID)` where `rc` is the `gincommon.RequestContext` extracted via `gincommon.GetRequestContext(c)`.
+  - `Envelope.JSON() ([]byte, error)` — canonical JSON serialisation (payload marshalled inline)
+  - `ParseEnvelope[T](data []byte) (Envelope[T], error)` — deserialise and validate required fields
+
+- **Publisher**
+  - `Publisher` interface — `Publish(ctx, Envelope[json.RawMessage]) error`; `PublishBatch(ctx, []Envelope[json.RawMessage]) error`
+  - `NewSNSPublisher(cfg SNSConfig, opts ...PublisherOption) (Publisher, error)` — constructs the SNS implementation; validates topic ARN format at construction time (panics if empty — prevents invalid label cardinality in metrics)
+  - `SNSConfig{TopicARN, Region, Logger, Tracer, Metrics}` — `TopicARN` required. `Logger` accepts any `port.Logger` implementation — pass the `ZapLogger` from `platform-gincommon` directly.
+  - `PublisherOption` — `WithMessageGroupID(fn)`, `WithMessageDeduplicationID(fn)` (FIFO topics), `WithAttributes(map)`
+  - `MockPublisher` (in `pkg/events/mock`) — in-memory, thread-safe; `Published() []Envelope[json.RawMessage]`
+
+- **Consumer**
+  - `Consumer` interface — `Start(ctx) error`; `Stop() error`
+  - `NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Consumer, error)` — constructs the SQS long-poll loop
+  - `SQSConfig{QueueURL, Region, MaxMessages, WaitSeconds, Logger, Tracer, Metrics}` — `QueueURL` required; `MaxMessages` default 10; `WaitSeconds` default 20. `Logger` accepts any `port.Logger` — pass `platform-gincommon`'s `ZapLogger` directly.
+  - `Handler` — `func(ctx context.Context, env Envelope[json.RawMessage]) error`; returning a non-nil error skips deletion (message becomes visible again after visibility timeout). The `ctx` passed to each handler has a `platform-gincommon`-compatible `RequestContext` injected (populated from `env.TenantID`, `env.TraceID`) so downstream calls to pgcommon pool helpers (e.g. `pool.WithTx`) pick up the correct GUC values automatically.
+  - `ConsumerOption` — `WithConcurrency(n)` (default 1), `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`
+  - `MockConsumer` (in `pkg/events/mock`) — in-memory queue; `Inject(env)` delivers messages synchronously
+
+- **HMAC helpers**
+  - `Sign(key []byte, payload []byte) string` — returns hex-encoded HMAC-SHA256 signature
+  - `Verify(key []byte, payload []byte, sig string) bool` — constant-time comparison; returns false on any parse/length error rather than panicking
+  - `SignEnvelope(key []byte, env Envelope[json.RawMessage]) (string, error)` — signs canonical JSON of envelope
+  - `VerifyEnvelope(key []byte, env Envelope[json.RawMessage], sig string) (bool, error)` — deserialises and verifies; safe for webhook receipt handlers
+
+**`pkg/outbox`** — transactional outbox:
+
+- `Runner{Pool, Publisher, Logger, PollInterval, BatchSize, MaxAttempts}` — configure the outbox runner. `Pool` is a `*pgcommon.Pool` from `platform-pgcommon`; `Publisher` are **required**.
+- `Runner.Start(ctx) error` — start the polling loop; blocks until `ctx` is cancelled.
+- `Runner.Stop() error` — graceful drain; waits for in-flight batch to complete before returning.
+- `Enqueue(ctx, tx pgx.Tx, env Envelope[json.RawMessage]) error` — insert a serialised envelope into the `outbox_events` table within the caller's transaction. No publish happens at insert time — the runner delivers asynchronously. Callers should pass the `pgx.Tx` obtained from `pgcommon.RunInTx` so the enqueue and the business-logic write commit or roll back as a single unit.
+- `ApplySchema(ctx, runner *migrate.Runner) error` — convenience wrapper that calls `platform-pgcommon`'s `migrate.Runner` to apply the embedded `pkg/outbox/migrations/` SQL files (`001_create_outbox_events.up.sql`, `002_create_outbox_dead_letters.up.sql`). Call once at service startup before `Runner.Start`.
+- Schema: `outbox_events(id UUID PK, event_type TEXT, payload JSONB, tenant_id TEXT, trace_id TEXT, attempts INT DEFAULT 0, last_error TEXT, created_at TIMESTAMPTZ, scheduled_at TIMESTAMPTZ, published_at TIMESTAMPTZ)`
+
+**Typical wiring with platform-pgcommon:**
+```go
+// 1. Apply outbox schema via pgcommon migrate runner
+migrateRunner := migrate.NewRunner(migrate.Config{DSN: cfg.DatabaseURL, Logger: logger})
+outbox.ApplySchema(ctx, migrateRunner)
+
+// 2. Construct outbox runner with pgcommon pool
+pool, _ := pgcommon.NewPool(ctx, pgcommon.ConfigFromEnv())
+runner := outbox.NewRunner(outbox.Config{Pool: pool, Publisher: snsPublisher, Logger: logger})
+go runner.Start(ctx)
+
+// 3. Enqueue inside a business transaction (pgcommon.RunInTx)
+pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+    _ = repo.SaveUser(ctx, tx, user)           // business write
+    return outbox.Enqueue(ctx, tx, envelope)   // event write — same transaction
+})
+```
+
+### Event Envelope Design
+
+`Envelope[T]` is the canonical wire format for all inter-service events:
+
+```json
+{
+  "id":             "01926e4f-...",     // UUID v7 — sortable, unique per event
+  "type":           "user.created",    // dot-separated, lower-snake: <domain>.<action>
+  "source":         "platform-iam",    // emitting service name
+  "tenant_id":      "acme",
+  "trace_id":       "4bf92f3577...",   // OTel trace ID (hex, 32 chars) or empty
+  "correlation_id": "...",             // optional: ties events in a saga/workflow
+  "timestamp":      "2026-05-27T...",  // RFC3339Nano, UTC
+  "payload":        { ... }            // typed T, inlined (not base64)
+}
+```
+
+`event_type` convention: `<domain>.<entity>.<past-tense-verb>` (e.g. `iam.user.created`, `billing.invoice.settled`). Consumers match on prefix with `strings.HasPrefix` or exact equality — no glob or regex routing in the base library.
+
+### SNS Publisher
+
+`NewSNSPublisher` wraps `aws-sdk-go-v2/service/sns`. Key behaviours:
+
+- **Message attributes** — `EventType`, `TenantID`, `Source`, and `EventID` are always set as SNS message attributes to enable SQS subscription filter policies without deserialising the body.
+- **FIFO topics** — if `TopicARN` ends in `.fifo`, the publisher requires `MessageGroupID`; `MessageDeduplicationID` defaults to `Envelope.ID` (content-based deduplication must be disabled at the topic level).
+- **Batching** — `PublishBatch` uses `sns:PublishBatch` (max 10 per call); batches larger than 10 are automatically split.
+- **Retry** — caller is responsible for retry (the outbox runner handles this); the SNS adapter does not retry internally. `Publish` returns the raw AWS error for callers to inspect (`smithy.APIError`).
+- **OTel** — each `Publish` call creates a child span `sns.publish` with attributes `messaging.system=aws_sns`, `messaging.destination`, `messaging.message_id`. OTel must be initialised by the consuming service before publishing; call `gincommon.InitTracingFromEnv()` (from `platform-gincommon`) at startup — `platform-events` calls `otel.Tracer(...)` and will produce no-op spans if the provider is not yet set.
+
+### SQS Consumer
+
+`NewSQSConsumer` runs a long-poll loop with configurable concurrency:
+
+```
+Start() →
+  loop:
+    ReceiveMessage (WaitSeconds, MaxMessages)
+    for each message:
+      go handler(ctx, envelope)   # bounded by semaphore (WithConcurrency)
+        if err == nil → DeleteMessage
+        if err != nil → log warn, increment retry metric, leave visible
+    back to top
+```
+
+- **Visibility extension** — if a handler runs longer than `VisibilityTimeout/2`, the consumer automatically calls `ChangeMessageVisibility` to extend by `VisibilityTimeout` until the handler returns.
+- **Dead-letter handler** — messages that have exceeded `MaxReceiveCount` (configured at the SQS level) are routed to `WithDeadLetterHandler` if set; otherwise they are logged at `ERROR` and deleted.
+- **Graceful shutdown** — `Stop()` cancels the receive loop, waits for all in-flight handlers to complete (up to `DrainTimeout`, default 30 s), then returns.
+- **OTel** — each message dispatch creates a child span `sqs.receive` with `messaging.system=aws_sqs`, `messaging.destination`, `messaging.message_id`, `messaging.operation=process`. The span is linked to the publisher's trace via `Envelope.TraceID`, giving end-to-end visibility across the SNS/SQS boundary in Tempo/Grafana. OTel must be initialised by the consuming service via `gincommon.InitTracingFromEnv()` before starting the consumer.
+- **RLS GUC propagation** — the handler `ctx` has `env.TenantID` and `env.TraceID` injected so that `pgcommon.Pool` GUC injection (via `platform-pgcommon`'s `RLSMiddleware` / `GUCProvider`) correctly scopes all DB queries inside the handler to the event's tenant without any extra wiring by the caller.
+
+### Outbox Runner
+
+The outbox pattern eliminates the dual-write problem: services write the event *inside their business transaction* (via `outbox.Enqueue`), and the runner publishes asynchronously with at-least-once delivery.
+
+**Poll cycle:**
+1. `SELECT ... FOR UPDATE SKIP LOCKED` — claim up to `BatchSize` unpublished records with no published_at.
+2. For each record: call `Publisher.Publish`; on success set `published_at = NOW()`.
+3. On failure: increment `attempts`; set `last_error`; if `attempts >= MaxAttempts` move to dead-letter table (`outbox_dead_letters`).
+4. Commit; sleep `PollInterval` (default `5s`).
+
+**Idempotency** — `Envelope.ID` (UUID v7) is forwarded as the SNS `MessageDeduplicationID` on FIFO topics and as a message attribute on standard topics. Consumers should use `Envelope.ID` as their idempotency key.
+
+### HMAC Helpers
+
+`Sign` / `Verify` operate on raw bytes. `SignEnvelope` / `VerifyEnvelope` serialise the envelope to canonical JSON before signing, ensuring field-ordering is deterministic (sorted keys via `encoding/json` + a stable marshaller).
+
+`Verify` uses `hmac.Equal` (constant-time) — not `==`. Never replace with string comparison. `VerifyEnvelope` returns `(false, nil)` on signature mismatch and `(false, err)` on malformed input — callers must check both return values.
+
+HMAC keys must be ≥ 32 bytes; `Sign` returns an error (not a panic) if the key is shorter.
+
+### Metrics
+
+`pkg/events/metrics.Init(serviceName, buildVersion string)` registers:
+- `events_published_total{service, topic, event_type, status}` — counter
+- `events_publish_duration_seconds{service, topic, event_type}` — histogram
+- `events_consumed_total{service, queue, event_type, status}` — counter
+- `events_consume_duration_seconds{service, queue, event_type}` — histogram
+- `outbox_pending_total{service}` — gauge (set each poll cycle)
+- `outbox_published_total{service, status}` — counter
+- `outbox_attempts_total{service}` — counter
+
+`InitWithRegisterer(serviceName, buildVersion, prometheus.Registerer)` — for isolated test registries; bypasses `sync.Once`.
+
+### Key Configuration Defaults
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `AWS_REGION` | `us-east-1` | Applies to both SNS and SQS clients |
+| `SNS_TOPIC_ARN` | — | Required for SNS publisher |
+| `SQS_QUEUE_URL` | — | Required for SQS consumer |
+| `SQS_MAX_MESSAGES` | `10` | 1–10; SQS hard limit |
+| `SQS_WAIT_SECONDS` | `20` | Long-poll duration |
+| `SQS_VISIBILITY_TIMEOUT` | `30s` | Parsed as `time.Duration` |
+| `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
+| `OUTBOX_POLL_INTERVAL` | `5s` | Parsed as `time.Duration` |
+| `OUTBOX_BATCH_SIZE` | `50` | Records per poll cycle |
+| `OUTBOX_MAX_ATTEMPTS` | `5` | Before moving to dead-letter |
+| `OTEL_SERVICE_NAME` | — | OTel resource attribute |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4317` | |
+| `OTEL_EXPORTER_OTLP_INSECURE` | `false` unless `APP_ENV=dev` | |
+
+`APP_ENV=dev/development/local` sets `OTEL_EXPORTER_OTLP_INSECURE=true` automatically. An unset `APP_ENV` is treated as production (TLS on, 10% trace sampling).
+
+## Key Environment Variables
+
+Defined in `.env-example` (copy to `.env` via `make setup`):
+
+```
+APP_NAME, APP_ENV, BUILD_VERSION
+AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  # use instance role / IRSA in production
+AWS_ENDPOINT_URL                                       # set to http://localhost:4566 for LocalStack
+SNS_TOPIC_ARN
+SQS_QUEUE_URL
+SQS_MAX_MESSAGES, SQS_WAIT_SECONDS, SQS_VISIBILITY_TIMEOUT, SQS_CONCURRENCY
+OUTBOX_POLL_INTERVAL, OUTBOX_BATCH_SIZE, OUTBOX_MAX_ATTEMPTS
+DATABASE_URL                                           # for outbox runner (platform-pgcommon DSN)
+OTEL_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT
+OTEL_EXPORTER_OTLP_INSECURE
+SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against real AWS
+```
+
+## Test Layout
+
+- `test/unit/` — isolated unit tests per package (envelope, hmac, outbox service, config, metrics, mock publisher/consumer)
+- `test/integration/` — tests against LocalStack (SNS publish round-trip, SQS consume loop, outbox runner end-to-end) and Postgres (outbox enqueue/publish/dead-letter)
+- `test/smoke/` — optional; requires live AWS resources (`SMOKE_SNS_TOPIC_ARN`, `SMOKE_SQS_QUEUE_URL`)
+- `test/fixtures/` — shared helpers (`MockPublisher`, `MockConsumer`, `MockLogger`, `FakeClock`, LocalStack bootstrap)
+- `test/testenv/` — loads `.env-example` for tests
+
+## Key Design Decisions
+
+**`Publisher` and `Consumer` are interfaces, not concrete types** — consumers of this library inject the interface, enabling `MockPublisher`/`MockConsumer` in unit tests without LocalStack. SNS/SQS constructors return the interface, not a pointer to a struct.
+
+**Envelope ID is UUID v7** — UUIDs v7 are time-ordered and collation-friendly in Postgres B-tree indexes. The outbox `SELECT ... ORDER BY id` scan is therefore an index scan, not a seq scan, as the table grows.
+
+**`Verify` uses constant-time comparison** — `hmac.Equal` prevents timing attacks. Never replace with string equality. The function signature returns `bool` (not error) for the happy path so call sites read naturally: `if !events.Verify(...) { return ErrBadSig }`.
+
+**Outbox uses `SKIP LOCKED`** — multiple outbox runner instances (e.g. in a horizontally scaled deployment) do not contend. Each runner claims its own batch atomically. No distributed lock is needed.
+
+**SNS message attributes enable zero-body filtering** — SQS subscription filter policies match on `EventType` and `TenantID` message attributes. Consumers that only handle a subset of event types do not deserialise envelopes they will discard.
+
+**Dead-letter is a Postgres table, not SQS DLQ** — the outbox dead-letter table (`outbox_dead_letters`) is queryable, retryable, and auditable from standard SQL tooling. SQS DLQs are recommended for consumption-side failures; the outbox handles publish-side failures.
+
+**`Consumer` graceful drain on `Stop()`** — in-flight handlers are given `DrainTimeout` (default 30 s) to complete before `Stop()` returns. This matches `net/http.Server.Shutdown` semantics and ensures clean pod termination in Kubernetes without losing partially-processed messages.
+
+**Nil-safe logger** — every component that accepts a `port.Logger` checks for `nil` before calling it. `SQSConsumer` with a nil logger runs silently. `OutboxRunner` with a nil logger skips per-record log lines but still updates metrics.
+
+**`ServiceName` required on metrics init** — `metrics.Init` panics on empty `ServiceName` to prevent invalid Prometheus const labels, matching the pattern established in `platform-gincommon`.
+
+**HMAC key length enforced at call time** — `Sign` returns `("", ErrKeyTooShort)` for keys < 32 bytes rather than silently using a weak key. Callers that ignore the error emit an empty signature, which `Verify` will reject (constant-time) — the system degrades safely.
+
+**OTel trace context propagated via Envelope** — `Envelope.TraceID` carries the OTel trace ID from the publishing service. On the consumer side, `NewSQSConsumer` reconstructs a remote span context from `TraceID` and sets it as the parent of the `sqs.receive` span, enabling cross-service trace continuity without relying on SNS/SQS message attributes for propagation.
+
+**`PublishBatch` splits automatically at 10** — SNS hard limit is 10 messages per `PublishBatch` call. The adapter splits silently rather than returning an error, so callers can pass arbitrarily-sized slices. Partial failures return a `BatchError` listing per-message errors; successful messages within the same batch are not retried.
+
+**Idempotent Prometheus registration** — `metrics.Init` is guarded by `sync.Once`. `InitWithRegisterer` bypasses it for test isolation — same pattern as `platform-gincommon` and `platform-pgcommon`.
+
+**`port.Logger` is interface-compatible with platform-gincommon's `ZapLogger`** — both libraries define `Logger` with the same method set (`Info`, `Warn`, `Error`, `With`, `Named`). A consuming service that already constructs a `ZapLogger` from `platform-gincommon` passes it directly to `SNSConfig.Logger`, `SQSConfig.Logger`, and `outbox.Runner.Logger` without any adapter. Do not introduce a second logger abstraction.
+
+**OTel is always initialised by the consuming service, never by this library** — `platform-events` calls standard `otel.Tracer(...)` / `otel.GetTracerProvider()` and produces no-op spans if no provider is set. The consuming service is responsible for calling `gincommon.InitTracingFromEnv()` (from `platform-gincommon`) at startup. This avoids double-initialisation when both `platform-gincommon` and `platform-events` are imported together.
+
+**`Envelope.TraceID` is sourced from `gincommon.RequestContext`** — when an HTTP handler publishes an event, `rc.TraceID` (from `gincommon.GetRequestContext(c)`) must be passed as `WithTraceID(rc.TraceID)`. This threads the HTTP trace through SNS/SQS and into the consumer's OTel span, making the full request→event→handler path visible in a single Tempo trace without manual W3C header forwarding across queues.
+
+**`Envelope.TenantID` drives RLS on the consumer side** — `platform-pgcommon`'s `GUCProvider` reads `tenant_id` from the handler context (injected by `NewSQSConsumer` from `env.TenantID`). Postgres RLS policies (`current_setting('app.tenant_id', true)`) therefore scope all DB queries inside a consumer handler to the correct tenant automatically, matching the HTTP path's behaviour via `platform-gincommon`'s `ContextMiddleware`.
+
+**Outbox schema lifecycle is owned by `platform-pgcommon`'s migrate runner** — `outbox.ApplySchema` is a thin wrapper that passes the embedded `pkg/outbox/migrations/` FS to `platform-pgcommon`'s `migrate.Runner`. Services that already call `migrateRunner.Up(ctx)` for their own schema can run outbox migrations in the same step. The outbox schema is versioned separately so consuming services can upgrade `platform-events` without conflating it with their domain migrations.
+
+**Outbox transactions compose with `pgcommon.RunInTx`** — `outbox.Enqueue` accepts a raw `pgx.Tx` rather than a pool so callers control the transaction boundary. The idiomatic pattern is `pgcommon.RunInTx(ctx, pool, opts, fn)` where `fn` performs the business write and calls `outbox.Enqueue(ctx, tx, env)` — both commit or both roll back. This avoids a second `BEGIN` inside `Enqueue` and keeps the dual-write window at zero.
+
+## CI/CD
+
+GitHub Actions runs three workflows. This is a **private module** — there is no production server deployment; CI validates library quality and publishes Go module versions via git tags.
+
+**`.github/workflows/validate.yml`** (reusable, called by both ci.yml and release.yml):
+1. `go mod download` + `go mod verify` — module integrity
+2. `gofmt -l` — format check
+3. `go mod tidy` drift check
+4. `go vet`
+5. `golangci-lint`
+6. `govulncheck ./internal/... ./pkg/...`
+7. `make test-ci` — unit + integration (LocalStack + Postgres via testcontainers) with race detector
+
+**`.github/workflows/ci.yml`** (push/PR to main):
+1. **validate** — calls validate.yml
+2. **coverage** — all tests with `-coverpkg` + ≥ 95% gate; uploads `coverage.out` artefact
+3. **build** — `make build`; verifies binary is executable
+
+**`.github/workflows/release.yml`** (push of `v*` tags):
+1. **validate** — calls validate.yml at the tag ref
+2. **build** — compile reference binary
+3. **publish** — create GitHub Release with notes from `CHANGELOG.md`; this is the **Go module release** consuming services pin to with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z`
+
+## Extending the Library
+
+- **New event type:** define a Go struct and use `NewEnvelope[YourType](...)`. No changes to the library itself — types are generic. Always pass `WithTenantID(rc.TenantID)` and `WithTraceID(rc.TraceID)` from the `gincommon.RequestContext` when publishing from an HTTP handler.
+- **New Publisher backend** (e.g. EventBridge): implement `port.Publisher` in `internal/adapter/outbound/eventbridge/`, expose a constructor in `pkg/events/`. Follow the SNS adapter as a template — call `otel.Tracer(...)` (not gincommon directly) + Prometheus metrics in the adapter.
+- **New Consumer backend** (e.g. Kinesis): implement `port.Consumer` in `internal/adapter/outbound/kinesis/`, expose via `pkg/events/`. `Handler` signature is shared — no changes to calling code. Inject tenant+trace into handler `ctx` using the same helper as `NewSQSConsumer` so `pgcommon` GUC injection works transparently.
+- **New outbox store backend** (e.g. DynamoDB): implement `port.OutboxStore` in `internal/core/port/outboxstore.go`, place in `internal/adapter/outbound/dynamooutbox/`, inject via `Runner.Store`. The Postgres implementation should remain the default — only swap if `platform-pgcommon` is not available in the consuming service.
+- **New outbox migration:** add `NNN_description.up.sql` / `NNN_description.down.sql` to `pkg/outbox/migrations/`. The embedded FS is recompiled on next build; `outbox.ApplySchema` picks it up automatically via `platform-pgcommon`'s `migrate.Runner`.
+- **Replace logger:** the `port.Logger` interface is deliberately kept identical to `platform-gincommon`'s. Do not change method signatures — consuming services pass a single `ZapLogger` instance to both libraries.
+- **New metrics:** add counters/histograms inside `initMetricsWithRegisterer` in `internal/adapter/outbound/metrics/metrics.go`.
+- **New use case:** add to `internal/core/service/`, depending only on `domain/` types and `port/` interfaces.

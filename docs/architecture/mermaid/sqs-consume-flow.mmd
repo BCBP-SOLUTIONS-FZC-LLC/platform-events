@@ -1,0 +1,31 @@
+sequenceDiagram
+    participant SQSAdp as adapter/outbound/sqs (loop)
+    participant SQS as AWS SQS
+    participant pgcommon
+    participant OTel
+    participant Handler
+
+    loop every poll
+        SQSAdp ->>+ SQS: ReceiveMessage(WaitSeconds=20, MaxMessages=10)
+        SQS -->>- SQSAdp: []Message
+
+        par for each message (bounded by semaphore)
+            SQSAdp ->> SQSAdp: json.Unmarshal body → Envelope
+            SQSAdp ->> pgcommon: WithGUCSet(ctx, GUCSet{TenantID})
+            SQSAdp ->>+ OTel: Start span "sqs.receive" linked to env.TraceID
+            OTel -->>- SQSAdp: handler ctx + span
+
+            SQSAdp ->>+ Handler: handler(ctx, Envelope)
+            Handler -->>- SQSAdp: error or nil
+
+            alt handler returned nil
+                SQSAdp ->> SQS: DeleteMessage
+                SQSAdp ->> SQSAdp: EventsConsumedTotal{status=success}.Inc()
+            else handler returned error
+                Note over SQSAdp: leave visible — SQS retries after timeout
+                SQSAdp ->> SQSAdp: EventsConsumedTotal{status=error}.Inc()
+            end
+
+            SQSAdp ->> OTel: span.End()
+        end
+    end

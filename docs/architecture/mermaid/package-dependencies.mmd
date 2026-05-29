@@ -1,0 +1,37 @@
+graph LR
+    cmd(["cmd/platform-events"])
+    events_pkg(["pkg/events"])
+    outbox_pkg(["pkg/outbox"])
+    sns(["adapter/outbound/sns"])
+    sqs(["adapter/outbound/sqs"])
+    outboxstore(["adapter/outbound/outboxstore"])
+    metrics(["adapter/outbound/metrics"])
+    logger(["adapter/outbound/logger"])
+    service(["core/service"])
+    port(["core/port"])
+    domain(["core/domain  (internal)"])
+    config(["internal/config"])
+    migs(["pkg/outbox/migrations"])
+
+    cmd          --> config
+    events_pkg   --> port
+    events_pkg   --> domain
+    events_pkg   --> sns
+    events_pkg   --> sqs
+    events_pkg   --> metrics
+    outbox_pkg   --> port
+    outbox_pkg   --> domain
+    outbox_pkg   --> service
+    outbox_pkg   --> outboxstore
+    outbox_pkg   --> migs
+    sns          --> port
+    sns          --> domain
+    sns          --> metrics
+    sqs          --> port
+    sqs          --> domain
+    sqs          --> metrics
+    outboxstore  --> port
+    outboxstore  --> domain
+    logger       --> port
+    service      --> port
+    service      --> domain

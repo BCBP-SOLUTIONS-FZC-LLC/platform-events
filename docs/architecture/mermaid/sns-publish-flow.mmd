@@ -1,0 +1,29 @@
+sequenceDiagram
+    participant Caller
+    participant Publisher as pkg/events.Publisher
+    participant SNSAdp as adapter/outbound/sns
+    participant OTel
+    participant SNS as AWS SNS
+
+    Caller ->>+ Publisher: Publish(ctx, Envelope)
+    Publisher ->>+ SNSAdp: snsPublisher.Publish(ctx, env)
+
+    SNSAdp ->> SNSAdp: json.Marshal(env) → message body
+    SNSAdp ->> SNSAdp: set attributes: EventType · TenantID · Source · EventID
+
+    SNSAdp ->>+ OTel: otel.Tracer.Start(ctx, "sns.publish")
+    OTel -->>- SNSAdp: span ctx + span
+
+    SNSAdp ->>+ SNS: sns.Client.PublishInput
+    SNS -->>- SNSAdp: MessageId or error
+
+    alt success
+        SNSAdp ->> OTel: span.End()
+        SNSAdp ->> SNSAdp: EventsPublishedTotal{status=success}.Inc()
+    else error
+        SNSAdp ->> OTel: span.RecordError + codes.Error
+        SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
+    end
+
+    SNSAdp -->>- Publisher: error or nil
+    Publisher -->>- Caller: error or nil
