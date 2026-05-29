@@ -17,9 +17,9 @@ A numbered walkthrough of what happens between a domain mutation and a processed
 3. **Domain entity written** to the database inside the transaction.
 4. **`outbox.Enqueue` called** inside the same transaction — inserts a serialised `Envelope` into `outbox_events`. No SNS call happens here.
 5. **Transaction commits** — both the domain write and the outbox row are durable. If the transaction rolls back, neither persists.
-6. **Outbox runner polls** `outbox_events` on `PollInterval`, claims a batch with `SELECT … FOR UPDATE SKIP LOCKED`.
+6. **Outbox runner polls** `outbox_events` — immediately on startup, then every `PollInterval`. Claims a batch with `SELECT … FOR UPDATE SKIP LOCKED WHERE scheduled_at <= NOW()` and extends `scheduled_at` as a claim lease so concurrent runners do not re-claim the same records.
 7. **`Publisher.Publish` called** — SNS receives the event, sets `EventType`, `TenantID`, `Source`, and `EventID` as message attributes for filter-policy routing.
-8. **Row marked published** (`published_at = NOW()`). On failure, `attempts` is incremented; after `MaxAttempts` the row moves to `outbox_dead_letters`.
+8. **Row marked published** (`published_at = NOW()`). On failure, `attempts` is incremented and the claim lease is released (`scheduled_at = NOW()`) for immediate retry; after `MaxAttempts` the row moves to `outbox_dead_letters`.
 
 > **Ordering:** no global ordering is guaranteed. Ordering is only preserved within the same SQS message group (FIFO queues with `WithMessageGroupID`). All other delivery is best-effort ordered.
 >
@@ -77,7 +77,8 @@ graph TD
     subgraph tests["Tests  —  test/"]
         test_unit["unit/\nno Docker · pure Go"]
         test_int["integration/\ntestcontainers-go · tag: integration"]
-        fixtures["fixtures/\nMockLogger · MockPublisher · MockConsumer\nFakeClock · LocalStack bootstrap"]
+        test_e2e["e2e/\nLocalStack + Postgres · tag: e2e\nfull outbox + SNS/SQS pipeline"]
+        fixtures["fixtures/\nMockLogger · MockPublisher · MockConsumer\nFakeClock · LocalStack bootstrap · NewTestDB"]
     end
 
     events_pkg    --> port_pkg
@@ -108,6 +109,9 @@ graph TD
     test_int      -.->|"imports"| outbox_pkg
     test_int      -.-> fixtures
     test_unit     -.-> fixtures
+    test_e2e      -.->|"imports"| events_pkg
+    test_e2e      -.->|"imports"| outbox_pkg
+    test_e2e      -.-> fixtures
 ```
 
 **Rule:** `domain` ← `port` ← `service` ← `adapter` ← `pkg`. The `domain` package imports nothing from this module. `port` imports only `domain`. Packages in `pkg/` depend on `core/` but never on `adapter/` directly. Tests (dashed arrows) consume the public API but are not part of the dependency chain.
@@ -182,7 +186,7 @@ graph LR
 | `Handler` | `func(ctx context.Context, env Envelope[json.RawMessage]) error` |
 | `NewSQSConsumer(cfg, handler, opts...)` | Constructs the SQS long-poll loop; returns error on empty `QueueURL` |
 | `SQSConfig` | `QueueURL` (required), `Region`, `EndpointURL`, `MaxMessages`, `WaitSeconds`, `Logger` |
-| `ConsumerOption` | `WithConcurrency(n)`, `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)` |
+| `ConsumerOption` | `WithConcurrency(n)`, `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`, `WithMaxReceiveCount(n)`, `WithDrainTimeout(d)` |
 | `Sign(key, payload)` | Hex-encoded HMAC-SHA256 signature |
 | `Verify(key, payload, sig)` | Constant-time comparison; returns `false` on any error |
 | `SignEnvelope(key, env)` | Signs canonical JSON of envelope |
@@ -196,7 +200,7 @@ graph LR
 
 | Symbol | Description |
 |--------|-------------|
-| `Config` | `Pool *pgcommon.Pool`, `Publisher`, `Logger`, `PollInterval`, `BatchSize`, `MaxAttempts` |
+| `Config` | `Pool *pgcommon.Pool`, `Publisher`, `Logger`, `PollInterval`, `BatchSize`, `MaxAttempts`, `ClaimLeaseDuration` (default 10 min — how long a claimed record is hidden from other runners) |
 | `NewRunner(cfg)` | Constructs the outbox runner; applies defaults |
 | `Runner.Start(ctx)` | Starts the poll loop; blocks until `ctx` is cancelled |
 | `Runner.Stop()` | Graceful drain; waits for in-flight batch to complete |
@@ -289,17 +293,19 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A([Runner.Start called]) --> B[sleep PollInterval]
-    B --> C["SELECT … FOR UPDATE SKIP LOCKED\nWHERE published_at IS NULL\nLIMIT BatchSize"]
-    C -- 0 rows --> B
-    C -- rows --> D[for each OutboxRecord]
+    A([Runner.Start called]) --> P[pollOnce\nimmediate first poll on startup]
+    P --> C["SELECT … FOR UPDATE SKIP LOCKED\nWHERE published_at IS NULL\n  AND scheduled_at ≤ NOW()\nORDER BY id  LIMIT BatchSize"]
+    C -- 0 rows --> B[wait PollInterval tick]
+    B --> C
+    C -- rows --> L["UPDATE scheduled_at = NOW() + claimLease\nWHERE id = ANY(ids)\n— claim lease, prevents re-claim by other runners —"]
+    L --> D[for each OutboxRecord]
     D --> E[json.Unmarshal Payload → Envelope]
-    E -- unmarshal error --> F[MarkFailed attempts++\nif attempts ≥ MaxAttempts → dead-letter]
+    E -- unmarshal error --> F["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\nif attempts ≥ MaxAttempts → dead-letter"]
     F --> D
     E -- ok --> G[Publisher.Publish]
     G -- success --> H[MarkPublished\npublished_at = NOW()]
     H --> D
-    G -- error --> I[MarkFailed attempts++\nlast_error = err.Error]
+    G -- error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)"]
     I --> J{attempts ≥ MaxAttempts?}
     J -- yes --> K[INSERT outbox_dead_letters\nDELETE outbox_events]
     J -- no  --> D

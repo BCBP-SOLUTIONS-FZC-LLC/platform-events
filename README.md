@@ -381,10 +381,13 @@ err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx 
 
 ### Poll cycle
 
-1. `SELECT … FOR UPDATE SKIP LOCKED` — claim up to `BatchSize` unpublished records (safe for horizontal scale; no distributed lock needed).
-2. For each record: call `Publisher.Publish`; on success set `published_at = NOW()`.
-3. On failure: increment `attempts`, set `last_error`. If `attempts >= MaxAttempts` move to `outbox_dead_letters`.
-4. Commit; sleep `PollInterval`.
+The runner fires one poll immediately on startup, then once per `PollInterval` tick.
+
+1. `SELECT … FOR UPDATE SKIP LOCKED WHERE published_at IS NULL AND scheduled_at <= NOW()` — claim up to `BatchSize` records. Safe for horizontal scale; concurrent runners claim disjoint batches.
+2. **Lease:** push `scheduled_at` forward by `ClaimLeaseDuration` (default 10 min) so other runners cannot re-claim the same records while publishing is in progress.
+3. For each record: call `Publisher.Publish`; on success set `published_at = NOW()`.
+4. On failure: increment `attempts`, reset `scheduled_at = NOW()` (releases the lease for immediate retry), set `last_error`. If `attempts >= MaxAttempts` move to `outbox_dead_letters`.
+5. Sleep `PollInterval`, then repeat.
 
 ### Dead letters
 
@@ -517,6 +520,12 @@ make test-smoke  # smoke tests — requires live AWS resources at SNS_TOPIC_ARN 
 make race        # unit + integration with -race detector
 make cover       # HTML coverage report (threshold: ≥95%)
 make cover-func  # per-function coverage summary in the terminal
+```
+
+End-to-end tests cover the full outbox pipeline (Postgres → runner → SNS → SQS → consumer):
+
+```bash
+go test ./test/e2e/... -tags=e2e -v   # requires Docker (LocalStack + Postgres via testcontainers-go)
 ```
 
 Pass `-short` to skip any test that requires Docker:

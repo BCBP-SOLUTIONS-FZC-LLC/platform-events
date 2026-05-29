@@ -1,15 +1,17 @@
 flowchart TD
-    A([Runner.Start called]) --> B[sleep PollInterval]
-    B --> C["SELECT … FOR UPDATE SKIP LOCKED\nWHERE published_at IS NULL\nLIMIT BatchSize"]
-    C -- 0 rows --> B
-    C -- rows --> D[for each OutboxRecord]
+    A([Runner.Start called]) --> P[pollOnce\nimmediate first poll on startup]
+    P --> C["SELECT … FOR UPDATE SKIP LOCKED\nWHERE published_at IS NULL\n  AND scheduled_at ≤ NOW()\nORDER BY id  LIMIT BatchSize"]
+    C -- 0 rows --> B[wait PollInterval tick]
+    B --> C
+    C -- rows --> L["UPDATE scheduled_at = NOW() + claimLease\nWHERE id = ANY(ids)\n— claim lease, prevents re-claim by other runners —"]
+    L --> D[for each OutboxRecord]
     D --> E[json.Unmarshal Payload → Envelope]
-    E -- unmarshal error --> F[MarkFailed attempts++\nif attempts ≥ MaxAttempts → dead-letter]
+    E -- unmarshal error --> F["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\nif attempts ≥ MaxAttempts → dead-letter"]
     F --> D
     E -- ok --> G[Publisher.Publish]
     G -- success --> H[MarkPublished\npublished_at = NOW()]
     H --> D
-    G -- error --> I[MarkFailed attempts++\nlast_error = err.Error]
+    G -- error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)"]
     I --> J{attempts ≥ MaxAttempts?}
     J -- yes --> K[INSERT outbox_dead_letters\nDELETE outbox_events]
     J -- no  --> D
