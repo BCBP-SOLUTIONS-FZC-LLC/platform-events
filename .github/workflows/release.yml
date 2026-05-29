@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: validate
+    env:
+      GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+      GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build binary
+        run: make build
+
+  publish:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract release notes from CHANGELOG.md
+        id: release-notes
+        run: |
+          VERSION="${{ github.ref_name }}"
+          NOTES=$(awk "/## \[${VERSION}\]/{found=1; next} /## \[/{if(found) exit} found{print}" CHANGELOG.md)
+          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.release-notes.outputs.notes }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}

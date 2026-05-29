@@ -1,0 +1,56 @@
+name: validate
+
+on:
+  workflow_call:
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    env:
+      GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+      GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Check gofmt
+        run: |
+          FMT=$(gofmt -l .)
+          if [ -n "$FMT" ]; then
+            echo "Files not formatted:"
+            echo "$FMT"
+            exit 1
+          fi
+
+      - name: Check go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./internal/... ./pkg/...
+
+      - name: Run tests (CI)
+        run: make test-ci

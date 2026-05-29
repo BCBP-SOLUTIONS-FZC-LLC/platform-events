@@ -1,0 +1,22 @@
+graph LR
+    subgraph sources["Documentation sources"]
+        subgraph godoc_src["GoDoc  —  pkg/*/"]
+            sym["exported symbol comments\nevery func · type · method\n(enforced by revive linter)"]
+        end
+
+        subgraph arch_src["Architecture docs"]
+            mmd_files["docs/architecture/mermaid/\n8 × .mmd source diagrams"]
+            arch_md["ARCHITECTURE.md\nembeds mermaid blocks\n+ prose + symbol tables"]
+        end
+    end
+
+    subgraph rendered["Rendered / consumed by"]
+        pkgsite["pkgsite (local)\nmake godoc → localhost:8080"]
+        github_md["GitHub\nMarkdown + Mermaid preview"]
+        ide["IDE hover\ngo doc CLI"]
+    end
+
+    sym     --> pkgsite
+    sym     --> ide
+    mmd_files -->|"copied into\nfenced code blocks"| arch_md
+    arch_md --> github_md

@@ -1,0 +1,63 @@
+graph TD
+    subgraph pub["Public API  —  pkg/"]
+        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
+        outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop\nEnqueue · ApplySchema"]
+    end
+
+    subgraph cli["CLI  —  cmd/"]
+        cmd["cmd/platform-events\nversion info"]
+    end
+
+    subgraph adapters["Adapters  —  internal/adapter/outbound/"]
+        sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption"]
+        sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nvisibility extension · drain"]
+        outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed"]
+        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal · OutboxAttemptsTotal"]
+        logger_adp["logger\nZapLogger → port.Logger\n(map-based fields; gincommon-compatible)"]
+    end
+
+    subgraph core["Core  —  internal/core/"]
+        port_pkg["port\nPublisher · Consumer · Handler\nLogger · Clock · OutboxStore"]
+        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge"]
+        service_pkg["service\nOutboxService · HMACService\nSign · Verify"]
+    end
+
+    subgraph infra["Infrastructure"]
+        config_pkg["internal/config\nSNSConfigEnv · SQSConfigEnv\nOutboxConfigEnv · OTelConfigEnv"]
+        migs_pkg["pkg/outbox/migrations\nembed.FS  (*.sql)"]
+    end
+
+    subgraph tests["Tests  —  test/"]
+        test_unit["unit/\nno Docker · pure Go"]
+        test_int["integration/\ntestcontainers-go · tag: integration"]
+        fixtures["fixtures/\nMockLogger · MockPublisher · MockConsumer\nFakeClock · LocalStack bootstrap"]
+    end
+
+    events_pkg    --> port_pkg
+    events_pkg    --> domain_pkg
+    events_pkg    --> sns_adp
+    events_pkg    --> sqs_adp
+    events_pkg    --> metrics_adp
+    outbox_pkg    --> port_pkg
+    outbox_pkg    --> domain_pkg
+    outbox_pkg    --> service_pkg
+    outbox_pkg    --> outboxstore_adp
+    outbox_pkg    --> migs_pkg
+    sns_adp       --> port_pkg
+    sns_adp       --> domain_pkg
+    sns_adp       --> metrics_adp
+    sqs_adp       --> port_pkg
+    sqs_adp       --> domain_pkg
+    sqs_adp       --> metrics_adp
+    outboxstore_adp --> port_pkg
+    outboxstore_adp --> domain_pkg
+    logger_adp    --> port_pkg
+    service_pkg   --> port_pkg
+    service_pkg   --> domain_pkg
+    cmd           --> config_pkg
+    test_unit     -.->|"imports"| events_pkg
+    test_unit     -.->|"imports"| outbox_pkg
+    test_int      -.->|"imports"| events_pkg
+    test_int      -.->|"imports"| outbox_pkg
+    test_int      -.-> fixtures
+    test_unit     -.-> fixtures

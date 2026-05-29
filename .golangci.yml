@@ -1,0 +1,32 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosimple
+    - gocritic
+    - misspell
+    - unconvert
+    - gofmt
+    - goimports
+    - gosec
+    - errorlint
+    - exhaustive
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/BCBP-SOLUTIONS-FZC-LLC
+  gosec:
+    excludes:
+      - G115 # integer overflow on conversion — acceptable in internal helpers
+  exhaustive:
+    default-signifies-exhaustive: true
+
+issues:
+  exclude-dirs:
+    - test/smoke
