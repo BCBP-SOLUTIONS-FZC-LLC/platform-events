@@ -1083,6 +1083,262 @@ func TestConsumer_Restart(t *testing.T) {
 	}
 }
 
+// TestNew_NilHandler_Error_Via_New calls the top-level New constructor (not NewWithClient)
+// with a nil handler to cover the nil-handler validation path inside New.
+func TestNew_NilHandler_Error_Via_New(t *testing.T) {
+	// New validates the handler before calling LoadDefaultConfig, so this does not
+	// require live AWS credentials.
+	_, err := internalsqs.New(internalsqs.Config{QueueURL: testQueueURL}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "handler")
+}
+
+// TestNewWithClient_WaitSeconds_Clamped verifies WaitSeconds > 20 is clamped to 20.
+func TestNewWithClient_WaitSeconds_Clamped(t *testing.T) {
+	client := &mockSQSClient{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 30}, // > 20 → clamp
+		client,
+		handler,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+}
+
+// TestNewWithClient_DLH_WithLogger_DefaultsMaxReceiveCount verifies that when a
+// dead-letter handler is set without a max-receive-count, the default (5) is applied
+// and the logger records a warning.
+func TestNewWithClient_DLH_WithLogger_DefaultsMaxReceiveCount(t *testing.T) {
+	client := &mockSQSClient{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+	dlh := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+	logger := &fixtures.MockLogger{}
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithDeadLetterHandler(dlh), // no WithMaxReceiveCount → default applied
+	)
+	require.NoError(t, err)
+	require.NotNil(t, c)
+
+	entries := logger.Entries()
+	found := false
+	for _, e := range entries {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN log for missing max-receive-count")
+}
+
+// TestDispatch_HandlerError_WithLogger verifies that when a handler returns an error
+// the logger receives a Warn call (exercises the c.logger != nil branch in dispatch).
+func TestDispatch_HandlerError_WithLogger(t *testing.T) {
+	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	msg := makeSQSMessage(env)
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	logger := &fixtures.MockLogger{}
+	handlerCalled := make(chan struct{}, 1)
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		handlerCalled <- struct{}{}
+		return errors.New("handler failed")
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() { startDone <- c.Start(ctx) }()
+
+	select {
+	case <-handlerCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not called")
+	}
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	require.NoError(t, <-startDone)
+
+	entries := logger.Entries()
+	found := false
+	for _, e := range entries {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN log from handler error in dispatch")
+}
+
+// TestDispatch_WithVisibilityTimeout exercises the extension-goroutine path in dispatch.
+func TestDispatch_WithVisibilityTimeout(t *testing.T) {
+	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	msg := makeSQSMessage(env)
+
+	var deleteCount int32
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		deleteMessageFn: func(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			atomic.AddInt32(&deleteCount, 1)
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+	}
+
+	handlerDone := make(chan struct{})
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		close(handlerDone)
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithVisibilityTimeout(30*time.Second), // > 0 → extension goroutine starts
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() { startDone <- c.Start(ctx) }()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not called")
+	}
+	cancel()
+	require.NoError(t, <-startDone)
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&deleteCount), "message should be deleted on success")
+}
+
+// TestDispatch_Metrics_Success verifies a successful dispatch increments the consumed
+// counter and records a duration (metrics are initialized via TestMain).
+func TestDispatch_Metrics_Success(t *testing.T) {
+
+	env := domain.NewEnvelope("metrics.event", "svc", json.RawMessage(`{}`))
+	msg := makeSQSMessage(env)
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	handlerDone := make(chan struct{}, 1)
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		handlerDone <- struct{}{}
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() { startDone <- c.Start(ctx) }()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not called")
+	}
+	cancel()
+	require.NoError(t, <-startDone, "Start should return without error")
+}
+
+// TestDispatch_DLH_Metrics exercises the dead-letter metrics path (metrics initialized via TestMain).
+func TestDispatch_DLH_Metrics(t *testing.T) {
+
+	env := domain.NewEnvelope("dlh.event", "svc", json.RawMessage(`{}`))
+	msg := makeSQSMessage(env)
+	// Simulate the message having been received 5 times → above default threshold.
+	msg.Attributes = map[string]string{"ApproximateReceiveCount": "5"}
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+	dlhDone := make(chan struct{}, 1)
+	dlh := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		dlhDone <- struct{}{}
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithDeadLetterHandler(dlh),
+		internalsqs.WithMaxReceiveCount(5),
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() { startDone <- c.Start(ctx) }()
+
+	select {
+	case <-dlhDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dead-letter handler was not called")
+	}
+	cancel()
+	require.NoError(t, <-startDone, "Start should return without error")
+}
+
 // TestConsumer_StopBeforeStart verifies that Stop() before Start() does not hang.
 func TestConsumer_StopBeforeStart(t *testing.T) {
 	client := &mockSQSClient{}

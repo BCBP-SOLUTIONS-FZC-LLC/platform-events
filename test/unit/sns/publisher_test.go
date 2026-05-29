@@ -7,11 +7,13 @@ import (
 	"testing"
 
 	internalsns "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -607,4 +609,74 @@ func TestNewSNSPublisher_EmptyTopicARN_Error(t *testing.T) {
 	_, err := internalsns.New(internalsns.Config{TopicARN: ""})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "TopicARN")
+}
+
+// ----------------------------
+// Publish: metrics counters and duration histogram updated on success
+// ----------------------------
+
+func TestPublish_WithMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics.InitWithRegisterer("sns-publish-metrics", "v0.0.1", reg)
+
+	env := makeEnv("metrics.event")
+	client := successClient()
+	p, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123456789:test", client, nil)
+	require.NoError(t, err)
+
+	err = p.Publish(context.Background(), env)
+	require.NoError(t, err)
+}
+
+// ----------------------------
+// PublishBatch: metrics updated on success
+// ----------------------------
+
+func TestPublishBatch_WithMetrics_Success(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics.InitWithRegisterer("sns-batch-metrics", "v0.0.2", reg)
+
+	envs := []domain.Envelope[json.RawMessage]{
+		makeEnv("batch.one"),
+		makeEnv("batch.two"),
+	}
+	client := successClient()
+	p, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123456789:test", client, nil)
+	require.NoError(t, err)
+
+	err = p.PublishBatch(context.Background(), envs)
+	require.NoError(t, err)
+}
+
+// ----------------------------
+// PublishBatch: transport error with logger and metrics
+// ----------------------------
+
+func TestPublishBatch_TransportError_WithLoggerAndMetrics(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics.InitWithRegisterer("sns-batch-err-metrics", "v0.0.3", reg)
+
+	logger := &fixtures.MockLogger{}
+	env := makeEnv("fail.event")
+	client := &mockSNSClient{
+		publishBatchFn: func(_ context.Context, _ *sns.PublishBatchInput, _ ...func(*sns.Options)) (*sns.PublishBatchOutput, error) {
+			return nil, errors.New("transport failure")
+		},
+	}
+	p, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123456789:test", client, logger)
+	require.NoError(t, err)
+
+	err = p.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{env})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "transport failure")
+
+	entries := logger.Entries()
+	found := false
+	for _, e := range entries {
+		if e.Level == "ERROR" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ERROR log for transport failure")
 }

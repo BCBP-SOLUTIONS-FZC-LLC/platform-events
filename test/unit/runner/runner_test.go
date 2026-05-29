@@ -516,3 +516,33 @@ func TestRunner_StopBeforeStart(t *testing.T) {
 		t.Fatal("Stop() before Start() hung — should return immediately")
 	}
 }
+
+// TestRunner_Start_AlreadyRunning_ReturnsError verifies that a second Start() call
+// while the runner is active returns an "already running" error.
+func TestRunner_Start_AlreadyRunning_ReturnsError(t *testing.T) {
+	store := newMockOutboxStore()
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r := outbox.NewRunner(outbox.Config{
+		Store:        store,
+		Publisher:    pub,
+		PollInterval: 10 * time.Second,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ready := make(chan struct{})
+	go func() {
+		close(ready)
+		_ = r.Start(ctx)
+	}()
+
+	<-ready
+	// Give the goroutine time to acquire the atomic.
+	time.Sleep(20 * time.Millisecond)
+
+	err := r.Start(ctx)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already running")
+}

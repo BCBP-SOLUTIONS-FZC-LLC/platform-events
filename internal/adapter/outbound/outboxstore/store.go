@@ -36,20 +36,21 @@ func New(pool *pgcommon.Pool, logger port.Logger, claimLeaseDuration time.Durati
 
 // InsertRecord executes the outbox INSERT within the caller's transaction.
 // Shared by Store.Enqueue (service-managed path) and outbox.Enqueue (public API).
+// created_at and scheduled_at use the DB server's NOW() to avoid clock-skew
+// between the Go client and the Postgres container breaking the ClaimBatch
+// scheduled_at <= NOW() predicate.
 func InsertRecord(ctx context.Context, tx pgx.Tx, record domain.OutboxRecord) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO outbox_events
 			(id, event_type, payload, tenant_id, trace_id, created_at, scheduled_at)
 		VALUES
-			($1, $2, $3, $4, $5, $6, $7)
+			($1, $2, $3, $4, $5, NOW(), NOW())
 	`,
 		record.ID,
 		record.EventType,
 		record.Payload,
 		record.TenantID,
 		record.TraceID,
-		record.CreatedAt,
-		record.ScheduledAt,
 	)
 	return err
 }

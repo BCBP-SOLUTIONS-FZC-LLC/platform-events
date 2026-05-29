@@ -355,6 +355,72 @@ func TestOutboxService_NilClock_UsesRealClock(t *testing.T) {
 	assert.NotNil(t, svc)
 }
 
+// TestOutboxService_CtxCancel_StrandedMarkFailedError covers the logger path when
+// MarkFailed itself returns an error while releasing stranded record leases.
+func TestOutboxService_CtxCancel_StrandedMarkFailedError_Logged(t *testing.T) {
+	store := &markFailedErrorStore{
+		mockStore: newMockStore(),
+		mfErr:     errors.New("mark failed error"),
+	}
+	for range 2 {
+		env := domain.NewEnvelope("x.y", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		store.records = append(store.records, domain.OutboxRecord{
+			ID:        env.ID,
+			EventType: env.Type,
+			Payload:   payload,
+		})
+	}
+
+	pub := &fixtures.MockPublisher{}
+	logger := &fixtures.MockLogger{}
+	svc := service.NewOutboxService(store, pub, logger, nil, 5)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel before PublishBatch runs the loop
+
+	err := svc.PublishBatch(ctx, 10)
+	require.Error(t, err)
+
+	entries := logger.Entries()
+	found := false
+	for _, e := range entries {
+		if e.Level == "ERROR" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ERROR log for MarkFailed failure during stranded-record cleanup")
+}
+
+// TestOutboxService_UnmarshalError_MarkFailedError_Logged covers the logger path
+// when MarkFailed fails for a record whose payload cannot be unmarshaled.
+func TestOutboxService_UnmarshalError_MarkFailedError_Logged(t *testing.T) {
+	store := &markFailedErrorStore{
+		mockStore: newMockStore(),
+		mfErr:     errors.New("mark failed error"),
+	}
+	store.records = []domain.OutboxRecord{
+		{ID: "bad-id", EventType: "x.y", Payload: []byte("not-json")},
+	}
+
+	pub := &fixtures.MockPublisher{}
+	logger := &fixtures.MockLogger{}
+	svc := service.NewOutboxService(store, pub, logger, nil, 5)
+
+	err := svc.PublishBatch(context.Background(), 10)
+	require.NoError(t, err) // per-record errors do not propagate
+
+	entries := logger.Entries()
+	errCount := 0
+	for _, e := range entries {
+		if e.Level == "ERROR" {
+			errCount++
+		}
+	}
+	assert.GreaterOrEqual(t, errCount, 2, "expected ERROR logs for both unmarshal failure and MarkFailed failure")
+}
+
 // ----------------------------
 // PublishBatch: stranded-record lease release on context cancellation
 // ----------------------------
