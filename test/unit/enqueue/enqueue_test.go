@@ -165,8 +165,9 @@ func TestEnqueue_FieldsForwardedCorrectly(t *testing.T) {
 	require.NoError(t, err)
 
 	args := tx.execArgs
-	// SQL params: $1=ID, $2=Type, $3=payload_json, $4=TenantID, $5=TraceID, $6=created_at, $7=scheduled_at
-	require.GreaterOrEqual(t, len(args), 7)
+	// SQL params: $1=ID, $2=Type, $3=payload_json, $4=TenantID, $5=TraceID
+	// created_at and scheduled_at use DB-side NOW() — not passed as parameters.
+	require.GreaterOrEqual(t, len(args), 5)
 	assert.Equal(t, env.ID, args[0])
 	assert.Equal(t, env.Type, args[1])
 	// args[2] is payload JSON

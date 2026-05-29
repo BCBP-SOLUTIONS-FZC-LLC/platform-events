@@ -313,6 +313,66 @@ func TestOutboxStore_ClaimBatch_Empty(t *testing.T) {
 }
 
 // ----------------------------
+// MarkFailed: non-existent record logs a warning (ErrNoRows path with logger)
+// ----------------------------
+
+func TestOutboxStore_MarkFailed_NonExistentRecord_WithLogger(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	_, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	logger := &fixtures.MockLogger{}
+	store := outboxstore.New(pool, logger, 0)
+
+	// Call MarkFailed on a non-existent record — should log a warning, not error.
+	err := store.MarkFailed(ctx, "01926e4f-dead-7000-beef-000000000002", "test error", 5)
+	require.NoError(t, err, "MarkFailed on a missing record must not error")
+
+	entries := logger.Entries()
+	found := false
+	for _, e := range entries {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN log when MarkFailed finds no matching row")
+}
+
+// ----------------------------
+// MarkPublished: non-existent record logs a warning (RowsAffected == 0 path)
+// ----------------------------
+
+func TestOutboxStore_MarkPublished_NonExistentRecord_LogsWarning(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	_, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	logger := &fixtures.MockLogger{}
+	store := outboxstore.New(pool, logger, 0)
+
+	// Call MarkPublished with a well-formed but non-existent ID.
+	err := store.MarkPublished(ctx, "01926e4f-dead-7000-beef-000000000099")
+	require.NoError(t, err, "MarkPublished on a missing record must not error")
+
+	entries := logger.Entries()
+	found := false
+	for _, e := range entries {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN log when MarkPublished finds no matching row")
+}
+
+// ----------------------------
 // schema.ApplySchema tested via NewTestDB fixture
 // ----------------------------
 
