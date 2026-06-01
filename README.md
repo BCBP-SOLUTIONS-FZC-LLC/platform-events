@@ -79,11 +79,17 @@ git config --global url."ssh://git@github.com/".insteadOf "https://github.com/"
 
 **Personal access token (CI / Docker builds):**
 
-```bash
-GONOSUMCHECK=github.com/BCBP-SOLUTIONS-FZC-LLC/* \
-GOFLAGS=-mod=mod \
-go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@v1.0.0
+Add a GitHub classic PAT (scope: `repo`) or fine-grained PAT (Contents: Read on all `BCBP-SOLUTIONS-FZC-LLC/*` repos) as a repository secret named `GO_PRIVATE_TOKEN`. The workflow configures git credentials before `go mod download`:
+
+```yaml
+- name: Configure private module access
+  run: |
+    git config --global credential.helper store
+    echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+    chmod 600 ~/.git-credentials
 ```
+
+> `persist-credentials: false` must be set on `actions/checkout` so that `GITHUB_TOKEN` (current-repo-only) does not override `GO_PRIVATE_TOKEN` when git fetches other private modules.
 
 ### Pin the version
 
@@ -664,16 +670,28 @@ Integration tests use `testcontainers-go` — Docker must be running locally. Un
 
 ## CI
 
-The GitHub Actions pipeline runs on every push and pull request to `main`:
+Three GitHub Actions workflows run against this repository:
+
+**`ci.yml`** — triggered on every push and pull request to `main`:
 
 | Job | What it checks |
 |-----|---------------|
-| `validate` | `gofmt`, `go mod tidy` drift, `go vet`, `golangci-lint`, `govulncheck`, race-detector tests |
-| `coverage` | unit + integration tests with race detector; coverage gate (≥95%) against `./internal/...` + `./pkg/...` |
-| `build` | Compiles the library and the `cmd/platform-events` binary |
-| `release` | Triggered on `v*` tags — creates a GitHub Release; this is the Go module release consuming services pin to |
+| `validate` | `make fmt-check`, `go mod tidy` drift, `make vet`, `make lint` (golangci-lint v2), `make vuln-check` (govulncheck), `make test-ci` (race detector) |
+| `coverage` | `make cover-func` — unit + integration + e2e tests with race detector; gate ≥ 95% against `./internal/...` + `./pkg/...` |
+| `build` | `make build` — compiles the library and `cmd/platform-events` binary |
 
-All checks must pass before merging. The coverage gate measures `./internal/...` and `./pkg/...` using `-coverpkg`.
+**`release.yml`** — triggered on `v*.*.*` tags:
+
+| Job | What it does |
+|-----|--------------|
+| `validate` | Same checks as CI |
+| `coverage` | Same ≥ 95% gate |
+| `build` | Compiles binary at the tagged ref |
+| `publish` | Extracts `[X.Y.Z]` section from `CHANGELOG.md` and creates a GitHub Release — this is the Go module version consuming services pin to |
+
+**`validate.yml`** — reusable workflow called by both `ci.yml` and `release.yml`.
+
+All checks must pass before merging. Private module access uses `GO_PRIVATE_TOKEN` via git credential store with `persist-credentials: false` on all checkout steps (see [GitHub authentication](#github-authentication)).
 
 ---
 
