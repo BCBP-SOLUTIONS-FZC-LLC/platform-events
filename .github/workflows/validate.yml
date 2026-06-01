@@ -1,23 +1,41 @@
-name: validate
+# Reusable validation workflow — called by ci.yml and release.yml.
+# Runs: checkout → Go setup → mod verify → fmt → tidy drift → vet → lint → vulncheck → test
+name: Validate
 
-on:
+"on":
   workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to check out (leave empty to use the caller ref)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+  GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
 
 jobs:
   validate:
     name: Validate
     runs-on: ubuntu-latest
-    env:
-      GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-      GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          cache-dependency-path: |
+            go.sum
+            go.mod
 
       - name: Download modules
         run: go mod download
@@ -25,32 +43,29 @@ jobs:
       - name: Verify modules
         run: go mod verify
 
-      - name: Check gofmt
+      - name: Format check
         run: |
-          FMT=$(gofmt -l .)
-          if [ -n "$FMT" ]; then
-            echo "Files not formatted:"
-            echo "$FMT"
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "gofmt violations:"
+            echo "$files"
             exit 1
           fi
 
-      - name: Check go mod tidy
+      - name: Tidy check
         run: |
-          go mod tidy
+          make tidy
           git diff --exit-code go.mod go.sum
 
-      - name: go vet
-        run: go vet ./...
+      - name: Vet
+        run: make vet
 
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: latest
+      - name: Lint
+        run: make lint
 
-      - name: govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./internal/... ./pkg/...
+      - name: Vulnerability check
+        # Scope to library packages only (internal and pkg)
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./internal/... ./pkg/...
 
-      - name: Run tests (CI)
+      - name: Test (race detector)
         run: make test-ci
