@@ -17,6 +17,7 @@ var (
 	OutboxPendingTotal    *prometheus.GaugeVec
 	OutboxPublishedTotal  *prometheus.CounterVec
 	OutboxAttemptsTotal   *prometheus.CounterVec
+	OutboxDeadLettersTotal *prometheus.CounterVec
 
 	initOnce sync.Once
 )
@@ -94,6 +95,15 @@ func initMetricsWithRegisterer(serviceName, buildVersion string, reg prometheus.
 	OutboxAttemptsTotal = factory.NewCounterVec(prometheus.CounterOpts{
 		Name:        "outbox_attempts_total",
 		Help:        "Total number of outbox publish attempts.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{})
+
+	// OutboxDeadLettersTotal counts records moved to outbox_dead_letters after
+	// exhausting MaxAttempts. This is the publish-side failure sink (distinct from
+	// the consumption-side SQS DLQ); alert on rate() > 0 to catch undelivered events.
+	OutboxDeadLettersTotal = factory.NewCounterVec(prometheus.CounterOpts{
+		Name:        "outbox_dead_letters_total",
+		Help:        "Total number of outbox records moved to the dead-letter table.",
 		ConstLabels: prometheus.Labels{"service": serviceName},
 	}, []string{})
 }

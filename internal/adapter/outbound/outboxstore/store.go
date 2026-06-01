@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
@@ -205,9 +206,16 @@ func (s *Store) MarkFailed(ctx context.Context, id string, lastError string, max
 		var eventType, tenantID, traceID string
 		var payload []byte
 		var createdAt time.Time
+		// FOR UPDATE serializes the attempts read against a concurrent runner that
+		// re-claimed this record after the claim lease expired mid-publish. Without
+		// it, two runners could read the same attempts value and double-increment or
+		// dead-letter one cycle early. SKIP LOCKED is intentionally NOT used here:
+		// we want the second runner to block briefly and observe the committed
+		// attempts, not skip the row.
 		err = tx.QueryRow(ctx, `
 			SELECT attempts, event_type, tenant_id, trace_id, payload, created_at
 			FROM outbox_events WHERE id = $1 AND published_at IS NULL
+			FOR UPDATE
 		`, id).Scan(&attempts, &eventType, &tenantID, &traceID, &payload, &createdAt)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -224,6 +232,7 @@ func (s *Store) MarkFailed(ctx context.Context, id string, lastError string, max
 		}
 
 		newAttempts := attempts + 1
+		deadLettered := newAttempts >= maxAttempts
 
 		if newAttempts >= maxAttempts {
 			// Move to dead-letter table. ON CONFLICT DO UPDATE ensures that a concurrent
@@ -265,6 +274,13 @@ func (s *Store) MarkFailed(ctx context.Context, id string, lastError string, max
 			return err
 		}
 		committed = true
+
+		// Increment the dead-letter counter only after a successful commit so the
+		// metric never overcounts on a rolled-back transaction. Enables alerting on
+		// publish-side failures (rate(outbox_dead_letters_total) > 0).
+		if deadLettered && metrics.OutboxDeadLettersTotal != nil {
+			metrics.OutboxDeadLettersTotal.WithLabelValues().Inc()
+		}
 		return nil
 	})
 }

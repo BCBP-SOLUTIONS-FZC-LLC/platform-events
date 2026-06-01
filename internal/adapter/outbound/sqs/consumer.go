@@ -455,11 +455,20 @@ func (c *sqsConsumer) dispatch(ctx context.Context, msg sqstypes.Message) {
 			for {
 				select {
 				case <-ticker.C:
-					_, _ = c.client.ChangeMessageVisibility(extCtx, &sqs.ChangeMessageVisibilityInput{
+					if _, err := c.client.ChangeMessageVisibility(extCtx, &sqs.ChangeMessageVisibilityInput{
 						QueueUrl:          aws.String(c.queueURL),
 						ReceiptHandle:     msg.ReceiptHandle,
 						VisibilityTimeout: secs,
-					})
+					}); err != nil && c.logger != nil {
+						// A failed extension means the message may become visible again
+						// while the handler is still running, causing duplicate delivery.
+						// Handlers are required to be idempotent, so this is not fatal —
+						// but it is worth surfacing when debugging duplicate processing.
+						c.logger.Warn("sqs: failed to extend message visibility — possible duplicate delivery", map[string]any{
+							"message_id": aws.ToString(msg.MessageId),
+							"error":      err.Error(),
+						})
+					}
 				case <-extCtx.Done():
 					return
 				}
