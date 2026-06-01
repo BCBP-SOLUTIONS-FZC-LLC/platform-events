@@ -12,9 +12,9 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
+	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
-	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

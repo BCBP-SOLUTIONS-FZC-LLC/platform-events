@@ -27,13 +27,14 @@ make test-unit
 
 ### Local module workspace
 
-The library depends on `platform-pgcommon`, which is a sibling private module. For local development, create a `go.work` file (gitignored) to use the local copy:
+`go.mod` pins `platform-pgcommon` at a released version (for CI and consumers). For local development against sibling repos, use a `go.work` file (gitignored):
 
 ```bash
 go work init . ../platform-pgcommon
+# optional: ../platform-gincommon if you are testing cross-library changes
 ```
 
-This avoids needing a published version of `platform-pgcommon` during development.
+CI for **platform-events** only checks out this repository and fetches private modules via `GOPRIVATE` — it does not clone sibling repos.
 
 ## Project layout
 

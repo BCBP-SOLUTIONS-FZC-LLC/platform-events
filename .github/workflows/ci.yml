@@ -30,10 +30,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Checkout platform-pgcommon
-        run: |
-          git clone "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon.git" ../platform-pgcommon
-
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -42,12 +38,16 @@ jobs:
             go.sum
             go.mod
 
+      - name: Configure private module access
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Download modules
+        run: go mod download
+
       - name: Coverage (≥95% required)
         run: |
-          go test $(go list ./test/... | grep -v /test/smoke$) \
-            -race -count=1 -timeout 120s \
-            -coverpkg=$(go list ./internal/... ./pkg/... | paste -sd,) \
-            -coverprofile=coverage.out
+          make cover-func
           pct=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
           echo "Total coverage: ${pct}%"
           awk -v p="$pct" 'BEGIN { if (p+0 < 95) { print "FAIL: " p "% is below the 95% threshold"; exit 1 } }'
@@ -68,10 +68,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Checkout platform-pgcommon
-        run: |
-          git clone "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon.git" ../platform-pgcommon
-
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -79,6 +75,13 @@ jobs:
           cache-dependency-path: |
             go.sum
             go.mod
+
+      - name: Configure private module access
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Download modules
+        run: go mod download
 
       - name: Build binary
         run: make build

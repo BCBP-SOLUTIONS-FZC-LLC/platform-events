@@ -1,5 +1,4 @@
-# Reusable validation workflow — called by ci.yml and release.yml.
-# Runs: checkout → Go setup → mod verify → fmt → tidy drift → vet → lint → vulncheck → test
+# Reusable validation workflow for platform-events — called by ci.yml and release.yml.
 name: Validate
 
 "on":
@@ -29,10 +28,6 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Checkout platform-pgcommon
-        run: |
-          git clone "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon.git" ../platform-pgcommon
-
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -41,6 +36,10 @@ jobs:
             go.sum
             go.mod
 
+      - name: Configure private module access
+        run: |
+          git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+
       - name: Download modules
         run: go mod download
 
@@ -48,13 +47,7 @@ jobs:
         run: go mod verify
 
       - name: Format check
-        run: |
-          files=$(gofmt -l .)
-          if [ -n "$files" ]; then
-            echo "gofmt violations:"
-            echo "$files"
-            exit 1
-          fi
+        run: make fmt-check
 
       - name: Tidy check
         run: |
@@ -68,8 +61,7 @@ jobs:
         run: make lint
 
       - name: Vulnerability check
-        # Scope to library packages only (internal and pkg)
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./internal/... ./pkg/...
+        run: make vuln-check
 
       - name: Test (race detector)
         run: make test-ci

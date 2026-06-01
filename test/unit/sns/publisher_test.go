@@ -6,8 +6,8 @@ import (
 	"errors"
 	"testing"
 
-	internalsns "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
+	internalsns "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -573,8 +573,8 @@ func TestPublish_WithAttributes_ReservedKeyWarning(t *testing.T) {
 		client,
 		logger,
 		internalsns.WithAttributes(map[string]string{
-			"EventType":    "override-attempt", // reserved — should be ignored with a warn log
-			"CustomField":  "allowed",
+			"EventType":   "override-attempt", // reserved — should be ignored with a warn log
+			"CustomField": "allowed",
 		}),
 	)
 	require.NoError(t, err)

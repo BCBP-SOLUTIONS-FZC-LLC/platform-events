@@ -10,13 +10,13 @@ import (
 
 // Global metric variables, initialised once by Init or InitWithRegisterer.
 var (
-	EventsPublishedTotal  *prometheus.CounterVec
-	EventsPublishDuration *prometheus.HistogramVec
-	EventsConsumedTotal   *prometheus.CounterVec
-	EventsConsumeDuration *prometheus.HistogramVec
-	OutboxPendingTotal    *prometheus.GaugeVec
-	OutboxPublishedTotal  *prometheus.CounterVec
-	OutboxAttemptsTotal   *prometheus.CounterVec
+	EventsPublishedTotal   *prometheus.CounterVec
+	EventsPublishDuration  *prometheus.HistogramVec
+	EventsConsumedTotal    *prometheus.CounterVec
+	EventsConsumeDuration  *prometheus.HistogramVec
+	OutboxPendingTotal     *prometheus.GaugeVec
+	OutboxPublishedTotal   *prometheus.CounterVec
+	OutboxAttemptsTotal    *prometheus.CounterVec
 	OutboxDeadLettersTotal *prometheus.CounterVec
 
 	initOnce sync.Once
