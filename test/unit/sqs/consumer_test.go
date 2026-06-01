@@ -1339,6 +1339,70 @@ func TestDispatch_DLH_Metrics(t *testing.T) {
 	require.NoError(t, <-startDone, "Start should return without error")
 }
 
+// TestDispatch_VisibilityExtension_Error_LoggerCalled drives the visibility-
+// extension goroutine's ticker path with a failing ChangeMessageVisibility and a
+// logger set, covering the WARN branch added for duplicate-delivery debugging.
+func TestDispatch_VisibilityExtension_Error_LoggerCalled(t *testing.T) {
+	env := domain.NewEnvelope("vis.err", "svc", json.RawMessage(`{}`))
+	msg := makeSQSMessage(env)
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		changeMessageVisibilityFn: func(_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+			return nil, errors.New("visibility extend failed")
+		},
+	}
+
+	logger := &fixtures.MockLogger{}
+	release := make(chan struct{})
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		<-release // block so the extension ticker fires at least once
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithVisibilityTimeout(2*time.Second), // half = 1s ticker interval
+		internalsqs.WithDrainTimeout(3*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() { startDone <- c.Start(ctx) }()
+
+	// Wait for the WARN from the failed extension (ticker fires at ~1s).
+	found := false
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, e := range logger.Entries() {
+			if e.Level == "WARN" {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	close(release) // let the handler finish
+	cancel()
+	require.NoError(t, <-startDone)
+	assert.True(t, found, "expected WARN log when ChangeMessageVisibility fails mid-handler")
+}
+
 // TestConsumer_StopBeforeStart verifies that Stop() before Start() does not hang.
 func TestConsumer_StopBeforeStart(t *testing.T) {
 	client := &mockSQSClient{}
