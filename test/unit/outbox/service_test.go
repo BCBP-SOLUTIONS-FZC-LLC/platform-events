@@ -575,7 +575,10 @@ func TestOutboxService_PublishTimeout_Fires_MarksFailed(t *testing.T) {
 
 func TestOutboxService_CtxCancel_DoesNotDeadLetterAtMaxAttemptsMinusOne(t *testing.T) {
 	// Custom store that captures the maxAttempts ceiling passed to MarkFailed.
-	type failCall struct{ id string; maxAttempts int }
+	type failCall struct {
+		id          string
+		maxAttempts int
+	}
 	var calls []failCall
 	store := &captureMaxAttemptsStore{
 		mockStore: newMockStore(),

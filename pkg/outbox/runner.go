@@ -18,10 +18,10 @@ import (
 )
 
 const (
-	defaultPollInterval  = 5 * time.Second
-	defaultBatchSize     = 50
-	defaultMaxAttempts   = 5
-	defaultDrainTimeout  = 30 * time.Second
+	defaultPollInterval   = 5 * time.Second
+	defaultBatchSize      = 50
+	defaultMaxAttempts    = 5
+	defaultDrainTimeout   = 30 * time.Second
 	defaultPublishTimeout = 10 * time.Second
 
 	// Poll backoff: doubles on each consecutive failure, capped at maxPollBackoff.
@@ -84,12 +84,12 @@ type Config struct {
 // Runner polls the outbox_events table and publishes pending records.
 // A Runner is fully restartable: Start() may be called again after Stop().
 type Runner struct {
-	svc    *service.OutboxService
-	cfg    Config
-	mu     sync.Mutex
-	cancel context.CancelFunc // signals the active Start() goroutine to stop
-	doneCh chan struct{}       // closed when the active Start() goroutine has exited
-	started atomic.Bool       // guards against concurrent Start() calls
+	svc     *service.OutboxService
+	cfg     Config
+	mu      sync.Mutex
+	cancel  context.CancelFunc // signals the active Start() goroutine to stop
+	doneCh  chan struct{}      // closed when the active Start() goroutine has exited
+	started atomic.Bool        // guards against concurrent Start() calls
 }
 
 // NewRunner constructs a Runner from the provided Config.

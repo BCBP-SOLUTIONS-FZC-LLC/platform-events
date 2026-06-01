@@ -37,9 +37,9 @@ type OutboxConfigEnv struct {
 
 // OTelConfigEnv holds environment-derived OpenTelemetry configuration.
 type OTelConfigEnv struct {
-	ServiceName     string
+	ServiceName      string
 	ExporterEndpoint string
-	Insecure        bool
+	Insecure         bool
 }
 
 // LoadSNS loads SNS configuration from environment variables.

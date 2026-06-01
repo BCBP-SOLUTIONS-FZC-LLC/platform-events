@@ -16,10 +16,10 @@ import (
 
 // LocalStack holds a running LocalStack container and AWS clients for testing.
 type LocalStack struct {
-	Container    testcontainers.Container
-	EndpointURL  string
-	SNSClient    *sns.Client
-	SQSClient    *sqs.Client
+	Container   testcontainers.Container
+	EndpointURL string
+	SNSClient   *sns.Client
+	SQSClient   *sqs.Client
 }
 
 // StartLocalStack starts a LocalStack container and returns the helper.
