@@ -12,7 +12,7 @@ graph TD
         sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption"]
         sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nvisibility extension · drain"]
         outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed"]
-        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal · OutboxAttemptsTotal"]
+        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal"]
         logger_adp["logger\nZapLogger → port.Logger\n(map-based fields; gincommon-compatible)"]
     end
 

@@ -59,7 +59,7 @@ graph TD
         sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption"]
         sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nvisibility extension · drain"]
         outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed"]
-        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal · OutboxAttemptsTotal"]
+        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal"]
         logger_adp["logger\nZapLogger → port.Logger\n(map-based fields; gincommon-compatible)"]
     end
 
@@ -200,11 +200,11 @@ graph LR
 
 | Symbol | Description |
 |--------|-------------|
-| `Config` | `Pool *pgcommon.Pool`, `Publisher`, `Logger`, `PollInterval`, `BatchSize`, `MaxAttempts`, `ClaimLeaseDuration` (default 10 min — how long a claimed record is hidden from other runners) |
-| `NewRunner(cfg)` | Constructs the outbox runner; applies defaults |
-| `Runner.Start(ctx)` | Starts the poll loop; blocks until `ctx` is cancelled |
-| `Runner.Stop()` | Graceful drain; waits for in-flight batch to complete |
-| `Enqueue(ctx, tx pgx.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction |
+| `Config` | `Pool *pgcommon.Pool`, `Publisher`, `Logger`, `PollInterval` (5s), `BatchSize` (50), `MaxAttempts` (5), `ClaimLeaseDuration` (10 min — how long a claimed record is hidden from other runners), `PublishConcurrency` (1 — parallel publishes per batch), `PublishTimeout` (10s — per-record), `DrainTimeout` (30s — `Stop()` bound), `StartupJitter` (0 — random pre-first-poll delay to desync replicas) |
+| `NewRunner(cfg)` | Constructs the outbox runner; applies defaults; panics if `Publisher` nil or both `Pool` and `Store` nil |
+| `Runner.Start(ctx)` | Starts the poll loop (immediate first poll, then per `PollInterval`); exponential backoff (1s→30s) on poll-cycle failure; blocks until `ctx` is cancelled |
+| `Runner.Stop()` | Graceful drain; waits up to `DrainTimeout` for the in-flight batch, then returns a non-nil error if it did not finish |
+| `Enqueue(ctx, tx pgx.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; rejects payloads > 240 KB; warns on empty `TenantID` |
 | `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations (`001_create_outbox_events`, `002_create_outbox_dead_letters`) |
 
 ---
@@ -416,8 +416,9 @@ When goroutine 1 finishes:
 |---|---|---|
 | Slow handlers | `events_consume_duration_seconds` p99 rising | Reduce concurrency or investigate handler latency |
 | Handler errors | `events_consumed_total{status=error}` growing | Messages being retried; check handler logic |
-| Outbox backlog | `outbox_pending_total` growing | Publisher slow or SNS throttling; check `outbox_published_total` |
-| Publish failures | `outbox_published_total{status=error}` | Check SNS connectivity and `outbox_dead_letters` table |
+| Outbox backlog | `outbox_pending_total` growing | Publisher slow or SNS throttling; raise `PublishConcurrency` or check `outbox_published_total` |
+| Publish failures | `outbox_published_total{status=error}` | Check SNS connectivity and the `outbox_dead_letters` table |
+| Dead letters | `outbox_dead_letters_total` rate > 0 | Records exhausted `MaxAttempts` — inspect `outbox_dead_letters` and replay; **primary publish-side alert** |
 
 ---
 
@@ -437,8 +438,15 @@ When goroutine 1 finishes:
 | Idempotent metrics registration | `Init` is guarded by `sync.Once`; `InitWithRegisterer` bypasses it for test isolation |
 | OTel initialised by consuming service | `platform-events` calls `otel.Tracer(...)` — no-op if no provider registered; no double-init |
 | Graceful consumer shutdown | `Stop()` waits `DrainTimeout` (30 s) for in-flight handlers before returning |
+| Graceful runner shutdown | `Runner.Stop()` waits up to `DrainTimeout` (30 s) for the in-flight batch, then returns a non-nil error; set Helm `terminationGracePeriodSeconds` > `DrainTimeout` |
+| Poll-failure backoff | On a failed poll cycle the runner backs off exponentially (1s→30s) instead of retrying every `PollInterval` |
+| Parallel publish bounded | `PublishConcurrency` caps concurrent publishes per batch (default 1); per-record `PublishTimeout` (10s) prevents one hung call stalling the batch |
+| Shutdown ≠ dead-letter | Records stranded by context cancellation are released with `MaxAttempts+1` so a rolling restart never alone dead-letters a near-max record |
+| `last_error` bounded | Error strings stored in `outbox_events`/`outbox_dead_letters` are truncated to 512 chars to prevent table bloat |
+| Envelope size bounded | `Enqueue` rejects serialised payloads > 240 KB (under the SNS 256 KB hard limit) |
+| `MarkFailed` serialized | The attempts read uses `SELECT … FOR UPDATE` so a lease-expiry re-claim cannot double-increment or dead-letter early |
 | SKIP LOCKED for horizontal scale | Multiple outbox runner instances claim disjoint batches; no distributed lock required |
-| Dead letters are queryable | `outbox_dead_letters` is a Postgres table; retryable and auditable from SQL tooling |
+| Dead letters are queryable & observable | `outbox_dead_letters` is a Postgres table (retryable from SQL); `outbox_dead_letters_total` counter enables alerting |
 | Batch split at 10 | `PublishBatch` splits silently; partial failures return `BatchError` per message |
 | Handlers must be idempotent | SQS delivers at least once; use `Envelope.ID` as the idempotency key for all side effects |
 | No global ordering guaranteed | Ordering is preserved only within a FIFO message group (`WithMessageGroupID`); standard queues offer best-effort order |
@@ -454,7 +462,7 @@ When goroutine 1 finishes:
 | `publisher.Publish` (happy path) | Network RTT to SNS | OTel span + Prometheus counter: < 2 µs on top |
 | `outbox.Enqueue` | One `INSERT` in the caller's tx | No SNS call; adds one row to the running transaction |
 | Outbox runner poll (empty) | One `SELECT` + `time.Sleep` | Negligible; one connection for the full poll interval |
-| Outbox runner poll (full batch) | `BatchSize × sns.Publish` | Parallelism limited by outbox runner goroutines; tune `BatchSize` and `PollInterval` |
+| Outbox runner poll (full batch) | `ceil(BatchSize / PublishConcurrency) × sns.Publish` | Publishes run `PublishConcurrency`-wide (default 1 = sequential); tune `PublishConcurrency`, `BatchSize`, and `PollInterval` together |
 | `sqs.ReceiveMessage` | Network RTT to SQS | Long-poll (20 s) returns when messages arrive or timeout elapses |
 | Handler dispatch overhead | < 1 µs | Semaphore acquire + goroutine start |
 | `Verify` (HMAC) | < 1 µs | Two HMAC computations + constant-time compare |
