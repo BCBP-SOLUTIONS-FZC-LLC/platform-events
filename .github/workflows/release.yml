@@ -51,7 +51,8 @@ jobs:
 
       - name: Configure private module access
         run: |
-          git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          echo "machine github.com login x-access-token password ${{ secrets.GO_PRIVATE_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
 
       - name: Download modules
         run: go mod download
@@ -83,7 +84,8 @@ jobs:
 
       - name: Configure private module access
         run: |
-          git config --global url."https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/".insteadOf "https://github.com/"
+          echo "machine github.com login x-access-token password ${{ secrets.GO_PRIVATE_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
 
       - name: Download modules
         run: go mod download
