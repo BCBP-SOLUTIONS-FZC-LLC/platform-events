@@ -112,7 +112,7 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
-
+ 
       - name: Extract release notes from CHANGELOG
         shell: bash
         run: |
