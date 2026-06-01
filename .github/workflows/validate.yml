@@ -38,8 +38,9 @@ jobs:
 
       - name: Configure private module access
         run: |
-          echo "machine github.com login x-access-token password ${{ secrets.GO_PRIVATE_TOKEN }}" >> ~/.netrc
-          chmod 600 ~/.netrc
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
 
       - name: Download modules
         run: go mod download
