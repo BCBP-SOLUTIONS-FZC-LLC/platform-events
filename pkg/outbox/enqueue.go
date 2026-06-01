@@ -40,6 +40,12 @@ func Enqueue(ctx context.Context, tx pgx.Tx, env events.Envelope[json.RawMessage
 	if err != nil {
 		return err
 	}
+	// SNS message size limit is 256 KB. Reject early to avoid persisting records
+	// that will always fail at publish time and burn outbox attempt budget.
+	const maxEnvelopeBytes = 240 * 1024
+	if len(b) > maxEnvelopeBytes {
+		return fmt.Errorf("outbox: serialised envelope is %d bytes — exceeds safe SNS limit (%d bytes); reduce payload size", len(b), maxEnvelopeBytes)
+	}
 	now := time.Now().UTC()
 	return outboxstore.InsertRecord(ctx, tx, domain.OutboxRecord{
 		ID:          env.ID,

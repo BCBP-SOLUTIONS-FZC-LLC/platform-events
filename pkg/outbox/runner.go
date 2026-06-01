@@ -2,7 +2,9 @@ package outbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,9 +18,15 @@ import (
 )
 
 const (
-	defaultPollInterval = 5 * time.Second
-	defaultBatchSize    = 50
-	defaultMaxAttempts  = 5
+	defaultPollInterval  = 5 * time.Second
+	defaultBatchSize     = 50
+	defaultMaxAttempts   = 5
+	defaultDrainTimeout  = 30 * time.Second
+	defaultPublishTimeout = 10 * time.Second
+
+	// Poll backoff: doubles on each consecutive failure, capped at maxPollBackoff.
+	initPollBackoff = 1 * time.Second
+	maxPollBackoff  = 30 * time.Second
 )
 
 // Config holds the parameters for constructing a Runner.
@@ -52,6 +60,25 @@ type Config struct {
 	// runners before it becomes eligible for re-claim. Defaults to 10 minutes.
 	// Should exceed BatchSize × worst-case per-record publish time.
 	ClaimLeaseDuration time.Duration
+
+	// DrainTimeout is the maximum time Stop() waits for the current poll cycle
+	// to complete before returning an error. Defaults to 30s.
+	DrainTimeout time.Duration
+
+	// PublishConcurrency is the number of records published concurrently within
+	// a single poll cycle. Defaults to 1 (sequential). Increase for high-throughput
+	// workloads where SNS latency is the bottleneck.
+	PublishConcurrency int
+
+	// PublishTimeout is the per-record timeout for calls to Publisher.Publish.
+	// Defaults to 10s. Prevents a hung SNS client from stalling the entire batch.
+	// 0 disables the per-record timeout.
+	PublishTimeout time.Duration
+
+	// StartupJitter adds a random delay in [0, StartupJitter) before the first
+	// poll. Use when running multiple runner instances to desynchronise their
+	// initial polls and avoid a thundering-herd burst on the DB.
+	StartupJitter time.Duration
 }
 
 // Runner polls the outbox_events table and publishes pending records.
@@ -85,6 +112,13 @@ func NewRunner(cfg Config) *Runner {
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = defaultMaxAttempts
 	}
+	if cfg.DrainTimeout <= 0 {
+		cfg.DrainTimeout = defaultDrainTimeout
+	}
+	if cfg.PublishTimeout <= 0 {
+		cfg.PublishTimeout = defaultPublishTimeout
+	}
+	// PublishConcurrency defaults to 1 (sequential); service constructor handles <= 0.
 
 	var store port.OutboxStore
 	if cfg.Store != nil {
@@ -93,10 +127,14 @@ func NewRunner(cfg Config) *Runner {
 		store = outboxstore.New(cfg.Pool, cfg.Logger, cfg.ClaimLeaseDuration)
 	}
 
-	// Wrap the public Publisher into the internal port.Publisher interface.
 	inner := &publisherBridge{pub: cfg.Publisher}
 
-	svc := service.NewOutboxService(store, inner, cfg.Logger, nil, cfg.MaxAttempts)
+	svc := service.NewOutboxService(
+		store, inner, cfg.Logger, nil,
+		cfg.MaxAttempts,
+		cfg.PublishConcurrency,
+		cfg.PublishTimeout,
+	)
 
 	// Pre-closed initial doneCh so Stop() before Start() returns immediately.
 	initialDone := make(chan struct{})
@@ -132,12 +170,33 @@ func (r *Runner) Start(ctx context.Context) error {
 		close(thisDone)
 	}()
 
+	// Optional startup jitter: desynchronises concurrent runner instances so
+	// they do not all hammer the DB at the same instant on a rolling restart.
+	if r.cfg.StartupJitter > 0 {
+		jitter := time.Duration(rand.Int64N(int64(r.cfg.StartupJitter)))
+		select {
+		case <-time.After(jitter):
+		case <-ctx.Done():
+			return nil
+		case <-stopCtx.Done():
+			return nil
+		}
+	}
+
 	ticker := time.NewTicker(r.cfg.PollInterval)
 	defer ticker.Stop()
 
+	pollBackoff := initPollBackoff
+
 	// Run one poll immediately on startup so events that arrived while the runner
 	// was stopped are not delayed by a full PollInterval.
-	r.pollOnce(ctx)
+	if r.pollOnce(ctx) {
+		if !r.sleepBackoff(ctx, stopCtx, &pollBackoff) {
+			return nil
+		}
+	} else {
+		pollBackoff = initPollBackoff
+	}
 
 	for {
 		select {
@@ -146,16 +205,38 @@ func (r *Runner) Start(ctx context.Context) error {
 		case <-stopCtx.Done():
 			return nil
 		case <-ticker.C:
-			r.pollOnce(ctx)
+			if r.pollOnce(ctx) {
+				if !r.sleepBackoff(ctx, stopCtx, &pollBackoff) {
+					return nil
+				}
+			} else {
+				pollBackoff = initPollBackoff
+			}
 		}
 	}
 }
 
+// sleepBackoff sleeps for the current backoff duration (interruptible by context
+// cancellation or Stop), then doubles the backoff up to maxPollBackoff.
+// Returns false if the caller should exit Start immediately.
+func (r *Runner) sleepBackoff(ctx, stopCtx context.Context, backoff *time.Duration) bool {
+	timer := time.NewTimer(*backoff)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		*backoff = min(*backoff*2, maxPollBackoff)
+		return true
+	case <-ctx.Done():
+		return false
+	case <-stopCtx.Done():
+		return false
+	}
+}
+
 // pollOnce runs a single gauge-update + publish-batch cycle.
-func (r *Runner) pollOnce(ctx context.Context) {
-	// Update the pending gauge before publishing so it reflects records
-	// waiting at the start of this cycle. Use a short bounded context so
-	// a slow COUNT(*) query cannot stall the entire poll loop.
+// Returns true when the cycle encountered an infrastructure error (triggers
+// backoff in Start); returns false on success or context cancellation.
+func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 	if metrics.OutboxPendingTotal != nil {
 		gcCtx, gcCancel := context.WithTimeout(ctx, 2*time.Second)
 		if n, err := r.svc.PendingCount(gcCtx); err == nil {
@@ -164,22 +245,33 @@ func (r *Runner) pollOnce(ctx context.Context) {
 		gcCancel()
 	}
 	if err := r.svc.PublishBatch(ctx, r.cfg.BatchSize); err != nil {
+		// Context cancellation is not an infrastructure error — no backoff.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return false
+		}
 		if r.cfg.Logger != nil {
 			r.cfg.Logger.Error("outbox: poll cycle failed", map[string]any{
 				"error": err.Error(),
 			})
 		}
+		return true
 	}
+	return false
 }
 
-// Stop signals the runner to stop and waits for the current poll cycle to finish.
+// Stop signals the runner to stop and waits up to DrainTimeout for the current
+// poll cycle to finish. Returns an error if the drain timeout is exceeded.
 // Safe to call multiple times and safe to call before Start.
 func (r *Runner) Stop() error {
 	r.mu.Lock()
 	r.cancel()
-	doneCh := r.doneCh // capture the current cycle's channel under lock
+	doneCh := r.doneCh
 	r.mu.Unlock()
 
-	<-doneCh // pre-closed before first Start(), fresh channel during/after Start()
-	return nil
+	select {
+	case <-doneCh:
+		return nil
+	case <-time.After(r.cfg.DrainTimeout):
+		return fmt.Errorf("outbox: runner did not stop within drain timeout (%s)", r.cfg.DrainTimeout)
+	}
 }

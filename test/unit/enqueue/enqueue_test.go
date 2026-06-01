@@ -174,3 +174,19 @@ func TestEnqueue_FieldsForwardedCorrectly(t *testing.T) {
 	assert.Equal(t, "tenant123", args[3])
 	assert.Equal(t, "trace-xyz", args[4])
 }
+
+func TestEnqueue_OversizedPayload_ReturnsError(t *testing.T) {
+	tx := &stubTx{}
+	// Build a payload that exceeds 240 KB after JSON serialisation.
+	bigPayload := make([]byte, 250*1024)
+	for i := range bigPayload {
+		bigPayload[i] = 'x'
+	}
+	env := events.NewEnvelope("big.event", "svc",
+		json.RawMessage(`"`+string(bigPayload)+`"`),
+		events.WithTenantID("t"),
+	)
+	err := outbox.Enqueue(context.Background(), tx, env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds safe SNS limit")
+}
