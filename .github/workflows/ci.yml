@@ -57,7 +57,7 @@ jobs:
           awk -v p="$pct" 'BEGIN { if (p+0 < 95) { print "FAIL: " p "% is below the 95% threshold"; exit 1 } }'
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: coverage-report
@@ -98,7 +98,7 @@ jobs:
         run: test -x bin/platform-events
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: platform-events-linux-amd64
           path: bin/platform-events
