@@ -29,6 +29,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Checkout platform-pgcommon
+        run: |
+          git clone "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon.git" ../platform-pgcommon
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
