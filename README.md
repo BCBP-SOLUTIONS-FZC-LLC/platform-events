@@ -29,6 +29,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for design decisions and layer diagrams.
 - [Observability — Prometheus and OTel](#observability--prometheus-and-otel)
 - [Configuration reference](#configuration-reference)
 - [Error reference](#error-reference)
+- [Testing in consuming services](#testing-in-consuming-services)
 - [Testing](#testing)
 - [CI](#ci)
 - [Docker](#docker)
@@ -508,6 +509,105 @@ Copy `.env-example` to `.env` via `make setup` for local development.
 | `domain.ErrKeyTooShort` | `events` | `Sign` / `SignEnvelope` called with key < 32 bytes |
 | `domain.ErrInvalidSignature` | `events` | Internal parse failure in `Verify` |
 | `domain.ErrBatchTooLarge` | `events` | Internal sentinel; `PublishBatch` splits automatically at 10 — this error is never returned to callers |
+
+---
+
+## Testing in consuming services
+
+`pkg/events/mock` ships ready-made, thread-safe test doubles so consuming services never need to stand up LocalStack or SNS just to run a unit test.
+
+```go
+import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events/mock"
+```
+
+### Mock Publisher
+
+```go
+func TestOrderService_PlaceOrder_PublishesEvent(t *testing.T) {
+    pub := &mock.Publisher{}
+    svc := NewOrderService(pub)
+
+    err := svc.PlaceOrder(ctx, Order{ID: "ord-1", Amount: 99})
+    require.NoError(t, err)
+
+    published := pub.Published()
+    require.Len(t, published, 1)
+    assert.Equal(t, "order.placed", published[0].Type)
+    assert.Equal(t, "acme", published[0].TenantID)
+}
+
+func TestOrderService_PlaceOrder_PublishError_IsHandled(t *testing.T) {
+    pub := &mock.Publisher{}
+    pub.SetError(errors.New("sns unavailable"))
+
+    svc := NewOrderService(pub)
+    err := svc.PlaceOrder(ctx, Order{ID: "ord-2", Amount: 50})
+
+    // Your service decides whether to propagate or swallow the publish error.
+    require.Error(t, err)
+    assert.Empty(t, pub.Published()) // nothing was recorded
+}
+```
+
+The `mock.Publisher` API:
+
+| Method | What it does |
+|--------|-------------|
+| `Publish(ctx, env)` | Records the envelope; returns any error set via `SetError` |
+| `PublishBatch(ctx, envs)` | Calls `Publish` for each envelope |
+| `Published()` | Returns a copy of all recorded envelopes (thread-safe) |
+| `SetError(err)` | Makes all subsequent `Publish` calls return `err` |
+| `Reset()` | Clears recorded envelopes and any configured error |
+
+### Mock Consumer
+
+```go
+func TestNotificationWorker_HandlesUserCreated(t *testing.T) {
+    consumer := &mock.Consumer{}
+    worker := NewNotificationWorker(consumer)
+
+    // Start the worker (mock Start() is a no-op — no goroutine needed).
+    require.NoError(t, consumer.Start(ctx))
+    worker.RegisterHandlers()
+
+    // Inject a message directly — no SQS, no network.
+    env := events.NewEnvelope("iam.user.created", "platform-iam",
+        json.RawMessage(`{"user_id":"u-123","email":"alice@example.com"}`),
+        events.WithTenantID("acme"),
+    )
+    err := consumer.Inject(env)
+    require.NoError(t, err)
+
+    // Assert your handler's side effects.
+    assert.True(t, worker.EmailWasSentTo("alice@example.com"))
+}
+```
+
+The `mock.Consumer` API:
+
+| Method | What it does |
+|--------|-------------|
+| `Start(ctx)` | No-op; marks consumer as running |
+| `Stop()` | No-op; marks consumer as stopped |
+| `SetHandler(fn)` | Registers the handler called by `Inject` |
+| `Inject(env)` | Delivers the envelope synchronously to the registered handler |
+| `IsRunning()` | Reports whether `Start` has been called without a matching `Stop` |
+
+### Wiring in tests
+
+Both mocks satisfy the `events.Publisher` and `events.Consumer` interfaces, so they drop in wherever the real implementations are used:
+
+```go
+// Production wiring:
+publisher, _ := events.NewSNSPublisher(events.SNSConfig{TopicARN: ..., Region: ...})
+svc := NewOrderService(publisher)
+
+// Test wiring — identical constructor, no AWS needed:
+pub := &mock.Publisher{}
+svc := NewOrderService(pub)
+```
+
+> **Why not write your own mock?** `events.Publisher` is only two methods, and writing a local stub is perfectly valid Go. The benefit of `pkg/events/mock` is the `SetError` / `Reset` / thread-safety boilerplate that every service would otherwise duplicate — and the guarantee that the mock's signature tracks the library's interface across version bumps.
 
 ---
 
