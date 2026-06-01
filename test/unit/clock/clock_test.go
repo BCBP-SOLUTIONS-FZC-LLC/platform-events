@@ -4,8 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 )
 
 func TestRealClock_Now(t *testing.T) {

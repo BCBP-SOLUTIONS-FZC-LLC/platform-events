@@ -6,10 +6,6 @@ import (
 	"testing"
 	"time"
 
-	internalsns "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
@@ -17,6 +13,11 @@ import (
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	internalsns "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
 // pubMockSQSClient is a local mock SQS client for publisher_test package.

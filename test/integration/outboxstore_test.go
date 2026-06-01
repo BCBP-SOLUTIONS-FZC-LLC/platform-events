@@ -8,17 +8,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/outboxstore"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/outboxstore"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
 
 func setupOutboxTest(ctx context.Context, t *testing.T) (*outboxstore.Store, *pgcommon.Pool, func()) {

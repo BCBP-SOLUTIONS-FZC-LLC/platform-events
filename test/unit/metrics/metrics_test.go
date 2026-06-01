@@ -3,9 +3,10 @@ package metrics_test
 import (
 	"testing"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
 func TestInitWithRegisterer_DoesNotPanic(t *testing.T) {

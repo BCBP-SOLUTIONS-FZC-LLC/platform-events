@@ -9,14 +9,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/service"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/service"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
 // noopTx is a minimal pgx.Tx stub used to avoid nil-tx panics when testing
