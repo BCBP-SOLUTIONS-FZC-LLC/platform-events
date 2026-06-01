@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,8 +45,11 @@ func (noopTx) Conn() *pgx.Conn                                        { return n
 
 var _ pgx.Tx = noopTx{}
 
-// mockStore is a simple in-memory OutboxStore for testing.
+// mockStore is a thread-safe in-memory OutboxStore for testing.
+// The mutex protects published and failed maps which are written by parallel
+// goroutines in tests that use publishConcurrency > 1.
 type mockStore struct {
+	mu        sync.Mutex
 	records   []domain.OutboxRecord
 	published map[string]bool
 	failed    map[string]string
@@ -60,11 +64,15 @@ func newMockStore() *mockStore {
 }
 
 func (s *mockStore) Enqueue(_ context.Context, _ pgx.Tx, rec domain.OutboxRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.records = append(s.records, rec)
 	return s.err
 }
 
 func (s *mockStore) ClaimBatch(_ context.Context, n int) ([]domain.OutboxRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.err != nil {
 		return nil, s.err
 	}
@@ -81,16 +89,22 @@ func (s *mockStore) ClaimBatch(_ context.Context, n int) ([]domain.OutboxRecord,
 }
 
 func (s *mockStore) MarkPublished(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.published[id] = true
 	return nil
 }
 
 func (s *mockStore) MarkFailed(_ context.Context, id, lastError string, _ int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.failed[id] = lastError
 	return nil
 }
 
 func (s *mockStore) PendingCount(_ context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return int64(len(s.records)), nil
 }
 
@@ -111,7 +125,7 @@ func TestOutboxService_PublishBatch_Success(t *testing.T) {
 		{ID: env.ID, EventType: env.Type, Payload: payload},
 	}
 
-	svc := service.NewOutboxService(store, pub, logger, clock, 5)
+	svc := service.NewOutboxService(store, pub, logger, clock, 5, 1, 0)
 	err = svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err)
 
@@ -134,7 +148,7 @@ func TestOutboxService_PublishBatch_PublishError(t *testing.T) {
 		{ID: env.ID, EventType: env.Type, Payload: payload},
 	}
 
-	svc := service.NewOutboxService(store, pub, logger, clock, 5)
+	svc := service.NewOutboxService(store, pub, logger, clock, 5, 1, 0)
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err) // batch-level errors do not propagate; they are logged
 
@@ -144,7 +158,7 @@ func TestOutboxService_PublishBatch_PublishError(t *testing.T) {
 func TestOutboxService_PublishBatch_Empty(t *testing.T) {
 	store := newMockStore()
 	pub := &fixtures.MockPublisher{}
-	svc := service.NewOutboxService(store, pub, nil, nil, 5)
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
 
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err)
@@ -159,7 +173,7 @@ func TestOutboxService_Enqueue_Success(t *testing.T) {
 	store := newMockStore()
 	pub := &fixtures.MockPublisher{}
 	clock := fixtures.NewFakeClock(time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
-	svc := service.NewOutboxService(store, pub, nil, clock, 5)
+	svc := service.NewOutboxService(store, pub, nil, clock, 5, 1, 0)
 
 	env := domain.NewEnvelope("order.placed", "billing", json.RawMessage(`{"amount":50}`))
 	env.TenantID = "acme"
@@ -179,7 +193,7 @@ func TestOutboxService_Enqueue_Success(t *testing.T) {
 func TestOutboxService_Enqueue_NilTx_ReturnsError(t *testing.T) {
 	store := newMockStore()
 	pub := &fixtures.MockPublisher{}
-	svc := service.NewOutboxService(store, pub, nil, nil, 5)
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
 
 	env := domain.NewEnvelope("x.y", "svc", json.RawMessage(`{}`))
 	err := svc.Enqueue(context.Background(), nil, env)
@@ -191,7 +205,7 @@ func TestOutboxService_Enqueue_StoreError(t *testing.T) {
 	store := newMockStore()
 	store.err = errors.New("store failure")
 	pub := &fixtures.MockPublisher{}
-	svc := service.NewOutboxService(store, pub, nil, nil, 5)
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
 
 	env := domain.NewEnvelope("x.y", "svc", json.RawMessage(`{}`))
 	err := svc.Enqueue(context.Background(), noopTx{}, env)
@@ -207,7 +221,7 @@ func TestOutboxService_PublishBatch_ClaimBatchError(t *testing.T) {
 	store := newMockStore()
 	store.err = errors.New("claim failed")
 	pub := &fixtures.MockPublisher{}
-	svc := service.NewOutboxService(store, pub, nil, nil, 5)
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
 
 	err := svc.PublishBatch(context.Background(), 10)
 	require.Error(t, err)
@@ -222,7 +236,7 @@ func TestOutboxService_PublishBatch_UnmarshalError_MarkFailed(t *testing.T) {
 	}
 	pub := &fixtures.MockPublisher{}
 	logger := &fixtures.MockLogger{}
-	svc := service.NewOutboxService(store, pub, logger, nil, 5)
+	svc := service.NewOutboxService(store, pub, logger, nil, 5, 1, 0)
 
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err) // per-record errors do not propagate
@@ -255,7 +269,7 @@ func TestOutboxService_PublishBatch_MarkPublishedError_Logged(t *testing.T) {
 
 	pub := &fixtures.MockPublisher{}
 	logger := &fixtures.MockLogger{}
-	svc := service.NewOutboxService(store, pub, logger, nil, 5)
+	svc := service.NewOutboxService(store, pub, logger, nil, 5, 1, 0)
 
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err) // errors are logged, not returned
@@ -287,7 +301,7 @@ func TestOutboxService_PublishBatch_MarkFailedError_Logged(t *testing.T) {
 	pub := &fixtures.MockPublisher{}
 	pub.SetError(errors.New("publish error"))
 	logger := &fixtures.MockLogger{}
-	svc := service.NewOutboxService(store, pub, logger, nil, 5)
+	svc := service.NewOutboxService(store, pub, logger, nil, 5, 1, 0)
 
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err) // per-record errors do not propagate
@@ -327,7 +341,7 @@ func (s *markFailedErrorStore) MarkFailed(_ context.Context, id, lastError strin
 func TestOutboxService_PendingCount(t *testing.T) {
 	store := newMockStore()
 	pub := &fixtures.MockPublisher{}
-	svc := service.NewOutboxService(store, pub, nil, nil, 5)
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
 
 	// Empty store → zero pending.
 	n, err := svc.PendingCount(context.Background())
@@ -351,7 +365,7 @@ func TestOutboxService_PendingCount(t *testing.T) {
 func TestOutboxService_NilClock_UsesRealClock(t *testing.T) {
 	store := newMockStore()
 	pub := &fixtures.MockPublisher{}
-	svc := service.NewOutboxService(store, pub, nil, nil, 5) // nil clock → RealClock
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0) // nil clock → RealClock
 	assert.NotNil(t, svc)
 }
 
@@ -374,7 +388,7 @@ func TestOutboxService_CtxCancel_StrandedMarkFailedError_Logged(t *testing.T) {
 
 	pub := &fixtures.MockPublisher{}
 	logger := &fixtures.MockLogger{}
-	svc := service.NewOutboxService(store, pub, logger, nil, 5)
+	svc := service.NewOutboxService(store, pub, logger, nil, 5, 1, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before PublishBatch runs the loop
@@ -406,7 +420,7 @@ func TestOutboxService_UnmarshalError_MarkFailedError_Logged(t *testing.T) {
 
 	pub := &fixtures.MockPublisher{}
 	logger := &fixtures.MockLogger{}
-	svc := service.NewOutboxService(store, pub, logger, nil, 5)
+	svc := service.NewOutboxService(store, pub, logger, nil, 5, 1, 0)
 
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err) // per-record errors do not propagate
@@ -445,7 +459,7 @@ func TestOutboxService_PublishBatch_CtxCancel_StrandedRecordsMarkedFailed(t *tes
 		})
 	}
 
-	svc := service.NewOutboxService(store, pub, logger, nil, 5)
+	svc := service.NewOutboxService(store, pub, logger, nil, 5, 1, 0)
 
 	// Cancel the context before PublishBatch is called so ctx.Err() fires
 	// on the very first record iteration — simulating a shutdown mid-batch.
@@ -461,4 +475,187 @@ func TestOutboxService_PublishBatch_CtxCancel_StrandedRecordsMarkedFailed(t *tes
 	for id, reason := range store.failed {
 		assert.Contains(t, reason, "context", "MarkFailed reason should mention context cancellation for %s", id)
 	}
+}
+
+// ----------------------------
+// Parallel publishing (publishConcurrency > 1)
+// ----------------------------
+
+func TestOutboxService_PublishBatch_Parallel_AllDelivered(t *testing.T) {
+	store := newMockStore()
+	pub := &fixtures.MockPublisher{}
+
+	const numRecords = 5
+	for range numRecords {
+		env := domain.NewEnvelope("parallel.event", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		store.records = append(store.records, domain.OutboxRecord{
+			ID: env.ID, EventType: env.Type, Payload: payload,
+		})
+	}
+
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 3, 0) // concurrency=3
+
+	err := svc.PublishBatch(context.Background(), numRecords)
+	require.NoError(t, err)
+	assert.Len(t, pub.Published(), numRecords, "all records should be published")
+	assert.Len(t, store.published, numRecords, "all records should be marked published")
+}
+
+func TestOutboxService_PublishBatch_Parallel_CtxCancel_StrandedMarkedFailed(t *testing.T) {
+	store := newMockStore()
+	pub := &fixtures.MockPublisher{}
+
+	for range 4 {
+		env := domain.NewEnvelope("cancel.event", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		store.records = append(store.records, domain.OutboxRecord{
+			ID: env.ID, EventType: env.Type, Payload: payload,
+		})
+	}
+
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 2, 0) // concurrency=2
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+
+	err := svc.PublishBatch(ctx, 10)
+	require.Error(t, err)
+	assert.Len(t, store.failed, 4, "all records should have MarkFailed called")
+}
+
+// ----------------------------
+// Publish timeout
+// ----------------------------
+
+type slowPublisher struct {
+	block chan struct{} // closed to unblock
+}
+
+func (p *slowPublisher) Publish(ctx context.Context, _ domain.Envelope[json.RawMessage]) error {
+	select {
+	case <-p.block:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err() // returns DeadlineExceeded when publishTimeout fires
+	}
+}
+func (p *slowPublisher) PublishBatch(ctx context.Context, envs []domain.Envelope[json.RawMessage]) error {
+	for _, e := range envs {
+		if err := p.Publish(ctx, e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var _ port.Publisher = (*slowPublisher)(nil)
+
+func TestOutboxService_PublishTimeout_Fires_MarksFailed(t *testing.T) {
+	store := newMockStore()
+	block := make(chan struct{}) // never closed → publisher always blocks
+	pub := &slowPublisher{block: block}
+
+	env := domain.NewEnvelope("slow.event", "svc", json.RawMessage(`{}`))
+	payload, _ := json.Marshal(env)
+	store.records = []domain.OutboxRecord{{ID: env.ID, EventType: env.Type, Payload: payload}}
+
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 50*time.Millisecond) // 50ms timeout
+
+	err := svc.PublishBatch(context.Background(), 10)
+	require.NoError(t, err)
+
+	// Record should be marked failed because the publish timed out.
+	assert.Contains(t, store.failed, env.ID, "timed-out record should be marked failed")
+}
+
+// ----------------------------
+// Shutdown does not dead-letter at-maxAttempts-1 records (maxAttempts+1 fix)
+// ----------------------------
+
+func TestOutboxService_CtxCancel_DoesNotDeadLetterAtMaxAttemptsMinusOne(t *testing.T) {
+	// Custom store that captures the maxAttempts ceiling passed to MarkFailed.
+	type failCall struct{ id string; maxAttempts int }
+	var calls []failCall
+	store := &captureMaxAttemptsStore{
+		mockStore: newMockStore(),
+		onFail:    func(id string, ma int) { calls = append(calls, failCall{id, ma}) },
+	}
+
+	env := domain.NewEnvelope("boundary.event", "svc", json.RawMessage(`{}`))
+	payload, _ := json.Marshal(env)
+	store.records = []domain.OutboxRecord{{ID: env.ID, EventType: env.Type, Payload: payload}}
+
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, nil, nil, 5, 1, 0) // maxAttempts=5
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_ = svc.PublishBatch(ctx, 10)
+
+	require.Len(t, calls, 1)
+	// Cancellation must pass maxAttempts+1 (=6) so attempts=4 is never dead-lettered by shutdown alone.
+	assert.Equal(t, 6, calls[0].maxAttempts, "cancellation path must use maxAttempts+1")
+}
+
+type captureMaxAttemptsStore struct {
+	*mockStore
+	onFail func(id string, maxAttempts int)
+}
+
+func (s *captureMaxAttemptsStore) MarkFailed(_ context.Context, id, _ string, maxAttempts int) error {
+	s.onFail(id, maxAttempts)
+	s.failed[id] = "captured"
+	return nil
+}
+
+// ----------------------------
+// TenantID warning
+// ----------------------------
+
+func TestOutboxService_Enqueue_EmptyTenantID_LogsWarning(t *testing.T) {
+	store := newMockStore()
+	logger := &fixtures.MockLogger{}
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, logger, nil, 5, 1, 0)
+
+	env := domain.NewEnvelope("evt.type", "svc", json.RawMessage(`{}`))
+	// env.TenantID intentionally left empty
+
+	err := svc.Enqueue(context.Background(), noopTx{}, env)
+	require.NoError(t, err)
+
+	entries := logger.Entries()
+	found := false
+	for _, e := range entries {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN for empty TenantID")
+}
+
+// ----------------------------
+// last_error truncation
+// ----------------------------
+
+func TestOutboxService_PublishBatch_LongError_Truncated(t *testing.T) {
+	store := newMockStore()
+
+	// Publisher that returns a very long error message.
+	longErr := errors.New(string(make([]byte, 1024))) // 1024 bytes of zeros
+	pub := &fixtures.MockPublisher{}
+	pub.SetError(longErr)
+
+	env := domain.NewEnvelope("long.err", "svc", json.RawMessage(`{}`))
+	payload, _ := json.Marshal(env)
+	store.records = []domain.OutboxRecord{{ID: env.ID, EventType: env.Type, Payload: payload}}
+
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
+	err := svc.PublishBatch(context.Background(), 10)
+	require.NoError(t, err)
+
+	stored := store.failed[env.ID]
+	assert.LessOrEqual(t, len(stored), 530, "last_error should be truncated to ~512 chars + truncation suffix")
+	assert.Contains(t, stored, "[truncated]", "truncated errors should have a suffix")
 }
