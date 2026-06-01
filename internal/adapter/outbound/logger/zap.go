@@ -2,9 +2,10 @@
 package logger
 
 import (
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 )
 
 // ZapLogger wraps a *zap.Logger and implements port.Logger.

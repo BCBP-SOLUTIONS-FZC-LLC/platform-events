@@ -4,13 +4,11 @@ package sns
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
@@ -20,6 +18,10 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	oteltrace "go.opentelemetry.io/otel/trace"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 )
 
 const maxSNSBatchSize = 10
@@ -246,7 +248,8 @@ func (p *snsPublisher) PublishBatch(ctx context.Context, envs []domain.Envelope[
 		end := min(i+maxSNSBatchSize, len(envs))
 		chunk := envs[i:end]
 		if err := p.publishChunk(ctx, chunk); err != nil {
-			if be, ok := err.(*BatchError); ok {
+			var be *BatchError
+			if errors.As(err, &be) {
 				if batchErr == nil {
 					batchErr = &BatchError{}
 				}

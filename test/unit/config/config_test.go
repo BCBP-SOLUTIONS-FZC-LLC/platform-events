@@ -4,8 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/config"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/config"
 )
 
 func TestLoadSQS_Defaults(t *testing.T) {

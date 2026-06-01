@@ -11,10 +11,11 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 )
 
 // stubStore is an in-memory port.OutboxStore for the white-box test.

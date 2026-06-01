@@ -3,8 +3,9 @@ package port
 import (
 	"context"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 )
 
 // OutboxStore persists and retrieves outbox records from durable storage.
