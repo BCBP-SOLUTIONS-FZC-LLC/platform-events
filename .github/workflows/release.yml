@@ -1,55 +1,125 @@
+# Triggered by version tags (e.g. v1.0.0 or v1.0.0-rc.1).
+# Pipeline: validate → coverage → build → GitHub release
 name: Release
 
-on:
+"on":
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+      - 'v[0-9]*.[0-9]*.[0-9]*-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v1.0.0)'
+        required: true
+
+# Default: read-only. Each job that needs extra permissions declares them explicitly.
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+  GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
 
 jobs:
   validate:
+    name: Validate
     uses: ./.github/workflows/validate.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref }}
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            go.mod
+
+      - name: Coverage (≥95% required)
+        run: |
+          go test $(go list ./test/... | grep -v /test/smoke$) \
+            -race -count=1 -timeout 120s \
+            -coverpkg=$(go list ./internal/... ./pkg/... | paste -sd,) \
+            -coverprofile=coverage.out
+          pct=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { if (p+0 < 95) { print "FAIL: " p "% is below the 95% threshold"; exit 1 } }'
 
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: validate
-    env:
-      GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-      GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-
+    needs: coverage
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          cache-dependency-path: |
+            go.sum
+            go.mod
 
-      - name: Build binary
+      - name: Build
         run: make build
 
+      - name: Verify binary
+        run: test -x bin/platform-events
+
   publish:
-    name: Publish Release
+    name: GitHub Release
     runs-on: ubuntu-latest
-    needs: [validate, build]
+    needs: build
     permissions:
       contents: write
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
-      - name: Extract release notes from CHANGELOG.md
-        id: release-notes
+      - name: Extract release notes from CHANGELOG
+        shell: bash
         run: |
-          VERSION="${{ github.ref_name }}"
-          NOTES=$(awk "/## \[${VERSION}\]/{found=1; next} /## \[/{if(found) exit} found{print}" CHANGELOG.md)
-          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$NOTES" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          # Use fgrep (fixed-string) to locate the section header, then awk to extract the block.
+          # This avoids treating dots in semver (e.g. 1.0.0) as awk regex wildcards.
+          awk -v ver="[${VERSION}]" '
+            substr($0, 1, 6) == "## " && index($0, ver) > 0 { found=1; next }
+            /^## \[/ { if (found) exit }
+            found { print }
+          ' CHANGELOG.md | sed -e 's/^[[:space:]]*$//' > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "No changelog entry found for ${VERSION}. Update CHANGELOG.md before tagging." >&2
+            exit 1
+          fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          body: ${{ steps.release-notes.outputs.notes }}
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRERELEASE_FLAG=""
+          if echo "$RELEASE_TAG" | grep -q -- '-'; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_TAG" \
+            --notes-file release-notes.md \
+            $PRERELEASE_FLAG

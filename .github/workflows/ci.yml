@@ -1,66 +1,85 @@
+# CI for https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events
 name: CI
 
-on:
+"on":
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+  GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
 
 jobs:
   validate:
+    name: Validate
     uses: ./.github/workflows/validate.yml
 
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
     needs: validate
-    env:
-      GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-      GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          cache-dependency-path: |
+            go.sum
+            go.mod
 
-      - name: Run tests with coverage
-        run: make cover
-
-      - name: Check coverage threshold (≥ 95%)
+      - name: Coverage (≥95% required)
         run: |
-          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print $3}' | tr -d '%')
-          echo "Coverage: ${COVERAGE}%"
-          if (( $(echo "$COVERAGE < 95" | bc -l) )); then
-            echo "Coverage ${COVERAGE}% is below the 95% threshold"
-            exit 1
-          fi
+          go test $(go list ./test/... | grep -v /test/smoke$) \
+            -race -count=1 -timeout 120s \
+            -coverpkg=$(go list ./internal/... ./pkg/... | paste -sd,) \
+            -coverprofile=coverage.out
+          pct=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { if (p+0 < 95) { print "FAIL: " p "% is below the 95% threshold"; exit 1 } }'
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: coverage
+          name: coverage-report
           path: coverage.out
+          if-no-files-found: ignore
 
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: validate
-    env:
-      GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-      GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-
+    needs: coverage
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          cache-dependency-path: |
+            go.sum
+            go.mod
 
       - name: Build binary
         run: make build
 
-      - name: Verify binary is executable
+      - name: Verify binary
         run: test -x bin/platform-events
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-events-linux-amd64
+          path: bin/platform-events
+          if-no-files-found: error
