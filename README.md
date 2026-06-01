@@ -358,10 +358,22 @@ runner := outbox.NewRunner(outbox.Config{
     PollInterval: 5 * time.Second,
     BatchSize:    50,
     MaxAttempts:  5,
+    // Production-hardening options (all have safe defaults):
+    PublishConcurrency: 5,                // parallel publishes per batch; default 1 (sequential)
+    PublishTimeout:     10 * time.Second, // per-record publish timeout; prevents a hung SNS call stalling the batch
+    DrainTimeout:       30 * time.Second, // Stop() waits up to this for the in-flight batch, then returns an error
+    StartupJitter:      200 * time.Millisecond, // random delay before first poll; desyncs replicas on rolling restart
 })
 go runner.Start(ctx) // blocks until ctx is cancelled
-defer runner.Stop()  // graceful drain of in-flight batch
+defer func() {
+    // Stop() returns an error if the in-flight batch does not drain within DrainTimeout.
+    if err := runner.Stop(); err != nil {
+        logger.Warn("outbox runner drain timeout — records retry after lease expiry", map[string]any{"error": err.Error()})
+    }
+}()
 ```
+
+**Config defaults:** `PollInterval` 5s · `BatchSize` 50 · `MaxAttempts` 5 · `PublishConcurrency` 1 · `PublishTimeout` 10s · `DrainTimeout` 30s · `ClaimLeaseDuration` 10m · `StartupJitter` 0. When a poll cycle fails (e.g. the DB is unreachable), the runner applies exponential backoff (1s → 30s) before retrying instead of hammering the pool every `PollInterval`.
 
 ### Enqueueing inside a transaction
 
@@ -379,6 +391,8 @@ err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx 
     return outbox.Enqueue(ctx, tx, env)
 })
 ```
+
+`Enqueue` validates the envelope (non-nil tx; non-empty `ID`/`Type`/`Source`) and rejects payloads whose serialised size exceeds **240 KB** — staying under the SNS 256 KB hard limit so a record that could never publish is never persisted. It logs a warning if `TenantID` is empty, since the consumer relies on it for RLS scoping.
 
 ### Poll cycle
 
@@ -463,6 +477,7 @@ Registered metrics:
 | `outbox_pending_total` | Gauge | `service` | Unpublished records in `outbox_events` |
 | `outbox_published_total` | Counter | `service`, `status` | Records published by the runner |
 | `outbox_attempts_total` | Counter | `service` | Total publish attempts by the runner |
+| `outbox_dead_letters_total` | Counter | `service` | Records moved to `outbox_dead_letters` after exhausting `MaxAttempts` — alert on `rate() > 0` |
 
 ### OpenTelemetry
 
