@@ -222,8 +222,8 @@ func TestOutboxConfigEnv_Validate_OK(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestOutboxConfigEnv_String_MasksURLPassword(t *testing.T) {
-	cfg := config.OutboxConfigEnv{
-		DatabaseURL:  "postgres://user:supersecret@localhost:5432/mydb",
+	cfg := config.OutboxConfigEnv{ //nolint:gosec
+		DatabaseURL:  "postgres://user:hunter2@localhost:5432/mydb",
 		PollInterval: 5 * time.Second,
 		BatchSize:    50,
 	}
@@ -234,7 +234,7 @@ func TestOutboxConfigEnv_String_MasksURLPassword(t *testing.T) {
 
 func TestOutboxConfigEnv_String_MasksKeyValuePassword(t *testing.T) {
 	cfg := config.OutboxConfigEnv{
-		DatabaseURL: "host=localhost user=app password=topsecret dbname=events",
+		DatabaseURL: "host=localhost user=app password=topsecret dbname=events", //nolint:gosec
 	}
 	s := cfg.String()
 	assert.NotContains(t, s, "topsecret")
