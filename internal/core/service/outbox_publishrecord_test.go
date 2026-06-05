@@ -164,3 +164,9 @@ func TestReleaseStranded_ThresholdIsMaxAttemptsPlus1(t *testing.T) {
 	assert.Equal(t, maxAttempts+1, store.thresholds[rec.ID],
 		"releaseStranded must use maxAttempts+1 so a shutdown never counts as a retry")
 }
+
+// TestPanicErr_Error verifies the internal panicErr type formats correctly.
+func TestPanicErr_Error(t *testing.T) {
+	e := &panicErr{msg: "something exploded"}
+	assert.Equal(t, "something exploded", e.Error())
+}

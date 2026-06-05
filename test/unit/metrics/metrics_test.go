@@ -171,3 +171,32 @@ func TestRecordOutboxMarkPublishedError_AfterInit(t *testing.T) {
 		internalmetics.RecordOutboxMarkPublishedError()
 	})
 }
+
+// ----------------------------
+// RecordOutboxDeadLettersReprocessed guard paths
+// ----------------------------
+
+func TestRecordOutboxDeadLettersReprocessed_ZeroIsNoOp(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	internalmetics.InitWithRegisterer("reprocess-zero-test", "v0.0.12", reg)
+	// n=0 must not increment the counter — zero is not a reprocess event
+	assert.NotPanics(t, func() {
+		internalmetics.RecordOutboxDeadLettersReprocessed(0)
+	})
+}
+
+func TestRecordOutboxDeadLettersReprocessed_NegativeIsNoOp(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	internalmetics.InitWithRegisterer("reprocess-neg-test", "v0.0.13", reg)
+	assert.NotPanics(t, func() {
+		internalmetics.RecordOutboxDeadLettersReprocessed(-1)
+	})
+}
+
+func TestRecordOutboxDeadLettersReprocessed_PositiveIncrements(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	internalmetics.InitWithRegisterer("reprocess-pos-test", "v0.0.14", reg)
+	assert.NotPanics(t, func() {
+		internalmetics.RecordOutboxDeadLettersReprocessed(3)
+	})
+}
