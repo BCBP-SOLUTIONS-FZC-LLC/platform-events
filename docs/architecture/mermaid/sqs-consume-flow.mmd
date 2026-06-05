@@ -6,7 +6,7 @@ sequenceDiagram
     participant Handler
 
     loop every poll
-        Note over SQSAdp: rcvCtx = context.WithTimeout(WaitSeconds + 5s)<br/>prevents hung ReceiveMessage calls
+        Note over SQSAdp: rcvCtx = context.WithTimeout(WaitSeconds + 5s) — prevents hung ReceiveMessage calls
         SQSAdp ->>+ SQS: ReceiveMessage(WaitSeconds=20, MaxMessages=10)
         SQS -->>- SQSAdp: []Message
 
@@ -23,7 +23,7 @@ sequenceDiagram
                 OTel -->>- SQSAdp: handler ctx + span
 
                 SQSAdp ->>+ Handler: handler(ctx, Envelope)
-                Note over Handler,SQSAdp: panic recovered; stack trace logged;<br/>message left visible for retry
+                Note over Handler,SQSAdp: panic recovered — stack trace logged — message left visible for retry
                 Handler -->>- SQSAdp: error or nil
 
                 alt handler returned nil
