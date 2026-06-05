@@ -42,3 +42,18 @@ func TestRetryableError_WrappedInErrors_Is(t *testing.T) {
 	wrapped := fmt.Errorf("outer: %w", re)
 	assert.True(t, errors.Is(wrapped, domain.ErrRetryable))
 }
+
+func TestBatchError_Error_FormatsCount(t *testing.T) {
+	be := &domain.BatchError{Failures: []domain.BatchFailure{
+		{ID: "1", Code: "Throttling", Message: "slow down"},
+		{ID: "2", Code: "InternalError", Message: "oops"},
+	}}
+	msg := be.Error()
+	assert.Contains(t, msg, "2")
+	assert.Contains(t, msg, "batch")
+}
+
+func TestBatchError_Error_SingleFailure(t *testing.T) {
+	be := &domain.BatchError{Failures: []domain.BatchFailure{{ID: "x"}}}
+	assert.Contains(t, be.Error(), "1")
+}

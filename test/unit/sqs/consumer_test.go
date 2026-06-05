@@ -1962,3 +1962,71 @@ func TestDispatch_TraceContextInAttributes_LinksSpan(t *testing.T) {
 	cancel()
 	require.NoError(t, c.Stop())
 }
+
+// ---------------------------------------------------------------------------
+// Option warn paths — require a logger to exercise the Warn branch
+// ---------------------------------------------------------------------------
+
+// warnMessages returns messages from WARN-level log entries.
+func warnMessages(logger *fixtures.MockLogger) []string {
+	var out []string
+	for _, e := range logger.Entries() {
+		if e.Level == "WARN" {
+			out = append(out, e.Message)
+		}
+	}
+	return out
+}
+
+func TestWithConcurrency_InvalidWithLogger_Warns(t *testing.T) {
+	logger := &fixtures.MockLogger{}
+	client := &mockSQSClient{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithConcurrency(0), // invalid — should warn and keep default 1
+	)
+	require.NoError(t, err)
+	assert.NotNil(t, c)
+
+	warns := warnMessages(logger)
+	require.NotEmpty(t, warns, "expect a Warn log when concurrency is 0")
+	assert.Contains(t, warns[0], "WithConcurrency")
+}
+
+func TestWithConcurrency_NegativeWithLogger_Warns(t *testing.T) {
+	logger := &fixtures.MockLogger{}
+	client := &mockSQSClient{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+
+	_, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithConcurrency(-5),
+	)
+	require.NoError(t, err)
+	assert.NotEmpty(t, warnMessages(logger))
+}
+
+func TestWithDrainTimeout_NegativeWithLogger_Warns(t *testing.T) {
+	logger := &fixtures.MockLogger{}
+	client := &mockSQSClient{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(-time.Second), // negative — should warn and keep default
+	)
+	require.NoError(t, err)
+	assert.NotNil(t, c)
+
+	warns := warnMessages(logger)
+	require.NotEmpty(t, warns, "expect a Warn log when drain timeout is negative")
+	assert.Contains(t, warns[0], "WithDrainTimeout")
+}

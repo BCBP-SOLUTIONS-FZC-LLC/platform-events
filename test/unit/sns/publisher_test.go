@@ -88,6 +88,36 @@ func TestNew_EmptyTopicARN_ReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), "TopicARN")
 }
 
+func TestNew_InvalidARNFormat_ReturnsError(t *testing.T) {
+	cases := []string{
+		"not-an-arn",
+		"arn:azure:sns:us-east-1:123:topic",
+		"arn:aws:sqs:us-east-1:123:topic", // wrong service
+		"http://localhost:4566/topic",
+	}
+	for _, arn := range cases {
+		t.Run(arn, func(t *testing.T) {
+			_, err := internalsns.New(internalsns.Config{TopicARN: arn})
+			require.Error(t, err, "expected error for invalid ARN: %s", arn)
+			assert.Contains(t, err.Error(), "TopicARN")
+		})
+	}
+}
+
+func TestNew_ValidARNPrefixes_Accepted(t *testing.T) {
+	cases := []string{
+		"arn:aws:sns:us-east-1:123456789012:topic",
+		"arn:aws-cn:sns:cn-north-1:123456789012:topic",
+		"arn:aws-us-gov:sns:us-gov-west-1:123456789012:topic",
+	}
+	for _, arn := range cases {
+		t.Run(arn, func(t *testing.T) {
+			_, err := internalsns.New(internalsns.Config{TopicARN: arn})
+			require.NoError(t, err, "expected no error for valid ARN: %s", arn)
+		})
+	}
+}
+
 // ----------------------------
 // NewWithClient construction
 // ----------------------------
