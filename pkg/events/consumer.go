@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"time"
 
+	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
+
 	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
@@ -68,6 +70,15 @@ func WithMaxReceiveCount(n int) ConsumerOption {
 	return internalsqs.WithMaxReceiveCount(n)
 }
 
+// SQSClientLike is the subset of the AWS SQS client API used by the consumer.
+// *sqs.Client from aws-sdk-go-v2 satisfies this interface. Implement it in
+// tests to inject a mock SQS client without real AWS credentials.
+type SQSClientLike interface {
+	ReceiveMessage(ctx context.Context, params *awssqs.ReceiveMessageInput, optFns ...func(*awssqs.Options)) (*awssqs.ReceiveMessageOutput, error)
+	DeleteMessage(ctx context.Context, params *awssqs.DeleteMessageInput, optFns ...func(*awssqs.Options)) (*awssqs.DeleteMessageOutput, error)
+	ChangeMessageVisibility(ctx context.Context, params *awssqs.ChangeMessageVisibilityInput, optFns ...func(*awssqs.Options)) (*awssqs.ChangeMessageVisibilityOutput, error)
+}
+
 // NewSQSConsumer constructs an SQS-backed Consumer.
 func NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Consumer, error) {
 	wrappedHandler := func(ctx context.Context, env domain.Envelope[json.RawMessage]) error {
@@ -85,7 +96,7 @@ func NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Con
 
 // NewSQSConsumerWithClient constructs an SQS-backed Consumer using an injected
 // SQS client. Useful in unit tests to avoid real AWS credentials.
-func NewSQSConsumerWithClient(cfg SQSConfig, client internalsqs.SQSClientAPI, handler Handler, opts ...ConsumerOption) (Consumer, error) {
+func NewSQSConsumerWithClient(cfg SQSConfig, client SQSClientLike, handler Handler, opts ...ConsumerOption) (Consumer, error) {
 	wrappedHandler := func(ctx context.Context, env domain.Envelope[json.RawMessage]) error {
 		return handler(ctx, domainToPublic(env))
 	}

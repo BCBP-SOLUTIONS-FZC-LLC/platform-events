@@ -2,11 +2,15 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 )
 
 // Envelope is the canonical wire format for all inter-service events.
@@ -15,6 +19,7 @@ type Envelope[T any] struct {
 	ID            string    `json:"id"`
 	Type          string    `json:"type"`
 	Source        string    `json:"source"`
+	SchemaVersion string    `json:"schema_version,omitempty"`
 	TenantID      string    `json:"tenant_id,omitempty"`
 	TraceID       string    `json:"trace_id,omitempty"`
 	CorrelationID string    `json:"correlation_id,omitempty"`
@@ -22,23 +27,52 @@ type Envelope[T any] struct {
 	Payload       T         `json:"payload"`
 }
 
-// EnvelopeOpt is applied to an envelope after construction.
-// Using a typed closure approach avoids the any-typed option.
-type EnvelopeOpt func(tenantID, traceID, correlationID *string)
+// envelopeConfig collects all optional envelope fields set via EnvelopeOpt.
+// Keeping this internal means adding new fields never changes the EnvelopeOpt
+// function signature and is always a backward-compatible MINOR bump.
+type envelopeConfig struct {
+	tenantID      string
+	traceID       string
+	correlationID string
+	schemaVersion string
+}
+
+// EnvelopeOpt is applied to a new Envelope at construction time.
+type EnvelopeOpt func(*envelopeConfig)
 
 // WithTenantID sets the TenantID field on the envelope.
 func WithTenantID(id string) EnvelopeOpt {
-	return func(tenantID, _, _ *string) { *tenantID = id }
+	return func(c *envelopeConfig) { c.tenantID = id }
 }
 
 // WithTraceID sets the TraceID field on the envelope.
 func WithTraceID(id string) EnvelopeOpt {
-	return func(_, traceID, _ *string) { *traceID = id }
+	return func(c *envelopeConfig) { c.traceID = id }
 }
 
 // WithCorrelationID sets the CorrelationID field on the envelope.
 func WithCorrelationID(id string) EnvelopeOpt {
-	return func(_, _, correlationID *string) { *correlationID = id }
+	return func(c *envelopeConfig) { c.correlationID = id }
+}
+
+// WithSchemaVersion records the payload schema version in the envelope.
+// Use "1" for the initial schema. Increment to "2", "3", etc. when a
+// breaking payload change is released alongside a versioned event_type
+// (e.g. "iam.user.created.v2"). Consumers that receive an unrecognised
+// version should reject the message rather than silently misparse it.
+func WithSchemaVersion(v string) EnvelopeOpt {
+	return func(c *envelopeConfig) { c.schemaVersion = v }
+}
+
+// SystemTenantID is the canonical sentinel for events not scoped to any tenant.
+// Defined in internal/core/domain and re-exported here for public API stability.
+const SystemTenantID = domain.SystemTenantID
+
+// WithSystemTenant marks the envelope as a system-level event with no tenant
+// scope. Use for background jobs and scheduled tasks that publish across tenants
+// or are not associated with any specific tenant.
+func WithSystemTenant() EnvelopeOpt {
+	return WithTenantID(SystemTenantID)
 }
 
 // NewEnvelope creates a new Envelope with UUID v7 ID and current UTC timestamp.
@@ -52,15 +86,28 @@ func NewEnvelope[T any](eventType, source string, payload T, opts ...EnvelopeOpt
 		Timestamp: time.Now().UTC(),
 		Payload:   payload,
 	}
+	var cfg envelopeConfig
 	for _, opt := range opts {
-		opt(&env.TenantID, &env.TraceID, &env.CorrelationID)
+		opt(&cfg)
 	}
+	env.TenantID = cfg.tenantID
+	env.TraceID = cfg.traceID
+	env.CorrelationID = cfg.correlationID
+	env.SchemaVersion = cfg.schemaVersion
 	return env
 }
 
 // JSON serialises the envelope to canonical JSON.
 func (e Envelope[T]) JSON() ([]byte, error) {
 	return json.Marshal(e)
+}
+
+// TraceIDFromContext returns the envelope TraceID injected by the SQS consumer
+// into the handler context. Returns an empty string if no TraceID is present.
+// Use this inside a consumer handler to access the originating trace ID when
+// gincommon.RequestContext is not available.
+func TraceIDFromContext(ctx context.Context) string {
+	return port.EnvelopeTraceIDFromContext(ctx)
 }
 
 // ParseEnvelope deserialises and validates a JSON-encoded envelope.
@@ -71,13 +118,16 @@ func ParseEnvelope[T any](data []byte) (Envelope[T], error) {
 		return env, err
 	}
 	if env.ID == "" {
-		return env, fmt.Errorf("events: envelope missing required field 'id'")
+		return env, ErrEnvelopeIDRequired
 	}
 	if env.Type == "" {
-		return env, fmt.Errorf("events: envelope missing required field 'type'")
+		return env, ErrEnvelopeTypeRequired
 	}
 	if env.Source == "" {
-		return env, fmt.Errorf("events: envelope missing required field 'source'")
+		return env, ErrEnvelopeSourceRequired
+	}
+	if env.Timestamp.IsZero() {
+		return env, fmt.Errorf("events: envelope missing required field 'timestamp'")
 	}
 	return env, nil
 }

@@ -6,26 +6,35 @@ sequenceDiagram
     participant Handler
 
     loop every poll
+        Note over SQSAdp: rcvCtx = context.WithTimeout(WaitSeconds + 5s)<br/>prevents hung ReceiveMessage calls
         SQSAdp ->>+ SQS: ReceiveMessage(WaitSeconds=20, MaxMessages=10)
         SQS -->>- SQSAdp: []Message
 
         par for each message (bounded by semaphore)
             SQSAdp ->> SQSAdp: json.Unmarshal body → Envelope
-            SQSAdp ->> pgcommon: WithGUCSet(ctx, GUCSet{TenantID})
-            SQSAdp ->>+ OTel: Start span "sqs.receive" linked to env.TraceID
-            OTel -->>- SQSAdp: handler ctx + span
 
-            SQSAdp ->>+ Handler: handler(ctx, Envelope)
-            Handler -->>- SQSAdp: error or nil
-
-            alt handler returned nil
+            alt unmarshal error (malformed message)
+                SQSAdp ->> SQSAdp: EventsConsumedTotal{status=malformed}.Inc()
                 SQSAdp ->> SQS: DeleteMessage
-                SQSAdp ->> SQSAdp: EventsConsumedTotal{status=success}.Inc()
-            else handler returned error
-                Note over SQSAdp: leave visible — SQS retries after timeout
-                SQSAdp ->> SQSAdp: EventsConsumedTotal{status=error}.Inc()
-            end
+            else valid Envelope
+                SQSAdp ->> pgcommon: WithGUCSet(ctx, GUCSet{TenantID})
+                SQSAdp ->> SQSAdp: WithEnvelopeTraceID(ctx, env.TraceID)
+                SQSAdp ->>+ OTel: Start span "sqs.receive" linked to env.TraceID
+                OTel -->>- SQSAdp: handler ctx + span
 
-            SQSAdp ->> OTel: span.End()
+                SQSAdp ->>+ Handler: handler(ctx, Envelope)
+                Note over Handler,SQSAdp: panic recovered; stack trace logged;<br/>message left visible for retry
+                Handler -->>- SQSAdp: error or nil
+
+                alt handler returned nil
+                    SQSAdp ->> SQS: DeleteMessage
+                    SQSAdp ->> SQSAdp: EventsConsumedTotal{status=success}.Inc()
+                else handler returned error
+                    Note over SQSAdp: leave visible — SQS retries after timeout
+                    SQSAdp ->> SQSAdp: EventsConsumedTotal{status=error}.Inc()
+                end
+
+                SQSAdp ->> OTel: span.End()
+            end
         end
     end

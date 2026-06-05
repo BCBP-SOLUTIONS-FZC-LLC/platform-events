@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
+	"github.com/aws/smithy-go"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -96,17 +98,22 @@ type Config struct {
 }
 
 // New constructs an SNS publisher from the provided configuration.
-// Returns an error if TopicARN is empty.
+// Returns an error if TopicARN is empty or does not look like an SNS ARN.
 func New(cfg Config, opts ...PublisherOption) (port.Publisher, error) {
 	if cfg.TopicARN == "" {
 		return nil, fmt.Errorf("sns: TopicARN is required")
+	}
+	if !strings.HasPrefix(cfg.TopicARN, "arn:aws:sns:") && !strings.HasPrefix(cfg.TopicARN, "arn:aws-cn:sns:") && !strings.HasPrefix(cfg.TopicARN, "arn:aws-us-gov:sns:") {
+		return nil, fmt.Errorf("sns: TopicARN %q does not look like a valid SNS ARN (expected prefix arn:aws:sns:, arn:aws-cn:sns:, or arn:aws-us-gov:sns:)", cfg.TopicARN)
 	}
 
 	awsOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
 	}
 
-	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsOpts...)
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer startupCancel()
+	awsCfg, err := awsconfig.LoadDefaultConfig(startupCtx, awsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("sns: failed to load AWS config: %w", err)
 	}
@@ -124,10 +131,13 @@ func New(cfg Config, opts ...PublisherOption) (port.Publisher, error) {
 
 // NewWithClient constructs an SNS publisher with an injected client.
 // Useful in tests to provide a mock SNS client without real AWS credentials.
-// Returns an error if topicARN is empty.
+// Returns an error if topicARN is empty or does not look like an SNS ARN.
 func NewWithClient(topicARN string, client SNSClientAPI, logger port.Logger, opts ...PublisherOption) (port.Publisher, error) {
 	if topicARN == "" {
 		return nil, fmt.Errorf("sns: TopicARN is required")
+	}
+	if !strings.HasPrefix(topicARN, "arn:aws:sns:") && !strings.HasPrefix(topicARN, "arn:aws-cn:sns:") && !strings.HasPrefix(topicARN, "arn:aws-us-gov:sns:") {
+		return nil, fmt.Errorf("sns: TopicARN %q does not look like a valid SNS ARN (expected prefix arn:aws:sns:, arn:aws-cn:sns:, or arn:aws-us-gov:sns:)", topicARN)
 	}
 	p := &snsPublisher{
 		client:   client,
@@ -137,6 +147,15 @@ func NewWithClient(topicARN string, client SNSClientAPI, logger port.Logger, opt
 	for _, opt := range opts {
 		opt(p)
 	}
+	// Warn at construction time if extra attributes are close to the SNS limit.
+	// 4 reserved + N extra + OTel headers (typically 1-3) must not exceed 10.
+	if p.logger != nil && len(p.extraAttributes) >= 5 {
+		p.logger.Warn("sns: WithAttributes count is high; combined with 4 reserved attributes and OTel headers the SNS limit of 10 may be exceeded at publish time", map[string]any{
+			"extra_attributes_count": len(p.extraAttributes),
+			"topic":                  topicARN,
+		})
+	}
+
 	// FIFO topics require MessageGroupId on every publish. Validate at construction
 	// so the misconfiguration is caught at wiring time, not on the first API call.
 	if strings.HasSuffix(topicARN, ".fifo") && p.messageGroupIDFn == nil {
@@ -147,6 +166,13 @@ func NewWithClient(topicARN string, client SNSClientAPI, logger port.Logger, opt
 
 // Publish publishes a single envelope to SNS.
 func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.RawMessage]) error {
+	// Validate required fields before the API call. Missing Type or Source will
+	// cause SNS subscription filter policies (which match on message attributes)
+	// to silently drop the message without any error from the API.
+	if err := validateEnvelopeFields(env); err != nil {
+		return err
+	}
+
 	tracer := otel.Tracer("platform-events")
 	ctx, span := tracer.Start(ctx, "sns.publish", oteltrace.WithSpanKind(oteltrace.SpanKindProducer))
 	defer span.End()
@@ -188,12 +214,16 @@ func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.Raw
 
 	// Inject W3C traceparent so the SQS consumer can reconstruct the full
 	// SpanContext (TraceID + SpanID) and create a valid OTel cross-service link.
+	// Guard against carrier keys that collide with reserved SNS attributes so
+	// propagator-injected headers cannot overwrite EventType/TenantID/Source/EventID.
 	carrier := make(propagation.MapCarrier)
 	otel.GetTextMapPropagator().Inject(ctx, carrier)
 	for k, v := range carrier {
-		input.MessageAttributes[k] = snstypes.MessageAttributeValue{
-			DataType:    aws.String("String"),
-			StringValue: aws.String(v),
+		if _, reserved := reservedSNSAttrs[k]; !reserved {
+			input.MessageAttributes[k] = snstypes.MessageAttributeValue{
+				DataType:    aws.String("String"),
+				StringValue: aws.String(v),
+			}
 		}
 	}
 
@@ -207,6 +237,20 @@ func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.Raw
 		} else {
 			input.MessageDeduplicationId = aws.String(env.ID)
 		}
+	}
+
+	// SNS hard limit: 10 message attributes per message. Validate before the
+	// API call so callers get a clear error rather than an opaque InvalidParameter.
+	if n := len(input.MessageAttributes); n > 10 {
+		metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
+		if p.logger != nil {
+			p.logger.Error("sns: message attribute count exceeds SNS limit of 10", map[string]any{
+				"count":      n,
+				"topic":      p.topicARN,
+				"event_type": env.Type,
+			})
+		}
+		return fmt.Errorf("sns: %d message attributes exceed SNS limit of 10; reduce WithAttributes entries or OTel header count", n)
 	}
 
 	start := time.Now()
@@ -225,22 +269,21 @@ func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.Raw
 				"error":      err.Error(),
 			})
 		}
+		err = wrapIfRetryable(err)
 	} else {
+		span.SetStatus(codes.Ok, "")
 		span.SetAttributes(attribute.String("messaging.message_id", aws.ToString(out.MessageId)))
 	}
 
-	if metrics.EventsPublishedTotal != nil {
-		metrics.EventsPublishedTotal.WithLabelValues(p.topicARN, env.Type, status).Inc()
-	}
-	if metrics.EventsPublishDuration != nil {
-		metrics.EventsPublishDuration.WithLabelValues(p.topicARN, env.Type).Observe(dur.Seconds())
-	}
+	metrics.RecordPublish(p.topicARN, env.Type, status, dur.Seconds())
 
 	return err
 }
 
 // PublishBatch publishes multiple envelopes. Batches larger than 10 are split automatically.
 // Returns a *BatchError listing per-message failures if any occur.
+// All chunks are always attempted — a transport error in one chunk does not
+// prevent remaining chunks from being sent.
 func (p *snsPublisher) PublishBatch(ctx context.Context, envs []domain.Envelope[json.RawMessage]) error {
 	var batchErr *BatchError
 
@@ -248,14 +291,22 @@ func (p *snsPublisher) PublishBatch(ctx context.Context, envs []domain.Envelope[
 		end := min(i+maxSNSBatchSize, len(envs))
 		chunk := envs[i:end]
 		if err := p.publishChunk(ctx, chunk); err != nil {
-			var be *BatchError
-			if errors.As(err, &be) {
-				if batchErr == nil {
-					batchErr = &BatchError{}
-				}
+			if batchErr == nil {
+				batchErr = &BatchError{}
+			}
+			if be, ok := errors.AsType[*BatchError](err); ok {
 				batchErr.Failures = append(batchErr.Failures, be.Failures...)
 			} else {
-				return err
+				// Transport-level error: record every message in the chunk as failed
+				// so callers know which IDs were not delivered. Remaining chunks are
+				// still attempted below.
+				for _, env := range chunk {
+					batchErr.Failures = append(batchErr.Failures, BatchFailure{
+						ID:      env.ID,
+						Code:    "TransportError",
+						Message: err.Error(),
+					})
+				}
 			}
 		}
 	}
@@ -283,11 +334,46 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 	otel.GetTextMapPropagator().Inject(ctx, traceCarrier)
 
 	entries := make([]snstypes.PublishBatchRequestEntry, 0, len(envs))
+	// entryEventType maps entry.Id (== env.ID, a UUID) to env.Type so that
+	// the transport-error metric path uses the event type label, not a UUID.
+	// Without this, every transport error creates a unique Prometheus time series
+	// (cardinality explosion) and dashboards show UUIDs instead of event types.
+	entryEventType := make(map[string]string, len(envs))
+	var marshalErr *BatchError
 	for _, env := range envs {
+		// Mirror the Publish validation: missing Type or Source causes
+		// buildMessageAttributes to omit EventType/Source attributes, which makes
+		// SQS subscription filter policies silently drop the message — no API
+		// error is returned because SNS accepts messages with arbitrary attribute sets.
+		if err := validateEnvelopeFields(env); err != nil {
+			metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
+			if marshalErr == nil {
+				marshalErr = &BatchError{}
+			}
+			marshalErr.Failures = append(marshalErr.Failures, BatchFailure{
+				ID:      env.ID,
+				Code:    "InvalidEnvelope",
+				Message: err.Error(),
+			})
+			continue
+		}
 		body, err := json.Marshal(env)
 		if err != nil {
-			return err
+			// Marshal failures are deterministic; record the metric and skip
+			// this entry rather than aborting the chunk — other envelopes
+			// in the same chunk can still be delivered successfully.
+			metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
+			if marshalErr == nil {
+				marshalErr = &BatchError{}
+			}
+			marshalErr.Failures = append(marshalErr.Failures, BatchFailure{
+				ID:      env.ID,
+				Code:    "MarshalError",
+				Message: err.Error(),
+			})
+			continue
 		}
+		entryEventType[env.ID] = env.Type
 		attrs := buildMessageAttributes(env)
 		for k, v := range p.extraAttributes {
 			if v != "" {
@@ -300,10 +386,27 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 			}
 		}
 		for k, v := range traceCarrier {
-			attrs[k] = snstypes.MessageAttributeValue{
-				DataType:    aws.String("String"),
-				StringValue: aws.String(v),
+			if _, reserved := reservedSNSAttrs[k]; !reserved {
+				attrs[k] = snstypes.MessageAttributeValue{
+					DataType:    aws.String("String"),
+					StringValue: aws.String(v),
+				}
 			}
+		}
+		// SNS hard limit: 10 message attributes per message. Mirror the single-
+		// Publish validation so batch callers also get a clear error rather than
+		// an opaque InvalidParameter from the API.
+		if n := len(attrs); n > 10 {
+			metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
+			if marshalErr == nil {
+				marshalErr = &BatchError{}
+			}
+			marshalErr.Failures = append(marshalErr.Failures, BatchFailure{
+				ID:      env.ID,
+				Code:    "TooManyAttributes",
+				Message: fmt.Sprintf("%d message attributes exceed SNS limit of 10; reduce WithAttributes entries or OTel header count", n),
+			})
+			continue
 		}
 		entry := snstypes.PublishBatchRequestEntry{
 			Id:                aws.String(env.ID),
@@ -323,6 +426,15 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 		entries = append(entries, entry)
 	}
 
+	// If all entries failed to marshal, skip the API call entirely.
+	if len(entries) == 0 {
+		if marshalErr != nil {
+			span.RecordError(marshalErr)
+			span.SetStatus(codes.Error, marshalErr.Error())
+		}
+		return marshalErr
+	}
+
 	start := time.Now()
 	out, err := p.client.PublishBatch(ctx, &sns.PublishBatchInput{
 		TopicArn:                   aws.String(p.topicARN),
@@ -336,20 +448,28 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 		if p.logger != nil {
 			p.logger.Error("sns: batch publish failed", map[string]any{
 				"topic": p.topicARN,
-				"count": len(envs),
+				"count": len(entries),
 				"error": err.Error(),
 			})
 		}
-		for _, env := range envs {
-			if metrics.EventsPublishedTotal != nil {
-				metrics.EventsPublishedTotal.WithLabelValues(p.topicARN, env.Type, "error").Inc()
-			}
+		perMsg := dur.Seconds() / float64(len(entries))
+		for _, entry := range entries {
+			eventType := entryEventType[aws.ToString(entry.Id)]
+			metrics.RecordPublish(p.topicARN, eventType, "error", perMsg)
 		}
-		if metrics.EventsPublishDuration != nil && len(envs) > 0 {
-			perMsg := dur.Seconds() / float64(len(envs))
-			for _, env := range envs {
-				metrics.EventsPublishDuration.WithLabelValues(p.topicARN, env.Type).Observe(perMsg)
+		// Merge any marshal failures accumulated before the API call so callers
+		// see the correct Code ("MarshalError" vs "TransportError") for each entry.
+		if marshalErr != nil {
+			combined := &BatchError{Failures: make([]BatchFailure, 0, len(marshalErr.Failures)+len(entries))}
+			combined.Failures = append(combined.Failures, marshalErr.Failures...)
+			for _, entry := range entries {
+				combined.Failures = append(combined.Failures, BatchFailure{
+					ID:      aws.ToString(entry.Id),
+					Code:    "TransportError",
+					Message: err.Error(),
+				})
 			}
+			return combined
 		}
 		return err
 	}
@@ -360,31 +480,86 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 		failedIDs[aws.ToString(f.Id)] = struct{}{}
 	}
 
-	perMsg := dur.Seconds() / float64(len(envs))
+	perMsg := dur.Seconds() / float64(len(entries))
 	for _, env := range envs {
+		if _, hadMarshalErr := func() (struct{}, bool) {
+			if marshalErr != nil {
+				for _, f := range marshalErr.Failures {
+					if f.ID == env.ID {
+						return struct{}{}, true
+					}
+				}
+			}
+			return struct{}{}, false
+		}(); hadMarshalErr {
+			continue // already recorded as error during entry building
+		}
 		_, failed := failedIDs[env.ID]
 		status := "success"
 		if failed {
 			status = "error"
 		}
-		if metrics.EventsPublishedTotal != nil {
-			metrics.EventsPublishedTotal.WithLabelValues(p.topicARN, env.Type, status).Inc()
-		}
-		if metrics.EventsPublishDuration != nil {
-			metrics.EventsPublishDuration.WithLabelValues(p.topicARN, env.Type).Observe(perMsg)
-		}
+		metrics.RecordPublish(p.topicARN, env.Type, status, perMsg)
 	}
 
+	// Merge API failures with any marshal failures collected during entry building.
+	var resultErr *BatchError
 	if len(out.Failed) > 0 {
-		be := &BatchError{}
+		resultErr = &BatchError{}
 		for _, f := range out.Failed {
-			be.Failures = append(be.Failures, BatchFailure{
+			resultErr.Failures = append(resultErr.Failures, BatchFailure{
 				ID:      aws.ToString(f.Id),
 				Code:    aws.ToString(f.Code),
 				Message: aws.ToString(f.Message),
 			})
 		}
-		return be
+	}
+	if marshalErr != nil {
+		if resultErr == nil {
+			resultErr = &BatchError{}
+		}
+		resultErr.Failures = append(resultErr.Failures, marshalErr.Failures...)
+	}
+	if resultErr != nil {
+		span.RecordError(resultErr)
+		span.SetStatus(codes.Error, resultErr.Error())
+		return resultErr
+	}
+	span.SetStatus(codes.Ok, "")
+	return nil
+}
+
+// retryableErrorCodes are AWS SNS error codes that indicate a transient failure
+// which should not count toward maxAttempts in the outbox service.
+var retryableErrorCodes = map[string]struct{}{
+	"Throttling":                    {},
+	"ThrottlingException":           {},
+	"RequestThrottled":              {},
+	"ProvisionedThroughputExceeded": {},
+	"RequestTimeout":                {},
+	"ServiceUnavailable":            {},
+	"InternalFailure":               {},
+}
+
+// wrapIfRetryable wraps err in a domain.RetryableError when the underlying
+// error indicates a transient failure that should not exhaust maxAttempts.
+// Covers AWS API throttle/service errors and network-level timeouts.
+func wrapIfRetryable(err error) error {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+		if _, ok := retryableErrorCodes[apiErr.ErrorCode()]; ok {
+			return &domain.RetryableError{Cause: err}
+		}
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return &domain.RetryableError{Cause: err}
+	}
+	return err
+}
+
+func validateEnvelopeFields(env domain.Envelope[json.RawMessage]) error {
+	if env.ID == "" || env.Type == "" || env.Source == "" {
+		return fmt.Errorf("sns: envelope missing required fields (id=%q, type=%q, source=%q)", env.ID, env.Type, env.Source)
 	}
 	return nil
 }

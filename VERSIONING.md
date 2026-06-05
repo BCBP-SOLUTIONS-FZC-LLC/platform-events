@@ -16,9 +16,9 @@ We use [SemVer 2.0.0](https://semver.org/): `MAJOR.MINOR.PATCH` (e.g. `v1.2.3`).
 
 | In scope (SemVer applies) | Out of scope (may change without MAJOR) |
 |---------------------------|----------------------------------------|
-| `pkg/events/*` | `internal/*` |
+| `pkg/events/*` | `internal/*` (except `internal/config` — deprecated alias of `pkg/config`) |
 | `pkg/outbox/*` | `cmd/platform-events` (reference CLI) |
-| Documented env vars in README | `pkg/outbox/migrations/*.sql` file names and internal schema |
+| `pkg/config/*` | `pkg/outbox/migrations/*.sql` file names (schema applied via `ApplySchema`) |
 
 Import only `pkg/events` and `pkg/outbox` from consumer services. Do not import `internal/` — Go enforces this boundary for external modules.
 
@@ -27,6 +27,21 @@ Import only `pkg/events` and `pkg/outbox` from consumer services. Do not import 
 - **MAJOR `v1`:** We avoid breaking changes in `pkg/*` within `v1.x`. When breaking changes are required, we release `v2.0.0` and document migration in CHANGELOG.
 - **MINOR:** Safe to upgrade with `go get` without code changes unless you opt into new features.
 - **PATCH:** Drop-in replacement; upgrade recommended for security fixes.
+
+### Envelope wire format guarantees
+
+The `Envelope` JSON wire format has its own stability contract, independent of Go API compatibility. Within `v1.x`:
+
+| Class | Fields | Guarantee |
+|-------|--------|-----------|
+| **Stable** | `id`, `type`, `source`, `timestamp` | Always present on the wire; never removed, renamed, or changed in type/format |
+| **Contextual** | `tenant_id`, `trace_id`, `correlation_id`, `schema_version` | Never removed; present when set; semantics of absent value frozen |
+| **Externally governed** | `payload` | Shape owned by the publishing service; library only validates well-formed JSON |
+| **Reserved** | Future optional fields | Added only in MINOR releases; always `omitempty`; never break existing consumers |
+
+Any violation of these wire format guarantees — removing a stable field or changing `id` format — constitutes a MAJOR bump even if the Go API is unchanged.
+
+See [ARCHITECTURE.md § Envelope compatibility guarantees](./ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field specification.
 
 ## Supported releases
 

@@ -13,6 +13,9 @@ import (
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/trace"
 
 	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
@@ -226,6 +229,7 @@ func TestStop_IsIdempotent(t *testing.T) {
 
 func TestDispatch_SuccessfulHandler_DeletesCalled(t *testing.T) {
 	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 
 	var deleteCount int32
@@ -280,6 +284,7 @@ func TestDispatch_SuccessfulHandler_DeletesCalled(t *testing.T) {
 
 func TestDispatch_HandlerError_NoDelete(t *testing.T) {
 	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 
 	var deleteCount int32
@@ -390,6 +395,7 @@ func TestDispatch_MalformedBody_Deleted(t *testing.T) {
 
 func TestDispatch_WithTraceID_OTelLinkCreated(t *testing.T) {
 	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	// A valid 32-char hex trace ID.
 	env.TraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
 	msg := makeSQSMessage(env)
@@ -437,6 +443,7 @@ func TestDispatch_WithTraceID_OTelLinkCreated(t *testing.T) {
 
 func TestStart_DrainTimeout(t *testing.T) {
 	env := domain.NewEnvelope("slow.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 
 	handlerStarted := make(chan struct{})
@@ -567,6 +574,7 @@ func TestWithDeadLetterHandler_ClosureInvoked(t *testing.T) {
 
 func TestDeleteMessage_Error_LoggerCalled(t *testing.T) {
 	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 
 	receiveCallCount := 0
@@ -716,6 +724,34 @@ func TestNewSQSConsumerWithClient_PublicWrapper_ReceivesPublicEnvelope(t *testin
 // MaxMessages default: values out of range clamp to 10
 // ----------------------------
 
+func TestNewWithClient_VisibilityTimeout_ExceedsMax_Error(t *testing.T) {
+	client := &mockSQSClient{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+
+	_, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithVisibilityTimeout(13*time.Hour), // > 12h SQS maximum
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "visibilityTimeout")
+	assert.Contains(t, err.Error(), "12 hours")
+}
+
+func TestNewWithClient_VisibilityTimeout_AtMax_Success(t *testing.T) {
+	client := &mockSQSClient{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+
+	_, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithVisibilityTimeout(12*time.Hour), // exactly at SQS maximum — allowed
+	)
+	require.NoError(t, err)
+}
+
 func TestNewWithClient_MaxMessages_OutOfRange(t *testing.T) {
 	client := &mockSQSClient{
 		receiveMessageFn: func(ctx context.Context, params *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
@@ -747,10 +783,11 @@ func TestDispatch_DeadLetterRouting_Invoked(t *testing.T) {
 	env := domain.NewEnvelope("dlq.event", "svc", json.RawMessage(`{}`))
 	env.TenantID = "acme"
 
-	// Message with ApproximateReceiveCount = 5.
+	// Message with ApproximateReceiveCount = 6 (> maxReceiveCount of 5).
+	// The DLH fires when count strictly exceeds the threshold, matching SQS DLQ semantics.
 	msg := makeSQSMessage(env)
 	msg.Attributes = map[string]string{
-		string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount): "5",
+		string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount): "6",
 	}
 
 	receiveCallCount := 0
@@ -783,7 +820,7 @@ func TestDispatch_DeadLetterRouting_Invoked(t *testing.T) {
 		client,
 		normalHandler,
 		internalsqs.WithDeadLetterHandler(dlh),
-		internalsqs.WithMaxReceiveCount(5), // threshold = 5; receive count = 5 → routed
+		internalsqs.WithMaxReceiveCount(5), // threshold = 5; receive count = 6 > 5 → routed
 		internalsqs.WithDrainTimeout(2*time.Second),
 	)
 	require.NoError(t, err)
@@ -804,9 +841,10 @@ func TestDispatch_DeadLetterRouting_Invoked(t *testing.T) {
 
 func TestDispatch_DeadLetterHandler_Error_LoggerCalled(t *testing.T) {
 	env := domain.NewEnvelope("dlq.err", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 	msg.Attributes = map[string]string{
-		string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount): "3",
+		string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount): "4",
 	}
 
 	receiveCallCount := 0
@@ -898,6 +936,7 @@ func TestNew_WithEndpointURL_Success(t *testing.T) {
 func TestDispatch_NoApproximateReceiveCountAttr_NotRouted(t *testing.T) {
 	// Message with NO ApproximateReceiveCount attr → approxReceiveCount returns 0 → not routed.
 	env := domain.NewEnvelope("test.no.attr", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 	// msg.Attributes is nil — no receive count attribute.
 
@@ -1139,6 +1178,7 @@ func TestNewWithClient_DLH_WithLogger_DefaultsMaxReceiveCount(t *testing.T) {
 // the logger receives a Warn call (exercises the c.logger != nil branch in dispatch).
 func TestDispatch_HandlerError_WithLogger(t *testing.T) {
 	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 
 	receiveCallCount := 0
@@ -1195,6 +1235,7 @@ func TestDispatch_HandlerError_WithLogger(t *testing.T) {
 // TestDispatch_WithVisibilityTimeout exercises the extension-goroutine path in dispatch.
 func TestDispatch_WithVisibilityTimeout(t *testing.T) {
 	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 
 	var deleteCount int32
@@ -1249,6 +1290,7 @@ func TestDispatch_WithVisibilityTimeout(t *testing.T) {
 func TestDispatch_Metrics_Success(t *testing.T) {
 
 	env := domain.NewEnvelope("metrics.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 
 	receiveCallCount := 0
@@ -1294,9 +1336,10 @@ func TestDispatch_Metrics_Success(t *testing.T) {
 func TestDispatch_DLH_Metrics(t *testing.T) {
 
 	env := domain.NewEnvelope("dlh.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
-	// Simulate the message having been received 5 times → above default threshold.
-	msg.Attributes = map[string]string{"ApproximateReceiveCount": "5"}
+	// Simulate the message having been received 6 times → strictly above maxReceiveCount=5.
+	msg.Attributes = map[string]string{"ApproximateReceiveCount": "6"}
 
 	receiveCallCount := 0
 	client := &mockSQSClient{
@@ -1345,6 +1388,7 @@ func TestDispatch_DLH_Metrics(t *testing.T) {
 // logger set, covering the WARN branch added for duplicate-delivery debugging.
 func TestDispatch_VisibilityExtension_Error_LoggerCalled(t *testing.T) {
 	env := domain.NewEnvelope("vis.err", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
 	msg := makeSQSMessage(env)
 
 	receiveCallCount := 0
@@ -1426,4 +1470,495 @@ func TestConsumer_StopBeforeStart(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Stop() before Start() hung — should return immediately")
 	}
+}
+
+// ----------------------------
+// deleteMessage: nil ReceiptHandle path
+// ----------------------------
+
+// TestDeleteMessage_NilReceiptHandle exercises the nil-ReceiptHandle guard in
+// deleteMessage. When a message has no ReceiptHandle the consumer must log an ERROR
+// and skip the delete without panicking or blocking.
+func TestDeleteMessage_NilReceiptHandle(t *testing.T) {
+	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
+	msg := makeSQSMessage(env)
+	msg.ReceiptHandle = nil // strip to trigger the nil-guard path
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	logger := &fixtures.MockLogger{}
+	handlerCalled := make(chan struct{}, 1)
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		handlerCalled <- struct{}{}
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	select {
+	case <-handlerCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not called")
+	}
+	time.Sleep(50 * time.Millisecond) // let deleteMessage goroutine complete
+	cancel()
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "ERROR" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ERROR log for nil ReceiptHandle")
+}
+
+// ----------------------------
+// deleteMessage: SQS API error path
+// ----------------------------
+
+// TestDeleteMessage_APIError exercises the DeleteMessage-API-error path.
+// When the DeleteMessage call returns an error the consumer must log an ERROR
+// and continue — the message will become visible again after visibility timeout.
+func TestDeleteMessage_APIError(t *testing.T) {
+	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "test-tenant"
+	msg := makeSQSMessage(env)
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		deleteMessageFn: func(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			return nil, errors.New("sqs: connection timeout")
+		},
+	}
+
+	logger := &fixtures.MockLogger{}
+	handlerCalled := make(chan struct{}, 1)
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		handlerCalled <- struct{}{}
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	select {
+	case <-handlerCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not called")
+	}
+	time.Sleep(50 * time.Millisecond) // let deleteMessage complete
+	cancel()
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "ERROR" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ERROR log for DeleteMessage API failure")
+}
+
+// ----------------------------
+// Dispatch: visibility extension ticker fires during long-running handler
+// ----------------------------
+
+// TestDispatch_VisibilityExtension_TickerFires exercises the visibility extension
+// goroutine's ticker.C path (consumer.go ~line 578). When visibilityTimeout is short
+// and the handler runs longer than visibilityTimeout/2, ChangeMessageVisibility is
+// called automatically to prevent the message re-appearing before the handler finishes.
+func TestDispatch_VisibilityExtension_TickerFires(t *testing.T) {
+	env := domain.NewEnvelope("slow.ext", "svc", json.RawMessage(`{}`))
+	env.TenantID = "acme"
+	msg := makeSQSMessage(env)
+
+	visExtCalled := make(chan struct{}, 10)
+	receiveCallCount := 0
+	handlerDone := make(chan struct{})
+
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		changeMessageVisibilityFn: func(_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+			select {
+			case visExtCalled <- struct{}{}:
+			default:
+			}
+			return &sqs.ChangeMessageVisibilityOutput{}, nil
+		},
+	}
+
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		<-handlerDone
+		return nil
+	}
+
+	// visibilityTimeout=200ms → extension fires every 100ms.
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithVisibilityTimeout(200*time.Millisecond),
+		internalsqs.WithDrainTimeout(3*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	// Wait for at least one visibility extension call (fires at 100ms).
+	select {
+	case <-visExtCalled:
+		// Good — extension fired.
+	case <-time.After(2 * time.Second):
+		close(handlerDone)
+		cancel()
+		t.Fatal("ChangeMessageVisibility was not called by the extension goroutine")
+	}
+
+	// Release the handler so the consumer can clean up.
+	close(handlerDone)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+}
+
+// ----------------------------
+// Start: handler panic is recovered and logged
+// ----------------------------
+
+func TestStart_HandlerPanic_Recovered(t *testing.T) {
+	env := domain.NewEnvelope("panic.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "acme"
+	msg := makeSQSMessage(env)
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	logger := &fixtures.MockLogger{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		panic("handler exploded")
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, e := range logger.Entries() {
+			if e.Level == "ERROR" {
+				cancel()
+				require.NoError(t, c.Stop())
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("expected ERROR log when handler panics")
+}
+
+// ----------------------------
+// Start: receive error then Stop during backoff
+// ----------------------------
+
+func TestStart_ReceiveError_StopDuringBackoff(t *testing.T) {
+	receiveCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCount++
+			if receiveCount == 1 {
+				return nil, errors.New("network blip")
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil },
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	go func() { _ = c.Start(ctx) }()
+
+	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, c.Stop())
+}
+
+// ----------------------------
+// Dispatch: malformed body longer than 512 chars is truncated in logs
+// ----------------------------
+
+func TestDispatch_MalformedBody_LongBodyTruncated(t *testing.T) {
+	longBody := `"` + string(make([]byte, 600)) + `"`
+	malformedMsg := sqstypes.Message{
+		MessageId:     aws.String("bad-long-msg"),
+		Body:          aws.String(longBody),
+		ReceiptHandle: aws.String("rh-bad-long"),
+	}
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{malformedMsg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		deleteMessageFn: func(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+	}
+
+	logger := &fixtures.MockLogger{}
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1, Logger: logger},
+		client,
+		func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil },
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, e := range logger.Entries() {
+			if body, ok := e.Fields["body"].(string); ok {
+				assert.Contains(t, body, "truncated")
+				cancel()
+				require.NoError(t, c.Stop())
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("expected truncated body in malformed-message log")
+}
+
+// ----------------------------
+// Dispatch: visibility extension skips nil receipt handle
+// ----------------------------
+
+func TestDispatch_VisibilityExtension_NilReceiptHandle(t *testing.T) {
+	env := domain.NewEnvelope("no-rh.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "acme"
+	body, _ := json.Marshal(env)
+	msg := sqstypes.Message{
+		MessageId: aws.String("msg-no-rh"),
+		Body:      aws.String(string(body)),
+		// ReceiptHandle intentionally nil
+	}
+
+	visExtCalled := atomic.Bool{}
+	receiveCallCount := 0
+	handlerDone := make(chan struct{})
+
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		changeMessageVisibilityFn: func(_ context.Context, _ *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+			visExtCalled.Store(true)
+			return &sqs.ChangeMessageVisibilityOutput{}, nil
+		},
+	}
+
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		<-handlerDone
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithVisibilityTimeout(200*time.Millisecond),
+		internalsqs.WithDrainTimeout(3*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	time.Sleep(150 * time.Millisecond)
+	assert.False(t, visExtCalled.Load(), "visibility extension must not call SQS without a receipt handle")
+
+	close(handlerDone)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+}
+
+// ----------------------------
+// Start: cancelled context hits top-of-loop Done path
+// ----------------------------
+
+func TestStart_ContextAlreadyCancelled(t *testing.T) {
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil },
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Start(ctx) }()
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Start did not return for pre-cancelled context")
+	}
+}
+
+// ----------------------------
+// Dispatch: W3C trace context in message attributes links spans
+// ----------------------------
+
+func TestDispatch_TraceContextInAttributes_LinksSpan(t *testing.T) {
+	env := domain.NewEnvelope("trace.consume", "svc", json.RawMessage(`{}`))
+	env.TenantID = "acme"
+	body, _ := json.Marshal(env)
+
+	tp := trace.NewTracerProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	publishCtx, span := tp.Tracer("test").Start(context.Background(), "publish")
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(publishCtx, carrier)
+	span.End()
+
+	attrs := map[string]sqstypes.MessageAttributeValue{}
+	for k, v := range carrier {
+		attrs[k] = sqstypes.MessageAttributeValue{
+			DataType:    aws.String("String"),
+			StringValue: aws.String(v),
+		}
+	}
+
+	msg := sqstypes.Message{
+		MessageId:         aws.String("msg-trace"),
+		Body:              aws.String(string(body)),
+		ReceiptHandle:     aws.String("rh-trace"),
+		MessageAttributes: attrs,
+	}
+
+	handlerCalled := atomic.Bool{}
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		deleteMessageFn: func(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+	}
+
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		handlerCalled.Store(true)
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	require.Eventually(t, handlerCalled.Load, 3*time.Second, 20*time.Millisecond)
+	cancel()
+	require.NoError(t, c.Stop())
 }

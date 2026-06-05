@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Repo Is
 
-`platform-events` is a **private Go shared library** (module: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26.3) that provides reusable SNS publisher and SQS consumer primitives for platform services. It lives in a **private GitHub repository** and is consumed as a Go module dependency by internal platform services — it is never deployed as a standalone server.
+`platform-events` is a **private Go shared library** (module: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26.4) that provides reusable SNS publisher and SQS consumer primitives for platform services. It lives in a **private GitHub repository** and is consumed as a Go module dependency by internal platform services — it is never deployed as a standalone server.
 
 Core capabilities:
 - `Publisher` interface + AWS SNS implementation
@@ -100,7 +100,7 @@ External dependencies (private modules):
 
 - **Envelope**
   - `Envelope[T any]` — typed event wrapper: `ID`, `Type`, `Source`, `TenantID`, `TraceID`, `Timestamp`, `Payload T`
-  - `NewEnvelope[T](eventType, source string, payload T, opts ...EnvelopeOption) Envelope[T]` — generates `ID` (UUID v7), sets `Timestamp` to `time.Now()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`. When publishing from an HTTP handler, pass `WithTenantID(rc.TenantID)` and `WithTraceID(rc.TraceID)` where `rc` is the `gincommon.RequestContext` extracted via `gincommon.GetRequestContext(c)`.
+  - `NewEnvelope[T](eventType, source string, payload T, opts ...EnvelopeOpt) Envelope[T]` — generates `ID` (UUID v7), sets `Timestamp` to `time.Now()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`. When publishing from an HTTP handler, pass `WithTenantID(rc.TenantID)`, `WithTraceID(rc.TraceID)`, and `WithSchemaVersion("1")` where `rc` is the `gincommon.RequestContext` extracted via `gincommon.GetRequestContext(c)`.
   - `Envelope.JSON() ([]byte, error)` — canonical JSON serialisation (payload marshalled inline)
   - `ParseEnvelope[T](data []byte) (Envelope[T], error)` — deserialise and validate required fields
 
@@ -159,8 +159,9 @@ pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx
 ```json
 {
   "id":             "01926e4f-...",     // UUID v7 — sortable, unique per event
-  "type":           "user.created",    // dot-separated, lower-snake: <domain>.<action>
+  "type":           "iam.user.created", // <domain>.<entity>.<past-tense-verb>[.v<N>]
   "source":         "platform-iam",    // emitting service name
+  "schema_version": "1",               // optional; omitted = treat as "1"
   "tenant_id":      "acme",
   "trace_id":       "4bf92f3577...",   // OTel trace ID (hex, 32 chars) or empty
   "correlation_id": "...",             // optional: ties events in a saga/workflow
@@ -169,7 +170,9 @@ pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx
 }
 ```
 
-`event_type` convention: `<domain>.<entity>.<past-tense-verb>` (e.g. `iam.user.created`, `billing.invoice.settled`). Consumers match on prefix with `strings.HasPrefix` or exact equality — no glob or regex routing in the base library.
+`event_type` convention: `<domain>.<entity>.<past-tense-verb>[.v<N>]` (e.g. `iam.user.created`, `billing.invoice.settled`). The `.v<N>` suffix only appears for breaking payload changes — v1 is implicit (no suffix). Consumers match on prefix with `strings.HasPrefix` or exact equality — no glob or regex routing in the base library.
+
+`schema_version` field: set via `WithSchemaVersion("1")` on every new event type at inception. Increment on additive-only field additions. For breaking changes, mint a new event type (`.v2`) and reset `schema_version` back to `"1"`. See `EVENT_SCHEMA_GOVERNANCE.md` for full rules, migration window pattern, and the cross-service event type registry.
 
 ### SNS Publisher
 
@@ -330,7 +333,7 @@ GitHub Actions runs three workflows. This is a **private module** — there is n
 2. `gofmt -l` — format check
 3. `go mod tidy` drift check
 4. `go vet`
-5. `golangci-lint`
+5. `golangci-lint` — invoked via `go tool golangci-lint` (declared in the `tool` directive in `go.mod`). The Go 1.24+ `tool` directive is NOT propagated to downstream consumers' `go.sum` — only the `require` block is. Consuming services that `go get platform-events` do not pull in golangci-lint or its transitive dependencies.
 6. `govulncheck ./internal/... ./pkg/...`
 7. `make test-ci` — unit + integration (LocalStack + Postgres via testcontainers) with race detector
 
@@ -346,7 +349,7 @@ GitHub Actions runs three workflows. This is a **private module** — there is n
 
 ## Extending the Library
 
-- **New event type:** define a Go struct and use `NewEnvelope[YourType](...)`. No changes to the library itself — types are generic. Always pass `WithTenantID(rc.TenantID)` and `WithTraceID(rc.TraceID)` from the `gincommon.RequestContext` when publishing from an HTTP handler.
+- **New event type:** define a Go struct and use `NewEnvelope[YourType](...)`. No changes to the library itself — types are generic. Always pass `WithTenantID(rc.TenantID)`, `WithTraceID(rc.TraceID)`, and `WithSchemaVersion("1")` from the `gincommon.RequestContext` when publishing from an HTTP handler. Register the new type in `EVENT_SCHEMA_GOVERNANCE.md`. For breaking payload changes, mint a new versioned type (e.g. `iam.user.created.v2`) and reset `WithSchemaVersion("1")` — never mutate the existing type's payload in an incompatible way.
 - **New Publisher backend** (e.g. EventBridge): implement `port.Publisher` in `internal/adapter/outbound/eventbridge/`, expose a constructor in `pkg/events/`. Follow the SNS adapter as a template — call `otel.Tracer(...)` (not gincommon directly) + Prometheus metrics in the adapter.
 - **New Consumer backend** (e.g. Kinesis): implement `port.Consumer` in `internal/adapter/outbound/kinesis/`, expose via `pkg/events/`. `Handler` signature is shared — no changes to calling code. Inject tenant+trace into handler `ctx` using the same helper as `NewSQSConsumer` so `pgcommon` GUC injection works transparently.
 - **New outbox store backend** (e.g. DynamoDB): implement `port.OutboxStore` in `internal/core/port/outboxstore.go`, place in `internal/adapter/outbound/dynamooutbox/`, inject via `Runner.Store`. The Postgres implementation should remain the default — only swap if `platform-pgcommon` is not available in the consuming service.

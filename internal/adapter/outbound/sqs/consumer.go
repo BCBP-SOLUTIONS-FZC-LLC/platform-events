@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"runtime/debug"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -15,6 +17,7 @@ import (
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	oteltrace "go.opentelemetry.io/otel/trace"
@@ -44,6 +47,10 @@ func WithConcurrency(n int) ConsumerOption {
 	return func(c *sqsConsumer) {
 		if n > 0 {
 			c.concurrency = n
+		} else if c.logger != nil {
+			c.logger.Warn("sqs: WithConcurrency called with invalid value (must be > 0); using default of 1", map[string]any{
+				"configured": n,
+			})
 		}
 	}
 }
@@ -70,8 +77,18 @@ func WithMaxReceiveCount(n int) ConsumerOption {
 }
 
 // WithDrainTimeout sets how long Stop() waits for in-flight handlers to finish.
+// A negative duration is ignored and the default (30s) is preserved.
 func WithDrainTimeout(d time.Duration) ConsumerOption {
-	return func(c *sqsConsumer) { c.drainTimeout = d }
+	return func(c *sqsConsumer) {
+		if d >= 0 {
+			c.drainTimeout = d
+		} else if c.logger != nil {
+			c.logger.Warn("sqs: WithDrainTimeout called with negative duration; using default", map[string]any{
+				"configured": d.String(),
+				"default":    defaultDrainTimeout.String(),
+			})
+		}
+	}
 }
 
 // Config holds the parameters for constructing an SQS consumer.
@@ -104,7 +121,6 @@ type sqsConsumer struct {
 
 	maxReceiveCount int
 	cancelFn        context.CancelFunc
-	wg              sync.WaitGroup
 	mu              sync.Mutex
 	running         bool
 	// doneCh is closed when the Start goroutine has fully returned (drain complete).
@@ -125,7 +141,9 @@ func New(cfg Config, handler port.Handler, opts ...ConsumerOption) (port.Consume
 	awsOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
 	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsOpts...)
+	startupCtx, startupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer startupCancel()
+	awsCfg, err := awsconfig.LoadDefaultConfig(startupCtx, awsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("sqs: failed to load AWS config: %w", err)
 	}
@@ -154,6 +172,11 @@ func NewWithClient(cfg Config, client SQSClientAPI, handler port.Handler, opts .
 
 	maxMessages := cfg.MaxMessages
 	if maxMessages <= 0 || maxMessages > 10 {
+		if cfg.Logger != nil && maxMessages != 0 {
+			cfg.Logger.Warn("sqs: MaxMessages out of range [1,10]; using 10", map[string]any{
+				"configured": maxMessages,
+			})
+		}
 		maxMessages = 10
 	}
 	waitSeconds := cfg.WaitSeconds
@@ -193,6 +216,15 @@ func NewWithClient(cfg Config, client SQSClientAPI, handler port.Handler, opts .
 		}
 	}
 
+	// SQS hard limit on VisibilityTimeout is 43200 seconds (12 hours).
+	// Exceeding it causes the ReceiveMessage and ChangeMessageVisibility API
+	// calls to fail with an InvalidParameterValue error, which is confusing
+	// to diagnose at runtime. Reject at construction time with a clear error.
+	const maxSQSVisibilityTimeout = 12 * time.Hour
+	if c.visibilityTimeout > maxSQSVisibilityTimeout {
+		return nil, fmt.Errorf("sqs: visibilityTimeout %s exceeds SQS maximum of 12 hours", c.visibilityTimeout)
+	}
+
 	return c, nil
 }
 
@@ -210,6 +242,7 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		return fmt.Errorf("sqs: consumer is already running")
 	}
 	loopCtx, cancel := context.WithCancel(ctx)
+	defer cancel() // always release loopCtx resources when Start() exits
 	c.cancelFn = cancel
 	c.running = true
 	thisDoneCh := make(chan struct{})
@@ -224,21 +257,44 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		close(thisDoneCh)
 	}()
 
+	// wg is local to this Start() cycle so that drain() can never mix in-flight
+	// handlers from a previous cycle (which would occur if wg were a struct field
+	// and a prior drain timeout left handlers still running).
+	var wg sync.WaitGroup
+
+	// drainCtx is cancelled when the drain timeout fires, propagating a
+	// cancellation signal to all in-flight handler goroutines so they can
+	// exit cleanly rather than leaking past the drain window.
+	drainCtx, drainCancel := context.WithCancel(context.Background())
+	defer drainCancel()
+
+	// inflight tracks the number of handler goroutines currently running so the
+	// drain timeout log can report how many were cancelled rather than just "some".
+	var inflight atomic.Int32
+
 	// drain waits for all in-flight handler goroutines to finish.
+	// If the drain timeout fires, drainCancel() is called to signal handlers.
 	drain := func() {
-		done := make(chan struct{})
+		drained := make(chan struct{})
 		go func() {
-			c.wg.Wait()
-			close(done)
+			wg.Wait()
+			close(drained)
 		}()
-		drainCtx, drainCancel := context.WithTimeout(context.Background(), c.drainTimeout)
-		defer drainCancel()
+		timer := time.NewTimer(c.drainTimeout)
+		defer timer.Stop()
 		select {
-		case <-done:
-		case <-drainCtx.Done():
+		case <-drained:
+		case <-timer.C:
+			drainCancel() // cancel in-flight handler contexts
 			if c.logger != nil {
-				c.logger.Warn("sqs: drain timeout exceeded; some handlers may not have completed", nil)
+				c.logger.Warn("sqs: drain timeout exceeded; cancelling remaining handlers", map[string]any{
+					"in_flight": inflight.Load(),
+				})
 			}
+			// drain() returns immediately after cancelling contexts. The wg.Wait()
+			// goroutine above will exit once handlers respond to the cancellation and
+			// return — this is bounded by handler responsiveness, not permanent. Handlers
+			// that do not check ctx will linger until they finish their current work.
 		}
 	}
 
@@ -279,7 +335,15 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		default:
 		}
 
-		out, err := c.client.ReceiveMessage(loopCtx, receiveInput)
+		// Bound each ReceiveMessage call with a per-call timeout so a hung network
+		// connection (established but no response) cannot stall the poll loop
+		// indefinitely. WaitTimeSeconds covers legitimate long-poll latency; the
+		// extra 5 s covers AWS control-plane overhead and TLS handshakes.
+		// We pass loopCtx as the parent so cancellation still propagates immediately
+		// on Stop(), even before the per-call deadline fires.
+		rcvCtx, rcvCancel := context.WithTimeout(loopCtx, time.Duration(int(c.waitSeconds)+5)*time.Second)
+		out, err := c.client.ReceiveMessage(rcvCtx, receiveInput)
+		rcvCancel()
 		if err != nil {
 			select {
 			case <-loopCtx.Done():
@@ -289,14 +353,18 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 				return nil
 			default:
 			}
+			metrics.RecordSQSReceiveError(c.queueURL)
 			if c.logger != nil {
 				c.logger.Error("sqs: receive message failed", map[string]any{"error": err.Error()})
 			}
-			// Interruptible backoff: wake immediately if Stop() is called rather
-			// than blocking for up to receiveBackoffMax (30s) and missing a shutdown.
+			// Interruptible backoff: use NewTimer so the timer goroutine is
+			// cancelled when Stop() fires, preventing a leak of up to 30s per
+			// error when the consumer is stopped during the backoff window.
+			backoffTimer := time.NewTimer(receiveBackoff)
 			select {
-			case <-time.After(receiveBackoff):
+			case <-backoffTimer.C:
 			case <-loopCtx.Done():
+				backoffTimer.Stop()
 				drain()
 				return nil
 			}
@@ -315,7 +383,9 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 				drain()
 				return nil
 			}
-			c.wg.Go(func() {
+			inflight.Add(1)
+			wg.Go(func() {
+				defer inflight.Add(-1)
 				defer func() { <-sem }()
 				defer func() {
 					if r := recover(); r != nil {
@@ -323,18 +393,19 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 							c.logger.Error("sqs: handler panic recovered", map[string]any{
 								"message_id": aws.ToString(msg.MessageId),
 								"panic":      fmt.Sprintf("%v", r),
+								"stack":      string(debug.Stack()),
 							})
 						}
 					}
 				}()
-				c.dispatch(loopCtx, msg)
+				c.dispatch(drainCtx, loopCtx, msg)
 			})
 		}
 	}
 }
 
 // Stop cancels the receive loop and waits for all in-flight handlers to finish
-// (up to DrainTimeout). Returns once Start has returned.
+// (up to DrainTimeout). Returns an error if the drain timeout is exceeded.
 // Safe to call multiple times and safe to call before Start.
 func (c *sqsConsumer) Stop() error {
 	c.mu.Lock()
@@ -342,26 +413,50 @@ func (c *sqsConsumer) Stop() error {
 		c.cancelFn()
 	}
 	doneCh := c.doneCh // capture current cycle's channel under lock
+	drainTimeout := c.drainTimeout
 	c.mu.Unlock()
 
-	<-doneCh // pre-closed before first Start(), fresh channel during/after Start()
-	return nil
+	// Hard deadline: drainTimeout (for handlers) + 5s margin for housekeeping.
+	// This ensures Stop() itself cannot block indefinitely if Start() hangs.
+	timer := time.NewTimer(drainTimeout + 5*time.Second)
+	defer timer.Stop()
+	select {
+	case <-doneCh:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("sqs: consumer did not stop within drain timeout (%s)", drainTimeout)
+	}
 }
 
-func (c *sqsConsumer) dispatch(ctx context.Context, msg sqstypes.Message) {
+// dispatch processes a single SQS message. It receives two contexts:
+//   - drainCtx: cancelled by the drain timeout; propagated to the user handler
+//     so in-flight handlers can be signalled when the drain deadline fires.
+//   - loopCtx: the receive-loop context cancelled by Stop(); used for
+//     visibility-timeout extension (which must stop when the loop stops).
+func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.Message) {
 	tracer := otel.Tracer("platform-events")
 
 	var env domain.Envelope[json.RawMessage]
 	body := aws.ToString(msg.Body)
 	if err := json.Unmarshal([]byte(body), &env); err != nil {
+		// Log the body (truncated) so engineers can diagnose schema mismatches
+		// without losing the message content. Deleting is correct here — a
+		// malformed message will never parse successfully, so retrying is futile.
+		logBody := body
+		if len(logBody) > 512 {
+			logBody = logBody[:512] + "...[truncated]"
+		}
 		if c.logger != nil {
 			c.logger.Error("sqs: failed to unmarshal message body", map[string]any{
 				"message_id": aws.ToString(msg.MessageId),
 				"error":      err.Error(),
 				"queue":      c.queueURL,
+				"body":       logBody,
 			})
 		}
 		// Delete malformed messages to avoid infinite retry loops.
+		// Record a metric so operators can detect producer schema mismatches.
+		metrics.RecordConsume(c.queueURL, "unknown", "malformed", 0)
 		c.deleteMessage(msg)
 		return
 	}
@@ -371,15 +466,29 @@ func (c *sqsConsumer) dispatch(ctx context.Context, msg sqstypes.Message) {
 	// writes and downstream calls uninterrupted — the drain() call in Start()
 	// gives them drainTimeout to finish. context.WithoutCancel preserves any
 	// context values (OTel baggage, etc.) while stripping the cancel signal.
-	handlerCtx := pgcommon.WithGUCSet(context.WithoutCancel(ctx), pgdomain.GUCSet{TenantID: env.TenantID})
+	// Inject TenantID for downstream pgcommon pool RLS enforcement.
+	// Inject TraceID via the port context key so handler code can retrieve it
+	// with events.TraceIDFromContext — GUCSet does not carry TraceID.
+	handlerBase := pgcommon.WithGUCSet(context.WithoutCancel(loopCtx), pgdomain.GUCSet{TenantID: env.TenantID})
+	handlerBase = port.WithEnvelopeTraceID(handlerBase, env.TraceID)
 
 	// Route to dead-letter handler when ApproximateReceiveCount reaches the threshold.
 	// The message is deleted only if the dead-letter handler succeeds; on failure it
 	// is left visible for retry, matching the semantics of the normal handler.
 	if c.deadLetterHandler != nil && c.maxReceiveCount > 0 {
-		if approxReceiveCount(msg.Attributes) >= c.maxReceiveCount {
+		// Use > (strictly greater than) to match SQS DLQ semantics: SQS moves a
+		// message after the receive count *exceeds* MaxReceiveCount (i.e. on the
+		// N+1th delivery). Using >= would fire one delivery too early, consuming
+		// the last retry budget before SQS would have acted.
+		if approxReceiveCount(msg.Attributes) > c.maxReceiveCount {
+			// Tie DLH context to drainCtx so it respects the drain deadline.
+			dlhCtx, dlhCancel := context.WithCancel(handlerBase)
+			stopDrain := context.AfterFunc(drainCtx, dlhCancel)
+			defer stopDrain()
+			defer dlhCancel()
+
 			start := time.Now()
-			dlhErr := c.deadLetterHandler(handlerCtx, env)
+			dlhErr := c.deadLetterHandler(dlhCtx, env)
 			dur := time.Since(start)
 
 			dlhStatus := "success"
@@ -394,15 +503,18 @@ func (c *sqsConsumer) dispatch(ctx context.Context, msg sqstypes.Message) {
 						"error":      dlhErr.Error(),
 					})
 				}
+			} else if c.logger != nil {
+				c.logger.Warn("sqs: dead-letter handler invoked", map[string]any{
+					"message_id":                aws.ToString(msg.MessageId),
+					"event_type":                env.Type,
+					"tenant_id":                 env.TenantID,
+					"event_id":                  env.ID,
+					"approximate_receive_count": approxReceiveCount(msg.Attributes),
+				})
 			}
 			// Emit the same consume metrics for DLH invocations so dashboards and
 			// alerts can distinguish DLH activity from normal handler activity.
-			if metrics.EventsConsumedTotal != nil {
-				metrics.EventsConsumedTotal.WithLabelValues(c.queueURL, env.Type, "dlq_"+dlhStatus).Inc()
-			}
-			if metrics.EventsConsumeDuration != nil {
-				metrics.EventsConsumeDuration.WithLabelValues(c.queueURL, env.Type).Observe(dur.Seconds())
-			}
+			metrics.RecordConsume(c.queueURL, env.Type, "dlq_"+dlhStatus, dur.Seconds())
 
 			if dlhErr != nil {
 				return // do NOT delete — leave visible for retry
@@ -422,12 +534,30 @@ func (c *sqsConsumer) dispatch(ctx context.Context, msg sqstypes.Message) {
 		}
 	}
 	if len(carrier) > 0 {
-		propCtx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
-		remoteSpan := oteltrace.SpanFromContext(propCtx)
+		// Extract into a clean context to get the remote span for linking.
+		// Async message consumers start a new trace root with a Link to the
+		// producer span — they do not inherit the remote span as a parent.
+		extractCtx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+		remoteSpan := oteltrace.SpanFromContext(extractCtx)
 		if remoteSpan.SpanContext().IsValid() {
 			spanOpts = append(spanOpts, oteltrace.WithLinks(oteltrace.Link{SpanContext: remoteSpan.SpanContext()}))
 		}
+		// Propagate W3C baggage (feature flags, correlation IDs, etc.) into
+		// handlerBase so handler code can access it via baggage.FromContext.
+		if b := baggage.FromContext(extractCtx); b.Len() > 0 {
+			handlerBase = baggage.ContextWithBaggage(handlerBase, b)
+		}
 	}
+
+	// Build a cancellable handler context tied to the drain deadline.
+	// context.WithoutCancel strips loopCtx cancellation (intentional — handlers
+	// must run to completion during graceful shutdown). context.AfterFunc links
+	// the drain deadline so handlers are cancelled when drain timeout fires.
+	handlerCtx, handlerCancel := context.WithCancel(handlerBase)
+	stopDrain := context.AfterFunc(drainCtx, handlerCancel)
+	defer stopDrain()
+	defer handlerCancel()
+
 	handlerCtx, span := tracer.Start(handlerCtx, "sqs.receive", spanOpts...)
 	defer span.End()
 
@@ -442,11 +572,14 @@ func (c *sqsConsumer) dispatch(ctx context.Context, msg sqstypes.Message) {
 
 	// Automatically extend the SQS visibility timeout so long-running handlers
 	// are not re-delivered while still processing. Fires every visibilityTimeout/2
-	// and stops when the handler returns.
+	// and stops when the handler returns (via extCancel).
 	if c.visibilityTimeout > 0 {
 		// Clamp to minimum 1s: int32 truncation would produce 0 for sub-second
 		// durations, which would make the message immediately re-visible.
 		secs := max(int32(c.visibilityTimeout.Seconds()), 1)
+		// extCtx is derived from context.Background() (not drainCtx) so visibility
+		// extensions continue until the handler completes, not until drain fires.
+		// The goroutine exits cleanly via extCancel() deferred below.
 		extCtx, extCancel := context.WithCancel(context.Background())
 		defer extCancel()
 		go func() {
@@ -456,19 +589,25 @@ func (c *sqsConsumer) dispatch(ctx context.Context, msg sqstypes.Message) {
 			for {
 				select {
 				case <-ticker.C:
+					if msg.ReceiptHandle == nil {
+						return
+					}
 					if _, err := c.client.ChangeMessageVisibility(extCtx, &sqs.ChangeMessageVisibilityInput{
 						QueueUrl:          aws.String(c.queueURL),
 						ReceiptHandle:     msg.ReceiptHandle,
 						VisibilityTimeout: secs,
-					}); err != nil && c.logger != nil {
-						// A failed extension means the message may become visible again
-						// while the handler is still running, causing duplicate delivery.
-						// Handlers are required to be idempotent, so this is not fatal —
-						// but it is worth surfacing when debugging duplicate processing.
-						c.logger.Warn("sqs: failed to extend message visibility — possible duplicate delivery", map[string]any{
-							"message_id": aws.ToString(msg.MessageId),
-							"error":      err.Error(),
-						})
+					}); err != nil {
+						metrics.RecordSQSVisibilityError(c.queueURL)
+						if c.logger != nil {
+							// A failed extension means the message may become visible again
+							// while the handler is still running, causing duplicate delivery.
+							// Handlers are required to be idempotent, so this is not fatal —
+							// but it is worth surfacing when debugging duplicate processing.
+							c.logger.Warn("sqs: failed to extend message visibility — possible duplicate delivery", map[string]any{
+								"message_id": aws.ToString(msg.MessageId),
+								"error":      err.Error(),
+							})
+						}
 					}
 				case <-extCtx.Done():
 					return
@@ -497,15 +636,11 @@ func (c *sqsConsumer) dispatch(ctx context.Context, msg sqstypes.Message) {
 		}
 		// Do not delete — leave visible for retry.
 	} else {
+		span.SetStatus(codes.Ok, "")
 		c.deleteMessage(msg)
 	}
 
-	if metrics.EventsConsumedTotal != nil {
-		metrics.EventsConsumedTotal.WithLabelValues(c.queueURL, env.Type, status).Inc()
-	}
-	if metrics.EventsConsumeDuration != nil {
-		metrics.EventsConsumeDuration.WithLabelValues(c.queueURL, env.Type).Observe(dur.Seconds())
-	}
+	metrics.RecordConsume(c.queueURL, env.Type, status, dur.Seconds())
 }
 
 // approxReceiveCount parses the ApproximateReceiveCount system attribute from SQS.
@@ -523,16 +658,27 @@ const deleteMessageTimeout = 10 * time.Second
 // deleteMessage deletes a processed message from SQS. It uses its own bounded
 // context so a network partition cannot hold a goroutine slot indefinitely.
 func (c *sqsConsumer) deleteMessage(msg sqstypes.Message) {
+	if msg.ReceiptHandle == nil {
+		if c.logger != nil {
+			c.logger.Error("sqs: cannot delete message with nil ReceiptHandle — skipping", map[string]any{
+				"message_id": aws.ToString(msg.MessageId),
+			})
+		}
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), deleteMessageTimeout)
 	defer cancel()
 	_, err := c.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
 		QueueUrl:      aws.String(c.queueURL),
 		ReceiptHandle: msg.ReceiptHandle,
 	})
-	if err != nil && c.logger != nil {
-		c.logger.Error("sqs: failed to delete message", map[string]any{
-			"message_id": aws.ToString(msg.MessageId),
-			"error":      err.Error(),
-		})
+	if err != nil {
+		metrics.RecordSQSDeleteError(c.queueURL)
+		if c.logger != nil {
+			c.logger.Error("sqs: failed to delete message", map[string]any{
+				"message_id": aws.ToString(msg.MessageId),
+				"error":      err.Error(),
+			})
+		}
 	}
 }

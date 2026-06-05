@@ -1,19 +1,24 @@
 flowchart TD
-    A([Runner.Start called]) --> P[pollOnce\nimmediate first poll on startup]
-    P --> C["SELECT … FOR UPDATE SKIP LOCKED\nWHERE published_at IS NULL\n  AND scheduled_at ≤ NOW()\nORDER BY id  LIMIT BatchSize"]
+    A([Runner.Start called]) --> JIT["sleep StartupJitter\n(random 0 → StartupJitter;\ndefault 0 — desyncs replicas)"]
+    JIT --> P[pollOnce\nimmediate first poll on startup]
+    P --> PM["SetOutboxPending(pendingCount)\noutbox_pending_total gauge\n(queried before claiming)"]
+    PM --> LM["SetOutboxLeased(leasedCount)\noutbox_leased_total gauge\n(queried before claiming)"]
+    LM --> C["SELECT … FOR UPDATE SKIP LOCKED\nWHERE published_at IS NULL\n  AND scheduled_at ≤ NOW()\nORDER BY scheduled_at, id  LIMIT BatchSize"]
     C -- 0 rows --> B[wait PollInterval tick]
-    B --> C
-    C -- rows --> L["UPDATE scheduled_at = NOW() + claimLease\nWHERE id = ANY(ids)\n— claim lease, prevents re-claim by other runners —"]
+    B --> P
+    C -- rows --> L["UPDATE scheduled_at = NOW() + ClaimLeaseDuration\nWHERE id = ANY(ids)\n— lease prevents re-claim by other runners —"]
     L --> D[for each OutboxRecord]
     D --> E[json.Unmarshal Payload → Envelope]
     E -- unmarshal error --> F["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\nif attempts ≥ MaxAttempts → dead-letter"]
     F --> D
     E -- ok --> G[Publisher.Publish]
-    G -- success --> H[MarkPublished\npublished_at = NOW()]
+    G -- success --> H["MarkPublished\npublished_at = NOW()\noutbox_published_total{success}++"]
     H --> D
-    G -- error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)"]
+    G -- retryable error\n(Throttling · ServiceUnavailable\n· InternalFailure · RequestTimeout) --> RI["MarkFailed threshold = MaxAttempts+1\n(does NOT exhaust MaxAttempts —\nno dead-letter on transient failure)"]
+    RI --> D
+    G -- permanent error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\noutbox_published_total{error}++"]
     I --> J{attempts ≥ MaxAttempts?}
-    J -- yes --> K[INSERT outbox_dead_letters\nDELETE outbox_events]
+    J -- yes --> K["INSERT outbox_dead_letters\nDELETE outbox_events\noutbox_dead_letters_total++"]
     J -- no  --> D
     K --> D
     D -- done --> B

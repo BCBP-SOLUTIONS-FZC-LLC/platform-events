@@ -1,6 +1,7 @@
 package envelope_test
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -8,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
@@ -61,21 +63,21 @@ func TestParseEnvelope_MissingID(t *testing.T) {
 	data := `{"type":"test.event","source":"svc","timestamp":"2026-01-01T00:00:00Z","payload":{}}`
 	_, err := events.ParseEnvelope[json.RawMessage]([]byte(data))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "id")
+	assert.ErrorIs(t, err, events.ErrEnvelopeIDRequired)
 }
 
 func TestParseEnvelope_MissingType(t *testing.T) {
 	data := `{"id":"01926e4f-1234-7abc-8def-000000000001","source":"svc","timestamp":"2026-01-01T00:00:00Z","payload":{}}`
 	_, err := events.ParseEnvelope[json.RawMessage]([]byte(data))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "type")
+	assert.ErrorIs(t, err, events.ErrEnvelopeTypeRequired)
 }
 
 func TestParseEnvelope_MissingSource(t *testing.T) {
 	data := `{"id":"01926e4f-1234-7abc-8def-000000000001","type":"test.event","timestamp":"2026-01-01T00:00:00Z","payload":{}}`
 	_, err := events.ParseEnvelope[json.RawMessage]([]byte(data))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "source")
+	assert.ErrorIs(t, err, events.ErrEnvelopeSourceRequired)
 }
 
 func TestParseEnvelope_InvalidJSON(t *testing.T) {
@@ -90,4 +92,83 @@ func TestEnvelope_UniqueIDs(t *testing.T) {
 		assert.False(t, ids[env.ID], "duplicate ID generated: %s", env.ID)
 		ids[env.ID] = true
 	}
+}
+
+// ----------------------------
+// WithSystemTenant
+// ----------------------------
+
+func TestWithSystemTenant_SetsTenantID(t *testing.T) {
+	env := events.NewEnvelope("sys.event", "worker", json.RawMessage(`{}`), events.WithSystemTenant())
+	assert.Equal(t, events.SystemTenantID, env.TenantID)
+}
+
+func TestSystemTenantID_Constant(t *testing.T) {
+	assert.Equal(t, "system", events.SystemTenantID)
+}
+
+// ----------------------------
+// TraceIDFromContext
+// ----------------------------
+
+func TestTraceIDFromContext_Missing(t *testing.T) {
+	got := events.TraceIDFromContext(context.Background())
+	assert.Equal(t, "", got)
+}
+
+func TestTraceIDFromContext_WithInjectedValue(t *testing.T) {
+	ctx := port.WithEnvelopeTraceID(context.Background(), "trace-xyz-789")
+	got := events.TraceIDFromContext(ctx)
+	assert.Equal(t, "trace-xyz-789", got)
+}
+
+// ----------------------------
+// WithSchemaVersion
+// ----------------------------
+
+func TestWithSchemaVersion_SetsField(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created.v2", "platform-iam", json.RawMessage(`{}`),
+		events.WithSchemaVersion("2"),
+	)
+	assert.Equal(t, "2", env.SchemaVersion)
+}
+
+func TestNewEnvelope_DefaultSchemaVersion_Empty(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`))
+	assert.Empty(t, env.SchemaVersion)
+}
+
+func TestEnvelope_SchemaVersion_RoundTrip(t *testing.T) {
+	original := events.NewEnvelope("billing.invoice.settled.v2", "billing-svc", json.RawMessage(`{"amount":100}`),
+		events.WithSchemaVersion("2"),
+		events.WithTenantID("acme"),
+	)
+
+	b, err := original.JSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"schema_version":"2"`)
+
+	parsed, err := events.ParseEnvelope[json.RawMessage](b)
+	require.NoError(t, err)
+	assert.Equal(t, "2", parsed.SchemaVersion)
+	assert.Equal(t, "acme", parsed.TenantID)
+}
+
+func TestEnvelope_SchemaVersion_OmittedFromJSON_WhenEmpty(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`))
+	b, err := env.JSON()
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "schema_version")
+}
+
+// ----------------------------
+// ParseEnvelope — timestamp zero check
+// ----------------------------
+
+func TestParseEnvelope_MissingTimestamp(t *testing.T) {
+	// Valid id, type, source, but no timestamp field
+	data := `{"id":"01926e4f-1234-7abc-8def-000000000001","type":"test.event","source":"svc","tenant_id":"acme","payload":{}}`
+	_, err := events.ParseEnvelope[json.RawMessage]([]byte(data))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timestamp")
 }

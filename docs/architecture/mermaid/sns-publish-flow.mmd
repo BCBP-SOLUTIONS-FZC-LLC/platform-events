@@ -8,6 +8,9 @@ sequenceDiagram
     Caller ->>+ Publisher: Publish(ctx, Envelope)
     Publisher ->>+ SNSAdp: snsPublisher.Publish(ctx, env)
 
+    SNSAdp ->> SNSAdp: validate env.ID · env.Type · env.Source (non-empty)
+    Note over SNSAdp: returns error immediately if any field is empty<br/>prevents invalid Prometheus label cardinality
+
     SNSAdp ->> SNSAdp: json.Marshal(env) → message body
     SNSAdp ->> SNSAdp: set attributes: EventType · TenantID · Source · EventID
 
@@ -20,7 +23,12 @@ sequenceDiagram
     alt success
         SNSAdp ->> OTel: span.End()
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=success}.Inc()
-    else error
+    else retryable AWS error (ThrottlingException · ServiceUnavailable · InternalFailure · RequestTimeout)
+        SNSAdp ->> SNSAdp: wrapIfRetryable → &RetryableError{Cause: err}
+        SNSAdp ->> OTel: span.RecordError + codes.Error
+        SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
+        Note over SNSAdp: caller (OutboxService) checks errors.Is(err, ErrRetryable)<br/>and does NOT count toward MaxAttempts
+    else permanent error
         SNSAdp ->> OTel: span.RecordError + codes.Error
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
     end

@@ -3,6 +3,7 @@ package outbox
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
@@ -27,6 +28,7 @@ func (b *publisherBridge) Publish(ctx context.Context, env domain.Envelope[json.
 		ID:            env.ID,
 		Type:          env.Type,
 		Source:        env.Source,
+		SchemaVersion: env.SchemaVersion,
 		TenantID:      env.TenantID,
 		TraceID:       env.TraceID,
 		CorrelationID: env.CorrelationID,
@@ -35,17 +37,12 @@ func (b *publisherBridge) Publish(ctx context.Context, env domain.Envelope[json.
 	}
 	err := b.pub.Publish(ctx, pub)
 
-	// Track every publish attempt (success or failure) as a per-record metric.
-	if metrics.OutboxAttemptsTotal != nil {
-		metrics.OutboxAttemptsTotal.WithLabelValues().Inc()
+	metrics.RecordOutboxAttempt(env.Type)
+	status := "success"
+	if err != nil {
+		status = "error"
 	}
-	if metrics.OutboxPublishedTotal != nil {
-		status := "success"
-		if err != nil {
-			status = "error"
-		}
-		metrics.OutboxPublishedTotal.WithLabelValues(status).Inc()
-	}
+	metrics.RecordOutboxPublished(env.Type, status)
 	return err
 }
 
@@ -56,12 +53,53 @@ func (b *publisherBridge) PublishBatch(ctx context.Context, envs []domain.Envelo
 			ID:            e.ID,
 			Type:          e.Type,
 			Source:        e.Source,
+			SchemaVersion: e.SchemaVersion,
 			TenantID:      e.TenantID,
 			TraceID:       e.TraceID,
 			CorrelationID: e.CorrelationID,
 			Timestamp:     e.Timestamp,
 			Payload:       e.Payload,
 		}
+		metrics.RecordOutboxAttempt(e.Type)
 	}
-	return b.pub.PublishBatch(ctx, pubEnvs)
+	err := b.pub.PublishBatch(ctx, pubEnvs)
+
+	// For partial failures (*events.BatchError), record per-message status so
+	// outbox_published_total accurately reflects which messages were delivered.
+	var batchErr *events.BatchError
+	if errors.As(err, &batchErr) {
+		failedIDs := make(map[string]struct{}, len(batchErr.Failures))
+		for _, f := range batchErr.Failures {
+			failedIDs[f.ID] = struct{}{}
+		}
+		for _, e := range envs {
+			if _, failed := failedIDs[e.ID]; failed {
+				metrics.RecordOutboxPublished(e.Type, "error")
+			} else {
+				metrics.RecordOutboxPublished(e.Type, "success")
+			}
+		}
+		return toDomainBatchError(batchErr)
+	}
+	// Transport-level error or nil: all messages share the same outcome.
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	for _, e := range envs {
+		metrics.RecordOutboxPublished(e.Type, status)
+	}
+	return err
+}
+
+func toDomainBatchError(batchErr *events.BatchError) *domain.BatchError {
+	out := &domain.BatchError{Failures: make([]domain.BatchFailure, len(batchErr.Failures))}
+	for i, f := range batchErr.Failures {
+		out.Failures[i] = domain.BatchFailure{
+			ID:      f.ID,
+			Code:    f.Code,
+			Message: f.Message,
+		}
+	}
+	return out
 }

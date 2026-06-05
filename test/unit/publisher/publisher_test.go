@@ -3,6 +3,7 @@ package publisher_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 	internalsns "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
@@ -73,6 +75,16 @@ func TestNewSNSPublisher_EmptyTopicARN_ReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), "TopicARN")
 }
 
+func TestNewSNSPublisher_ValidTopicARN_NoError(t *testing.T) {
+	// sns.New calls awsconfig.LoadDefaultConfig which succeeds without real credentials.
+	pub, err := events.NewSNSPublisher(events.SNSConfig{
+		TopicARN: "arn:aws:sns:us-east-1:123456789012:test-topic",
+		Region:   "us-east-1",
+	})
+	require.NoError(t, err)
+	assert.NotNil(t, pub)
+}
+
 // ----------------------------
 // NewPublisherFromPort wraps mock publisher correctly
 // ----------------------------
@@ -103,8 +115,8 @@ func TestNewPublisherFromPort_PublishBatch(t *testing.T) {
 	pub := events.NewPublisherFromPort(inner)
 
 	envs := []events.Envelope[json.RawMessage]{
-		events.NewEnvelope("evt.one", "svc", json.RawMessage(`{}`)),
-		events.NewEnvelope("evt.two", "svc", json.RawMessage(`{}`)),
+		events.NewEnvelope("evt.one", "svc", json.RawMessage(`{}`), events.WithTenantID("acme")),
+		events.NewEnvelope("evt.two", "svc", json.RawMessage(`{}`), events.WithTenantID("acme")),
 	}
 
 	err := pub.PublishBatch(context.Background(), envs)
@@ -181,7 +193,7 @@ func TestWithMessageGroupID_InvokesDomainToPublic(t *testing.T) {
 	require.NotNil(t, pub)
 
 	// Call publish to ensure domainToPublic is exercised in the bridge.
-	env := events.NewEnvelope("bridge.test", "svc", json.RawMessage(`{}`))
+	env := events.NewEnvelope("bridge.test", "svc", json.RawMessage(`{}`), events.WithTenantID("acme"))
 	err := pub.Publish(context.Background(), env)
 	require.NoError(t, err)
 	published := inner.Published()
@@ -261,7 +273,7 @@ func TestWithMessageDeduplicationID_CallsDomainToPublic(t *testing.T) {
 	require.NoError(t, err)
 
 	evtPub := events.NewPublisherFromPort(pub)
-	env := events.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env := events.NewEnvelope("test.event", "svc", json.RawMessage(`{}`), events.WithTenantID("acme"))
 	err = evtPub.Publish(context.Background(), env)
 	require.NoError(t, err)
 	assert.Equal(t, "dedup-"+env.ID, capturedDedupID)
@@ -277,7 +289,7 @@ func TestPublisherBridge_PublishBatch_MultipleEnvelopes(t *testing.T) {
 
 	envs := make([]events.Envelope[json.RawMessage], 3)
 	for i := range envs {
-		envs[i] = events.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+		envs[i] = events.NewEnvelope("test.event", "svc", json.RawMessage(`{}`), events.WithTenantID("acme"))
 	}
 
 	err := pub.PublishBatch(context.Background(), envs)
@@ -298,7 +310,8 @@ func TestWithDeadLetterHandler_ClosureActuallyInvoked(t *testing.T) {
 		Body:          func() *string { b, _ := json.Marshal(env); s := string(b); return &s }(),
 		ReceiptHandle: aws.String("rh-dlh-closure"),
 		Attributes: map[string]string{
-			string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount): "3",
+			// count=4 > maxReceiveCount=3 → DLH fires (strict > semantics match SQS DLQ).
+			string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount): "4",
 		},
 	}
 
@@ -341,4 +354,99 @@ func TestWithDeadLetterHandler_ClosureActuallyInvoked(t *testing.T) {
 		t.Fatal("dead-letter handler closure was not invoked")
 	}
 	cancel()
+}
+
+// ----------------------------
+// BatchError.Error()
+// ----------------------------
+
+func TestBatchError_Error_ContainsFailureCount(t *testing.T) {
+	failures := make([]events.BatchFailure, 3)
+	failures[0] = events.BatchFailure{ID: "msg-1", Code: "InternalError", Message: "Server error"}
+	failures[1] = events.BatchFailure{ID: "msg-2", Code: "InvalidParameter", Message: "Bad input"}
+	failures[2] = events.BatchFailure{ID: "msg-3", Code: "InvalidParameter", Message: "Bad input"}
+
+	batchErr := &events.BatchError{Failures: failures}
+	errMsg := batchErr.Error()
+
+	assert.Contains(t, errMsg, "3")
+	assert.Contains(t, errMsg, "failed")
+}
+
+// ----------------------------
+// publisherAdapter.PublishBatch: internal *sns.BatchError translated to public *events.BatchError
+// ----------------------------
+
+// snsBatchErrPortPublisher is a port.Publisher that returns an internal *sns.BatchError.
+// This exercises the translation path in publisherAdapter.PublishBatch.
+type snsBatchErrPortPublisher struct {
+	err *internalsns.BatchError
+}
+
+func (p *snsBatchErrPortPublisher) Publish(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+	if p.err == nil {
+		return nil
+	}
+	return p.err
+}
+
+func (p *snsBatchErrPortPublisher) PublishBatch(_ context.Context, _ []domain.Envelope[json.RawMessage]) error {
+	if p.err == nil {
+		return nil
+	}
+	return p.err
+}
+
+var _ port.Publisher = (*snsBatchErrPortPublisher)(nil)
+
+// TestPublisherAdapter_PublishBatch_SNSBatchError_Translated covers the
+// *sns.BatchError → *events.BatchError translation in publisherAdapter.PublishBatch
+// (pkg/events/publisher.go lines 111-116). The public Publisher must convert the
+// internal batch error type so callers never need to import the internal package.
+func TestPublisherAdapter_PublishBatch_SNSBatchError_Translated(t *testing.T) {
+	inner := &snsBatchErrPortPublisher{
+		err: &internalsns.BatchError{
+			Failures: []internalsns.BatchFailure{
+				{ID: "msg-1", Code: "InternalError", Message: "sns error"},
+				{ID: "msg-2", Code: "InvalidParameter", Message: "bad param"},
+			},
+		},
+	}
+
+	pub := events.NewPublisherFromPort(inner)
+
+	envs := []events.Envelope[json.RawMessage]{
+		events.NewEnvelope("evt.a", "svc", json.RawMessage(`{}`), events.WithTenantID("acme")),
+		events.NewEnvelope("evt.b", "svc", json.RawMessage(`{}`), events.WithTenantID("acme")),
+	}
+
+	err := pub.PublishBatch(context.Background(), envs)
+	require.Error(t, err)
+
+	var batchErr *events.BatchError
+	require.ErrorAs(t, err, &batchErr, "internal BatchError must be translated to public BatchError")
+	require.Len(t, batchErr.Failures, 2)
+	assert.Equal(t, "msg-1", batchErr.Failures[0].ID)
+	assert.Equal(t, "InternalError", batchErr.Failures[0].Code)
+	assert.Equal(t, "msg-2", batchErr.Failures[1].ID)
+}
+
+// TestPublisherAdapter_PublishBatch_GenericError covers the passthrough of non-BatchError
+// errors in publisherAdapter.PublishBatch (pkg/events/publisher.go line 118).
+func TestPublisherAdapter_PublishBatch_GenericError(t *testing.T) {
+	inner := &fixtures.MockPublisher{}
+	inner.SetError(errors.New("sns: connection refused"))
+	pub := events.NewPublisherFromPort(inner)
+
+	envs := []events.Envelope[json.RawMessage]{
+		events.NewEnvelope("evt.x", "svc", json.RawMessage(`{}`), events.WithTenantID("acme")),
+	}
+
+	err := pub.PublishBatch(context.Background(), envs)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "connection refused")
+
+	// Must NOT be a BatchError — it should pass through unchanged.
+	var batchErr *events.BatchError
+	assert.False(t, errors.As(err, &batchErr), "generic error must not be wrapped in BatchError")
 }

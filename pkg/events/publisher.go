@@ -3,11 +3,30 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 )
+
+// BatchError collects per-message errors from a PublishBatch call.
+// Exposed so pkg/outbox and callers can inspect partial batch failures.
+type BatchError struct {
+	Failures []BatchFailure
+}
+
+func (e *BatchError) Error() string {
+	return fmt.Sprintf("events: %d message(s) failed in batch", len(e.Failures))
+}
+
+// BatchFailure describes a single failed message within a batch.
+type BatchFailure struct {
+	ID      string
+	Code    string
+	Message string
+}
 
 // Publisher publishes event envelopes to a message broker.
 type Publisher interface {
@@ -17,7 +36,7 @@ type Publisher interface {
 
 // SNSConfig configures an SNS publisher.
 type SNSConfig struct {
-	// TopicARN is required. NewSNSPublisher panics if empty.
+	// TopicARN is required. NewSNSPublisher returns an error if empty.
 	TopicARN    string
 	Region      string
 	EndpointURL string // optional — LocalStack endpoint for testing
@@ -81,7 +100,22 @@ func (a *publisherAdapter) PublishBatch(ctx context.Context, envs []Envelope[jso
 	for i, e := range envs {
 		domainEnvs[i] = publicToDomain(e)
 	}
-	return a.inner.PublishBatch(ctx, domainEnvs)
+	err := a.inner.PublishBatch(ctx, domainEnvs)
+	if err == nil {
+		return nil
+	}
+	// Translate internal *sns.BatchError to the public *events.BatchError so
+	// callers in pkg/outbox can inspect partial failures without importing the
+	// internal adapter package.
+	var snsBatchErr *sns.BatchError
+	if errors.As(err, &snsBatchErr) {
+		pubErr := &BatchError{Failures: make([]BatchFailure, len(snsBatchErr.Failures))}
+		for i, f := range snsBatchErr.Failures {
+			pubErr.Failures[i] = BatchFailure{ID: f.ID, Code: f.Code, Message: f.Message}
+		}
+		return pubErr
+	}
+	return err
 }
 
 // publicToDomain converts a public Envelope to the internal domain Envelope.
@@ -90,6 +124,7 @@ func publicToDomain(e Envelope[json.RawMessage]) domain.Envelope[json.RawMessage
 		ID:            e.ID,
 		Type:          e.Type,
 		Source:        e.Source,
+		SchemaVersion: e.SchemaVersion,
 		TenantID:      e.TenantID,
 		TraceID:       e.TraceID,
 		CorrelationID: e.CorrelationID,
@@ -104,6 +139,7 @@ func domainToPublic(e domain.Envelope[json.RawMessage]) Envelope[json.RawMessage
 		ID:            e.ID,
 		Type:          e.Type,
 		Source:        e.Source,
+		SchemaVersion: e.SchemaVersion,
 		TenantID:      e.TenantID,
 		TraceID:       e.TraceID,
 		CorrelationID: e.CorrelationID,

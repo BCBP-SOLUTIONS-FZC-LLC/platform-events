@@ -110,7 +110,7 @@ func TestPublishConsume_HandlerError_MessageRetried(t *testing.T) {
 	queueURL := ls.CreateQueue(ctx, t, "retry-queue")
 
 	// Publish a message directly to SQS.
-	env := events.NewEnvelope("retry.event", "svc", json.RawMessage(`{}`))
+	env := events.NewEnvelope("retry.event", "svc", json.RawMessage(`{}`), events.WithTenantID("test-tenant"))
 	body, _ := json.Marshal(env)
 	_, err := ls.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:    aws.String(queueURL),
@@ -199,7 +199,7 @@ func TestPublishConsume_Concurrent(t *testing.T) {
 	// Publish 5 messages.
 	const numMessages = 5
 	for i := 0; i < numMessages; i++ {
-		env := events.NewEnvelope("concurrent.event", "svc", json.RawMessage(`{}`))
+		env := events.NewEnvelope("concurrent.event", "svc", json.RawMessage(`{}`), events.WithTenantID("test-tenant"))
 		err := pub.Publish(ctx, env)
 		require.NoError(t, err)
 	}
@@ -263,9 +263,9 @@ func TestPublishBatch_EndToEnd(t *testing.T) {
 
 	// Batch publish 3 events.
 	envs := []events.Envelope[json.RawMessage]{
-		events.NewEnvelope("batch.one", "svc", json.RawMessage(`{}`)),
-		events.NewEnvelope("batch.two", "svc", json.RawMessage(`{}`)),
-		events.NewEnvelope("batch.three", "svc", json.RawMessage(`{}`)),
+		events.NewEnvelope("batch.one", "svc", json.RawMessage(`{}`), events.WithTenantID("test-tenant")),
+		events.NewEnvelope("batch.two", "svc", json.RawMessage(`{}`), events.WithTenantID("test-tenant")),
+		events.NewEnvelope("batch.three", "svc", json.RawMessage(`{}`), events.WithTenantID("test-tenant")),
 	}
 	err = pub.PublishBatch(ctx, envs)
 	require.NoError(t, err)
