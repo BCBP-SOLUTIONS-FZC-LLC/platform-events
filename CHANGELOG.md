@@ -116,3 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - OTel tracing on SNS publish and SQS receive spans
 - GUC injection into SQS handler context for `platform-pgcommon` RLS
 - GitHub Actions CI/CD workflows (validate, CI, release)
+
+### Chore
+
+- Bump `actions/upload-artifact` from v4 to v7 in CI workflows
