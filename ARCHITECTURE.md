@@ -455,7 +455,7 @@ sequenceDiagram
     Publisher ->>+ SNSAdp: snsPublisher.Publish(ctx, env)
 
     SNSAdp ->> SNSAdp: validate env.ID · env.Type · env.Source (non-empty)
-    Note over SNSAdp: returns error immediately if any field is empty<br/>prevents invalid Prometheus label cardinality
+    Note over SNSAdp: returns error immediately if any field is empty — prevents invalid Prometheus label cardinality
 
     SNSAdp ->> SNSAdp: json.Marshal(env) → message body
     SNSAdp ->> SNSAdp: set attributes: EventType · TenantID · Source · EventID
@@ -473,7 +473,7 @@ sequenceDiagram
         SNSAdp ->> SNSAdp: wrapIfRetryable → &RetryableError{Cause: err}
         SNSAdp ->> OTel: span.RecordError + codes.Error
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
-        Note over SNSAdp: caller (OutboxService) checks errors.Is(err, ErrRetryable)<br/>and does NOT count toward MaxAttempts
+        Note over SNSAdp: caller (OutboxService) checks errors.Is(err, ErrRetryable) — does NOT count toward MaxAttempts
     else permanent error
         SNSAdp ->> OTel: span.RecordError + codes.Error
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
@@ -498,7 +498,7 @@ sequenceDiagram
     participant Handler
 
     loop every poll
-        Note over SQSAdp: rcvCtx = context.WithTimeout(WaitSeconds + 5s)<br/>prevents hung ReceiveMessage calls
+        Note over SQSAdp: rcvCtx = context.WithTimeout(WaitSeconds + 5s)
         SQSAdp ->>+ SQS: ReceiveMessage(WaitSeconds=20, MaxMessages=10)
         SQS -->>- SQSAdp: []Message
 
@@ -509,27 +509,38 @@ sequenceDiagram
                 SQSAdp ->> SQSAdp: EventsConsumedTotal{status=malformed}.Inc()
                 SQSAdp ->> SQS: DeleteMessage
             else valid Envelope
+                Note over SQSAdp: [Worker Goroutine Scope Starts]
                 SQSAdp ->> pgcommon: WithGUCSet(ctx, GUCSet{TenantID})
                 SQSAdp ->> SQSAdp: WithEnvelopeTraceID(ctx, env.TraceID)
-                SQSAdp ->>+ OTel: Start span "sqs.receive" linked to env.TraceID
+                SQSAdp ->>+ OTel: Start span "sqs.receive"
                 OTel -->>- SQSAdp: handler ctx + span
+                
+                Note over SQSAdp: DEFER STACK REGISTERED — 1. Recover panics and set span Error — 2. Clear/Reset DB GUC state — 3. Close OTel Span (.End)
 
                 SQSAdp ->>+ Handler: handler(ctx, Envelope)
-                Note over Handler,SQSAdp: panic recovered; stack trace logged;<br/>message left visible for retry
-                Handler -->>- SQSAdp: error or nil
-
-                alt handler returned nil
+                
+                alt Handler Panicked
+                    Note over Handler,SQSAdp: Panic caught by Defer Stack
+                    SQSAdp ->> OTel: span.SetStatus(Error) + RecordError
+                    SQSAdp ->> SQSAdp: EventsConsumedTotal{status=error}.Inc()
+                else handler returned nil
+                    Handler -->> SQSAdp: nil
                     SQSAdp ->> SQS: DeleteMessage
                     SQSAdp ->> SQSAdp: EventsConsumedTotal{status=success}.Inc()
+                    Note over SQSAdp,pgcommon: Connection returns to pool clean
                 else handler returned error
-                    Note over SQSAdp: leave visible — SQS retries after timeout
+                    Handler -->> SQSAdp: error
+                    SQSAdp ->> OTel: span.SetStatus(Error)
                     SQSAdp ->> SQSAdp: EventsConsumedTotal{status=error}.Inc()
                 end
 
+                Note over SQSAdp: [Goroutine Exits] — Defer Stack executes in LIFO order: Resets GUC then Ends OTel Span
+                SQSAdp ->> pgcommon: ResetGUC / Release Connection
                 SQSAdp ->> OTel: span.End()
             end
         end
     end
+
 ```
 
 Ensure `VisibilityTimeout` exceeds worst-case handler duration, or messages may be re-delivered while still processing.
