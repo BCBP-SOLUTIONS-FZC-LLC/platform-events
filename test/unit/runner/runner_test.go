@@ -77,12 +77,15 @@ func (s *mockOutboxStore) MarkPublished(_ context.Context, id string) error {
 	return nil
 }
 
-func (s *mockOutboxStore) MarkFailed(_ context.Context, id, lastError string, _ int) error {
+func (s *mockOutboxStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, _ int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.failed[id] = lastError
+	s.failed[rec.ID] = lastError
 	return nil
 }
+
+func (s *mockOutboxStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
+func (s *mockOutboxStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
 
 func (s *mockOutboxStore) PendingCount(_ context.Context) (int64, error) {
 	s.mu.Lock()
@@ -518,6 +521,40 @@ func TestApplySchema_EmptyDSN_Error(t *testing.T) {
 	assert.Contains(t, err.Error(), "non-empty DSN")
 }
 
+func TestRunner_PollOnce_SchemaMissingHint_Logged(t *testing.T) {
+	store := newMockOutboxStore()
+	store.setClaimErr(errors.New(`pq: relation "outbox_events" does not exist`))
+
+	logger := &fixtures.MockLogger{}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+	r := outbox.NewRunner(outbox.Config{
+		Store:        store,
+		Publisher:    pub,
+		Logger:       logger,
+		PollInterval: 50 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go func() { _ = r.Start(ctx) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, e := range logger.Entries() {
+			if e.Level == "ERROR" {
+				if hint, ok := e.Fields["hint"].(string); ok {
+					assert.Contains(t, hint, "ApplySchema")
+					require.NoError(t, r.Stop())
+					return
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("expected ERROR log with ApplySchema hint when outbox_events is missing")
+}
+
 func TestRunner_StopBeforeStart(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
@@ -604,6 +641,53 @@ func TestRunner_Stop_DrainTimeout_ReturnsError(t *testing.T) {
 
 	require.Error(t, err, "Stop() should return an error when drain timeout is exceeded")
 	assert.Contains(t, err.Error(), "drain timeout")
+}
+
+// ----------------------------
+// Runner: recovery after transient poll error (exercises backoff reset path)
+// ----------------------------
+
+// TestRunner_RecoveryAfterPollError verifies that the runner recovers from a
+// transient ClaimBatch error and successfully closes Ready() once the error clears.
+// This exercises the pollBackoff reset path in runner.go (pollBackoff = initPollBackoff
+// on success after failures) — if the backoff did not reset, the runner would still
+// recover but would sleep progressively longer between each subsequent failure cycle.
+func TestRunner_RecoveryAfterPollError(t *testing.T) {
+	store := newMockOutboxStore()
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	// Inject a transient DB error so the first poll fails and backoff is triggered.
+	store.setClaimErr(errors.New("transient db connection reset"))
+
+	r := outbox.NewRunner(outbox.Config{
+		Store:        store,
+		Publisher:    pub,
+		PollInterval: 10 * time.Millisecond,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- r.Start(ctx) }()
+
+	// Give the runner time to attempt the first poll and enter backoff sleep.
+	time.Sleep(50 * time.Millisecond)
+
+	// Clear the error — runner must recover after the backoff sleep (initPollBackoff=1s).
+	store.setClaimErr(nil)
+
+	// Ready() closes on the first successful poll. With a 1s backoff sleep the
+	// recovery window is ~1.1s; allow 5s total for slow CI environments.
+	select {
+	case <-r.Ready():
+		// Runner recovered: backoff fired, poll succeeded, Ready closed.
+	case <-time.After(5 * time.Second):
+		t.Fatal("runner did not recover from transient poll error within timeout")
+	}
+
+	require.NoError(t, r.Stop())
+	require.NoError(t, <-errCh)
 }
 
 // blockingPublicPublisher blocks until its channel is closed.
@@ -841,3 +925,274 @@ func TestRunner_StartupJitter_ContextCancelled_During_Jitter(t *testing.T) {
 		t.Fatal("Start did not return after ctx cancel during jitter")
 	}
 }
+
+// ----------------------------
+// Runner.ReprocessDeadLetters
+// ----------------------------
+
+// reprocessableStore overrides ReprocessDeadLetters to return configurable results.
+type reprocessableStore struct {
+	*mockOutboxStore
+	count int
+	err   error
+}
+
+func (s *reprocessableStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) {
+	return s.count, s.err
+}
+
+func TestRunner_ReprocessDeadLetters_Success(t *testing.T) {
+	store := &reprocessableStore{mockOutboxStore: newMockOutboxStore(), count: 5}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+
+	n, err := r.ReprocessDeadLetters(context.Background(), 10)
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+}
+
+func TestRunner_ReprocessDeadLetters_Zero(t *testing.T) {
+	store := &reprocessableStore{mockOutboxStore: newMockOutboxStore(), count: 0}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+
+	n, err := r.ReprocessDeadLetters(context.Background(), 10)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+}
+
+func TestRunner_ReprocessDeadLetters_Error(t *testing.T) {
+	store := &reprocessableStore{mockOutboxStore: newMockOutboxStore(), err: errors.New("db failure")}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+
+	_, err := r.ReprocessDeadLetters(context.Background(), 10)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "db failure")
+}
+
+// ----------------------------
+// outboxMetricsAdapter: RecordUnmarshalError via invalid-payload record
+// ----------------------------
+
+// TestRunner_UnmarshalError_MarksRecordFailed exercises the outboxMetricsAdapter's
+// RecordUnmarshalError path. When a record payload cannot be unmarshalled the runner
+// must mark the record failed (not panic) and log an ERROR.
+func TestRunner_UnmarshalError_MarksRecordFailed(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics.InitWithRegisterer("runner-unmarshal-err", "v0.0.1", reg)
+
+	store := newMockOutboxStore()
+	store.records = []domain.OutboxRecord{
+		{ID: "bad-json-record", EventType: "test.event", Payload: []byte("not-valid-json")},
+	}
+
+	inner := &fixtures.MockPublisher{}
+	pub := &mockPublicPublisher{inner: inner}
+	logger := &fixtures.MockLogger{}
+
+	r := outbox.NewRunner(outbox.Config{
+		Store:        store,
+		Publisher:    pub,
+		Logger:       logger,
+		PollInterval: 50 * time.Millisecond,
+		BatchSize:    10,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = r.Start(ctx) }()
+
+	// Wait for the record to be processed (marked failed).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		store.mu.Lock()
+		done := len(store.failed) > 0
+		store.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Contains(t, store.failed, "bad-json-record", "invalid-JSON record must be marked failed")
+	assert.Empty(t, inner.Published(), "invalid-JSON record must not be published")
+}
+
+// ----------------------------
+// outboxMetricsAdapter: RecordMarkPublishedError via MarkPublished failure
+// ----------------------------
+
+// markPublishedErrStore overrides MarkPublished to always return an error.
+type markPublishedErrStore struct {
+	*mockOutboxStore
+}
+
+func (s *markPublishedErrStore) MarkPublished(_ context.Context, _ string) error {
+	return errors.New("db: mark published timed out")
+}
+
+// TestRunner_MarkPublishedError_LogsError exercises the outboxMetricsAdapter's
+// RecordMarkPublishedError path. After a successful publish, if MarkPublished fails
+// the runner must log the error and continue (the record will be re-delivered).
+func TestRunner_MarkPublishedError_LogsError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics.InitWithRegisterer("runner-mark-published-err", "v0.0.2", reg)
+
+	base := newMockOutboxStore()
+	store := &markPublishedErrStore{mockOutboxStore: base}
+
+	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	payload, _ := json.Marshal(env)
+	base.records = []domain.OutboxRecord{
+		{ID: env.ID, EventType: env.Type, Payload: payload},
+	}
+
+	inner := &fixtures.MockPublisher{}
+	pub := &mockPublicPublisher{inner: inner}
+	logger := &fixtures.MockLogger{}
+
+	r := outbox.NewRunner(outbox.Config{
+		Store:        store,
+		Publisher:    pub,
+		Logger:       logger,
+		PollInterval: 50 * time.Millisecond,
+		BatchSize:    10,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = r.Start(ctx) }()
+
+	// Wait for the publish attempt (publisher should be called).
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(inner.Published()) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // let the MarkPublished error path complete
+	cancel()
+
+	assert.NotEmpty(t, inner.Published(), "publisher must be called before MarkPublished error")
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "ERROR" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ERROR log when MarkPublished fails after successful publish")
+}
+
+// ----------------------------
+// pollOnce: PendingCount error path (metrics initialized, PendingCount fails)
+// ----------------------------
+
+// errPendingStore overrides PendingCount to return an error.
+type errPendingStore struct {
+	*mockOutboxStore
+	pendErr   error
+	leasedErr error
+}
+
+func (s *errPendingStore) PendingCount(_ context.Context) (int64, error) {
+	if s.pendErr != nil {
+		return 0, s.pendErr
+	}
+	return 0, nil
+}
+
+func (s *errPendingStore) LeasedCount(_ context.Context) (int64, error) {
+	if s.leasedErr != nil {
+		return 0, s.leasedErr
+	}
+	return 0, nil
+}
+
+// TestRunner_PollOnce_PendingCountError exercises the pendErr != nil branch in pollOnce.
+// When metrics are registered and PendingCount returns an error the runner must log a
+// WARN (not an ERROR) and set the gauge to -1, then continue the poll cycle normally.
+func TestRunner_PollOnce_PendingCountError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics.InitWithRegisterer("poll-once-pend-err", "v0.0.1", reg)
+
+	base := newMockOutboxStore()
+	store := &errPendingStore{
+		mockOutboxStore: base,
+		pendErr:         errors.New("db: count query timed out"),
+	}
+
+	logger := &fixtures.MockLogger{}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r := outbox.NewRunner(outbox.Config{
+		Store:        store,
+		Publisher:    pub,
+		Logger:       logger,
+		PollInterval: 10 * time.Second, // long — ctx cancel fires first
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	err := r.Start(ctx)
+	require.NoError(t, err)
+
+	// The runner must have logged a WARN about the PendingCount failure.
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN log when PendingCount returns an error")
+}
+
+// TestRunner_PollOnce_LeasedCountError exercises the leasedErr != nil branch in pollOnce.
+// When metrics are registered and LeasedCount returns an error the runner must log a
+// WARN (not an ERROR) and continue the poll cycle without setting the leased gauge.
+func TestRunner_PollOnce_LeasedCountError(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	metrics.InitWithRegisterer("poll-once-leased-err", "v0.0.2", reg)
+
+	base := newMockOutboxStore()
+	store := &errPendingStore{
+		mockOutboxStore: base,
+		leasedErr:       errors.New("db: leased count timed out"),
+	}
+
+	logger := &fixtures.MockLogger{}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r := outbox.NewRunner(outbox.Config{
+		Store:        store,
+		Publisher:    pub,
+		Logger:       logger,
+		PollInterval: 10 * time.Second,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	err := r.Start(ctx)
+	require.NoError(t, err)
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN log when LeasedCount returns an error")
+}
+
+// ----------------------------
+// drainTicker: exercises the <-ticker.C drain branch after backoff
+// ----------------------------

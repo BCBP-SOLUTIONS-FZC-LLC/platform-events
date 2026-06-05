@@ -246,7 +246,8 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 	go func() { _ = consumer.Start(consumerCtx) }()
 
 	// Enqueue inside a transaction that we force to roll back by returning an error.
-	rolledBackEnv := events.NewEnvelope("payment.failed", "billing-svc", json.RawMessage(`{}`))
+	rolledBackEnv := events.NewEnvelope("payment.failed", "billing-svc", json.RawMessage(`{}`),
+		events.WithTenantID("test-tenant"))
 	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
 		_ = outbox.Enqueue(ctx, tx, rolledBackEnv)
 		return errIntentionalRollback // non-nil error causes RunInTx to rollback
@@ -255,7 +256,8 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 
 	// Enqueue a sentinel event in a committed transaction so we know the runner
 	// has processed at least one poll cycle after the rollback.
-	sentinelEnv := events.NewEnvelope("heartbeat.ping", "billing-svc", json.RawMessage(`{}`))
+	sentinelEnv := events.NewEnvelope("heartbeat.ping", "billing-svc", json.RawMessage(`{}`),
+		events.WithTenantID("test-tenant"))
 	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
 		return outbox.Enqueue(ctx, tx, sentinelEnv)
 	})

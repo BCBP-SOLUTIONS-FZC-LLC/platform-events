@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,6 +37,12 @@ func Enqueue(ctx context.Context, tx pgx.Tx, env events.Envelope[json.RawMessage
 	}
 	if env.Source == "" {
 		return fmt.Errorf("outbox: Enqueue requires a non-empty envelope Source")
+	}
+	if env.Timestamp.IsZero() {
+		return fmt.Errorf("outbox: Enqueue requires a non-zero Timestamp — use events.NewEnvelope to construct envelopes")
+	}
+	if strings.ContainsRune(env.ID, '\x00') || strings.ContainsRune(env.Type, '\x00') || strings.ContainsRune(env.Source, '\x00') {
+		return fmt.Errorf("outbox: envelope fields (ID, Type, Source) must not contain null bytes")
 	}
 	b, err := json.Marshal(env)
 	if err != nil {

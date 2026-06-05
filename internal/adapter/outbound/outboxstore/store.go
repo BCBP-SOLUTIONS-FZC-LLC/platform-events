@@ -38,21 +38,27 @@ func New(pool *pgcommon.Pool, logger port.Logger, claimLeaseDuration time.Durati
 
 // InsertRecord executes the outbox INSERT within the caller's transaction.
 // Shared by Store.Enqueue (service-managed path) and outbox.Enqueue (public API).
-// created_at and scheduled_at use the DB server's NOW() to avoid clock-skew
-// between the Go client and the Postgres container breaking the ClaimBatch
-// scheduled_at <= NOW() predicate.
+// created_at uses DB server NOW() to avoid clock-skew between the Go client
+// and Postgres breaking the ClaimBatch scheduled_at <= NOW() predicate.
+// scheduled_at is expressed as an offset from NOW() so any ScheduledAt delay
+// set by the caller is honoured without trusting the Go clock for absolute times.
 func InsertRecord(ctx context.Context, tx pgx.Tx, record domain.OutboxRecord) error {
+	delaySecs := record.ScheduledAt.Sub(record.CreatedAt).Seconds()
+	if delaySecs < 0 {
+		delaySecs = 0
+	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO outbox_events
 			(id, event_type, payload, tenant_id, trace_id, created_at, scheduled_at)
 		VALUES
-			($1, $2, $3, $4, $5, NOW(), NOW())
+			($1, $2, $3, $4, $5, NOW(), NOW() + make_interval(secs => $6))
 	`,
 		record.ID,
 		record.EventType,
 		record.Payload,
 		record.TenantID,
 		record.TraceID,
+		delaySecs,
 	)
 	return err
 }
@@ -68,7 +74,15 @@ func (s *Store) Enqueue(ctx context.Context, tx pgx.Tx, record domain.OutboxReco
 // concurrent runners from claiming the same records (TOCTOU race).
 // Claimed records have scheduled_at pushed forward by claimLeaseDuration; they
 // are made available again immediately by MarkPublished or MarkFailed.
+// Returns an error if batchSize <= 0.
 func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxRecord, error) {
+	if batchSize <= 0 {
+		return nil, fmt.Errorf("outboxstore: batchSize must be positive (got %d)", batchSize)
+	}
+	// Apply a per-call timeout so a hung SELECT FOR UPDATE (e.g. long lock wait
+	// under DB saturation) cannot stall the poll loop indefinitely.
+	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
+	defer cancel()
 	var records []domain.OutboxRecord
 	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
 		tx, err := conn.Begin(ctx)
@@ -88,7 +102,7 @@ func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxR
 			FROM outbox_events
 			WHERE published_at IS NULL
 			  AND scheduled_at <= NOW()
-			ORDER BY id
+			ORDER BY scheduled_at, id
 			LIMIT $1
 			FOR UPDATE SKIP LOCKED
 		`, batchSize)
@@ -124,9 +138,18 @@ func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxR
 		}
 
 		if len(ids) > 0 {
+			// Close rows explicitly before executing the UPDATE on the same
+			// transaction. pgx requires no open cursor when issuing the next
+			// statement; deferring rows.Close() is not sufficient here because
+			// the defer fires at function return, which is after this Exec.
+			rows.Close()
+
 			// Push scheduled_at forward to prevent other runners from claiming
 			// these records while we are publishing them (lease pattern).
-			secs := int(s.claimLeaseDuration.Seconds())
+			// Use float64 to preserve sub-second precision — int(0.5s) would
+			// truncate to 0, making the lease instant-expire and causing duplicate
+			// claims by concurrent runners.
+			secs := s.claimLeaseDuration.Seconds()
 			_, err = tx.Exec(ctx, `
 				UPDATE outbox_events
 				SET scheduled_at = NOW() + make_interval(secs => $2)
@@ -146,11 +169,15 @@ func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxR
 	return records, err
 }
 
+const defaultStoreQueryTimeout = 5 * time.Second
+
 // PendingCount returns the number of records in outbox_events that are waiting
 // to be published (not yet claimed by any runner). Excludes leased records whose
 // scheduled_at has been pushed forward by ClaimBatch — those are in-flight, not
 // truly pending. Used to populate the outbox_pending_total gauge.
 func (s *Store) PendingCount(ctx context.Context) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
+	defer cancel()
 	var count int64
 	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
 		return conn.QueryRow(ctx, `
@@ -189,7 +216,9 @@ func (s *Store) MarkPublished(ctx context.Context, id string) error {
 
 // MarkFailed increments attempts and sets last_error.
 // If attempts >= maxAttempts, the record is moved to outbox_dead_letters.
-func (s *Store) MarkFailed(ctx context.Context, id string, lastError string, maxAttempts int) error {
+// rec carries the record's original fields so dead-letter insertion does not
+// require an additional DB read of the payload.
+func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int) error {
 	return s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
 		tx, err := conn.Begin(ctx)
 		if err != nil {
@@ -202,29 +231,24 @@ func (s *Store) MarkFailed(ctx context.Context, id string, lastError string, max
 			}
 		}()
 
-		// Read current attempts.
+		// Read only the current attempts count under FOR UPDATE to serialise against
+		// a concurrent runner that re-claimed this record after lease expiry. The
+		// payload and other fields come from the in-memory rec — they are identical
+		// to the DB values because only attempts/last_error/scheduled_at are mutated.
+		// SKIP LOCKED is intentionally NOT used: we want the second runner to block
+		// briefly and observe the committed attempts, not skip the row.
 		var attempts int
-		var eventType, tenantID, traceID string
-		var payload []byte
-		var createdAt time.Time
-		// FOR UPDATE serializes the attempts read against a concurrent runner that
-		// re-claimed this record after the claim lease expired mid-publish. Without
-		// it, two runners could read the same attempts value and double-increment or
-		// dead-letter one cycle early. SKIP LOCKED is intentionally NOT used here:
-		// we want the second runner to block briefly and observe the committed
-		// attempts, not skip the row.
 		err = tx.QueryRow(ctx, `
-			SELECT attempts, event_type, tenant_id, trace_id, payload, created_at
-			FROM outbox_events WHERE id = $1 AND published_at IS NULL
+			SELECT attempts FROM outbox_events WHERE id = $1 AND published_at IS NULL
 			FOR UPDATE
-		`, id).Scan(&attempts, &eventType, &tenantID, &traceID, &payload, &createdAt)
+		`, rec.ID).Scan(&attempts)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				// Record was already published or dead-lettered by a concurrent runner
 				// (race after lease expiry). This is expected — not an error.
 				if s.logger != nil {
 					s.logger.Warn("outboxstore: MarkFailed found no claimable record — already published or removed", map[string]any{
-						"id": id,
+						"id": rec.ID,
 					})
 				}
 				return nil
@@ -236,9 +260,10 @@ func (s *Store) MarkFailed(ctx context.Context, id string, lastError string, max
 		deadLettered := newAttempts >= maxAttempts
 
 		if newAttempts >= maxAttempts {
-			// Move to dead-letter table. ON CONFLICT DO UPDATE ensures that a concurrent
-			// runner claiming the same record after lease expiry updates the dead-letter
-			// entry with the latest error and attempt count rather than leaving stale data.
+			// Move to dead-letter table using in-memory record fields — avoids a
+			// second SELECT of the payload. ON CONFLICT DO UPDATE ensures a concurrent
+			// runner updates the dead-letter entry with the latest error and attempt
+			// count rather than leaving stale data.
 			_, err = tx.Exec(ctx, `
 				INSERT INTO outbox_dead_letters
 					(id, event_type, payload, tenant_id, trace_id, attempts, last_error, created_at)
@@ -247,11 +272,11 @@ func (s *Store) MarkFailed(ctx context.Context, id string, lastError string, max
 					attempts   = EXCLUDED.attempts,
 					last_error = EXCLUDED.last_error,
 					failed_at  = NOW()
-			`, id, eventType, payload, tenantID, traceID, newAttempts, lastError, createdAt)
+			`, rec.ID, rec.EventType, rec.Payload, rec.TenantID, rec.TraceID, newAttempts, lastError, rec.CreatedAt)
 			if err != nil {
 				return err
 			}
-			_, err = tx.Exec(ctx, `DELETE FROM outbox_events WHERE id = $1`, id)
+			_, err = tx.Exec(ctx, `DELETE FROM outbox_events WHERE id = $1`, rec.ID)
 			if err != nil {
 				return err
 			}
@@ -265,7 +290,7 @@ func (s *Store) MarkFailed(ctx context.Context, id string, lastError string, max
 				UPDATE outbox_events
 				SET attempts = $1, last_error = $2, scheduled_at = NOW()
 				WHERE id = $3 AND published_at IS NULL
-			`, newAttempts, lastError, id)
+			`, newAttempts, lastError, rec.ID)
 			if err != nil {
 				return err
 			}
@@ -277,11 +302,65 @@ func (s *Store) MarkFailed(ctx context.Context, id string, lastError string, max
 		committed = true
 
 		// Increment the dead-letter counter only after a successful commit so the
-		// metric never overcounts on a rolled-back transaction. Enables alerting on
-		// publish-side failures (rate(outbox_dead_letters_total) > 0).
-		if deadLettered && metrics.OutboxDeadLettersTotal != nil {
-			metrics.OutboxDeadLettersTotal.WithLabelValues().Inc()
+		// metric never overcounts on a rolled-back transaction.
+		if deadLettered {
+			metrics.RecordOutboxDeadLetter(rec.EventType)
 		}
 		return nil
 	})
+}
+
+// LeasedCount returns the number of records currently claimed by a runner
+// (scheduled_at > NOW() and published_at IS NULL). These are in-flight records
+// that may not appear in PendingCount, providing a complete outbox health picture.
+func (s *Store) LeasedCount(ctx context.Context) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
+	defer cancel()
+	var count int64
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, `
+			SELECT COUNT(*) FROM outbox_events
+			WHERE published_at IS NULL
+			  AND scheduled_at > NOW()
+		`).Scan(&count)
+	})
+	return count, err
+}
+
+// ReprocessDeadLetters moves up to limit records from outbox_dead_letters back
+// to outbox_events, resetting attempts to 0 so they are retried from scratch.
+// Returns the number of records re-queued. Returns an error if limit <= 0.
+// The caller is responsible for supplying a context with an appropriate deadline —
+// this operation runs a CTE delete+insert and may be slow for large limit values.
+func (s *Store) ReprocessDeadLetters(ctx context.Context, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("outboxstore: limit must be positive (got %d)", limit)
+	}
+	var moved int
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		tag, err := conn.Exec(ctx, `
+			WITH moved AS (
+				DELETE FROM outbox_dead_letters
+				WHERE id IN (
+					SELECT id FROM outbox_dead_letters
+					ORDER BY created_at
+					LIMIT $1
+				)
+				RETURNING id, event_type, payload, tenant_id, trace_id, created_at
+			)
+			INSERT INTO outbox_events
+				(id, event_type, payload, tenant_id, trace_id, attempts, created_at, scheduled_at)
+			SELECT id, event_type, payload, tenant_id, trace_id, 0, created_at, NOW()
+			FROM moved
+		`, limit)
+		if err != nil {
+			return err
+		}
+		moved = int(tag.RowsAffected())
+		return nil
+	})
+	if err == nil && moved > 0 {
+		metrics.RecordOutboxDeadLettersReprocessed(moved)
+	}
+	return moved, err
 }

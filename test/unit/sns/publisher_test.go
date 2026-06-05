@@ -4,20 +4,38 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
+	smithy "github.com/aws/smithy-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/trace"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	internalsns "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
+
+// mockAPIError is a minimal smithy.APIError implementation for testing wrapIfRetryable.
+type mockAPIError struct {
+	code    string
+	message string
+}
+
+func (e *mockAPIError) Error() string                 { return e.message }
+func (e *mockAPIError) ErrorCode() string             { return e.code }
+func (e *mockAPIError) ErrorMessage() string          { return e.message }
+func (e *mockAPIError) ErrorFault() smithy.ErrorFault { return smithy.FaultClient }
+
+var _ smithy.APIError = (*mockAPIError)(nil)
 
 // mockSNSClient is a test double for SNSClientAPI.
 type mockSNSClient struct {
@@ -36,7 +54,9 @@ func (m *mockSNSClient) PublishBatch(ctx context.Context, params *sns.PublishBat
 var _ internalsns.SNSClientAPI = (*mockSNSClient)(nil)
 
 func makeEnv(eventType string) domain.Envelope[json.RawMessage] {
-	return domain.NewEnvelope(eventType, "test-svc", json.RawMessage(`{"x":1}`))
+	env := domain.NewEnvelope(eventType, "test-svc", json.RawMessage(`{"x":1}`))
+	env.TenantID = "acme"
+	return env
 }
 
 // successClient returns a mock that always succeeds Publish with a fixed message ID.
@@ -396,10 +416,13 @@ func TestPublishBatch_TransportError(t *testing.T) {
 	envs := []domain.Envelope[json.RawMessage]{makeEnv("test.event")}
 	err = pub.PublishBatch(context.Background(), envs)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "network error")
-	// Should NOT be a BatchError.
+	// Transport errors are now wrapped as BatchError failures so remaining chunks
+	// are still attempted. The failure message carries the original error text.
 	var be *internalsns.BatchError
-	assert.False(t, errors.As(err, &be))
+	require.True(t, errors.As(err, &be), "expected *BatchError wrapping transport error")
+	require.Len(t, be.Failures, 1)
+	assert.Contains(t, be.Failures[0].Message, "network error")
+	assert.Equal(t, "TransportError", be.Failures[0].Code)
 }
 
 // ----------------------------
@@ -669,7 +692,11 @@ func TestPublishBatch_TransportError_WithLoggerAndMetrics(t *testing.T) {
 
 	err = p.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{env})
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "transport failure")
+	// Transport errors are wrapped as BatchError failures; the original message is in Failures[0].
+	var be *internalsns.BatchError
+	require.True(t, errors.As(err, &be), "expected *BatchError wrapping transport error")
+	require.Len(t, be.Failures, 1)
+	assert.Contains(t, be.Failures[0].Message, "transport failure")
 
 	entries := logger.Entries()
 	found := false
@@ -680,4 +707,513 @@ func TestPublishBatch_TransportError_WithLoggerAndMetrics(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected ERROR log for transport failure")
+}
+
+// ----------------------------
+// wrapIfRetryable: retryable AWS error codes
+// ----------------------------
+
+func TestPublish_ThrottlingException_WrappedAsRetryable(t *testing.T) {
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			return nil, &mockAPIError{code: "ThrottlingException", message: "rate exceeded"}
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	pubErr := pub.Publish(context.Background(), makeEnv("order.placed"))
+	require.Error(t, pubErr)
+	assert.True(t, errors.Is(pubErr, domain.ErrRetryable), "ThrottlingException should be wrapped as ErrRetryable")
+}
+
+func TestPublish_ServiceUnavailable_WrappedAsRetryable(t *testing.T) {
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			return nil, &mockAPIError{code: "ServiceUnavailable", message: "service down"}
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	pubErr := pub.Publish(context.Background(), makeEnv("order.placed"))
+	require.Error(t, pubErr)
+	assert.True(t, errors.Is(pubErr, domain.ErrRetryable))
+}
+
+func TestPublish_NonRetryableError_NotWrapped(t *testing.T) {
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			return nil, &mockAPIError{code: "InvalidParameter", message: "bad input"}
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	pubErr := pub.Publish(context.Background(), makeEnv("order.placed"))
+	require.Error(t, pubErr)
+	assert.False(t, errors.Is(pubErr, domain.ErrRetryable), "InvalidParameter should not be ErrRetryable")
+}
+
+func TestPublish_InternalFailure_WrappedAsRetryable(t *testing.T) {
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			return nil, &mockAPIError{code: "InternalFailure", message: "internal server error"}
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	pubErr := pub.Publish(context.Background(), makeEnv("order.placed"))
+	require.Error(t, pubErr)
+	assert.True(t, errors.Is(pubErr, domain.ErrRetryable))
+}
+
+// ----------------------------
+// Publish: required field validation (single-message path)
+// ----------------------------
+
+func TestPublish_EmptyType_ReturnsError(t *testing.T) {
+	// Publish must reject an envelope with empty Type before calling SNS.
+	// Empty Type means no EventType message attribute, causing SQS filter
+	// policies to silently drop the message.
+	var apiCalled bool
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			apiCalled = true
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	env := domain.Envelope[json.RawMessage]{
+		ID:      "01926e4f-dead-7000-beef-000000000001",
+		Type:    "", // empty
+		Source:  "svc",
+		Payload: json.RawMessage(`{}`),
+	}
+	pubErr := pub.Publish(context.Background(), env)
+	require.Error(t, pubErr)
+	assert.Contains(t, pubErr.Error(), "type=")
+	assert.False(t, apiCalled, "SNS API must not be called for invalid envelope")
+}
+
+func TestPublish_EmptyID_ReturnsError(t *testing.T) {
+	var apiCalled bool
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			apiCalled = true
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	env := domain.Envelope[json.RawMessage]{
+		ID:      "", // empty
+		Type:    "order.placed",
+		Source:  "svc",
+		Payload: json.RawMessage(`{}`),
+	}
+	pubErr := pub.Publish(context.Background(), env)
+	require.Error(t, pubErr)
+	assert.Contains(t, pubErr.Error(), "id=")
+	assert.False(t, apiCalled)
+}
+
+func TestPublish_EmptySource_ReturnsError(t *testing.T) {
+	var apiCalled bool
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			apiCalled = true
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	env := domain.Envelope[json.RawMessage]{
+		ID:      "01926e4f-dead-7000-beef-000000000001",
+		Type:    "order.placed",
+		Source:  "", // empty
+		Payload: json.RawMessage(`{}`),
+	}
+	pubErr := pub.Publish(context.Background(), env)
+	require.Error(t, pubErr)
+	assert.Contains(t, pubErr.Error(), "source=")
+	assert.False(t, apiCalled)
+}
+
+func TestPublish_TooManyAttributes_ReturnsError(t *testing.T) {
+	// Single Publish must reject envelopes where combined attributes (fixed + extra)
+	// exceed the SNS limit of 10.
+	var apiCalled bool
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			apiCalled = true
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	// 8 extra + 4 reserved = 12 total → exceeds limit.
+	extraAttrs := map[string]string{
+		"a1": "v1", "a2": "v2", "a3": "v3", "a4": "v4",
+		"a5": "v5", "a6": "v6", "a7": "v7", "a8": "v8",
+	}
+	pub, err := internalsns.NewWithClient(
+		"arn:aws:sns:us-east-1:123:test", client, nil,
+		internalsns.WithAttributes(extraAttrs),
+	)
+	require.NoError(t, err)
+
+	env := domain.NewEnvelope("order.placed", "billing", json.RawMessage(`{}`))
+	env.TenantID = "acme" // ensure all 4 reserved attrs are present
+	pubErr := pub.Publish(context.Background(), env)
+	require.Error(t, pubErr)
+	assert.Contains(t, pubErr.Error(), "10")
+	assert.False(t, apiCalled, "SNS API must not be called when attribute count exceeds limit")
+}
+
+// ----------------------------
+// PublishBatch: envelope field validation (batch path must mirror single Publish)
+// ----------------------------
+
+func TestPublishBatch_InvalidEnvelope_EmptyType_ReturnsBatchError(t *testing.T) {
+	// PublishBatch should reject envelopes with empty Type without calling SNS.
+	// An envelope with empty Type has no EventType message attribute, causing SQS
+	// filter policies to silently drop the message even though SNS accepts it.
+	var apiCalled bool
+	client := &mockSNSClient{
+		publishBatchFn: func(_ context.Context, _ *sns.PublishBatchInput, _ ...func(*sns.Options)) (*sns.PublishBatchOutput, error) {
+			apiCalled = true
+			return &sns.PublishBatchOutput{}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	badEnv := domain.Envelope[json.RawMessage]{
+		ID:      "01926e4f-dead-7000-beef-000000000001",
+		Type:    "", // empty — must be rejected
+		Source:  "svc",
+		Payload: json.RawMessage(`{}`),
+	}
+	batchErr := pub.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{badEnv})
+	require.Error(t, batchErr)
+	var be *internalsns.BatchError
+	require.ErrorAs(t, batchErr, &be)
+	require.Len(t, be.Failures, 1)
+	assert.Equal(t, "InvalidEnvelope", be.Failures[0].Code)
+	assert.Contains(t, be.Failures[0].Message, "type=")
+	assert.False(t, apiCalled, "SNS API must not be called when all envelopes are invalid")
+}
+
+func TestPublishBatch_MixedInvalidAndValid_ValidDelivered(t *testing.T) {
+	// Valid envelopes in the same batch as an invalid one must still be delivered.
+	var deliveredIDs []string
+	client := &mockSNSClient{
+		publishBatchFn: func(_ context.Context, params *sns.PublishBatchInput, _ ...func(*sns.Options)) (*sns.PublishBatchOutput, error) {
+			var successful []snstypes.PublishBatchResultEntry
+			for _, e := range params.PublishBatchRequestEntries {
+				deliveredIDs = append(deliveredIDs, aws.ToString(e.Id))
+				successful = append(successful, snstypes.PublishBatchResultEntry{
+					Id:        e.Id,
+					MessageId: aws.String("msg-" + aws.ToString(e.Id)),
+				})
+			}
+			return &sns.PublishBatchOutput{Successful: successful}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	validEnv := makeEnv("order.placed")
+	badEnv := domain.Envelope[json.RawMessage]{
+		ID:      "01926e4f-dead-7000-beef-000000000099",
+		Type:    "", // empty — invalid
+		Source:  "svc",
+		Payload: json.RawMessage(`{}`),
+	}
+	batchErr := pub.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{badEnv, validEnv})
+	require.Error(t, batchErr)
+	var be *internalsns.BatchError
+	require.ErrorAs(t, batchErr, &be)
+	// One failure for the invalid envelope.
+	require.Len(t, be.Failures, 1)
+	assert.Equal(t, "InvalidEnvelope", be.Failures[0].Code)
+	// The valid envelope must have been delivered.
+	assert.Contains(t, deliveredIDs, validEnv.ID)
+}
+
+// ----------------------------
+// PublishBatch: TooManyAttributes limit per entry
+// ----------------------------
+
+func TestPublishBatch_TooManyAttributes_ReturnsBatchError(t *testing.T) {
+	// An entry with > 10 message attributes must be rejected pre-flight with a clear
+	// TooManyAttributes code rather than hitting the SNS API and getting an opaque
+	// InvalidParameter error.
+	var apiCalled bool
+	client := &mockSNSClient{
+		publishBatchFn: func(_ context.Context, _ *sns.PublishBatchInput, _ ...func(*sns.Options)) (*sns.PublishBatchOutput, error) {
+			apiCalled = true
+			return &sns.PublishBatchOutput{}, nil
+		},
+	}
+	// Build a publisher with 8 extra attributes (+ 4 reserved = 12 total → exceeds 10).
+	extraAttrs := map[string]string{
+		"a1": "v1", "a2": "v2", "a3": "v3", "a4": "v4",
+		"a5": "v5", "a6": "v6", "a7": "v7", "a8": "v8",
+	}
+	pub, err := internalsns.NewWithClient(
+		"arn:aws:sns:us-east-1:123:test", client, nil,
+		internalsns.WithAttributes(extraAttrs),
+	)
+	require.NoError(t, err)
+
+	env := makeEnv("billing.invoice.settled")
+	batchErr := pub.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{env})
+	require.Error(t, batchErr)
+	var be *internalsns.BatchError
+	require.ErrorAs(t, batchErr, &be)
+	require.Len(t, be.Failures, 1)
+	assert.Equal(t, "TooManyAttributes", be.Failures[0].Code)
+	assert.Contains(t, be.Failures[0].Message, "exceed SNS limit of 10")
+	assert.False(t, apiCalled, "SNS API must not be called when entry has too many attributes")
+}
+
+func TestPublishBatch_TooManyAttributes_MixedWithValid(t *testing.T) {
+	// Valid envelopes in the same batch as a TooManyAttributes-rejected entry
+	// must still reach the SNS API. Use 8 publisher extras (4+8=12) on one entry
+	// and a separate publisher with 6 extras (4+6=10) is not possible in one call —
+	// instead, pair a TooManyAttributes envelope (8 extras) with a valid envelope
+	// on a 6-extra publisher where the over-limit entry is rejected pre-flight.
+	var deliveredIDs []string
+	client := &mockSNSClient{
+		publishBatchFn: func(_ context.Context, params *sns.PublishBatchInput, _ ...func(*sns.Options)) (*sns.PublishBatchOutput, error) {
+			var successful []snstypes.PublishBatchResultEntry
+			for _, e := range params.PublishBatchRequestEntries {
+				deliveredIDs = append(deliveredIDs, aws.ToString(e.Id))
+				successful = append(successful, snstypes.PublishBatchResultEntry{
+					Id:        e.Id,
+					MessageId: aws.String("msg-" + aws.ToString(e.Id)),
+				})
+			}
+			return &sns.PublishBatchOutput{Successful: successful}, nil
+		},
+	}
+	// 6 extras + 4 reserved = 10 → at SNS limit.
+	extraAttrs := map[string]string{
+		"a1": "v1", "a2": "v2", "a3": "v3", "a4": "v4", "a5": "v5", "a6": "v6",
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil,
+		internalsns.WithAttributes(extraAttrs))
+	require.NoError(t, err)
+
+	envValid := makeEnv("order.placed")
+	// 7th extra attribute on this envelope via a reserved-key collision is not
+	// possible; use a publisher with 8 extras for the over-limit case only.
+	pubOver, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil,
+		internalsns.WithAttributes(map[string]string{
+			"a1": "v1", "a2": "v2", "a3": "v3", "a4": "v4",
+			"a5": "v5", "a6": "v6", "a7": "v7", "a8": "v8",
+		}))
+	require.NoError(t, err)
+	envOver := makeEnv("billing.invoice.settled")
+
+	// Over-limit publisher: single envelope rejected, none delivered.
+	batchErr := pubOver.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{envOver, envValid})
+	require.Error(t, batchErr)
+	var be *internalsns.BatchError
+	require.ErrorAs(t, batchErr, &be)
+	assert.Equal(t, "TooManyAttributes", be.Failures[0].Code)
+
+	// At-limit publisher: both envelopes fit (4 reserved + 6 extra = 10).
+	err = pub.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{envValid, makeEnv("user.created")})
+	require.NoError(t, err)
+	assert.Len(t, deliveredIDs, 2)
+}
+
+// ----------------------------
+// publishChunk: combined marshal-error + transport error
+// ----------------------------
+
+// TestPublishBatch_MarshalErrAndTransportError exercises the combined-error path in
+// publishChunk (sns/publisher.go ~line 456-466). When some entries fail pre-flight
+// (InvalidEnvelope/TooManyAttributes) AND the SNS API call also fails with a transport
+// error, the returned BatchError must contain failures from BOTH sources with the
+// correct Code labels ("InvalidEnvelope" + "TransportError").
+func TestPublishBatch_MarshalErrAndTransportError(t *testing.T) {
+	client := &mockSNSClient{
+		publishBatchFn: func(_ context.Context, _ *sns.PublishBatchInput, _ ...func(*sns.Options)) (*sns.PublishBatchOutput, error) {
+			return nil, errors.New("sns: connection reset")
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	// badEnv fails pre-flight (empty Type) → marshalErr set before API call.
+	badEnv := domain.Envelope[json.RawMessage]{
+		ID:      "01926e4f-dead-7000-beef-000000000001",
+		Type:    "",
+		Source:  "svc",
+		Payload: json.RawMessage(`{}`),
+	}
+	// validEnv passes pre-flight validation and enters the API call which fails.
+	validEnv := makeEnv("order.placed")
+
+	batchErr := pub.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{badEnv, validEnv})
+	require.Error(t, batchErr)
+
+	var be *internalsns.BatchError
+	require.ErrorAs(t, batchErr, &be, "combined failures must be returned as *BatchError")
+
+	codes := make(map[string]bool)
+	for _, f := range be.Failures {
+		codes[f.Code] = true
+	}
+	assert.True(t, codes["InvalidEnvelope"], "expected InvalidEnvelope failure from pre-flight rejection")
+	assert.True(t, codes["TransportError"], "expected TransportError failure from API call failure")
+}
+
+// ----------------------------
+// NewWithClient: high WithAttributes count warning
+// ----------------------------
+
+func TestNewWithClient_HighAttributesCount_Warns(t *testing.T) {
+	logger := &fixtures.MockLogger{}
+	extra := make(map[string]string, 5)
+	for i := range 5 {
+		extra[fmt.Sprintf("attr_%d", i)] = "v"
+	}
+
+	_, err := internalsns.NewWithClient(
+		"arn:aws:sns:us-east-1:123456789012:test-topic",
+		&mockSNSClient{},
+		logger,
+		internalsns.WithAttributes(extra),
+	)
+	require.NoError(t, err)
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN when WithAttributes count is high")
+}
+
+// ----------------------------
+// wrapIfRetryable: network timeout errors
+// ----------------------------
+
+type timeoutNetError struct{}
+
+func (timeoutNetError) Error() string   { return "i/o timeout" }
+func (timeoutNetError) Timeout() bool   { return true }
+func (timeoutNetError) Temporary() bool { return true }
+
+func TestPublish_NetTimeout_WrappedAsRetryable(t *testing.T) {
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			return nil, timeoutNetError{}
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	pubErr := pub.Publish(context.Background(), makeEnv("order.placed"))
+	require.Error(t, pubErr)
+	assert.True(t, errors.Is(pubErr, domain.ErrRetryable))
+}
+
+// ----------------------------
+// Publish: OTel trace context injected into message attributes
+// ----------------------------
+
+func TestPublish_WithActiveSpan_InjectsTraceCarrier(t *testing.T) {
+	var captured *sns.PublishInput
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, params *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			captured = params
+			return &sns.PublishOutput{MessageId: aws.String("mid")}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	tp := trace.NewTracerProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	tracer := tp.Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "publish-test")
+	defer span.End()
+
+	require.NoError(t, pub.Publish(ctx, makeEnv("trace.event")))
+	require.NotNil(t, captured)
+	assert.Contains(t, captured.MessageAttributes, "traceparent")
+}
+
+func TestPublishBatch_WithActiveSpan_InjectsTraceCarrier(t *testing.T) {
+	var captured *sns.PublishBatchInput
+	client := &mockSNSClient{
+		publishBatchFn: func(_ context.Context, params *sns.PublishBatchInput, _ ...func(*sns.Options)) (*sns.PublishBatchOutput, error) {
+			captured = params
+			var successful []snstypes.PublishBatchResultEntry
+			for _, e := range params.PublishBatchRequestEntries {
+				successful = append(successful, snstypes.PublishBatchResultEntry{
+					Id: e.Id, MessageId: aws.String("mid-" + aws.ToString(e.Id)),
+				})
+			}
+			return &sns.PublishBatchOutput{Successful: successful}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	tp := trace.NewTracerProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+
+	tracer := tp.Tracer("test")
+	ctx, span := tracer.Start(context.Background(), "publish-batch-test")
+	defer span.End()
+
+	env := makeEnv("trace.batch")
+	require.NoError(t, pub.PublishBatch(ctx, []domain.Envelope[json.RawMessage]{env}))
+	require.NotNil(t, captured)
+	require.NotEmpty(t, captured.PublishBatchRequestEntries)
+	assert.Contains(t, captured.PublishBatchRequestEntries[0].MessageAttributes, "traceparent")
+}
+
+func TestPublish_TooManyAttributes_WithLogger_LogsError(t *testing.T) {
+	logger := &fixtures.MockLogger{}
+	extraAttrs := map[string]string{
+		"a1": "v1", "a2": "v2", "a3": "v3", "a4": "v4",
+		"a5": "v5", "a6": "v6", "a7": "v7", "a8": "v8",
+	}
+	pub, err := internalsns.NewWithClient(
+		"arn:aws:sns:us-east-1:123:test", &mockSNSClient{}, logger,
+		internalsns.WithAttributes(extraAttrs),
+	)
+	require.NoError(t, err)
+
+	env := domain.NewEnvelope("order.placed", "billing", json.RawMessage(`{}`))
+	env.TenantID = "acme"
+	pubErr := pub.Publish(context.Background(), env)
+	require.Error(t, pubErr)
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "ERROR" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ERROR log when attribute count exceeds SNS limit")
 }

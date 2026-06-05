@@ -57,7 +57,17 @@ test/           ← All tests live here, not beside production code
 
 ## Adding a new event type
 
-No library changes needed — types are generic. Define a Go struct and use `events.NewEnvelope[YourType](...)` in the consuming service. Always pass `WithTenantID(rc.TenantID)` and `WithTraceID(rc.TraceID)` from the `gincommon.RequestContext` when publishing from an HTTP handler.
+No library changes needed — types are generic. Define a Go struct and use `events.NewEnvelope[YourType](...)` in the consuming service. Always pass `WithTenantID(rc.TenantID)`, `WithTraceID(rc.TraceID)`, and `WithSchemaVersion("1")` from the `gincommon.RequestContext` when publishing from an HTTP handler.
+
+Register the new event type in [EVENT_SCHEMA_GOVERNANCE.md](./EVENT_SCHEMA_GOVERNANCE.md#event-type-registry) before publishing. Follow the naming convention `<domain>.<entity>.<past-tense-verb>` (`.v<N>` suffix only for breaking changes).
+
+**Payload struct rules:**
+- **Event types are immutable once published** — treat a published `event_type` string as a permanent contract
+- All optional fields must be tagged `json:",omitempty"`; consumers must never use `json.Decoder.DisallowUnknownFields()` on event payloads
+- No field removals, renames, type changes, or semantic changes without minting a new versioned event type
+- Adding a new optional field is non-breaking — increment `schema_version` so consumers can distinguish payload generations
+
+See [EVENT_SCHEMA_GOVERNANCE.md](./EVENT_SCHEMA_GOVERNANCE.md) for the full ruleset, migration window pattern, and consumer compatibility contract.
 
 ## Adding a new Publisher backend (e.g. EventBridge)
 
@@ -102,6 +112,10 @@ All unit tests must pass without Docker (`make test-unit`). Integration tests sp
 - [ ] New sentinel errors are added to `internal/core/domain/errors.go` and the README Error Reference table
 - [ ] New public package exports have a `doc.go` package overview
 - [ ] `CHANGELOG.md` `[Unreleased]` section is updated
+- [ ] New event types are registered in `EVENT_SCHEMA_GOVERNANCE.md` event type registry
+- [ ] New payload structs use `json:",omitempty"` on all optional fields and set `WithSchemaVersion`
+- [ ] Breaking payload changes mint a new versioned event type (`iam.user.created.v2`) — never mutate existing
+- [ ] Any new `publisher.Publish` call site is reviewed against the [Publishing rules](./README.md#publishing-rules) decision table — if it is tied to a DB write, it must be converted to `outbox.Enqueue`
 
 ## Release process
 

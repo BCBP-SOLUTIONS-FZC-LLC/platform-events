@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -97,7 +98,7 @@ func TestEnqueue_Success(t *testing.T) {
 
 func TestEnqueue_ExecError(t *testing.T) {
 	tx := &stubTx{execErr: errors.New("db error")}
-	env := events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`))
+	env := events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`), events.WithTenantID("acme"))
 
 	err := outbox.Enqueue(context.Background(), tx, env)
 	require.Error(t, err)
@@ -145,7 +146,7 @@ func TestEnqueue_EmptySource_ReturnsError(t *testing.T) {
 
 func TestEnqueue_ValidEnvelope_NoExecOnValidationPass(t *testing.T) {
 	tx := &stubTx{}
-	env := events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`))
+	env := events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`), events.WithTenantID("acme"))
 	err := outbox.Enqueue(context.Background(), tx, env)
 	require.NoError(t, err)
 	assert.Contains(t, tx.execSQL, "INSERT INTO outbox_events")
@@ -174,6 +175,67 @@ func TestEnqueue_FieldsForwardedCorrectly(t *testing.T) {
 	// args[2] is payload JSON
 	assert.Equal(t, "tenant123", args[3])
 	assert.Equal(t, "trace-xyz", args[4])
+}
+
+func TestEnqueue_EmptyTenantID_Succeeds(t *testing.T) {
+	tx := &stubTx{}
+	env := events.Envelope[json.RawMessage]{
+		ID:        "01926e4f-dead-7000-beef-000000000001",
+		Type:      "x.y",
+		Source:    "svc",
+		Payload:   json.RawMessage(`{}`),
+		Timestamp: time.Now(),
+	}
+	err := outbox.Enqueue(context.Background(), tx, env)
+	require.NoError(t, err)
+	require.NotEmpty(t, tx.execSQL)
+}
+
+func TestEnqueue_SystemTenantID_Succeeds(t *testing.T) {
+	tx := &stubTx{}
+	env := events.NewEnvelope("system.gc", "scheduler", json.RawMessage(`{}`), events.WithSystemTenant())
+	err := outbox.Enqueue(context.Background(), tx, env)
+	require.NoError(t, err)
+	assert.Contains(t, tx.execSQL, "INSERT INTO outbox_events")
+}
+
+func TestEnqueue_ZeroTimestamp_ReturnsError(t *testing.T) {
+	tx := &stubTx{}
+	env := events.Envelope[json.RawMessage]{
+		ID:     "01926e4f-dead-7000-beef-000000000001",
+		Type:   "x.y",
+		Source: "svc",
+		// Timestamp intentionally zero (not set) to simulate manually-constructed envelope.
+	}
+	err := outbox.Enqueue(context.Background(), tx, env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Timestamp")
+}
+
+func TestEnqueue_NullByteInID_ReturnsError(t *testing.T) {
+	tx := &stubTx{}
+	env := events.Envelope[json.RawMessage]{
+		ID:        "bad\x00id",
+		Type:      "x.y",
+		Source:    "svc",
+		Timestamp: time.Now(),
+	}
+	err := outbox.Enqueue(context.Background(), tx, env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "null bytes")
+}
+
+func TestEnqueue_NullByteInType_ReturnsError(t *testing.T) {
+	tx := &stubTx{}
+	env := events.Envelope[json.RawMessage]{
+		ID:        "01926e4f-dead-7000-beef-000000000001",
+		Type:      "x\x00y",
+		Source:    "svc",
+		Timestamp: time.Now(),
+	}
+	err := outbox.Enqueue(context.Background(), tx, env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "null bytes")
 }
 
 func TestEnqueue_OversizedPayload_ReturnsError(t *testing.T) {

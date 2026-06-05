@@ -1,18 +1,19 @@
 package service
 
-// White-box test for publishRecord's ctx.Err() fast-path (lines 154-162).
-// The fast-path fires when a goroutine is dispatched from PublishBatch just
-// before the context is cancelled — a narrow race window that cannot be
-// triggered reliably from black-box tests. Calling publishRecord directly with
-// a pre-cancelled context is the only deterministic way to cover these lines.
+// White-box tests for outbox service internals that cannot be exercised reliably
+// from black-box tests: publishRecord's ctx.Err() fast-path, failureThreshold
+// retryable-vs-non-retryable branching, and releaseStranded behaviour.
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
@@ -30,11 +31,13 @@ func (s *stubStore) ClaimBatch(_ context.Context, _ int) ([]domain.OutboxRecord,
 	return nil, nil
 }
 func (s *stubStore) MarkPublished(_ context.Context, _ string) error { return nil }
-func (s *stubStore) MarkFailed(_ context.Context, id, reason string, _ int) error {
-	s.failed[id] = reason
+func (s *stubStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, reason string, _ int) error {
+	s.failed[rec.ID] = reason
 	return nil
 }
-func (s *stubStore) PendingCount(_ context.Context) (int64, error) { return 0, nil }
+func (s *stubStore) PendingCount(_ context.Context) (int64, error)              { return 0, nil }
+func (s *stubStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
+func (s *stubStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
 
 var _ port.OutboxStore = (*stubStore)(nil)
 
@@ -71,4 +74,93 @@ func TestPublishRecord_CtxCancelledBeforeRun(t *testing.T) {
 		"publishRecord should call MarkFailed when ctx is already cancelled")
 	assert.Contains(t, store.failed[rec.ID], "context",
 		"failure reason should mention context cancellation")
+}
+
+// TestFailureThreshold_RetryableError verifies that context.Canceled,
+// context.DeadlineExceeded, and domain.ErrRetryable use maxAttempts+1 as the
+// failure threshold so a graceful-shutdown or transient-SNS failure does not
+// dead-letter a record that still has retry budget remaining.
+func TestFailureThreshold_RetryableErrors(t *testing.T) {
+	svc := NewOutboxService(newStubStore(), stubPublisher{}, nil, nil, 5, 1, 0)
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"context.Canceled", context.Canceled},
+		{"context.DeadlineExceeded", context.DeadlineExceeded},
+		{"domain.ErrRetryable", domain.ErrRetryable},
+		{"wrapped ErrRetryable", fmt.Errorf("sns throttle: %w", domain.ErrRetryable)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			threshold := svc.failureThreshold(tc.err)
+			assert.Equal(t, svc.maxAttempts+1, threshold,
+				"retryable error must use maxAttempts+1 to avoid premature dead-lettering")
+		})
+	}
+}
+
+// TestFailureThreshold_NonRetryableError verifies that ordinary SNS errors use
+// maxAttempts as the threshold so records exhaust retries and reach dead-letter.
+func TestFailureThreshold_NonRetryableError(t *testing.T) {
+	svc := NewOutboxService(newStubStore(), stubPublisher{}, nil, nil, 5, 1, 0)
+	threshold := svc.failureThreshold(errors.New("sns: InvalidParameter"))
+	assert.Equal(t, svc.maxAttempts, threshold,
+		"non-retryable error must use maxAttempts so record eventually dead-letters")
+}
+
+// TestReleaseStranded verifies that releaseStranded marks the record failed
+// with threshold maxAttempts+1 (not maxAttempts) so a single graceful-shutdown
+// event does not consume a retry slot or trigger dead-lettering.
+func TestReleaseStranded_UsesMaxAttemptsPlus1(t *testing.T) {
+	store := newStubStore()
+	svc := NewOutboxService(store, stubPublisher{}, nil, nil, 5, 1, 0)
+
+	env := domain.NewEnvelope("stranded.event", "svc", json.RawMessage(`{}`))
+	payload, _ := json.Marshal(env)
+	rec := domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload}
+
+	svc.releaseStranded(context.Background(), rec, "shutdown")
+
+	require.Contains(t, store.failed, rec.ID)
+	assert.Equal(t, "shutdown", store.failed[rec.ID],
+		"releaseStranded should record the shutdown reason")
+}
+
+// stubStoreWithThreshold captures the threshold argument passed to MarkFailed
+// so tests can verify it without inspecting internal logic.
+type stubStoreWithThreshold struct {
+	stubStore
+	thresholds map[string]int
+}
+
+func newStubStoreWithThreshold() *stubStoreWithThreshold {
+	return &stubStoreWithThreshold{
+		stubStore:  stubStore{failed: make(map[string]string)},
+		thresholds: make(map[string]int),
+	}
+}
+
+func (s *stubStoreWithThreshold) MarkFailed(_ context.Context, rec domain.OutboxRecord, reason string, threshold int) error {
+	s.failed[rec.ID] = reason
+	s.thresholds[rec.ID] = threshold
+	return nil
+}
+
+// TestReleaseStranded_ThresholdIsMaxAttemptsPlus1 uses stubStoreWithThreshold
+// to directly assert that the threshold passed to MarkFailed is maxAttempts+1.
+func TestReleaseStranded_ThresholdIsMaxAttemptsPlus1(t *testing.T) {
+	store := newStubStoreWithThreshold()
+	const maxAttempts = 3
+	svc := NewOutboxService(store, stubPublisher{}, nil, nil, maxAttempts, 1, 0)
+
+	env := domain.NewEnvelope("stranded.event", "svc", json.RawMessage(`{}`))
+	payload, _ := json.Marshal(env)
+	rec := domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload}
+
+	svc.releaseStranded(context.Background(), rec, "ctx cancelled")
+
+	assert.Equal(t, maxAttempts+1, store.thresholds[rec.ID],
+		"releaseStranded must use maxAttempts+1 so a shutdown never counts as a retry")
 }

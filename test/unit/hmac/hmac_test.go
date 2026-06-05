@@ -105,9 +105,9 @@ func TestVerifyEnvelope_ShortKey(t *testing.T) {
 	key := []byte("tooshort") // < 32 bytes
 	env := events.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
 	ok, err := events.VerifyEnvelope(key, env, "deadbeef")
-	// Short key: Sign returns ("", ErrKeyTooShort), Verify returns false.
-	// VerifyEnvelope returns (false, nil) because Verify itself absorbs errors.
-	require.NoError(t, err)
+	// Short key: VerifyEnvelope now returns (false, error) so callers can
+	// distinguish a configuration error from a legitimate signature mismatch.
+	require.Error(t, err, "short key must return an error, not a silent false")
 	assert.False(t, ok)
 }
 
@@ -128,4 +128,23 @@ func TestSign_ReturnsHexString(t *testing.T) {
 	sig, err := events.Sign(key, []byte("hello"))
 	require.NoError(t, err)
 	assert.Regexp(t, "^[0-9a-f]+$", sig)
+}
+
+func TestSignEnvelope_InvalidJSONPayload_Error(t *testing.T) {
+	key := key32()
+	// json.RawMessage with non-JSON bytes causes json.Marshal to return an error
+	// when encoding the hmacEnvelope (compact validates the bytes).
+	env := events.NewEnvelope("test.event", "svc", json.RawMessage(`invalid-json`))
+	_, err := events.SignEnvelope(key, env)
+	require.Error(t, err, "invalid JSON payload must cause a marshal error")
+	assert.Contains(t, err.Error(), "SignEnvelope marshal failed")
+}
+
+func TestVerifyEnvelope_InvalidJSONPayload_Error(t *testing.T) {
+	key := key32()
+	env := events.NewEnvelope("test.event", "svc", json.RawMessage(`invalid-json`))
+	ok, err := events.VerifyEnvelope(key, env, "anysignature")
+	require.Error(t, err, "invalid JSON payload must cause a marshal error")
+	assert.Contains(t, err.Error(), "VerifyEnvelope marshal failed")
+	assert.False(t, ok)
 }

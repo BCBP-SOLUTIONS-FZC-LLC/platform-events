@@ -121,7 +121,7 @@ func TestOutboxStore_MarkFailed_IncrementsAttempts(t *testing.T) {
 	require.NoError(t, err)
 
 	// Mark as failed (maxAttempts = 5, so we won't move to dead letter yet).
-	err = store.MarkFailed(ctx, rec.ID, "publish error", 5)
+	err = store.MarkFailed(ctx, rec, "publish error", 5)
 	require.NoError(t, err)
 
 	// Record should still be in outbox_events with attempts=1.
@@ -152,9 +152,9 @@ func TestOutboxStore_MarkFailed_MovesToDeadLetter(t *testing.T) {
 	// Initialise metrics against an isolated registry so we can assert the
 	// dead-letter counter increments when a record moves to the dead-letter table.
 	metrics.InitWithRegisterer("outboxstore-dl-test", "v0.0.0", prometheus.NewRegistry())
-	// WithLabelValues() materializes the empty-label series at 0 so ToFloat64 has
-	// exactly one series to read (a fresh CounterVec has none until first touched).
-	dlCounter := metrics.OutboxDeadLettersTotal.WithLabelValues()
+	// WithLabelValues materializes the series at 0 so ToFloat64 has exactly one
+	// series to read. "invoice.settled" matches the event type used by makeRecord below.
+	dlCounter := metrics.OutboxDeadLettersTotal.WithLabelValues("invoice.settled")
 	before := testutil.ToFloat64(dlCounter)
 
 	rec := makeRecord("invoice.settled")
@@ -164,7 +164,7 @@ func TestOutboxStore_MarkFailed_MovesToDeadLetter(t *testing.T) {
 	require.NoError(t, err)
 
 	// Fail it maxAttempts times (maxAttempts=1 so it moves immediately).
-	err = store.MarkFailed(ctx, rec.ID, "fatal error", 1)
+	err = store.MarkFailed(ctx, rec, "fatal error", 1)
 	require.NoError(t, err)
 
 	// The dead-letter counter must have incremented by exactly one.
@@ -238,7 +238,7 @@ func TestOutboxStore_MarkFailed_DeadLetter_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Move to dead letter.
-	err = store.MarkFailed(ctx, rec.ID, "error1", 1)
+	err = store.MarkFailed(ctx, rec, "error1", 1)
 	require.NoError(t, err)
 
 	// Re-enqueue to test re-insertion to dead letter (ON CONFLICT DO NOTHING should not error).
@@ -247,7 +247,7 @@ func TestOutboxStore_MarkFailed_DeadLetter_Idempotent(t *testing.T) {
 		return store.Enqueue(ctx, tx, rec2)
 	})
 	require.NoError(t, err)
-	err = store.MarkFailed(ctx, rec2.ID, "error2", 1)
+	err = store.MarkFailed(ctx, rec2, "error2", 1)
 	require.NoError(t, err)
 
 	// Both records should be in dead letters.
@@ -276,7 +276,7 @@ func TestOutboxStore_MarkFailed_RecordNotFound(t *testing.T) {
 	// A valid UUID that does not exist in the table. MarkFailed now returns nil
 	// when the record is absent (it was already published or removed by a
 	// concurrent runner) — this is logged at WARN, not propagated as an error.
-	err := store.MarkFailed(ctx, "01926e4f-dead-7000-beef-000000000001", "error", 5)
+	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000001"}, "error", 5)
 	require.NoError(t, err, "non-existent record should return nil — treated as already-handled")
 }
 
@@ -344,7 +344,7 @@ func TestOutboxStore_MarkFailed_NonExistentRecord_WithLogger(t *testing.T) {
 	store := outboxstore.New(pool, logger, 0)
 
 	// Call MarkFailed on a non-existent record — should log a warning, not error.
-	err := store.MarkFailed(ctx, "01926e4f-dead-7000-beef-000000000002", "test error", 5)
+	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000002"}, "test error", 5)
 	require.NoError(t, err, "MarkFailed on a missing record must not error")
 
 	entries := logger.Entries()
@@ -422,4 +422,285 @@ func TestApplySchema_CreatesOutboxTables(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.True(t, dlTableExists, "outbox_dead_letters table should exist")
+}
+
+// ----------------------------
+// LeasedCount
+// ----------------------------
+
+func TestOutboxStore_LeasedCount(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	// Initially no leased records.
+	n, err := store.LeasedCount(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n)
+
+	// Enqueue a record and claim it (ClaimBatch sets scheduled_at to a future time = leased).
+	rec := makeRecord("leased.event")
+	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		return store.Enqueue(ctx, tx, rec)
+	})
+	require.NoError(t, err)
+
+	claimed, err := store.ClaimBatch(ctx, 1)
+	require.NoError(t, err)
+	require.Len(t, claimed, 1)
+
+	n, err = store.LeasedCount(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+
+	// After marking published the record is gone — leased count returns to zero.
+	require.NoError(t, store.MarkPublished(ctx, rec.ID))
+	n, err = store.LeasedCount(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n)
+}
+
+// ----------------------------
+// ReprocessDeadLetters
+// ----------------------------
+
+func TestOutboxStore_ReprocessDeadLetters(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	// Initially no dead-letter records to reprocess.
+	n, err := store.ReprocessDeadLetters(ctx, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+
+	// Enqueue a record and move it to the dead-letter table via MarkFailed.
+	rec := makeRecord("dl.reprocess")
+	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		return store.Enqueue(ctx, tx, rec)
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.MarkFailed(ctx, rec, "permanent failure", 1 /* maxAttempts=1 */))
+
+	// Verify record is now in dead_letters.
+	var dlCount int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx,
+			"SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec.ID,
+		).Scan(&dlCount)
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1, dlCount)
+
+	// Reprocess: should move the record back to outbox_events.
+	n, err = store.ReprocessDeadLetters(ctx, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n, "one record should be reprocessed")
+
+	// Verify it's back in outbox_events and no longer in dead_letters.
+	var outboxCount int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx,
+			"SELECT COUNT(*) FROM outbox_events WHERE id = $1", rec.ID,
+		).Scan(&outboxCount)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, outboxCount, "reprocessed record should be back in outbox_events")
+
+	var newDlCount int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx,
+			"SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec.ID,
+		).Scan(&newDlCount)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 0, newDlCount, "record should be removed from dead_letters after reprocessing")
+}
+
+func TestOutboxStore_ReprocessDeadLetters_Limit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	// Create 3 dead-letter records.
+	for i := 0; i < 3; i++ {
+		rec := makeRecord("dl.limit")
+		err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+			return store.Enqueue(ctx, tx, rec)
+		})
+		require.NoError(t, err)
+		require.NoError(t, store.MarkFailed(ctx, rec, "fatal", 1))
+	}
+
+	// Reprocess only 2.
+	n, err := store.ReprocessDeadLetters(ctx, 2)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n, "only limit records should be reprocessed")
+}
+
+// ----------------------------
+// ClaimBatch: batchSize <= 0 validation
+// ----------------------------
+
+func TestOutboxStore_ClaimBatch_InvalidBatchSize(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, _, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	for _, size := range []int{0, -1, -100} {
+		records, err := store.ClaimBatch(ctx, size)
+		require.Error(t, err, "batchSize=%d should return error", size)
+		assert.Nil(t, records)
+		assert.Contains(t, err.Error(), "batchSize must be positive")
+	}
+}
+
+// ----------------------------
+// MarkPublished: 0 rows affected (record already published)
+// ----------------------------
+
+func TestOutboxStore_MarkPublished_AlreadyPublished(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	_, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	// Create store with a logger so the WARN branch exercises the log call.
+	logger := &fixtures.MockLogger{}
+	storeWithLogger := outboxstore.New(pool, logger, 0)
+
+	rec := makeRecord("double.publish")
+	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		return storeWithLogger.Enqueue(ctx, tx, rec)
+	})
+	require.NoError(t, err)
+
+	// First MarkPublished — marks the row.
+	require.NoError(t, storeWithLogger.MarkPublished(ctx, rec.ID))
+
+	// Second MarkPublished — 0 rows affected; must not error and must log WARN.
+	logger.Reset()
+	err = storeWithLogger.MarkPublished(ctx, rec.ID)
+	require.NoError(t, err, "second MarkPublished must not return an error")
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN log when MarkPublished finds 0 rows (already published)")
+}
+
+// ----------------------------
+// MarkFailed: dead-letter path when attempts >= maxAttempts
+// ----------------------------
+
+func TestOutboxStore_MarkFailed_DeadLetterOnFirstAttempt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	rec := makeRecord("dead.letter.immediate")
+	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		return store.Enqueue(ctx, tx, rec)
+	})
+	require.NoError(t, err)
+
+	// With maxAttempts=1, attempts(0)+1=1 >= 1 → record moves to dead_letters immediately.
+	require.NoError(t, store.MarkFailed(ctx, rec, "permanent error", 1))
+
+	var outboxCount int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx,
+			"SELECT COUNT(*) FROM outbox_events WHERE id = $1", rec.ID,
+		).Scan(&outboxCount)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 0, outboxCount, "record must be removed from outbox_events after dead-lettering")
+
+	var dlCount int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx,
+			"SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec.ID,
+		).Scan(&dlCount)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, dlCount, "record must be present in outbox_dead_letters")
+}
+
+// ----------------------------
+// InsertRecord: negative delay is clamped to 0
+// ----------------------------
+
+func TestOutboxStore_InsertRecord_NegativeDelay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	// ScheduledAt is 5 seconds before CreatedAt — negative delay must be clamped to 0.
+	now := time.Now().UTC()
+	env := domain.NewEnvelope("negative.delay", "test-svc", json.RawMessage(`{"test":true}`))
+	payload, _ := json.Marshal(env)
+	rec := domain.OutboxRecord{
+		ID:          env.ID,
+		EventType:   "negative.delay",
+		Payload:     payload,
+		TenantID:    "acme",
+		TraceID:     "trace-neg",
+		CreatedAt:   now,
+		ScheduledAt: now.Add(-5 * time.Second), // 5 s in the past → delaySecs < 0
+	}
+
+	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		return store.Enqueue(ctx, tx, rec)
+	})
+	require.NoError(t, err)
+
+	// With delaySecs clamped to 0, scheduled_at = NOW(), so the record is immediately claimable.
+	records, err := store.ClaimBatch(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, records, 1, "negative-delay record must be immediately claimable (delay clamped to 0)")
+	assert.Equal(t, rec.ID, records[0].ID)
+}
+
+// ----------------------------
+// ReprocessDeadLetters: limit <= 0 validation
+// ----------------------------
+
+func TestOutboxStore_ReprocessDeadLetters_InvalidLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, _, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	for _, limit := range []int{0, -1, -50} {
+		n, err := store.ReprocessDeadLetters(ctx, limit)
+		require.Error(t, err, "limit=%d should return error", limit)
+		assert.Equal(t, 0, n)
+		assert.Contains(t, err.Error(), "limit must be positive")
+	}
 }

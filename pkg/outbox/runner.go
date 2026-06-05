@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -72,7 +73,7 @@ type Config struct {
 
 	// PublishTimeout is the per-record timeout for calls to Publisher.Publish.
 	// Defaults to 10s. Prevents a hung SNS client from stalling the entire batch.
-	// 0 disables the per-record timeout.
+	// Set a negative value (e.g. -1) to disable the per-record timeout.
 	PublishTimeout time.Duration
 
 	// StartupJitter adds a random delay in [0, StartupJitter) before the first
@@ -90,7 +91,19 @@ type Runner struct {
 	cancel  context.CancelFunc // signals the active Start() goroutine to stop
 	doneCh  chan struct{}      // closed when the active Start() goroutine has exited
 	started atomic.Bool        // guards against concurrent Start() calls
+
+	// readyCh is closed after the first successful poll cycle (or empty poll),
+	// signalling that the DB connection and schema are healthy. Expose via Ready().
+	readyCh   chan struct{}
+	readyOnce sync.Once
 }
+
+// outboxMetricsAdapter routes OutboxService metric callbacks to the adapter
+// layer without the service layer needing to import the adapter.
+type outboxMetricsAdapter struct{}
+
+func (outboxMetricsAdapter) RecordUnmarshalError()     { metrics.RecordOutboxUnmarshalError() }
+func (outboxMetricsAdapter) RecordMarkPublishedError() { metrics.RecordOutboxMarkPublishedError() }
 
 // NewRunner constructs a Runner from the provided Config.
 // Panics if Publisher is nil, or if both Store and Pool are nil.
@@ -115,10 +128,28 @@ func NewRunner(cfg Config) *Runner {
 	if cfg.DrainTimeout <= 0 {
 		cfg.DrainTimeout = defaultDrainTimeout
 	}
-	if cfg.PublishTimeout <= 0 {
+	if cfg.PublishTimeout == 0 {
 		cfg.PublishTimeout = defaultPublishTimeout
 	}
 	// PublishConcurrency defaults to 1 (sequential); service constructor handles <= 0.
+
+	// Validate that ClaimLeaseDuration covers the worst-case publish budget so a
+	// second runner cannot re-claim the same record before the first finishes,
+	// which would cause silent duplicate delivery. The effective lease when zero
+	// is the outboxstore default of 10 minutes.
+	effectiveLease := cfg.ClaimLeaseDuration
+	if effectiveLease <= 0 {
+		effectiveLease = 10 * time.Minute
+	}
+	if cfg.PublishTimeout > 0 {
+		minLease := time.Duration(cfg.BatchSize)*cfg.PublishTimeout + time.Minute
+		if effectiveLease < minLease {
+			panic(fmt.Sprintf(
+				"outbox: ClaimLeaseDuration (%s) is too short — must be at least BatchSize×PublishTimeout+1m (%d×%s+1m = %s) to prevent duplicate delivery",
+				effectiveLease, cfg.BatchSize, cfg.PublishTimeout, minLease,
+			))
+		}
+	}
 
 	var store port.OutboxStore
 	if cfg.Store != nil {
@@ -135,16 +166,18 @@ func NewRunner(cfg Config) *Runner {
 		cfg.PublishConcurrency,
 		cfg.PublishTimeout,
 	)
+	svc.SetOutboxMetrics(outboxMetricsAdapter{})
 
 	// Pre-closed initial doneCh so Stop() before Start() returns immediately.
 	initialDone := make(chan struct{})
 	close(initialDone)
 
 	return &Runner{
-		svc:    svc,
-		cfg:    cfg,
-		cancel: func() {}, // noop before first Start()
-		doneCh: initialDone,
+		svc:     svc,
+		cfg:     cfg,
+		cancel:  func() {}, // noop before first Start()
+		doneCh:  initialDone,
+		readyCh: make(chan struct{}),
 	}
 }
 
@@ -152,22 +185,29 @@ func NewRunner(cfg Config) *Runner {
 // Returns an error if Start has already been called and is still running.
 // The runner is fully restartable: Start() may be called again after Stop().
 func (r *Runner) Start(ctx context.Context) error {
+	// Hold the mutex across the CAS and the r.cancel/r.doneCh assignment so that
+	// Stop() cannot read the stale pre-closed doneCh in the window between the CAS
+	// and the mutex write. Without this guard, Stop() could return immediately
+	// while Start() is still initialising (TOCTOU race).
+	r.mu.Lock()
 	if !r.started.CompareAndSwap(false, true) {
+		r.mu.Unlock()
 		return fmt.Errorf("outbox: runner is already running")
 	}
-
-	// Create a fresh stop context and doneCh for this cycle under the mutex so
-	// Stop() always captures the channel belonging to the current cycle.
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 	thisDone := make(chan struct{})
-	r.mu.Lock()
 	r.cancel = stopCancel
 	r.doneCh = thisDone
+	r.readyCh = make(chan struct{})
+	r.readyOnce = sync.Once{}
 	r.mu.Unlock()
+	defer stopCancel() // always release stopCtx resources when Start() exits
 
+	// close(thisDone) BEFORE Store(false) so a racing Start() cannot succeed its
+	// CAS and install a new doneCh before the old one is closed.
 	defer func() {
-		r.started.Store(false)
 		close(thisDone)
+		r.started.Store(false)
 	}()
 
 	// Optional startup jitter: desynchronises concurrent runner instances so
@@ -209,6 +249,7 @@ func (r *Runner) Start(ctx context.Context) error {
 				if !r.sleepBackoff(ctx, stopCtx, &pollBackoff) {
 					return nil
 				}
+				ticker.Reset(r.cfg.PollInterval)
 			} else {
 				pollBackoff = initPollBackoff
 			}
@@ -227,8 +268,10 @@ func (r *Runner) sleepBackoff(ctx, stopCtx context.Context, backoff *time.Durati
 		*backoff = min(*backoff*2, maxPollBackoff)
 		return true
 	case <-ctx.Done():
+		*backoff = initPollBackoff // reset so a future Start() cycle begins at base backoff
 		return false
 	case <-stopCtx.Done():
+		*backoff = initPollBackoff
 		return false
 	}
 }
@@ -237,26 +280,80 @@ func (r *Runner) sleepBackoff(ctx, stopCtx context.Context, backoff *time.Durati
 // Returns true when the cycle encountered an infrastructure error (triggers
 // backoff in Start); returns false on success or context cancellation.
 func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
-	if metrics.OutboxPendingTotal != nil {
+	if metrics.HasOutboxPendingMetric() {
 		gcCtx, gcCancel := context.WithTimeout(ctx, 2*time.Second)
-		if n, err := r.svc.PendingCount(gcCtx); err == nil {
-			metrics.OutboxPendingTotal.WithLabelValues().Set(float64(n))
-		}
+		n, pendErr := r.svc.PendingCount(gcCtx)
 		gcCancel()
+		if pendErr != nil {
+			// Set to -1 so dashboards can distinguish "zero pending" from
+			// "reading unavailable" — a stale zero would mask a lagging outbox.
+			metrics.SetOutboxPending(-1)
+			if r.cfg.Logger != nil {
+				r.cfg.Logger.Warn("outbox: failed to query pending count", map[string]any{
+					"error": pendErr.Error(),
+				})
+			}
+		} else {
+			metrics.SetOutboxPending(float64(n))
+		}
+	}
+	if metrics.HasOutboxLeasedMetric() {
+		lcCtx, lcCancel := context.WithTimeout(ctx, 2*time.Second)
+		n, leasedErr := r.svc.LeasedCount(lcCtx)
+		lcCancel()
+		if leasedErr != nil {
+			if r.cfg.Logger != nil {
+				r.cfg.Logger.Warn("outbox: failed to query leased count", map[string]any{
+					"error": leasedErr.Error(),
+				})
+			}
+		} else {
+			metrics.SetOutboxLeased(float64(n))
+		}
 	}
 	if err := r.svc.PublishBatch(ctx, r.cfg.BatchSize); err != nil {
 		// Context cancellation is not an infrastructure error — no backoff.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return false
 		}
+		metrics.RecordOutboxPollError()
+		logFields := map[string]any{"error": err.Error()}
+		// Surface a clear diagnostic when the outbox schema has not been applied.
+		if strings.Contains(err.Error(), `relation "outbox_events" does not exist`) {
+			logFields["hint"] = "call outbox.ApplySchema before starting the runner"
+		}
 		if r.cfg.Logger != nil {
-			r.cfg.Logger.Error("outbox: poll cycle failed", map[string]any{
-				"error": err.Error(),
-			})
+			r.cfg.Logger.Error("outbox: poll cycle failed", logFields)
 		}
 		return true
 	}
+	// First successful (or empty) poll: signal readiness for health probes.
+	r.readyOnce.Do(func() { close(r.readyCh) })
 	return false
+}
+
+// Ready returns a channel that is closed after the first successful poll cycle.
+// A successful poll means the DB connection is healthy and the outbox schema exists.
+// Use this to gate Kubernetes readiness probes:
+//
+//	select {
+//	case <-runner.Ready():
+//	    // signal /readyz OK
+//	case <-time.After(30 * time.Second):
+//	    // signal /readyz not ready
+//	}
+func (r *Runner) Ready() <-chan struct{} {
+	r.mu.Lock()
+	ch := r.readyCh
+	r.mu.Unlock()
+	return ch
+}
+
+// ReprocessDeadLetters moves up to limit records from outbox_dead_letters back
+// to outbox_events for redelivery, resetting their attempt counters.
+// Returns the number of records re-queued and any database error.
+func (r *Runner) ReprocessDeadLetters(ctx context.Context, limit int) (int, error) {
+	return r.svc.ReprocessDeadLetters(ctx, limit)
 }
 
 // Stop signals the runner to stop and waits up to DrainTimeout for the current
@@ -268,10 +365,14 @@ func (r *Runner) Stop() error {
 	doneCh := r.doneCh
 	r.mu.Unlock()
 
+	// Use NewTimer so the timer goroutine is stopped immediately when doneCh fires,
+	// preventing a 30s goroutine leak on every normal (fast) Stop() call.
+	timer := time.NewTimer(r.cfg.DrainTimeout)
+	defer timer.Stop()
 	select {
 	case <-doneCh:
 		return nil
-	case <-time.After(r.cfg.DrainTimeout):
+	case <-timer.C:
 		return fmt.Errorf("outbox: runner did not stop within drain timeout (%s)", r.cfg.DrainTimeout)
 	}
 }

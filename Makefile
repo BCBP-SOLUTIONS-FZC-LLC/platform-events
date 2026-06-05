@@ -39,7 +39,7 @@ help:
 	@echo "  make vet             - go vet all packages"
 	@echo "  make lint            - run golangci-lint"
 	@echo "  make test            - unit + integration tests (requires Docker)"
-	@echo "  make test-ci         - test with race detector (used in CI)"
+	@echo "  make test-ci         - unit + integration + e2e with race detector (used in CI)"
 	@echo "  make test-unit       - unit tests only"
 	@echo "  make test-int        - integration tests (requires Docker / LocalStack)"
 	@echo "  make test-smoke      - smoke tests (requires live AWS resources)"
@@ -54,7 +54,7 @@ help:
 	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
 	@echo "  make mod-verify      - go mod verify (check module download integrity)"
 	@echo "  make vuln-check      - govulncheck on library packages"
-	@echo "  make race            - unit + integration tests with -race flag"
+	@echo "  make race            - unit + integration + e2e with -race flag"
 	@echo "  make clean           - remove build artefacts"
 
 # -----------------------------
@@ -92,10 +92,12 @@ test:
 	$(GO) test $(TEST_INT_PKGS)  -tags=integration -count=1 -timeout 300s -v
 
 # test-ci: used by CI and release workflows; enables the race detector.
+# Includes e2e tests (requires Docker on the runner, same as cover-func).
 .PHONY: test-ci
 test-ci:
 	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 120s
 	$(GO) test $(TEST_INT_PKGS)  -tags=integration -race -count=1 -timeout 300s
+	$(GO) test $(TEST_E2E_PKGS)  -tags=e2e -race -count=1 -timeout 300s
 
 .PHONY: test-unit
 test-unit:
@@ -213,9 +215,12 @@ mod-verify:
 	$(GO) mod verify
 
 # vuln-check: scan library packages for known vulnerabilities (excludes cmd/).
+# Version is pinned to prevent unintended breakage from new advisories landing mid-CI.
+# To upgrade: go run golang.org/x/vuln/cmd/govulncheck@latest --version, then update below.
+GOVULNCHECK_VERSION ?= v1.1.4
 .PHONY: vuln-check
 vuln-check:
-	$(GO) run golang.org/x/vuln/cmd/govulncheck@latest ./internal/... ./pkg/...
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./internal/... ./pkg/...
 
 # -----------------------------
 # CLEAN

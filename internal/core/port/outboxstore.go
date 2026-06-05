@@ -22,9 +22,27 @@ type OutboxStore interface {
 
 	// MarkFailed increments attempts and sets last_error.
 	// If attempts >= maxAttempts, moves the record to the dead-letter table.
-	MarkFailed(ctx context.Context, id string, lastError string, maxAttempts int) error
+	// rec carries the record's original fields for dead-letter insertion, avoiding
+	// a second DB read of the payload when moving to outbox_dead_letters.
+	MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int) error
 
 	// PendingCount returns the number of records not yet published.
 	// Used to update the outbox_pending_total Prometheus gauge each poll cycle.
 	PendingCount(ctx context.Context) (int64, error)
+
+	// LeasedCount returns the number of records currently claimed by a runner
+	// (scheduled_at > NOW() and published_at IS NULL). Used for the outbox_leased_total gauge.
+	LeasedCount(ctx context.Context) (int64, error)
+
+	// ReprocessDeadLetters moves up to limit records from outbox_dead_letters back
+	// to outbox_events for redelivery. Returns the number of records re-queued.
+	ReprocessDeadLetters(ctx context.Context, limit int) (int, error)
+}
+
+// OutboxMetrics is the observability surface the OutboxService needs.
+// Defined in port so the service layer does not import the adapter layer.
+// Implementations live in the adapter layer; nil disables all recording.
+type OutboxMetrics interface {
+	RecordUnmarshalError()
+	RecordMarkPublishedError()
 }
