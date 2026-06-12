@@ -2,6 +2,7 @@ package port
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -37,6 +38,13 @@ type OutboxStore interface {
 	// ReprocessDeadLetters moves up to limit records from outbox_dead_letters back
 	// to outbox_events for redelivery. Returns the number of records re-queued.
 	ReprocessDeadLetters(ctx context.Context, limit int) (int, error)
+
+	// PrunePublished deletes published records older than olderThan from outbox_events
+	// to prevent unbounded table growth. The delete is batched to at most limit rows
+	// per call. Callers should run this periodically (e.g. daily) with an olderThan
+	// window that exceeds the longest idempotency window of any downstream consumer.
+	// Returns the number of rows deleted and any database error.
+	PrunePublished(ctx context.Context, olderThan time.Duration, limit int) (int64, error)
 }
 
 // OutboxMetrics is the observability surface the OutboxService needs.

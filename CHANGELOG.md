@@ -9,21 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`pkg/config`** — public env loading (`LoadSNS`, `LoadSQS`, `LoadOutbox`, `LoadOTel`) plus wiring helpers (`RunnerConfigFromEnv`, `SQSConfigFromEnv`, `SQSConsumerOptions`, `LogWarnings`)
+- **`pkg/config`** — public env loading (`LoadSNS`, `LoadSQS`, `LoadOutbox`, `LoadOTel`) plus wiring helpers (`RunnerConfigFromEnv`, `SQSConfigFromEnv`, `SQSConsumerOptions`, `LogWarnings`, `LogWarningsTo`)
+- `config.LogWarningsTo(logger port.Logger, warnings []string)` — emits configuration warnings via a structured logger (Warn level); falls back to stderr when logger is nil. Prefer over `LogWarnings` when a structured logger is available so warnings reach log aggregators (Loki, CloudWatch)
+- `outbox.Runner.PrunePublished(ctx, olderThan time.Duration, limit int) (int64, error)` — removes published `outbox_events` rows older than `olderThan`; call periodically from a scheduled job to prevent unbounded table growth. Delegates to `port.OutboxStore.PrunePublished`
+- `port.OutboxStore.PrunePublished(ctx, olderThan time.Duration, limit int) (int64, error)` — **breaking interface change**: all `OutboxStore` implementations must add this method. The Postgres implementation in `internal/adapter/outbound/outboxstore` applies a 30 s internal timeout and uses the `idx_outbox_events_published_at` partial index (migration 007) for efficient batch deletes
+- Migration `007_add_prune_index` — partial index `idx_outbox_events_published_at ON outbox_events(published_at) WHERE published_at IS NOT NULL`; makes `PrunePublished` an index scan instead of a sequential scan as the table grows
+- `metrics.OversizedEventTypeLabelTotal` counter (`events_oversized_event_type_label_total`) — incremented by `SanitizeEventType` whenever an `event_type` value exceeds 128 bytes and is replaced with `"__oversized__"`; alert when non-zero to detect misconfigured or adversarial producers
 - `OUTBOX_PUBLISH_CONCURRENCY`, `OUTBOX_PUBLISH_TIMEOUT`, `OUTBOX_DRAIN_TIMEOUT` env vars for outbox runner tuning
 - `SQS_MAX_RECEIVE_COUNT` env var — map to `events.WithMaxReceiveCount` when wiring `WithDeadLetterHandler`
 - Sequential outbox publish path (`PublishConcurrency=1`) uses SNS `PublishBatch` (up to 10 per API call) for higher throughput
+- `outbox.MigrationsTable` — exported constant (`"outbox_migrations"`); `ApplySchema` injects `x-migrations-table=outbox_migrations` into the DSN so the outbox migration history is tracked in its own table, isolated from the consuming service's `schema_migrations` and `pgcommon_migrations` tables
+
+### Breaking Changes
+
+- **`port.OutboxStore` interface** has a new required method: `PrunePublished(ctx context.Context, olderThan time.Duration, limit int) (int64, error)`. Any code that implements `OutboxStore` (e.g. test mocks) must add this method. The no-op implementation is `func (s *myStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) { return 0, nil }`.
 
 ### Changed
 
+- **Breaking:** `outbox.NewRunner` now returns `(*Runner, error)` instead of `*Runner` — returns an error when `ClaimLeaseDuration` is too short for the configured `BatchSize × PublishTimeout`; panics are reserved for nil `Publisher` / nil `Store+Pool` (programming errors). Update all call sites: `runner, err := outbox.NewRunner(cfg)`.
+- `ClaimLeaseDuration` validation: when `PublishTimeout` is disabled (≤0), a minimum floor of 30 s is enforced so leases never expire instantly, preventing duplicate delivery across concurrent runners
+- Panicking SQS handlers now record the panic as an OTel span error (via `span.RecordError` + `span.SetStatus(codes.Error)`) before re-panicking, giving end-to-end trace visibility even when handlers crash
+- `maskDSN` (internal) now also masks `password=` / `passwd=` values that appear in URL query parameters (e.g. `postgres://host/db?password=secret`), preventing credential leaks in `OutboxConfigEnv.String()` log output
+- `publishClaimedSequential` (sequential outbox batch path): per-failure `Code == "TransportError"` in a `domain.BatchError` now uses `threshold = MaxAttempts+1`, matching the concurrent single-record path — SNS transport failures (ThrottlingException, ServiceUnavailable) no longer consume a retry slot and will not prematurely dead-letter healthy records
+- `outboxstore.MarkPublished` and `outboxstore.MarkFailed` now apply a 5 s per-call DB timeout (`defaultStoreQueryTimeout`), consistent with `ClaimBatch`, `PendingCount`, and `LeasedCount` — a saturated DB can no longer stall the entire batch bookkeeping loop
+- `outboxstore.ReprocessDeadLetters` now applies a 30 s internal DB timeout (`defaultPruneTimeout`) so a saturated DB does not block the caller indefinitely
+- `WithDrainTimeout(0)` is now documented: a zero drain timeout disables the drain window — in-flight handler contexts are cancelled immediately when `Stop` is called. Negative values are rejected (default 30 s preserved). Use zero only in tests
+- `bridge.PublishBatch`: `RecordOutboxAttempt` and `RecordOutboxPublished` are now recorded post-call so a panicking publisher leaves both counters at 0 rather than creating a permanent `attempts > published{success+error}` mismatch in dashboards
 - `events.SystemTenantID` re-exported from `internal/core/domain` — single canonical definition
 - Reference CLI (`cmd/platform-events`) calls `events.Init`, logs config `Warnings`, and prints production wiring reminders; `-strict` exits non-zero on missing required env vars
 - `internal/config` is a deprecated alias of `pkg/config` — import `pkg/config` in new code
+- `logger.NewLogger` default encoder corrected: `"dev"`, `"development"`, and `"local"` use a colored console encoder; all other values (including `"staging"`, unknown, empty) use a JSON production encoder. Previously any env value other than `"production"`/`"prod"` triggered dev mode, causing staging deployments to emit colored console output.
+- SQS consumer receive-error backoff now includes ±25% random jitter so concurrent consumer replicas do not retry in lock-step after a shared SQS error.
+- Handler `ctx` uses `context.WithoutCancel` — `ctx.Deadline()` always returns a zero time. Handlers must not rely on the parent deadline for timeouts; use `context.WithTimeout` explicitly instead. Cancellation is only delivered once the consumer's drain timeout expires.
 
 ### Fixed
 
 - `CHANGELOG` claim-lease default corrected: `OUTBOX_CLAIM_LEASE_DURATION` unset → **10 minutes** (store default), not 30s
 - `.env-example` documents `OUTBOX_CLAIM_LEASE_DURATION`, `OUTBOX_STARTUP_JITTER`, runner tuning vars, and `RawMessageDelivery` requirement
+- `outbox_service.truncateError`: truncation marker (`"…[truncated]"`, 12 runes) is now counted within the `maxLastErrorLen` cap rather than appended after it, preventing error strings of up to `maxLastErrorLen+12` runes from reaching the database column.
+- `metrics.Init` now acquires `metricsMu` inside the `sync.Once` callback, closing a race window with concurrent `InitWithRegisterer` calls.
+- `outboxstore.MarkPublished` doc comment corrected: returns `nil` (not an error) when 0 rows are affected and logs a `WARN` instead — the concurrent-update case (record published/removed by another runner between claim and mark) is an expected non-error condition.
+- `publishChunk` (SNS adapter sequential batch path): transport-level errors are now wrapped with `wrapIfRetryable` before returning so the outbox service's `failureThreshold` correctly identifies retryable SNS errors (ThrottlingException, ServiceUnavailable) and uses `MaxAttempts+1`
 
 ---
 

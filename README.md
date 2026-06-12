@@ -256,7 +256,10 @@ func main() {
     // 5. Start the outbox runner (delivers events asynchronously).
     outboxEnv := config.LoadOutbox()
     config.LogWarnings(outboxEnv.Warnings)
-    runner := outbox.NewRunner(config.RunnerConfigFromEnv(outboxEnv, pool, publisher, logger))
+    runner, err := outbox.NewRunner(config.RunnerConfigFromEnv(outboxEnv, pool, publisher, logger))
+    if err != nil {
+        log.Fatal(err)
+    }
     go runner.Start(ctx)
     defer runner.Stop()
 
@@ -605,6 +608,8 @@ defer consumer.Stop()    // graceful drain — waits up to 30s for in-flight han
 | Unmarshal failure | Message deleted immediately; counted as `events_consumed_total{status=malformed}` |
 
 **VisibilityTimeout limit:** SQS enforces a hard maximum of 12 hours. `NewSQSConsumer` returns an error if `VisibilityTimeout > 12h`.
+
+**Context contract:** the `ctx` passed to each handler has its cancellation stripped via `context.WithoutCancel` so handlers run to completion during graceful shutdown. As a consequence, `ctx.Deadline()` always returns a zero time — handlers must set their own timeouts (e.g. `context.WithTimeout(ctx, 5*time.Second)`) instead of relying on the parent deadline. Cancellation is delivered only when the consumer's drain timeout expires.
 
 ### Error classification
 
@@ -979,7 +984,7 @@ if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
 }
 
 // 2. Construct the outbox runner.
-runner := outbox.NewRunner(outbox.Config{
+runner, err := outbox.NewRunner(outbox.Config{
     Pool:         pool,       // *pgcommon.Pool — required
     Publisher:    publisher,  // events.Publisher — required
     Logger:       logger,
@@ -993,6 +998,9 @@ runner := outbox.NewRunner(outbox.Config{
     StartupJitter:      200 * time.Millisecond, // random delay before first poll; desyncs replicas on rolling restart
     // To load these from env: config.RunnerConfigFromEnv(config.LoadOutbox(), pool, publisher, logger)
 })
+if err != nil {
+    log.Fatal(err) // ClaimLeaseDuration too short for configured BatchSize × PublishTimeout
+}
 go runner.Start(ctx) // blocks until ctx is cancelled
 defer func() {
     // Stop() returns an error if the in-flight batch does not drain within DrainTimeout.
@@ -1000,6 +1008,17 @@ defer func() {
         logger.Warn("outbox runner drain timeout — records retry after lease expiry", map[string]any{"error": err.Error()})
     }
 }()
+
+// Optional: gate the Kubernetes readiness probe until the first poll succeeds.
+// Ready() returns a channel that is closed after the first successful (or empty) poll,
+// confirming that the DB connection is live and the outbox schema exists.
+//
+//   select {
+//   case <-runner.Ready():
+//       // signal /readyz OK
+//   case <-time.After(30 * time.Second):
+//       // signal /readyz not ready
+//   }
 ```
 
 **Config defaults:** `PollInterval` 5s · `BatchSize` 50 · `MaxAttempts` 5 · `PublishConcurrency` 1 · `PublishTimeout` 10s · `DrainTimeout` 30s · `ClaimLeaseDuration` 10m · `StartupJitter` 0. When `PublishConcurrency` is `1` (default), the runner publishes via SNS `PublishBatch` (10 messages per API call). Values `> 1` publish records in parallel goroutines with per-record `Publish` calls. When a poll cycle fails (e.g. the DB is unreachable), the runner applies exponential backoff (1s → 30s) before retrying instead of hammering the pool every `PollInterval`.
@@ -1101,6 +1120,26 @@ logger.Info("dead letters requeued", map[string]any{"count": n})
 
 A large backlog in `outbox_events` usually indicates downstream delivery issues (SNS/SQS) or insufficient runner throughput — monitor `outbox_pending_total` and scale runners accordingly.
 
+### Pruning published records
+
+Published records in `outbox_events` are not deleted automatically — the runner marks them with `published_at` but leaves the row in place. Without periodic pruning the table grows unboundedly, degrading `ClaimBatch` index scans over time.
+
+Call `PrunePublished` from a scheduled job (e.g. a Kubernetes `CronJob` or `time.Ticker`):
+
+```go
+// Delete published records older than 7 days, up to 1000 per call.
+n, err := runner.PrunePublished(ctx, 7*24*time.Hour, 1000)
+if err != nil {
+    logger.Error("outbox prune failed", map[string]any{"error": err})
+}
+logger.Info("outbox pruned", map[string]any{"deleted": n})
+```
+
+**Guidance:**
+- `olderThan` must be long enough that all consumers have processed the event before the row is deleted. 7 days covers most SLA windows; increase for slow consumers.
+- `limit` bounds the DELETE batch size (and lock hold time). For large tables, call in a loop until the return value is 0.
+- Migration 007 adds a partial index on `(published_at) WHERE published_at IS NOT NULL` to make prune scans efficient. Run `outbox.ApplySchema` to apply it.
+
 ### Replay guarantees
 
 Replay (via `ReprocessDeadLetters`, manual SQL reset, or SQS DLQ redrive) carries no stronger delivery guarantees than the original delivery path. Before triggering a replay, consumers must be prepared for all of the following:
@@ -1187,13 +1226,13 @@ Registered metrics:
 |---|---|---|---|
 | `events_published_total` | Counter | `service`, `topic`, `event_type`, `status` | SNS publish attempts |
 | `events_publish_duration_seconds` | Histogram | `service`, `topic`, `event_type` | SNS publish latency |
-| `events_consumed_total` | Counter | `service`, `queue`, `event_type`, `status` | SQS messages processed (`status` = `success`/`error`/`malformed`) |
+| `events_consumed_total` | Counter | `service`, `queue`, `event_type`, `status` | SQS messages processed (`status` = `success`/`error`/`malformed`/`dlq_success`/`dlq_error`; `dlq_*` emitted when the dead-letter handler is invoked) |
 | `events_consume_duration_seconds` | Histogram | `service`, `queue`, `event_type` | Handler execution latency |
 | `outbox_pending_total` | Gauge | `service` | Unpublished records in `outbox_events` |
 | `outbox_leased_total` | Gauge | `service` | Records currently claimed (leased) by a runner — combine with `outbox_pending_total` for a complete in-flight picture |
-| `outbox_published_total` | Counter | `service`, `status` | Records published by the runner |
-| `outbox_attempts_total` | Counter | `service` | Total publish attempts by the runner |
-| `outbox_dead_letters_total` | Counter | `service` | Records moved to `outbox_dead_letters` after exhausting `MaxAttempts` — alert on `rate() > 0` |
+| `outbox_published_total` | Counter | `service`, `event_type`, `status` | Records published by the runner |
+| `outbox_attempts_total` | Counter | `service`, `event_type` | Total publish attempts by the runner |
+| `outbox_dead_letters_total` | Counter | `service`, `event_type` | Records moved to `outbox_dead_letters` after exhausting `MaxAttempts` — alert on `rate() > 0` |
 | `outbox_dead_letters_reprocessed_total` | Counter | `service` | Dead-letter records re-queued via `ReprocessDeadLetters` |
 | `sqs_receive_errors_total` | Counter | `service`, `queue` | SQS `ReceiveMessage` errors (excludes context cancellation) — alert on `rate() > 0` |
 | `sqs_delete_errors_total` | Counter | `service`, `queue` | SQS `DeleteMessage` errors — a non-zero rate causes duplicate message delivery |
@@ -1201,6 +1240,7 @@ Registered metrics:
 | `outbox_poll_errors_total` | Counter | `service` | Outbox poll cycle errors (ClaimBatch / DB errors) — triggers exponential backoff |
 | `outbox_unmarshal_errors_total` | Counter | `service` | Outbox records that failed JSON unmarshal during publish |
 | `outbox_mark_published_errors_total` | Counter | `service` | `MarkPublished` failures after a successful SNS delivery — non-zero rate signals potential duplicate delivery on next poll |
+| `events_oversized_event_type_label_total` | Counter | `service` | `event_type` values that exceeded 128 bytes and were replaced with `"__oversized__"` — alert on `rate() > 0` to detect misconfigured or adversarial producers |
 
 ### OpenTelemetry
 
@@ -1423,7 +1463,7 @@ if err != nil {
     return fmt.Errorf("sqs consumer: %w", err)
 }
 
-runner := outbox.NewRunner(outbox.Config{
+runner, err := outbox.NewRunner(outbox.Config{
     Pool:         pool,
     Publisher:    publisher,
     Logger:       logger,
@@ -1431,6 +1471,9 @@ runner := outbox.NewRunner(outbox.Config{
     BatchSize:    50,
     MaxAttempts:  5,
 })
+if err != nil {
+    return fmt.Errorf("outbox runner: %w", err)
+}
 ```
 
 ### What to monitor on day one

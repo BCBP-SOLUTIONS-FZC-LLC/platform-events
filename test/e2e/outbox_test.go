@@ -50,13 +50,14 @@ func TestOutbox_EnqueueAndDeliver_EndToEnd(t *testing.T) {
 	require.NoError(t, err)
 
 	// Start the outbox runner.
-	runner := outbox.NewRunner(outbox.Config{
+	runner, err := outbox.NewRunner(outbox.Config{
 		Pool:         pool,
 		Publisher:    snsPub,
 		PollInterval: 500 * time.Millisecond,
 		BatchSize:    10,
 		MaxAttempts:  3,
 	})
+	require.NoError(t, err)
 	runnerCtx, runnerCancel := context.WithCancel(ctx)
 	defer runnerCancel()
 	go func() { _ = runner.Start(runnerCtx) }()
@@ -131,13 +132,14 @@ func TestOutbox_MultipleEvents(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	runner := outbox.NewRunner(outbox.Config{
+	runner, err := outbox.NewRunner(outbox.Config{
 		Pool:         pool,
 		Publisher:    snsPub,
 		PollInterval: 500 * time.Millisecond,
 		BatchSize:    10,
 		MaxAttempts:  3,
 	})
+	require.NoError(t, err)
 	runnerCtx, runnerCancel := context.WithCancel(ctx)
 	defer runnerCancel()
 	go func() { _ = runner.Start(runnerCtx) }()
@@ -214,13 +216,14 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	runner := outbox.NewRunner(outbox.Config{
+	runner, err := outbox.NewRunner(outbox.Config{
 		Pool:         pool,
 		Publisher:    snsPub,
 		PollInterval: 500 * time.Millisecond,
 		BatchSize:    10,
 		MaxAttempts:  3,
 	})
+	require.NoError(t, err)
 	runnerCtx, runnerCancel := context.WithCancel(ctx)
 	defer runnerCancel()
 	go func() { _ = runner.Start(runnerCtx) }()

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -78,6 +79,9 @@ func WithMaxReceiveCount(n int) ConsumerOption {
 
 // WithDrainTimeout sets how long Stop() waits for in-flight handlers to finish.
 // A negative duration is ignored and the default (30s) is preserved.
+// A zero duration disables the drain window entirely — in-flight handler contexts
+// are cancelled immediately when Stop is called, with no waiting period. This is
+// useful for tests; in production prefer a positive value (≥ p99 handler latency).
 func WithDrainTimeout(d time.Duration) ConsumerOption {
 	return func(c *sqsConsumer) {
 		if d >= 0 {
@@ -368,7 +372,11 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 				drain()
 				return nil
 			}
-			receiveBackoff = min(receiveBackoff*2, receiveBackoffMax)
+			// Add ±25% jitter so concurrent consumer instances do not
+			// retry in lock-step after a shared SQS error, preventing a
+			// thundering-herd on recovery.
+			jitter := time.Duration(rand.Int64N(int64(receiveBackoff) / 2))
+			receiveBackoff = min(receiveBackoff*2+jitter, receiveBackoffMax)
 			continue
 		}
 		receiveBackoff = receiveBackoffInit // reset on success
@@ -406,6 +414,11 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 
 // Stop cancels the receive loop and waits for all in-flight handlers to finish
 // (up to DrainTimeout). Returns an error if the drain timeout is exceeded.
+// When DrainTimeout is exceeded, Stop returns the error and signals handler
+// contexts with drainCancel(), but outstanding handler goroutines may still be
+// running — they are bounded by handler responsiveness, not killed immediately.
+// In Kubernetes, ensure your pod terminationGracePeriodSeconds > DrainTimeout
+// so the process does not receive SIGKILL before handlers exit.
 // Safe to call multiple times and safe to call before Start.
 func (c *sqsConsumer) Stop() error {
 	c.mu.Lock()
@@ -617,8 +630,25 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	}
 
 	start := time.Now()
-	handlerErr := c.handler(handlerCtx, env)
+
+	// Wrap the handler call to capture panics inside this function where the span
+	// is accessible. On panic: record error on the span, then re-panic so the
+	// goroutine-level recovery can log the stack trace.
+	var handlerErr error
+	var handlerPanic interface{}
+	func() {
+		defer func() { handlerPanic = recover() }()
+		handlerErr = c.handler(handlerCtx, env)
+	}()
 	dur := time.Since(start)
+
+	if handlerPanic != nil {
+		panicErr := fmt.Errorf("handler panic: %v", handlerPanic)
+		span.RecordError(panicErr)
+		span.SetStatus(codes.Error, panicErr.Error())
+		metrics.RecordConsume(c.queueURL, env.Type, "error", dur.Seconds())
+		panic(handlerPanic) // propagate to goroutine-level recovery for stack logging
+	}
 
 	status := "success"
 	if handlerErr != nil {

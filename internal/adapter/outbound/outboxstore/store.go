@@ -190,8 +190,10 @@ func (s *Store) PendingCount(ctx context.Context) (int64, error) {
 }
 
 // MarkPublished sets published_at = NOW() for the given record ID.
-// Returns an error if no row was updated (record missing or already deleted).
+// Logs a warning if no row was updated (record already published or removed by a concurrent runner).
 func (s *Store) MarkPublished(ctx context.Context, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
+	defer cancel()
 	return s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
 		// WHERE published_at IS NULL prevents a concurrent runner from overwriting
 		// an already-published timestamp and suppressing the RowsAffected==0 warning.
@@ -219,6 +221,8 @@ func (s *Store) MarkPublished(ctx context.Context, id string) error {
 // rec carries the record's original fields so dead-letter insertion does not
 // require an additional DB read of the payload.
 func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int) error {
+	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
+	defer cancel()
 	return s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
 		tx, err := conn.Begin(ctx)
 		if err != nil {
@@ -327,15 +331,57 @@ func (s *Store) LeasedCount(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+// defaultPruneTimeout is a generous timeout for prune deletes, which may scan
+// and lock more rows than a typical point-query. Larger than defaultStoreQueryTimeout
+// (5 s) because batches of 1000+ rows take more time under normal load.
+const defaultPruneTimeout = 30 * time.Second
+
+// PrunePublished deletes published records older than olderThan from outbox_events.
+// Batches the delete to at most limit rows so the lock hold time stays bounded.
+// Uses the idx_outbox_events_published_at partial index (migration 007) for an
+// efficient scan; without that index the query falls back to a sequential scan.
+// Applies defaultPruneTimeout (30 s) so a saturated DB does not block indefinitely.
+// Returns the number of rows deleted and any database error.
+func (s *Store) PrunePublished(ctx context.Context, olderThan time.Duration, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("outboxstore: PrunePublished limit must be positive (got %d)", limit)
+	}
+	if olderThan <= 0 {
+		return 0, fmt.Errorf("outboxstore: PrunePublished olderThan must be positive (got %s)", olderThan)
+	}
+	ctx, cancel := context.WithTimeout(ctx, defaultPruneTimeout)
+	defer cancel()
+	var deleted int64
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		tag, err := conn.Exec(ctx, `
+			DELETE FROM outbox_events
+			WHERE id IN (
+				SELECT id FROM outbox_events
+				WHERE published_at IS NOT NULL
+				  AND published_at < NOW() - make_interval(secs => $1)
+				LIMIT $2
+			)
+		`, olderThan.Seconds(), limit)
+		if err != nil {
+			return err
+		}
+		deleted = tag.RowsAffected()
+		return nil
+	})
+	return deleted, err
+}
+
 // ReprocessDeadLetters moves up to limit records from outbox_dead_letters back
 // to outbox_events, resetting attempts to 0 so they are retried from scratch.
 // Returns the number of records re-queued. Returns an error if limit <= 0.
-// The caller is responsible for supplying a context with an appropriate deadline —
-// this operation runs a CTE delete+insert and may be slow for large limit values.
+// Applies defaultPruneTimeout (30 s) internally so a saturated DB does not
+// block the caller indefinitely.
 func (s *Store) ReprocessDeadLetters(ctx context.Context, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, fmt.Errorf("outboxstore: limit must be positive (got %d)", limit)
 	}
+	ctx, cancel := context.WithTimeout(ctx, defaultPruneTimeout)
+	defer cancel()
 	var moved int
 	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
 		tag, err := conn.Exec(ctx, `

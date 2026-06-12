@@ -32,6 +32,11 @@ var (
 	OutboxUnmarshalErrorsTotal     *prometheus.CounterVec
 	OutboxMarkPublishedErrorsTotal *prometheus.CounterVec
 
+	// OversizedEventTypeLabelTotal counts calls where an event_type value exceeded
+	// maxEventTypeLabelLen and was replaced with "__oversized__". Alert when non-zero
+	// to detect misconfigured or adversarial producers generating unbounded label values.
+	OversizedEventTypeLabelTotal *prometheus.CounterVec
+
 	initOnce  sync.Once
 	metricsMu sync.RWMutex // guards all global metric vars for InitWithRegisterer concurrency
 )
@@ -44,6 +49,8 @@ const maxEventTypeLabelLen = 128
 // SanitizeEventType caps event_type to maxEventTypeLabelLen bytes and returns
 // "__oversized__" for inputs that exceed the limit. Exported so callers outside
 // this package (consumer.go, publisher.go) apply the same cap before metric calls.
+// Increments OversizedEventTypeLabelTotal when truncation occurs so operators can
+// detect misconfigured or adversarial producers via a non-zero counter rate.
 func SanitizeEventType(s string) string {
 	if utf8.RuneCountInString(s) == 0 {
 		return "unknown"
@@ -51,7 +58,17 @@ func SanitizeEventType(s string) string {
 	if len(s) <= maxEventTypeLabelLen {
 		return s
 	}
+	recordOversizedLabel()
 	return "__oversized__"
+}
+
+func recordOversizedLabel() {
+	metricsMu.RLock()
+	c := OversizedEventTypeLabelTotal
+	metricsMu.RUnlock()
+	if c != nil {
+		c.WithLabelValues().Inc()
+	}
 }
 
 // Init registers metrics using the default Prometheus registerer.
@@ -62,6 +79,10 @@ func Init(serviceName, buildVersion string) {
 		panic("platform-events: metrics.Init requires a non-empty serviceName")
 	}
 	initOnce.Do(func() {
+		// Acquire metricsMu so a concurrent InitWithRegisterer call (which also
+		// acquires it) cannot write globals simultaneously.
+		metricsMu.Lock()
+		defer metricsMu.Unlock()
 		initMetricsWithRegisterer(serviceName, buildVersion, prometheus.DefaultRegisterer)
 	})
 }
@@ -196,6 +217,12 @@ func initMetricsWithRegisterer(serviceName, buildVersion string, reg prometheus.
 	OutboxMarkPublishedErrorsTotal = factory.NewCounterVec(prometheus.CounterOpts{
 		Name:        "outbox_mark_published_errors_total",
 		Help:        "Total failures to mark an outbox record as published after successful SNS delivery. A non-zero rate causes duplicate delivery.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{})
+
+	OversizedEventTypeLabelTotal = factory.NewCounterVec(prometheus.CounterOpts{
+		Name:        "events_oversized_event_type_label_total",
+		Help:        "Total event_type values that exceeded the label length cap and were replaced with __oversized__. A non-zero rate indicates misconfigured or adversarial producers.",
 		ConstLabels: prometheus.Labels{"service": serviceName},
 	}, []string{})
 }

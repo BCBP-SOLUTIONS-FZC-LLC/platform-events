@@ -21,6 +21,13 @@ type Consumer interface {
 // Handler processes a single event message.
 // Returning non-nil skips message deletion; the message becomes visible after
 // the visibility timeout for retry.
+//
+// Context contract: the ctx passed to each handler has its cancellation signal
+// stripped (via context.WithoutCancel) so handlers run to completion during
+// graceful shutdown. As a consequence, ctx.Deadline() always returns a zero
+// time — handlers must set their own timeouts instead of relying on the
+// parent deadline. Cancellation is delivered only when the consumer's drain
+// timeout expires, after which the context is cancelled.
 type Handler func(ctx context.Context, env Envelope[json.RawMessage]) error
 
 // SQSConfig configures an SQS consumer.

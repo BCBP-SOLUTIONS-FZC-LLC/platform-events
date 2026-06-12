@@ -2,6 +2,8 @@
 package logger
 
 import (
+	"strings"
+
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -14,14 +16,18 @@ type ZapLogger struct {
 }
 
 // NewLogger creates a ZapLogger configured for the given environment.
-// env "production"/"prod" uses a production JSON encoder; anything else uses development mode.
+// Local/development environments ("dev", "development", "local") use a colored
+// console encoder. Everything else — including unknown values and staging /
+// pre-prod names — uses a JSON production encoder so log aggregators (Loki,
+// Fluentd) can parse the output correctly.
 func NewLogger(env string) (*ZapLogger, error) {
 	var cfg zap.Config
-	if env == "production" || env == "prod" {
-		cfg = zap.NewProductionConfig()
-	} else {
+	switch strings.ToLower(env) {
+	case "dev", "development", "local":
 		cfg = zap.NewDevelopmentConfig()
 		cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	default:
+		cfg = zap.NewProductionConfig()
 	}
 	l, err := cfg.Build()
 	if err != nil {

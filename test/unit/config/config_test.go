@@ -339,3 +339,107 @@ func TestLoadOTel_CustomEndpoint(t *testing.T) {
 	assert.Equal(t, "my-service", cfg.ServiceName)
 	assert.Equal(t, "collector:4317", cfg.ExporterEndpoint)
 }
+
+// ---------------------------------------------------------------------------
+// maskQueryParams (via OutboxConfigEnv.String with URL query-param password)
+// ---------------------------------------------------------------------------
+
+func TestOutboxConfigEnv_String_MasksURLQueryParamPassword(t *testing.T) {
+	cfg := config.OutboxConfigEnv{ //nolint:gosec
+		DatabaseURL: "postgres://user:pass@host/db?password=secret&sslmode=require",
+	}
+	s := cfg.String()
+	assert.NotContains(t, s, "secret", "password query param must be masked")
+	assert.Contains(t, s, "***", "masked value must appear in output")
+}
+
+func TestOutboxConfigEnv_String_MasksURLQueryParamPasswd(t *testing.T) {
+	cfg := config.OutboxConfigEnv{ //nolint:gosec
+		DatabaseURL: "postgres://user:pass@host/db?passwd=topsecret",
+	}
+	s := cfg.String()
+	assert.NotContains(t, s, "topsecret", "passwd query param must be masked")
+}
+
+// ---------------------------------------------------------------------------
+// LoadSQS: additional warning paths (WaitSeconds, Concurrency, MaxReceiveCount)
+// ---------------------------------------------------------------------------
+
+func TestLoadSQS_AllRemainingInvalidValuesProduceWarnings(t *testing.T) {
+	t.Setenv("SQS_QUEUE_URL", "https://sqs.us-east-1.amazonaws.com/123/q")
+	t.Setenv("SQS_MAX_MESSAGES", "")
+	t.Setenv("SQS_WAIT_SECONDS", "bad")
+	t.Setenv("SQS_VISIBILITY_TIMEOUT", "")
+	t.Setenv("SQS_CONCURRENCY", "bad")
+	t.Setenv("SQS_MAX_RECEIVE_COUNT", "bad")
+
+	cfg := config.LoadSQS()
+	assert.GreaterOrEqual(t, len(cfg.Warnings), 3,
+		"invalid WaitSeconds, Concurrency, and MaxReceiveCount should each produce a warning")
+
+	hasWait := false
+	hasConc := false
+	hasRecv := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "SQS_WAIT_SECONDS") {
+			hasWait = true
+		}
+		if strings.Contains(w, "SQS_CONCURRENCY") {
+			hasConc = true
+		}
+		if strings.Contains(w, "SQS_MAX_RECEIVE_COUNT") {
+			hasRecv = true
+		}
+	}
+	assert.True(t, hasWait, "expected warning for SQS_WAIT_SECONDS")
+	assert.True(t, hasConc, "expected warning for SQS_CONCURRENCY")
+	assert.True(t, hasRecv, "expected warning for SQS_MAX_RECEIVE_COUNT")
+}
+
+// ---------------------------------------------------------------------------
+// LoadOutbox: remaining invalid-value warning paths
+// ---------------------------------------------------------------------------
+
+func TestLoadOutbox_AllRemainingInvalidValuesProduceWarnings(t *testing.T) {
+	t.Setenv("OUTBOX_POLL_INTERVAL", "")
+	t.Setenv("OUTBOX_BATCH_SIZE", "")
+	t.Setenv("OUTBOX_MAX_ATTEMPTS", "")
+	t.Setenv("OUTBOX_CLAIM_LEASE_DURATION", "bad")
+	t.Setenv("OUTBOX_STARTUP_JITTER", "bad")
+	t.Setenv("OUTBOX_PUBLISH_CONCURRENCY", "bad")
+	t.Setenv("OUTBOX_PUBLISH_TIMEOUT", "bad")
+	t.Setenv("OUTBOX_DRAIN_TIMEOUT", "bad")
+	t.Setenv("DATABASE_URL", "")
+
+	cfg := config.LoadOutbox()
+	assert.GreaterOrEqual(t, len(cfg.Warnings), 5,
+		"invalid ClaimLeaseDuration, StartupJitter, PublishConcurrency, PublishTimeout, and DrainTimeout should each produce a warning")
+
+	hasLease := false
+	hasJitter := false
+	hasConc := false
+	hasTimeout := false
+	hasDrain := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "OUTBOX_CLAIM_LEASE_DURATION") {
+			hasLease = true
+		}
+		if strings.Contains(w, "OUTBOX_STARTUP_JITTER") {
+			hasJitter = true
+		}
+		if strings.Contains(w, "OUTBOX_PUBLISH_CONCURRENCY") {
+			hasConc = true
+		}
+		if strings.Contains(w, "OUTBOX_PUBLISH_TIMEOUT") {
+			hasTimeout = true
+		}
+		if strings.Contains(w, "OUTBOX_DRAIN_TIMEOUT") {
+			hasDrain = true
+		}
+	}
+	assert.True(t, hasLease, "expected warning for OUTBOX_CLAIM_LEASE_DURATION")
+	assert.True(t, hasJitter, "expected warning for OUTBOX_STARTUP_JITTER")
+	assert.True(t, hasConc, "expected warning for OUTBOX_PUBLISH_CONCURRENCY")
+	assert.True(t, hasTimeout, "expected warning for OUTBOX_PUBLISH_TIMEOUT")
+	assert.True(t, hasDrain, "expected warning for OUTBOX_DRAIN_TIMEOUT")
+}

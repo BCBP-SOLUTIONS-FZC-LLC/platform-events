@@ -64,6 +64,35 @@ func TestLogWarnings_WithWarnings(t *testing.T) {
 	})
 }
 
+func TestLogWarningsTo_EmptyWarnings_Noop(t *testing.T) {
+	// nil logger + empty warnings → no-op, no panic.
+	config.LogWarningsTo(nil, nil)
+	config.LogWarningsTo(nil, []string{})
+}
+
+func TestLogWarningsTo_NilLogger_FallsBackToStderr(t *testing.T) {
+	// nil logger falls back to stderr via LogWarnings — must not panic.
+	config.LogWarningsTo(nil, []string{"OUTBOX_POLL_INTERVAL: invalid, using default 5s"})
+}
+
+func TestLogWarningsTo_WithLogger_EmitsWarn(t *testing.T) {
+	// A real logger is used so warnings go through the structured log pipeline.
+	// Verify each warning is emitted as a WARN-level log entry.
+	logger := &mockWarnLogger{}
+	config.LogWarningsTo(logger, []string{"warning one", "warning two"})
+	assert.Equal(t, 2, logger.count, "expected two WARN entries, one per warning")
+}
+
+// mockWarnLogger captures Warn calls to verify LogWarningsTo routing.
+type mockWarnLogger struct {
+	count int
+}
+
+func (l *mockWarnLogger) Debug(_ string, _ map[string]any) {}
+func (l *mockWarnLogger) Info(_ string, _ map[string]any)  {}
+func (l *mockWarnLogger) Error(_ string, _ map[string]any) {}
+func (l *mockWarnLogger) Warn(_ string, _ map[string]any)  { l.count++ }
+
 func TestSQSConfigFromEnv_MapsFields(t *testing.T) {
 	env := config.SQSConfigEnv{
 		QueueURL:    "https://sqs.us-east-1.amazonaws.com/123/queue",

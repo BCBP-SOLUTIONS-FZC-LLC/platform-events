@@ -34,13 +34,14 @@ func TestOutboxRunner_EndToEnd(t *testing.T) {
 	mockPub := &fixtures.MockPublisher{}
 	pub := events.NewPublisherFromPort(mockPub)
 
-	runner := outbox.NewRunner(outbox.Config{
+	runner, err := outbox.NewRunner(outbox.Config{
 		Pool:         pool,
 		Publisher:    pub,
 		PollInterval: 100 * time.Millisecond,
 		BatchSize:    10,
 		MaxAttempts:  3,
 	})
+	require.NoError(t, err)
 
 	runnerCtx, runnerCancel := context.WithCancel(ctx)
 	defer func() {
@@ -55,7 +56,7 @@ func TestOutboxRunner_EndToEnd(t *testing.T) {
 		events.WithTraceID("trace-e2e"),
 	)
 
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
 		return outbox.Enqueue(ctx, tx, env)
 	})
 	require.NoError(t, err)
@@ -101,11 +102,12 @@ func TestOutboxEnqueue_TransactionRollback(t *testing.T) {
 	mockPub := &fixtures.MockPublisher{}
 	pub := events.NewPublisherFromPort(mockPub)
 
-	runner := outbox.NewRunner(outbox.Config{
+	runner, err := outbox.NewRunner(outbox.Config{
 		Pool:         pool,
 		Publisher:    pub,
 		PollInterval: 50 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	runnerCtx, runnerCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer runnerCancel()

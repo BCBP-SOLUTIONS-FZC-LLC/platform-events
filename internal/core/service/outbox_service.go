@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -97,9 +98,19 @@ func (s *OutboxService) Enqueue(ctx context.Context, tx pgx.Tx, env domain.Envel
 	if env.Source == "" {
 		return domain.ErrEnvelopeSourceRequired
 	}
+	if env.Timestamp.IsZero() {
+		return fmt.Errorf("outbox: Enqueue requires a non-zero Timestamp — use events.NewEnvelope to construct envelopes")
+	}
+	if strings.ContainsRune(env.ID, '\x00') || strings.ContainsRune(env.Type, '\x00') || strings.ContainsRune(env.Source, '\x00') {
+		return fmt.Errorf("outbox: envelope fields (ID, Type, Source) must not contain null bytes")
+	}
 	b, err := json.Marshal(env)
 	if err != nil {
 		return err
+	}
+	const maxEnvelopeBytes = 240 * 1024
+	if len(b) > maxEnvelopeBytes {
+		return fmt.Errorf("outbox: serialised envelope is %d bytes — exceeds safe SNS limit (%d bytes); reduce payload size", len(b), maxEnvelopeBytes)
 	}
 	record := domain.OutboxRecord{
 		ID:          env.ID,
@@ -278,13 +289,24 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 
 	var batchErr *domain.BatchError
 	if errors.As(err, &batchErr) {
-		failed := make(map[string]string, len(batchErr.Failures))
+		type failInfo struct {
+			msg       string
+			threshold int
+		}
+		failed := make(map[string]failInfo, len(batchErr.Failures))
 		for _, f := range batchErr.Failures {
-			failed[f.ID] = f.Message
+			// "TransportError" is the code used by publishChunk for transport-level
+			// failures (ThrottlingException, ServiceUnavailable, etc.). Treat it as
+			// retryable so it does not consume a retry slot prematurely.
+			threshold := s.maxAttempts
+			if f.Code == "TransportError" {
+				threshold = s.maxAttempts + 1
+			}
+			failed[f.ID] = failInfo{msg: f.Message, threshold: threshold}
 		}
 		for _, it := range items {
-			if msg, ok := failed[it.rec.ID]; ok {
-				s.markFailed(bookkeepCtx, it.rec, msg, s.maxAttempts)
+			if fi, ok := failed[it.rec.ID]; ok {
+				s.markFailed(bookkeepCtx, it.rec, fi.msg, fi.threshold)
 			} else {
 				s.markPublished(bookkeepCtx, it.rec, it.env)
 			}
@@ -421,12 +443,21 @@ func (s *OutboxService) ReprocessDeadLetters(ctx context.Context, limit int) (in
 	return s.store.ReprocessDeadLetters(ctx, limit)
 }
 
+// PrunePublished deletes published records older than olderThan from outbox_events.
+func (s *OutboxService) PrunePublished(ctx context.Context, olderThan time.Duration, limit int) (int64, error) {
+	return s.store.PrunePublished(ctx, olderThan, limit)
+}
+
 // truncateError caps an error string to maxLastErrorLen runes to prevent
 // unbounded growth of the last_error column in outbox_events.
 // Uses rune-safe slicing to avoid writing invalid UTF-8 to PostgreSQL.
+// The truncation marker ("…[truncated]", 12 runes) is included in the cap so
+// the total output never exceeds maxLastErrorLen runes.
 func truncateError(msg string) string {
+	const marker = "…[truncated]"
+	const markerLen = 12 // rune count of marker
 	if utf8.RuneCountInString(msg) <= maxLastErrorLen {
 		return msg
 	}
-	return string([]rune(msg)[:maxLastErrorLen]) + "…[truncated]"
+	return string([]rune(msg)[:maxLastErrorLen-markerLen]) + marker
 }

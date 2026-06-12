@@ -78,6 +78,9 @@ func WithSystemTenant() EnvelopeOpt {
 // NewEnvelope creates a new Envelope with UUID v7 ID and current UTC timestamp.
 // Pass WithTenantID and WithTraceID from the gincommon.RequestContext when
 // publishing from an HTTP handler.
+//
+// ID generation uses uuid.Must — it panics only if the OS random source is
+// exhausted, which is an unrecoverable system-level failure.
 func NewEnvelope[T any](eventType, source string, payload T, opts ...EnvelopeOpt) Envelope[T] {
 	env := Envelope[T]{
 		ID:        uuid.Must(uuid.NewV7()).String(),
