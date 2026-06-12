@@ -471,7 +471,10 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 			}
 			return combined
 		}
-		return err
+		// Wrap transport-level errors so the outbox service's failureThreshold()
+		// correctly identifies retryable failures (ThrottlingException, ServiceUnavailable)
+		// and uses maxAttempts+1 instead of maxAttempts, preventing premature dead-lettering.
+		return wrapIfRetryable(err)
 	}
 
 	// Build a set of failed IDs for O(1) lookup.

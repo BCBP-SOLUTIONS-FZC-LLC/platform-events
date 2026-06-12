@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -67,12 +68,40 @@ func maskDSN(dsn string) string {
 	if idx >= 0 {
 		rest := dsn[idx+len(sep):]
 		atIdx := strings.LastIndex(rest, "@")
-		if atIdx < 0 {
-			return dsn
+		// Mask the userinfo (user:password) section before "@".
+		if atIdx >= 0 {
+			dsn = dsn[:idx+len(sep)] + "***" + rest[atIdx:]
 		}
-		return dsn[:idx+len(sep)] + "***" + rest[atIdx:]
+		// Also mask any password= / passwd= appearing in URL query params,
+		// e.g. postgres://user:pass@host/db?password=extra prevents credential leak.
+		if qIdx := strings.Index(dsn, "?"); qIdx >= 0 {
+			dsn = dsn[:qIdx+1] + maskQueryParams(dsn[qIdx+1:])
+		}
+		return dsn
 	}
 	return maskKeyValueDSN(dsn)
+}
+
+// maskQueryParams replaces the value of any key named "password" or "passwd" in
+// an ampersand-delimited query string (e.g. "host=h&password=secret&sslmode=require").
+// Percent-decoded key names are compared so that %70assword=secret is also masked.
+func maskQueryParams(query string) string {
+	parts := strings.Split(query, "&")
+	for i, part := range parts {
+		eqIdx := strings.Index(part, "=")
+		if eqIdx < 0 {
+			continue
+		}
+		key := part[:eqIdx]
+		if decoded, err := url.QueryUnescape(key); err == nil {
+			key = decoded
+		}
+		switch strings.ToLower(key) {
+		case "password", "passwd":
+			parts[i] = part[:eqIdx+1] + "***"
+		}
+	}
+	return strings.Join(parts, "&")
 }
 
 func maskKeyValueDSN(dsn string) string {

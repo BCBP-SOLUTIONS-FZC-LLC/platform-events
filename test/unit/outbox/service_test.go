@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -105,6 +106,9 @@ func (s *mockStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastE
 
 func (s *mockStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *mockStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
+func (s *mockStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
+	return 0, nil
+}
 
 func (s *mockStore) PendingCount(_ context.Context) (int64, error) {
 	s.mu.Lock()
@@ -187,6 +191,42 @@ func TestOutboxService_PublishBatch_Sequential_PartialBatchError(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, store.published[envOK.ID])
 	assert.Contains(t, store.failed, envFail.ID)
+}
+
+// TestOutboxService_PublishBatch_Sequential_TransportError_UsesMaxAttemptsPlus1 verifies
+// that a BatchError failure with Code="TransportError" (e.g. SNS throttle wrapped by
+// publishChunk) uses maxAttempts+1 as the MarkFailed threshold so transient transport
+// failures do not consume a retry slot and prematurely dead-letter healthy records.
+func TestOutboxService_PublishBatch_Sequential_TransportError_UsesMaxAttemptsPlus1(t *testing.T) {
+	const maxAttempts = 5
+	var capturedThresholds []int
+	capture := &captureMaxAttemptsStore{
+		mockStore: newMockStore(),
+		onFail: func(_ string, threshold int) {
+			capturedThresholds = append(capturedThresholds, threshold)
+		},
+	}
+
+	env := domain.NewEnvelope("throttled.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "acme"
+	payload, _ := json.Marshal(env)
+	capture.records = []domain.OutboxRecord{{ID: env.ID, EventType: env.Type, Payload: payload}}
+
+	pub := &domainBatchErrPublisher{
+		err: &domain.BatchError{
+			Failures: []domain.BatchFailure{
+				{ID: env.ID, Code: "TransportError", Message: "ThrottlingException"},
+			},
+		},
+	}
+	svc := service.NewOutboxService(capture, pub, nil, nil, maxAttempts, 1, 0)
+
+	err := svc.PublishBatch(context.Background(), 10)
+	require.NoError(t, err)
+
+	require.Len(t, capturedThresholds, 1, "MarkFailed must be called exactly once")
+	assert.Equal(t, maxAttempts+1, capturedThresholds[0],
+		"TransportError must use maxAttempts+1 to avoid consuming a retry slot")
 }
 
 func TestOutboxService_PublishBatch_Success(t *testing.T) {
@@ -1199,4 +1239,157 @@ func TestOutboxService_PublishBatch_PanicRecovered_MarkFailedError_Logged(t *tes
 		}
 	}
 	assert.True(t, found, "expected ERROR log when MarkFailed fails after panic recovery")
+}
+
+// ----------------------------
+// OutboxService.PrunePublished
+// ----------------------------
+
+// pruneStore overrides PrunePublished to return configurable results.
+type pruneStore struct {
+	*mockStore
+	n   int64
+	err error
+}
+
+func (s *pruneStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
+	return s.n, s.err
+}
+
+func TestOutboxService_PrunePublished_Success(t *testing.T) {
+	store := &pruneStore{mockStore: newMockStore(), n: 15}
+	pub := &fixtures.MockPublisher{}
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
+
+	n, err := svc.PrunePublished(context.Background(), 24*time.Hour, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(15), n)
+}
+
+func TestOutboxService_PrunePublished_Zero(t *testing.T) {
+	store := &pruneStore{mockStore: newMockStore(), n: 0}
+	pub := &fixtures.MockPublisher{}
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
+
+	n, err := svc.PrunePublished(context.Background(), 7*24*time.Hour, 500)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n)
+}
+
+func TestOutboxService_PrunePublished_Error(t *testing.T) {
+	store := &pruneStore{mockStore: newMockStore(), err: errors.New("db: prune failed")}
+	pub := &fixtures.MockPublisher{}
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
+
+	_, err := svc.PrunePublished(context.Background(), 48*time.Hour, 200)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "db: prune failed")
+}
+
+// ----------------------------
+// Enqueue: missing-branch validation tests
+// ----------------------------
+
+func TestOutboxService_Enqueue_ZeroTimestamp_ReturnsError(t *testing.T) {
+	store := newMockStore()
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, nil, nil, 5, 1, 0)
+
+	var env domain.Envelope[json.RawMessage]
+	env.ID = "some-id"
+	env.Type = "order.placed"
+	env.Source = "billing"
+	env.Payload = json.RawMessage(`{}`)
+	// env.Timestamp is zero value
+
+	err := svc.Enqueue(context.Background(), noopTx{}, env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-zero Timestamp")
+}
+
+func TestOutboxService_Enqueue_NullByte_ReturnsError(t *testing.T) {
+	store := newMockStore()
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, nil, nil, 5, 1, 0)
+
+	env := domain.NewEnvelope("ok.type", "billing", json.RawMessage(`{}`))
+	env.ID = "id-with-\x00-null"
+
+	err := svc.Enqueue(context.Background(), noopTx{}, env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "null bytes")
+}
+
+func TestOutboxService_Enqueue_OversizedPayload_ReturnsError(t *testing.T) {
+	store := newMockStore()
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, nil, nil, 5, 1, 0)
+
+	// Construct a payload that exceeds 240 KB after JSON marshalling.
+	bigPayload := json.RawMessage(`"` + strings.Repeat("x", 250*1024) + `"`)
+	env := domain.NewEnvelope("big.event", "billing", bigPayload)
+
+	err := svc.Enqueue(context.Background(), noopTx{}, env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds safe SNS limit")
+}
+
+// ----------------------------
+// PublishBatch: parallel path panic recovery with logger
+// ----------------------------
+
+// TestOutboxService_PublishBatch_Parallel_Panic_WithLogger verifies the goroutine-pool
+// panic-recovery path when publishConcurrency > 1. The panic must be caught, logged at
+// ERROR, and the record marked failed — matching the sequential path but via the goroutine
+// defer/recover block in PublishBatch (not publishClaimedSequential).
+func TestOutboxService_PublishBatch_Parallel_Panic_WithLogger(t *testing.T) {
+	store := newMockStore()
+	pub := &panicPortPublisher{}
+	logger := &fixtures.MockLogger{}
+
+	env := domain.NewEnvelope("parallel.panic", "svc", json.RawMessage(`{}`))
+	payload, _ := json.Marshal(env)
+	store.records = []domain.OutboxRecord{{ID: env.ID, EventType: env.Type, Payload: payload}}
+
+	svc := service.NewOutboxService(store, pub, logger, nil, 5, 2, 0) // concurrency=2 → goroutine pool
+	err := svc.PublishBatch(context.Background(), 10)
+	require.NoError(t, err)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	require.Contains(t, store.failed, env.ID, "panicked record must be marked failed")
+	assert.Contains(t, store.failed[env.ID], "panic")
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "ERROR" && strings.Contains(e.Message, "panic recovered") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ERROR log for panic recovery in goroutine pool")
+}
+
+// TestOutboxService_PublishBatch_Parallel_Panic_MarkFailedError_WithLogger covers the
+// markErr != nil branch inside the goroutine panic recovery when MarkFailed fails.
+func TestOutboxService_PublishBatch_Parallel_Panic_MarkFailedError_WithLogger(t *testing.T) {
+	store := &markFailedErrorStore{
+		mockStore: newMockStore(),
+		mfErr:     errors.New("mark failed error"),
+	}
+	pub := &panicPortPublisher{}
+	logger := &fixtures.MockLogger{}
+
+	env := domain.NewEnvelope("parallel.panic.mf", "svc", json.RawMessage(`{}`))
+	payload, _ := json.Marshal(env)
+	store.records = []domain.OutboxRecord{{ID: env.ID, EventType: env.Type, Payload: payload}}
+
+	svc := service.NewOutboxService(store, pub, logger, nil, 5, 2, 0) // concurrency=2
+	require.NoError(t, svc.PublishBatch(context.Background(), 10))
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "ERROR" && strings.Contains(e.Message, "failed to mark record failed after panic") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected ERROR log when MarkFailed fails after goroutine panic")
 }

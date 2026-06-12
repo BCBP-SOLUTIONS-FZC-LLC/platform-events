@@ -106,15 +106,15 @@ External dependencies (private modules):
 
 - **Publisher**
   - `Publisher` interface — `Publish(ctx, Envelope[json.RawMessage]) error`; `PublishBatch(ctx, []Envelope[json.RawMessage]) error`
-  - `NewSNSPublisher(cfg SNSConfig, opts ...PublisherOption) (Publisher, error)` — constructs the SNS implementation; validates topic ARN format at construction time (panics if empty — prevents invalid label cardinality in metrics)
-  - `SNSConfig{TopicARN, Region, Logger, Tracer, Metrics}` — `TopicARN` required. `Logger` accepts any `port.Logger` implementation — pass the `ZapLogger` from `platform-gincommon` directly.
+  - `NewSNSPublisher(cfg SNSConfig, opts ...PublisherOption) (Publisher, error)` — constructs the SNS implementation; returns an error if `TopicARN` is empty (prevents invalid label cardinality in metrics)
+  - `SNSConfig{TopicARN, Region, EndpointURL, Logger}` — `TopicARN` required. `Logger` accepts any `port.Logger` implementation — pass the `ZapLogger` from `platform-gincommon` directly.
   - `PublisherOption` — `WithMessageGroupID(fn)`, `WithMessageDeduplicationID(fn)` (FIFO topics), `WithAttributes(map)`
   - `MockPublisher` (in `pkg/events/mock`) — in-memory, thread-safe; `Published() []Envelope[json.RawMessage]`
 
 - **Consumer**
   - `Consumer` interface — `Start(ctx) error`; `Stop() error`
   - `NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Consumer, error)` — constructs the SQS long-poll loop
-  - `SQSConfig{QueueURL, Region, MaxMessages, WaitSeconds, Logger, Tracer, Metrics}` — `QueueURL` required; `MaxMessages` default 10; `WaitSeconds` default 20. `Logger` accepts any `port.Logger` — pass `platform-gincommon`'s `ZapLogger` directly.
+  - `SQSConfig{QueueURL, Region, EndpointURL, MaxMessages, WaitSeconds, Logger}` — `QueueURL` required; `MaxMessages` default 10; `WaitSeconds` default 20. `Logger` accepts any `port.Logger` — pass `platform-gincommon`'s `ZapLogger` directly.
   - `Handler` — `func(ctx context.Context, env Envelope[json.RawMessage]) error`; returning a non-nil error skips deletion (message becomes visible again after visibility timeout). The `ctx` passed to each handler has a `platform-gincommon`-compatible `RequestContext` injected (populated from `env.TenantID`, `env.TraceID`) so downstream calls to pgcommon pool helpers (e.g. `pool.WithTx`) pick up the correct GUC values automatically.
   - `ConsumerOption` — `WithConcurrency(n)` (default 1), `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`
   - `MockConsumer` (in `pkg/events/mock`) — in-memory queue; `Inject(env)` delivers messages synchronously
@@ -130,22 +130,45 @@ External dependencies (private modules):
 - `Runner{Pool, Publisher, Logger, PollInterval, BatchSize, MaxAttempts}` — configure the outbox runner. `Pool` is a `*pgcommon.Pool` from `platform-pgcommon`; `Publisher` are **required**.
 - `Runner.Start(ctx) error` — start the polling loop; blocks until `ctx` is cancelled.
 - `Runner.Stop() error` — graceful drain; waits for in-flight batch to complete before returning.
+- `Runner.PrunePublished(ctx, olderThan time.Duration, limit int) (int64, error)` — deletes published records older than `olderThan` from `outbox_events` (up to `limit` rows per call) to prevent unbounded table growth. Call periodically from a scheduled job. Applies a 30 s internal DB timeout.
+- `Runner.ReprocessDeadLetters(ctx, limit int) (int, error)` — moves up to `limit` records from `outbox_dead_letters` back to `outbox_events` for retry; applies a 30 s internal DB timeout.
 - `Enqueue(ctx, tx pgx.Tx, env Envelope[json.RawMessage]) error` — insert a serialised envelope into the `outbox_events` table within the caller's transaction. No publish happens at insert time — the runner delivers asynchronously. Callers should pass the `pgx.Tx` obtained from `pgcommon.RunInTx` so the enqueue and the business-logic write commit or roll back as a single unit.
-- `ApplySchema(ctx, runner *migrate.Runner) error` — convenience wrapper that calls `platform-pgcommon`'s `migrate.Runner` to apply the embedded `pkg/outbox/migrations/` SQL files (`001_create_outbox_events.up.sql`, `002_create_outbox_dead_letters.up.sql`). Call once at service startup before `Runner.Start`.
+- `ApplySchema(ctx, runner *migrate.Runner) error` — convenience wrapper that calls `platform-pgcommon`'s `migrate.Runner` to apply the embedded `pkg/outbox/migrations/` SQL files (`001`–`007`). Call once at service startup before `Runner.Start`.
 - Schema: `outbox_events(id UUID PK, event_type TEXT, payload JSONB, tenant_id TEXT, trace_id TEXT, attempts INT DEFAULT 0, last_error TEXT, created_at TIMESTAMPTZ, scheduled_at TIMESTAMPTZ, published_at TIMESTAMPTZ)`
 
 **Typical wiring with platform-pgcommon:**
 ```go
+// 0. Logger — call Sync() on shutdown to flush buffered entries.
+logger, _ := logger.NewLogger(os.Getenv("APP_ENV"))
+defer func() { _ = logger.Sync() }()
+
 // 1. Apply outbox schema via pgcommon migrate runner
-migrateRunner := migrate.NewRunner(migrate.Config{DSN: cfg.DatabaseURL, Logger: logger})
+migrateRunner := &migrate.Runner{DSN: cfg.DatabaseURL, Logger: logger}
 outbox.ApplySchema(ctx, migrateRunner)
 
-// 2. Construct outbox runner with pgcommon pool
-pool, _ := pgcommon.NewPool(ctx, pgcommon.ConfigFromEnv())
-runner := outbox.NewRunner(outbox.Config{Pool: pool, Publisher: snsPublisher, Logger: logger})
-go runner.Start(ctx)
+// 2. Load config and log any warnings via the structured logger (preferred over LogWarnings).
+outboxEnv := config.LoadOutbox()
+config.LogWarningsTo(logger, outboxEnv.Warnings) // falls back to stderr when logger is nil
 
-// 3. Enqueue inside a business transaction (pgcommon.RunInTx)
+// 3. Construct outbox runner with pgcommon pool.
+// NewRunner returns an error for misconfigured ClaimLeaseDuration.
+pool, _ := pgcommon.NewPool(ctx, pgcommon.ConfigFromEnv())
+runner, err := outbox.NewRunner(outbox.Config{Pool: pool, Publisher: snsPublisher, Logger: logger})
+if err != nil {
+    log.Fatal(err)
+}
+
+// 3. Wire OS signals so SIGTERM/SIGINT trigger graceful shutdown.
+ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+defer stop()
+
+go func() { _ = runner.Start(ctx) }()
+
+// 4. Wait for termination, then drain in-flight messages.
+<-ctx.Done()
+_ = runner.Stop()
+
+// 5. Enqueue inside a business transaction (pgcommon.RunInTx)
 pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
     _ = repo.SaveUser(ctx, tx, user)           // business write
     return outbox.Enqueue(ctx, tx, envelope)   // event write — same transaction
@@ -233,8 +256,9 @@ HMAC keys must be ≥ 32 bytes; `Sign` returns an error (not a panic) if the key
 - `events_consumed_total{service, queue, event_type, status}` — counter
 - `events_consume_duration_seconds{service, queue, event_type}` — histogram
 - `outbox_pending_total{service}` — gauge (set each poll cycle)
-- `outbox_published_total{service, status}` — counter
-- `outbox_attempts_total{service}` — counter
+- `outbox_published_total{service, event_type, status}` — counter
+- `outbox_attempts_total{service, event_type}` — counter
+- `events_oversized_event_type_label_total{service}` — counter; incremented by `SanitizeEventType` when an `event_type` value exceeds 128 bytes and is replaced with `"__oversized__"`; alert on `rate() > 0`
 
 `InitWithRegisterer(serviceName, buildVersion, prometheus.Registerer)` — for isolated test registries; bypasses `sync.Once`.
 

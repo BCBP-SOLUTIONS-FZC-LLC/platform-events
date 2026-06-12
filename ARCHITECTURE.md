@@ -159,6 +159,32 @@ When an on-call alert fires on `outbox_dead_letters_total`, the fix is on the **
 | `events_consumed_total{status=malformed}` > 0 | Producer publishing invalid JSON or wrong topic/queue pair | Dead-lettered messages in SQS DLQ | Check producer serialisation; verify SQS filter policies |
 | SQS DLQ depth growing | Handler consistently failing after `MaxReceiveCount` retries | SQS DLQ message bodies; handler logs | Fix handler; redrive DLQ |
 
+### `outbox_events` table pruning
+
+Published records are marked with `published_at` but **never deleted automatically**. Without periodic pruning, `outbox_events` grows unboundedly. Use `Runner.PrunePublished`:
+
+```go
+// Prune published records older than 7 days in batches of 1000.
+// Call daily from a maintenance goroutine or scheduled job.
+n, err := runner.PrunePublished(ctx, 7*24*time.Hour, 1000)
+```
+
+Choose `olderThan` to exceed the longest consumer idempotency deduplication window. 7 days is a safe default for most workloads. Loop until 0 rows are returned to fully drain accumulated records on first install.
+
+### Migration 003 — production upgrade runbook
+
+Migration 003 (`003_optimize_outbox_index.up.sql`) creates a composite index on `(scheduled_at, id) WHERE published_at IS NULL`. The migrate runner executes inside a transaction, so `CREATE INDEX CONCURRENTLY` cannot be used. On a table with many rows this acquires an `ACCESS EXCLUSIVE` lock and blocks all reads/writes for the duration of the index build.
+
+**Before upgrading past v1.1.0 on a non-empty table:**
+1. Run manually outside a transaction (non-blocking):
+   ```sql
+   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_outbox_events_scheduled_at_id
+       ON outbox_events (scheduled_at, id) WHERE published_at IS NULL;
+   ```
+2. Then run `outbox.ApplySchema` — the runner will skip migration 003 because the index already exists.
+
+If `outbox_events` is empty at upgrade time (e.g. new service), the normal `ApplySchema` call is safe with no manual steps.
+
 ### Dead-letter table retention
 
 `outbox_dead_letters` has no automatic TTL — it grows unbounded until cleared. Services must schedule periodic cleanup to prevent table bloat. Recommended strategies:
@@ -190,7 +216,7 @@ The library is organised in concentric Clean Architecture layers. Inner layers h
 graph TD
     subgraph pub["Public API  —  pkg/"]
         events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
-        outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop\nEnqueue · ApplySchema · ReprocessDeadLetters"]
+        outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · ReprocessDeadLetters · PrunePublished"]
     end
 
     subgraph cli["CLI  —  cmd/"]
@@ -200,13 +226,13 @@ graph TD
     subgraph adapters["Adapters  —  internal/adapter/outbound/"]
         sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption\nwrapIfRetryable"]
         sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nvisibility extension · drain\nper-call receive timeout"]
-        outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed\nLeasedCount · ReprocessDeadLetters"]
-        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal"]
+        outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed\nLeasedCount · ReprocessDeadLetters · PrunePublished"]
+        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal\nOversizedEventTypeLabelTotal"]
         logger_adp["logger\nZapLogger → port.Logger\n(map-based fields; gincommon-compatible)"]
     end
 
     subgraph core["Core  —  internal/core/"]
-        port_pkg["port\nPublisher · Consumer · Handler\nLogger · Clock\nOutboxStore · LeasedCount · ReprocessDeadLetters\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
+        port_pkg["port\nPublisher · Consumer · Handler\nLogger · Clock\nOutboxStore · LeasedCount · ReprocessDeadLetters · PrunePublished\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
         domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge\nErrRetryable · RetryableError"]
         service_pkg["service\nOutboxService · HMACService\nSign · Verify\nLeasedCount · ReprocessDeadLetters"]
     end
@@ -348,12 +374,15 @@ graph LR
 | Symbol | Description |
 |--------|-------------|
 | `Config` | `Pool *pgcommon.Pool`, `Publisher`, `Logger`, `PollInterval` (5s), `BatchSize` (50), `MaxAttempts` (5), `ClaimLeaseDuration` (10 min), `PublishConcurrency` (1 — SNS `PublishBatch` path; `> 1` parallel per-record `Publish`), `PublishTimeout` (10s), `DrainTimeout` (30s), `StartupJitter` (0) |
-| `NewRunner(cfg)` | Constructs the outbox runner; applies defaults; panics if `Publisher` nil or both `Pool` and `Store` nil |
+| `NewRunner(cfg) (*Runner, error)` | Constructs the outbox runner; applies defaults; returns an error if `ClaimLeaseDuration` is too short for the configured `BatchSize × PublishTimeout`; panics if `Publisher` nil or both `Pool` and `Store` nil (programming errors) |
 | `Runner.Start(ctx)` | Starts the poll loop (immediate first poll, then per `PollInterval`); exponential backoff (1s→30s) on poll-cycle failure; blocks until `ctx` is cancelled |
 | `Runner.Stop()` | Graceful drain; waits up to `DrainTimeout` for the in-flight batch, then returns a non-nil error if it did not finish |
+| `Runner.Ready() <-chan struct{}` | Returns a channel closed after the first successful poll cycle; use to gate Kubernetes readiness probes — a closed channel confirms the DB connection is healthy and the outbox schema exists |
 | `Runner.ReprocessDeadLetters(ctx, limit)` | Moves up to `limit` records from `outbox_dead_letters` back to `outbox_events`, resetting attempt counters for redelivery; returns the count requeued |
+| `Runner.PrunePublished(ctx, olderThan, limit)` | Deletes published records older than `olderThan` from `outbox_events` (batched to `limit` rows). Call periodically (e.g. daily) to prevent unbounded table growth; choose `olderThan ≥` the longest consumer idempotency window (minimum 7 days is safe for most workloads) |
 | `Enqueue(ctx, tx pgx.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; validates non-empty `ID`/`Type`/`Source`, non-zero `Timestamp`, and absence of null bytes in string fields; rejects payloads > 240 KB |
-| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`006` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default) |
+| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`007` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
+| `MigrationsTable` | Exported constant (`"outbox_migrations"`) — the golang-migrate tracking table used by `ApplySchema`; isolated from the consuming service's `schema_migrations` to prevent version-number collisions |
 
 ---
 
@@ -621,8 +650,8 @@ graph LR
         metrics_init["pkg/events.Init\nregisters Prometheus metrics"]
         sns_new["pkg/events.NewSNSPublisher\nreturns error on empty or invalid TopicARN"]
         sqs_new["pkg/events.NewSQSConsumer\ninjects GUCSet · links OTel trace"]
-        outbox_new["pkg/outbox.NewRunner\nrequires *pgcommon.Pool"]
-        apply_schema["pkg/outbox.ApplySchema\nembedded SQL migrations"]
+        outbox_new["pkg/outbox.NewRunner\nrequires *pgcommon.Pool\nreturns (*Runner, error)"]
+        apply_schema["pkg/outbox.ApplySchema\nembedded SQL migrations\ntable: outbox_migrations"]
         enqueue["pkg/outbox.Enqueue\nINSERT inside caller's pgx.Tx"]
     end
 

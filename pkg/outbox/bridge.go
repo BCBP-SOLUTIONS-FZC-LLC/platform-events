@@ -60,9 +60,12 @@ func (b *publisherBridge) PublishBatch(ctx context.Context, envs []domain.Envelo
 			Timestamp:     e.Timestamp,
 			Payload:       e.Payload,
 		}
-		metrics.RecordOutboxAttempt(e.Type)
 	}
 	err := b.pub.PublishBatch(ctx, pubEnvs)
+
+	// Record metrics post-call so attempt and published counters are always
+	// consistent: a panicking publisher leaves both at 0 rather than creating a
+	// permanent mismatch (attempts > published{success+error}) on a Grafana dashboard.
 
 	// For partial failures (*events.BatchError), record per-message status so
 	// outbox_published_total accurately reflects which messages were delivered.
@@ -73,6 +76,7 @@ func (b *publisherBridge) PublishBatch(ctx context.Context, envs []domain.Envelo
 			failedIDs[f.ID] = struct{}{}
 		}
 		for _, e := range envs {
+			metrics.RecordOutboxAttempt(e.Type)
 			if _, failed := failedIDs[e.ID]; failed {
 				metrics.RecordOutboxPublished(e.Type, "error")
 			} else {
@@ -87,6 +91,7 @@ func (b *publisherBridge) PublishBatch(ctx context.Context, envs []domain.Envelo
 		status = "error"
 	}
 	for _, e := range envs {
+		metrics.RecordOutboxAttempt(e.Type)
 		metrics.RecordOutboxPublished(e.Type, status)
 	}
 	return err

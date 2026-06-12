@@ -106,9 +106,11 @@ func (outboxMetricsAdapter) RecordUnmarshalError()     { metrics.RecordOutboxUnm
 func (outboxMetricsAdapter) RecordMarkPublishedError() { metrics.RecordOutboxMarkPublishedError() }
 
 // NewRunner constructs a Runner from the provided Config.
-// Panics if Publisher is nil, or if both Store and Pool are nil.
-// Applies defaults for zero-value fields.
-func NewRunner(cfg Config) *Runner {
+// Returns an error if ClaimLeaseDuration is too short to prevent duplicate
+// delivery (must be ≥ BatchSize×PublishTimeout+1m when PublishTimeout > 0).
+// Panics if Publisher is nil, or if both Store and Pool are nil — those are
+// programming errors, not operator configuration mistakes.
+func NewRunner(cfg Config) (*Runner, error) {
 	if cfg.Publisher == nil {
 		panic("outbox: Config.Publisher is required but was nil")
 	}
@@ -141,14 +143,23 @@ func NewRunner(cfg Config) *Runner {
 	if effectiveLease <= 0 {
 		effectiveLease = 10 * time.Minute
 	}
+	const minLeaseFallback = 30 * time.Second
 	if cfg.PublishTimeout > 0 {
 		minLease := time.Duration(cfg.BatchSize)*cfg.PublishTimeout + time.Minute
 		if effectiveLease < minLease {
-			panic(fmt.Sprintf(
+			return nil, fmt.Errorf(
 				"outbox: ClaimLeaseDuration (%s) is too short — must be at least BatchSize×PublishTimeout+1m (%d×%s+1m = %s) to prevent duplicate delivery",
 				effectiveLease, cfg.BatchSize, cfg.PublishTimeout, minLease,
-			))
+			)
 		}
+	} else if effectiveLease < minLeaseFallback {
+		// PublishTimeout is disabled, so we cannot compute a precise minimum lease.
+		// Enforce a 30s floor to prevent near-instant lease expiry that would cause
+		// concurrent runners to re-claim in-flight records and produce duplicates.
+		return nil, fmt.Errorf(
+			"outbox: ClaimLeaseDuration (%s) is too short — minimum is %s when PublishTimeout is disabled",
+			effectiveLease, minLeaseFallback,
+		)
 	}
 
 	var store port.OutboxStore
@@ -178,7 +189,7 @@ func NewRunner(cfg Config) *Runner {
 		cancel:  func() {}, // noop before first Start()
 		doneCh:  initialDone,
 		readyCh: make(chan struct{}),
-	}
+	}, nil
 }
 
 // Start runs the poll loop until ctx is cancelled or Stop is called. Blocks.
@@ -351,9 +362,25 @@ func (r *Runner) Ready() <-chan struct{} {
 
 // ReprocessDeadLetters moves up to limit records from outbox_dead_letters back
 // to outbox_events for redelivery, resetting their attempt counters.
+// Applies a 30 s internal DB timeout so a saturated database does not block indefinitely.
 // Returns the number of records re-queued and any database error.
 func (r *Runner) ReprocessDeadLetters(ctx context.Context, limit int) (int, error) {
 	return r.svc.ReprocessDeadLetters(ctx, limit)
+}
+
+// PrunePublished deletes published records from outbox_events that are older than
+// olderThan to prevent unbounded table growth. Batches the delete to at most limit
+// rows per call to keep lock hold time bounded.
+//
+// Call periodically from a scheduled job or maintenance endpoint:
+//
+//	n, err := runner.PrunePublished(ctx, 7*24*time.Hour, 1000)
+//
+// Choose olderThan to exceed the longest idempotency deduplication window of any
+// downstream consumer. A safe minimum for most workloads is 7 days.
+// Returns the number of rows deleted and any database error.
+func (r *Runner) PrunePublished(ctx context.Context, olderThan time.Duration, limit int) (int64, error) {
+	return r.svc.PrunePublished(ctx, olderThan, limit)
 }
 
 // Stop signals the runner to stop and waits up to DrainTimeout for the current

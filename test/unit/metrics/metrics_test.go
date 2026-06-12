@@ -5,6 +5,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	internalmetics "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
@@ -150,6 +151,28 @@ func TestSanitizeEventType_OversizedString(t *testing.T) {
 	oversized := "event.type." + string(make([]byte, 150)) // creates a 161-byte string
 	result := internalmetics.SanitizeEventType(oversized)
 	assert.Equal(t, "__oversized__", result)
+}
+
+func TestSanitizeEventType_OversizedCounter_Increments(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	internalmetics.InitWithRegisterer("oversized-counter-test", "v0.0.15", reg)
+
+	oversized := "iam.user.created." + string(make([]byte, 200))
+	result := internalmetics.SanitizeEventType(oversized)
+	assert.Equal(t, "__oversized__", result)
+
+	// Gather metrics from the isolated registry and verify the counter is non-zero.
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "events_oversized_event_type_label_total" {
+			found = true
+			require.Len(t, mf.GetMetric(), 1)
+			assert.Equal(t, float64(1), mf.GetMetric()[0].GetCounter().GetValue())
+		}
+	}
+	assert.True(t, found, "events_oversized_event_type_label_total counter not registered")
 }
 
 // ----------------------------

@@ -9,7 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
@@ -38,6 +41,9 @@ func (s *stubStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, reaso
 func (s *stubStore) PendingCount(_ context.Context) (int64, error)              { return 0, nil }
 func (s *stubStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *stubStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
+func (s *stubStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
+	return 0, nil
+}
 
 var _ port.OutboxStore = (*stubStore)(nil)
 
@@ -169,4 +175,75 @@ func TestReleaseStranded_ThresholdIsMaxAttemptsPlus1(t *testing.T) {
 func TestPanicErr_Error(t *testing.T) {
 	e := &panicErr{msg: "something exploded"}
 	assert.Equal(t, "something exploded", e.Error())
+}
+
+// errPublisher returns a configurable error from Publish.
+type errPublisher struct{ err error }
+
+func (p *errPublisher) Publish(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+	return p.err
+}
+func (p *errPublisher) PublishBatch(_ context.Context, _ []domain.Envelope[json.RawMessage]) error {
+	return p.err
+}
+
+var _ port.Publisher = (*errPublisher)(nil)
+
+// mockLoggerWB is a minimal port.Logger that records Warn calls.
+type mockLoggerWB struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (l *mockLoggerWB) Debug(_ string, _ map[string]any) {}
+func (l *mockLoggerWB) Info(_ string, _ map[string]any)  {}
+func (l *mockLoggerWB) Warn(msg string, _ map[string]any) {
+	l.mu.Lock()
+	l.entries = append(l.entries, "WARN:"+msg)
+	l.mu.Unlock()
+}
+func (l *mockLoggerWB) Error(msg string, _ map[string]any) {
+	l.mu.Lock()
+	l.entries = append(l.entries, "ERROR:"+msg)
+	l.mu.Unlock()
+}
+
+// TestPublishRecord_UnmarshalError covers the json.Unmarshal failure branch in publishRecord.
+func TestPublishRecord_UnmarshalError(t *testing.T) {
+	store := newStubStore()
+	svc := NewOutboxService(store, stubPublisher{}, nil, nil, 5, 2, 0)
+
+	rec := domain.OutboxRecord{ID: "bad-id", EventType: "x.y", Payload: []byte("not-json")}
+
+	bookkeepCtx := context.Background()
+	svc.publishRecord(context.Background(), bookkeepCtx, rec)
+
+	assert.Contains(t, store.failed, "bad-id",
+		"publishRecord must mark record failed when payload is not valid JSON")
+}
+
+// TestPublishRecord_PublishError_WithLogger covers the logger.Warn branch in publishRecord
+// when the publisher returns an error and a logger is configured.
+func TestPublishRecord_PublishError_WithLogger(t *testing.T) {
+	store := newStubStore()
+	logger := &mockLoggerWB{}
+	svc := NewOutboxService(store, &errPublisher{err: errors.New("sns down")}, logger, nil, 5, 2, 0)
+
+	env := domain.NewEnvelope("pub.err", "svc", json.RawMessage(`{}`))
+	payload, _ := json.Marshal(env)
+	rec := domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload}
+
+	svc.publishRecord(context.Background(), context.Background(), rec)
+
+	assert.Contains(t, store.failed, env.ID,
+		"publishRecord must mark record failed on publish error")
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
+	found := false
+	for _, e := range logger.entries {
+		if strings.Contains(e, "WARN") && strings.Contains(e, "publish failed") {
+			found = true
+		}
+	}
+	assert.True(t, found, "publishRecord must log a WARN when publish fails and logger is set")
 }

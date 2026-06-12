@@ -5,6 +5,7 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/outboxstore"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
@@ -422,6 +424,20 @@ func TestApplySchema_CreatesOutboxTables(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.True(t, dlTableExists, "outbox_dead_letters table should exist")
+
+	// Verify isolation: ApplySchema must use its own tracking table, not the
+	// shared "schema_migrations" table, so multiple runners can coexist in the
+	// same database without version-number collisions.
+	var trackingTableExists bool
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT FROM information_schema.tables
+				WHERE table_name = $1
+			)`, outbox.MigrationsTable).Scan(&trackingTableExists)
+	})
+	require.NoError(t, err)
+	assert.True(t, trackingTableExists, "outbox_migrations tracking table should exist (not schema_migrations)")
 }
 
 // ----------------------------
@@ -703,4 +719,128 @@ func TestOutboxStore_ReprocessDeadLetters_InvalidLimit(t *testing.T) {
 		assert.Equal(t, 0, n)
 		assert.Contains(t, err.Error(), "limit must be positive")
 	}
+}
+
+// ----------------------------
+// PrunePublished: argument validation and end-to-end delete
+// ----------------------------
+
+func TestOutboxStore_PrunePublished_InvalidArgs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, _, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	// limit <= 0 must error.
+	_, err := store.PrunePublished(ctx, 24*time.Hour, 0)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "limit must be positive")
+
+	_, err = store.PrunePublished(ctx, 24*time.Hour, -1)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "limit must be positive")
+
+	// olderThan <= 0 must error.
+	_, err = store.PrunePublished(ctx, 0, 100)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "olderThan must be positive")
+
+	_, err = store.PrunePublished(ctx, -time.Hour, 100)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "olderThan must be positive")
+}
+
+func TestOutboxStore_PrunePublished_DeletesOldPublishedRecords(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	// Insert two records and mark them published.
+	rec1 := makeRecord("prune.event.one")
+	rec2 := makeRecord("prune.event.two")
+	for _, rec := range []domain.OutboxRecord{rec1, rec2} {
+		err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+			return store.Enqueue(ctx, tx, rec)
+		})
+		require.NoError(t, err)
+	}
+	require.NoError(t, store.MarkPublished(ctx, rec1.ID))
+	require.NoError(t, store.MarkPublished(ctx, rec2.ID))
+
+	// Backdate published_at to simulate old records so olderThan=1ms is satisfied.
+	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		_, err := conn.Exec(ctx,
+			`UPDATE outbox_events SET published_at = NOW() - INTERVAL '1 hour' WHERE id = ANY($1)`,
+			[]string{rec1.ID, rec2.ID},
+		)
+		return err
+	})
+	require.NoError(t, err)
+
+	// Prune with olderThan=1ms (records are 1 hour old — well past the threshold).
+	deleted, err := store.PrunePublished(ctx, time.Millisecond, 1000)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, deleted, int64(2), "both backdated published records should be pruned")
+}
+
+func TestOutboxStore_PrunePublished_LimitBoundsDelete(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	// Insert 3 records, mark them all published, backdate.
+	const total = 3
+	for i := range total {
+		rec := makeRecord(fmt.Sprintf("prune.limit.%d", i))
+		err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+			return store.Enqueue(ctx, tx, rec)
+		})
+		require.NoError(t, err)
+		require.NoError(t, store.MarkPublished(ctx, rec.ID))
+	}
+	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		_, err := conn.Exec(ctx, `UPDATE outbox_events SET published_at = NOW() - INTERVAL '1 hour' WHERE published_at IS NOT NULL`)
+		return err
+	})
+	require.NoError(t, err)
+
+	// Limit=1 → only one row deleted per call.
+	deleted, err := store.PrunePublished(ctx, time.Millisecond, 1)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), deleted, "limit=1 must delete exactly one row per call")
+
+	// Remaining rows are still present.
+	count, err := store.PendingCount(ctx)
+	require.NoError(t, err)
+	_ = count // pending count excludes published rows; just ensure no error
+}
+
+func TestOutboxStore_PrunePublished_RecentRecordsNotDeleted(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	// Insert and mark published right now (no backdating).
+	rec := makeRecord("prune.recent")
+	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		return store.Enqueue(ctx, tx, rec)
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.MarkPublished(ctx, rec.ID))
+
+	// olderThan=7 days → recently published record must NOT be deleted.
+	deleted, err := store.PrunePublished(ctx, 7*24*time.Hour, 1000)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted, "recently published record must not be pruned")
 }

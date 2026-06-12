@@ -86,6 +86,9 @@ func (s *mockOutboxStore) MarkFailed(_ context.Context, rec domain.OutboxRecord,
 
 func (s *mockOutboxStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *mockOutboxStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
+func (s *mockOutboxStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
+	return 0, nil
+}
 
 func (s *mockOutboxStore) PendingCount(_ context.Context) (int64, error) {
 	s.mu.Lock()
@@ -132,10 +135,11 @@ func TestNewRunner_Defaults(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:     store,
 		Publisher: pub,
 	})
+	require.NoError(t, err)
 	assert.NotNil(t, r)
 }
 
@@ -143,13 +147,14 @@ func TestNewRunner_CustomValues(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 2 * time.Second,
 		BatchSize:    20,
 		MaxAttempts:  3,
 	})
+	require.NoError(t, err)
 	assert.NotNil(t, r)
 }
 
@@ -161,16 +166,17 @@ func TestRunner_Start_ImmediateCancel(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 10 * time.Second, // long interval — context cancels first
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel immediately
 
-	err := r.Start(ctx)
+	err = r.Start(ctx)
 	require.NoError(t, err)
 }
 
@@ -182,11 +188,12 @@ func TestRunner_StartStop(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 100 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	errCh := make(chan error, 1)
@@ -196,7 +203,7 @@ func TestRunner_StartStop(t *testing.T) {
 
 	time.Sleep(150 * time.Millisecond)
 
-	err := r.Stop()
+	err = r.Stop()
 	require.NoError(t, err)
 
 	select {
@@ -215,11 +222,12 @@ func TestRunner_Stop_IsIdempotent(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 100 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _ = r.Start(ctx) }()
@@ -249,13 +257,14 @@ func TestRunner_PollsPublisher(t *testing.T) {
 		{ID: env.ID, EventType: env.Type, Payload: payload},
 	}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 50 * time.Millisecond,
 		BatchSize:    10,
 		MaxAttempts:  3,
 	})
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	go func() { _ = r.Start(ctx) }()
@@ -285,17 +294,18 @@ func TestRunner_WithLogger_LogsOnError(t *testing.T) {
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 	logger := &fixtures.MockLogger{}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		Logger:       logger,
 		PollInterval: 50 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := r.Start(ctx)
+	err = r.Start(ctx)
 	require.NoError(t, err)
 }
 
@@ -349,7 +359,7 @@ func TestPublisherBridge_Publish(t *testing.T) {
 func TestNewRunner_NilPublisher_Panics(t *testing.T) {
 	store := newMockOutboxStore()
 	assert.Panics(t, func() {
-		outbox.NewRunner(outbox.Config{
+		_, _ = outbox.NewRunner(outbox.Config{
 			Store:     store,
 			Publisher: nil, // required — must panic at construction time
 		})
@@ -359,12 +369,45 @@ func TestNewRunner_NilPublisher_Panics(t *testing.T) {
 func TestNewRunner_NilPoolAndNilStore_Panics(t *testing.T) {
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 	assert.Panics(t, func() {
-		outbox.NewRunner(outbox.Config{
+		_, _ = outbox.NewRunner(outbox.Config{
 			Pool:      nil, // both nil → panic
 			Store:     nil,
 			Publisher: pub,
 		})
 	})
+}
+
+func TestNewRunner_InvalidClaimLeaseDuration_Error(t *testing.T) {
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+	store := newMockOutboxStore()
+	// BatchSize=10, PublishTimeout=5s → min lease = 10×5s+1m = 110s; 10s is too short.
+	_, err := outbox.NewRunner(outbox.Config{
+		Store:              store,
+		Publisher:          pub,
+		PublishTimeout:     5 * time.Second,
+		BatchSize:          10,
+		ClaimLeaseDuration: 10 * time.Second,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ClaimLeaseDuration")
+}
+
+// TestNewRunner_DisabledPublishTimeout_ClaimLeaseTooShort_Error covers the
+// "else if effectiveLease < minLeaseFallback" branch in NewRunner when
+// PublishTimeout is disabled (≤ 0) and ClaimLeaseDuration is < 30 s.
+func TestNewRunner_DisabledPublishTimeout_ClaimLeaseTooShort_Error(t *testing.T) {
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+	store := newMockOutboxStore()
+	// PublishTimeout=-1 disables per-record timeout; effective lease 5s < 30s floor.
+	_, err := outbox.NewRunner(outbox.Config{
+		Store:              store,
+		Publisher:          pub,
+		PublishTimeout:     -1 * time.Second,
+		ClaimLeaseDuration: 5 * time.Second,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ClaimLeaseDuration")
+	assert.Contains(t, err.Error(), "minimum is")
 }
 
 // ----------------------------
@@ -377,12 +420,13 @@ func TestRunner_Start_LogsError(t *testing.T) {
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 	logger := &fixtures.MockLogger{}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		Logger:       logger,
 		PollInterval: 30 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	startDone := make(chan struct{})
@@ -417,11 +461,12 @@ func TestRunner_Restart(t *testing.T) {
 	inner := &fixtures.MockPublisher{}
 	pub := &mockPublicPublisher{inner: inner}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 50 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	// First cycle.
 	ctx1, cancel1 := context.WithCancel(context.Background())
@@ -491,16 +536,17 @@ func TestRunner_PollOnce_UpdatesPendingGauge(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 10 * time.Second, // long — ctx will cancel first
 	})
+	require.NoError(t, err)
 
 	// Start runs pollOnce immediately, then waits for ticker.
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	err := r.Start(ctx)
+	err = r.Start(ctx)
 	require.NoError(t, err)
 }
 
@@ -521,18 +567,34 @@ func TestApplySchema_EmptyDSN_Error(t *testing.T) {
 	assert.Contains(t, err.Error(), "non-empty DSN")
 }
 
+func TestApplySchema_MigrationsTableConstant(t *testing.T) {
+	// The constant must equal the well-known table name so consumers and
+	// integration tests can reference it without hardcoding a string.
+	assert.Equal(t, "outbox_migrations", outbox.MigrationsTable)
+}
+
+func TestApplySchema_InvalidDSN_Error(t *testing.T) {
+	// A DSN that url.Parse cannot handle should surface an error from
+	// ApplySchema rather than silently falling back to "schema_migrations".
+	runner := &migrate.Runner{DSN: "://not a valid url \x00"}
+	err := outbox.ApplySchema(context.Background(), runner)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "migrations table")
+}
+
 func TestRunner_PollOnce_SchemaMissingHint_Logged(t *testing.T) {
 	store := newMockOutboxStore()
 	store.setClaimErr(errors.New(`pq: relation "outbox_events" does not exist`))
 
 	logger := &fixtures.MockLogger{}
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		Logger:       logger,
 		PollInterval: 50 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -559,7 +621,8 @@ func TestRunner_StopBeforeStart(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
 
 	done := make(chan struct{})
 	go func() {
@@ -580,11 +643,12 @@ func TestRunner_Start_AlreadyRunning_ReturnsError(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 10 * time.Second,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -599,7 +663,7 @@ func TestRunner_Start_AlreadyRunning_ReturnsError(t *testing.T) {
 	// Give the goroutine time to acquire the atomic.
 	time.Sleep(20 * time.Millisecond)
 
-	err := r.Start(ctx)
+	err = r.Start(ctx)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "already running")
 }
@@ -622,12 +686,13 @@ func TestRunner_Stop_DrainTimeout_ReturnsError(t *testing.T) {
 	blockCh := make(chan struct{})
 	blockingPub := &blockingPublicPublisher{ch: blockCh}
 
-	r2 := outbox.NewRunner(outbox.Config{
+	r2, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    blockingPub,
 		PollInterval: 10 * time.Second,
 		DrainTimeout: 50 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	go func() { _ = r2.Start(ctx) }()
 
@@ -635,7 +700,7 @@ func TestRunner_Stop_DrainTimeout_ReturnsError(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 
 	// Stop should time out because the poll cycle is blocked.
-	err := r2.Stop()
+	err = r2.Stop()
 	// Release the block so Start can exit cleanly (avoids goroutine leak in test).
 	close(blockCh)
 
@@ -659,11 +724,12 @@ func TestRunner_RecoveryAfterPollError(t *testing.T) {
 	// Inject a transient DB error so the first poll fails and backoff is triggered.
 	store.setClaimErr(errors.New("transient db connection reset"))
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 10 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -723,12 +789,13 @@ func TestRunner_PollBackoff_ResetOnSuccess(t *testing.T) {
 	// Make ClaimBatch fail initially, then succeed.
 	store.setClaimErr(errors.New("db error"))
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		Logger:       logger,
 		PollInterval: 20 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	startDone := make(chan error, 1)
@@ -773,12 +840,13 @@ func TestRunner_StartupJitter_DoesNotPreventNormalOperation(t *testing.T) {
 	payload, _ := json.Marshal(env)
 	store.records = []domain.OutboxRecord{{ID: env.ID, EventType: env.Type, Payload: payload}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:         store,
 		Publisher:     pub,
 		PollInterval:  100 * time.Millisecond,
 		StartupJitter: 20 * time.Millisecond, // tiny jitter for fast test
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -803,19 +871,20 @@ func TestRunner_StartupJitter_StoppedDuringJitter(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:         store,
 		Publisher:     pub,
 		PollInterval:  10 * time.Second,
 		StartupJitter: 10 * time.Second, // long jitter so Stop fires first
 	})
+	require.NoError(t, err)
 
 	ctx := context.Background()
 	startDone := make(chan error, 1)
 	go func() { startDone <- r.Start(ctx) }()
 
 	time.Sleep(20 * time.Millisecond) // let jitter sleep begin
-	err := r.Stop()                   // fires stopCtx.Done() path
+	err = r.Stop()                    // fires stopCtx.Done() path
 	require.NoError(t, err)
 
 	select {
@@ -834,11 +903,12 @@ func TestRunner_SleepBackoff_TimerFires(t *testing.T) {
 	store.setClaimErr(errors.New("db error"))
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		PollInterval: 10 * time.Second, // long so ticker doesn't interfere
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	startDone := make(chan error, 1)
@@ -865,12 +935,13 @@ func TestRunner_TickerPollFails_Backoff(t *testing.T) {
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 	logger := &fixtures.MockLogger{}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		Logger:       logger,
 		PollInterval: 20 * time.Millisecond,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	startDone := make(chan error, 1)
@@ -904,12 +975,13 @@ func TestRunner_StartupJitter_ContextCancelled_During_Jitter(t *testing.T) {
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:         store,
 		Publisher:     pub,
 		PollInterval:  10 * time.Second,
 		StartupJitter: 10 * time.Second, // long jitter — ctx will cancel first
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	startDone := make(chan error, 1)
@@ -945,7 +1017,8 @@ func TestRunner_ReprocessDeadLetters_Success(t *testing.T) {
 	store := &reprocessableStore{mockOutboxStore: newMockOutboxStore(), count: 5}
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
 
 	n, err := r.ReprocessDeadLetters(context.Background(), 10)
 	require.NoError(t, err)
@@ -956,7 +1029,8 @@ func TestRunner_ReprocessDeadLetters_Zero(t *testing.T) {
 	store := &reprocessableStore{mockOutboxStore: newMockOutboxStore(), count: 0}
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
 
 	n, err := r.ReprocessDeadLetters(context.Background(), 10)
 	require.NoError(t, err)
@@ -967,9 +1041,10 @@ func TestRunner_ReprocessDeadLetters_Error(t *testing.T) {
 	store := &reprocessableStore{mockOutboxStore: newMockOutboxStore(), err: errors.New("db failure")}
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
 
-	_, err := r.ReprocessDeadLetters(context.Background(), 10)
+	_, err = r.ReprocessDeadLetters(context.Background(), 10)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "db failure")
 }
@@ -994,13 +1069,14 @@ func TestRunner_UnmarshalError_MarksRecordFailed(t *testing.T) {
 	pub := &mockPublicPublisher{inner: inner}
 	logger := &fixtures.MockLogger{}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		Logger:       logger,
 		PollInterval: 50 * time.Millisecond,
 		BatchSize:    10,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _ = r.Start(ctx) }()
@@ -1057,13 +1133,14 @@ func TestRunner_MarkPublishedError_LogsError(t *testing.T) {
 	pub := &mockPublicPublisher{inner: inner}
 	logger := &fixtures.MockLogger{}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		Logger:       logger,
 		PollInterval: 50 * time.Millisecond,
 		BatchSize:    10,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _ = r.Start(ctx) }()
@@ -1132,16 +1209,17 @@ func TestRunner_PollOnce_PendingCountError(t *testing.T) {
 	logger := &fixtures.MockLogger{}
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		Logger:       logger,
 		PollInterval: 10 * time.Second, // long — ctx cancel fires first
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	err := r.Start(ctx)
+	err = r.Start(ctx)
 	require.NoError(t, err)
 
 	// The runner must have logged a WARN about the PendingCount failure.
@@ -1171,16 +1249,17 @@ func TestRunner_PollOnce_LeasedCountError(t *testing.T) {
 	logger := &fixtures.MockLogger{}
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
 
-	r := outbox.NewRunner(outbox.Config{
+	r, err := outbox.NewRunner(outbox.Config{
 		Store:        store,
 		Publisher:    pub,
 		Logger:       logger,
 		PollInterval: 10 * time.Second,
 	})
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	err := r.Start(ctx)
+	err = r.Start(ctx)
 	require.NoError(t, err)
 
 	found := false
@@ -1191,6 +1270,48 @@ func TestRunner_PollOnce_LeasedCountError(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected WARN log when LeasedCount returns an error")
+}
+
+// ----------------------------
+// Runner.PrunePublished
+// ----------------------------
+
+// pruneableStore overrides PrunePublished to return configurable results.
+type pruneableStore struct {
+	*mockOutboxStore
+	n   int64
+	err error
+}
+
+func (s *pruneableStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
+	return s.n, s.err
+}
+
+func TestRunner_PrunePublished_Success(t *testing.T) {
+	store := &pruneableStore{mockOutboxStore: newMockOutboxStore(), n: 42}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	n, err := r.PrunePublished(context.Background(), 7*24*time.Hour, 1000)
+	require.NoError(t, err)
+	assert.Equal(t, int64(42), n)
+}
+
+func TestRunner_PrunePublished_Error(t *testing.T) {
+	store := &pruneableStore{
+		mockOutboxStore: newMockOutboxStore(),
+		err:             errors.New("db: prune timed out"),
+	}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	_, err = r.PrunePublished(context.Background(), 24*time.Hour, 500)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "db: prune timed out")
 }
 
 // ----------------------------
