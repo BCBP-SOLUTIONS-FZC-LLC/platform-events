@@ -36,6 +36,7 @@ var reservedSNSAttrs = map[string]struct{}{
 	"TenantID":  {},
 	"Source":    {},
 	"EventID":   {},
+	"Subject":   {},
 }
 
 // SNSClientAPI is the subset of the AWS SNS API used by the publisher.
@@ -570,7 +571,7 @@ func validateEnvelopeFields(env domain.Envelope[json.RawMessage]) error {
 // buildMessageAttributes returns SNS message attributes for an envelope.
 // Only non-empty values are included — SNS rejects empty String attribute values.
 func buildMessageAttributes(env domain.Envelope[json.RawMessage]) map[string]snstypes.MessageAttributeValue {
-	attrs := make(map[string]snstypes.MessageAttributeValue, 4)
+	attrs := make(map[string]snstypes.MessageAttributeValue, 5)
 	if env.Type != "" {
 		attrs["EventType"] = snstypes.MessageAttributeValue{DataType: aws.String("String"), StringValue: aws.String(env.Type)}
 	}
@@ -582,6 +583,9 @@ func buildMessageAttributes(env domain.Envelope[json.RawMessage]) map[string]sns
 	}
 	if env.ID != "" {
 		attrs["EventID"] = snstypes.MessageAttributeValue{DataType: aws.String("String"), StringValue: aws.String(env.ID)}
+	}
+	if env.Subject != "" {
+		attrs["Subject"] = snstypes.MessageAttributeValue{DataType: aws.String("String"), StringValue: aws.String(env.Subject)}
 	}
 	return attrs
 }

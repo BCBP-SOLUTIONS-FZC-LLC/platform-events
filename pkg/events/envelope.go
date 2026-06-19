@@ -23,6 +23,8 @@ type Envelope[T any] struct {
 	TenantID      string    `json:"tenant_id,omitempty"`
 	TraceID       string    `json:"trace_id,omitempty"`
 	CorrelationID string    `json:"correlation_id,omitempty"`
+	Subject       string    `json:"subject,omitempty"`
+	Actor         string    `json:"actor,omitempty"`
 	Timestamp     time.Time `json:"timestamp"`
 	Payload       T         `json:"payload"`
 }
@@ -35,6 +37,8 @@ type envelopeConfig struct {
 	traceID       string
 	correlationID string
 	schemaVersion string
+	subject       string
+	actor         string
 }
 
 // EnvelopeOpt is applied to a new Envelope at construction time.
@@ -75,6 +79,20 @@ func WithSystemTenant() EnvelopeOpt {
 	return WithTenantID(SystemTenantID)
 }
 
+// WithSubject sets the Subject field on the envelope — a resource URI or
+// identifier that the event is about (e.g. "users/01926e4f-...").
+// Consumers may use this for fine-grained filtering without deserialising the payload.
+func WithSubject(subject string) EnvelopeOpt {
+	return func(c *envelopeConfig) { c.subject = subject }
+}
+
+// WithActor sets the Actor field on the envelope — the user or service identity
+// that caused the event (e.g. a user UUID, a service account name).
+// Populated from domain.DomainEvent.Actor at the outbox enqueue site.
+func WithActor(actor string) EnvelopeOpt {
+	return func(c *envelopeConfig) { c.actor = actor }
+}
+
 // NewEnvelope creates a new Envelope with UUID v7 ID and current UTC timestamp.
 // Pass WithTenantID and WithTraceID from the gincommon.RequestContext when
 // publishing from an HTTP handler.
@@ -97,6 +115,8 @@ func NewEnvelope[T any](eventType, source string, payload T, opts ...EnvelopeOpt
 	env.TraceID = cfg.traceID
 	env.CorrelationID = cfg.correlationID
 	env.SchemaVersion = cfg.schemaVersion
+	env.Subject = cfg.subject
+	env.Actor = cfg.actor
 	return env
 }
 

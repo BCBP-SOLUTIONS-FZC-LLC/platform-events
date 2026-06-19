@@ -303,6 +303,8 @@ func main() {
   "tenant_id":      "acme",
   "trace_id":       "4bf92f3577b34da6a3ce929d0e0e4736",
   "correlation_id": "...",
+  "subject":        "users/01926e4f-...",
+  "actor":          "admin@acme.com",
   "timestamp":      "2026-05-27T12:00:00Z",
   "payload":        { ... }
 }
@@ -460,7 +462,7 @@ func route(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 
 ### Envelope compatibility guarantees
 
-The `id`, `type`, `source`, and `timestamp` fields are **stable** — always present, never removed or renamed, format frozen within `v1.x`. The remaining fields (`tenant_id`, `trace_id`, `correlation_id`, `schema_version`) are **contextual** — present when set, never removed. The library may add new optional fields in MINOR releases; existing consumers are unaffected. See [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field stability class table and the `v1.x` never-break list.
+The `id`, `type`, `source`, and `timestamp` fields are **stable** — always present, never removed or renamed, format frozen within `v1.x`. The remaining fields (`tenant_id`, `trace_id`, `correlation_id`, `schema_version`, `subject`, `actor`) are **contextual** — present when set, never removed. The library may add new optional fields in MINOR releases; existing consumers are unaffected. See [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field stability class table and the `v1.x` never-break list.
 
 ---
 
@@ -566,7 +568,7 @@ When `TopicARN` ends in `.fifo`, `MessageGroupID` is required; `MessageDeduplica
 
 ### Message attributes
 
-`EventType`, `TenantID`, `Source`, and `EventID` are always set as SNS message attributes. This enables SQS subscription filter policies that scope queues to specific event types or tenants without deserialising the message body.
+`EventType`, `TenantID`, `Source`, `EventID`, and `Subject` (when non-empty) are set as SNS message attributes. This enables SQS subscription filter policies that scope queues to specific event types, tenants, or resource subjects without deserialising the message body. `Actor` is an audit-trail field and is not forwarded as an SNS attribute.
 
 ---
 

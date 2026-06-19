@@ -556,6 +556,7 @@ func TestPublish_MessageAttributesSet(t *testing.T) {
 	env := makeEnv("user.created")
 	env.TenantID = "tenant1"
 	env.Source = "iam-svc"
+	env.Subject = "users/u1"
 	_ = pub.Publish(context.Background(), env)
 
 	require.NotNil(t, capturedInput)
@@ -564,6 +565,26 @@ func TestPublish_MessageAttributesSet(t *testing.T) {
 	assert.Equal(t, "tenant1", aws.ToString(attrs["TenantID"].StringValue))
 	assert.Equal(t, "iam-svc", aws.ToString(attrs["Source"].StringValue))
 	assert.Equal(t, env.ID, aws.ToString(attrs["EventID"].StringValue))
+	assert.Equal(t, "users/u1", aws.ToString(attrs["Subject"].StringValue))
+}
+
+func TestPublish_SubjectAttribute_OmittedWhenEmpty(t *testing.T) {
+	var capturedInput *sns.PublishInput
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, params *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			capturedInput = params
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	env := makeEnv("user.created")
+	_ = pub.Publish(context.Background(), env)
+
+	require.NotNil(t, capturedInput)
+	_, hasSubject := capturedInput.MessageAttributes["Subject"]
+	assert.False(t, hasSubject, "Subject attribute must be absent when envelope.Subject is empty")
 }
 
 // ----------------------------

@@ -35,6 +35,8 @@ type hmacEnvelope struct {
 	TenantID      string          `json:"tenant_id"`
 	TraceID       string          `json:"trace_id"`
 	CorrelationID string          `json:"correlation_id"`
+	Subject       string          `json:"subject"`
+	Actor         string          `json:"actor"`
 	Timestamp     time.Time       `json:"timestamp"`
 	Payload       json.RawMessage `json:"payload"`
 }
