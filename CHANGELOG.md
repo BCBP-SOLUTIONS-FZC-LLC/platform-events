@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.0] - 2026-06-19
+
+### Added
+
+- **`Envelope.Subject`** (`json:"subject,omitempty"`) — optional resource URI or identifier the event is about (e.g. `"users/01926e4f-..."`). Set via `events.WithSubject(subject string)`. Forwarded as an SNS message attribute (`Subject`) when non-empty, enabling SQS subscription filter policies to route by resource without deserialising the message body. Added to `reservedSNSAttrs` so `WithAttributes` callers cannot overwrite it.
+- **`Envelope.Actor`** (`json:"actor,omitempty"`) — optional identity that caused the event (user UUID, service-account name, etc.). Set via `events.WithActor(actor string)`. Audit-trail field — not forwarded as an SNS message attribute.
+- `events.WithSubject(subject string) EnvelopeOpt` — sets `Subject` on the envelope at construction time.
+- `events.WithActor(actor string) EnvelopeOpt` — sets `Actor` on the envelope at construction time.
+
+### Changed
+
+- `buildMessageAttributes` (SNS adapter) now emits a `Subject` SNS message attribute when `env.Subject` is non-empty, alongside the existing `EventType`, `TenantID`, `Source`, and `EventID` attributes.
+- `hmacEnvelope` (internal) updated to include `Subject` and `Actor` so `SignEnvelope` / `VerifyEnvelope` cover both fields in the canonical HMAC payload.
+- `publicToDomain` / `domainToPublic` conversion functions carry `Subject` and `Actor` through without loss.
+
+---
+
 ## [1.2.0] - 2026-06-12
 
 ### Added
