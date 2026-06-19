@@ -12,7 +12,7 @@ sequenceDiagram
     Note over SNSAdp: returns error immediately if any field is empty<br/>prevents invalid Prometheus label cardinality
 
     SNSAdp ->> SNSAdp: json.Marshal(env) → message body
-    SNSAdp ->> SNSAdp: set attributes: EventType · TenantID · Source · EventID
+    SNSAdp ->> SNSAdp: set attributes: EventType · TenantID · Source · EventID · Subject (if set)
 
     SNSAdp ->>+ OTel: otel.Tracer.Start(ctx, "sns.publish")
     OTel -->>- SNSAdp: span ctx + span

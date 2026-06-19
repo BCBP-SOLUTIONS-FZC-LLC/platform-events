@@ -100,7 +100,7 @@ External dependencies (private modules):
 
 - **Envelope**
   - `Envelope[T any]` — typed event wrapper: `ID`, `Type`, `Source`, `TenantID`, `TraceID`, `Timestamp`, `Payload T`
-  - `NewEnvelope[T](eventType, source string, payload T, opts ...EnvelopeOpt) Envelope[T]` — generates `ID` (UUID v7), sets `Timestamp` to `time.Now()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`. When publishing from an HTTP handler, pass `WithTenantID(rc.TenantID)`, `WithTraceID(rc.TraceID)`, and `WithSchemaVersion("1")` where `rc` is the `gincommon.RequestContext` extracted via `gincommon.GetRequestContext(c)`.
+  - `NewEnvelope[T](eventType, source string, payload T, opts ...EnvelopeOpt) Envelope[T]` — generates `ID` (UUID v7), sets `Timestamp` to `time.Now()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor`. When publishing from an HTTP handler, pass `WithTenantID(rc.TenantID)`, `WithTraceID(rc.TraceID)`, and `WithSchemaVersion("1")` where `rc` is the `gincommon.RequestContext` extracted via `gincommon.GetRequestContext(c)`. Pass `WithSubject` to identify the resource the event is about (e.g. `"users/<id>"`); pass `WithActor` to record who triggered it.
   - `Envelope.JSON() ([]byte, error)` — canonical JSON serialisation (payload marshalled inline)
   - `ParseEnvelope[T](data []byte) (Envelope[T], error)` — deserialise and validate required fields
 
@@ -188,6 +188,8 @@ pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx
   "tenant_id":      "acme",
   "trace_id":       "4bf92f3577...",   // OTel trace ID (hex, 32 chars) or empty
   "correlation_id": "...",             // optional: ties events in a saga/workflow
+  "subject":        "users/01926e4f-...", // optional: resource the event is about; also an SNS filter attribute
+  "actor":          "admin@acme.com",  // optional: identity that caused the event (audit trail)
   "timestamp":      "2026-05-27T...",  // RFC3339Nano, UTC
   "payload":        { ... }            // typed T, inlined (not base64)
 }
@@ -201,7 +203,7 @@ pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx
 
 `NewSNSPublisher` wraps `aws-sdk-go-v2/service/sns`. Key behaviours:
 
-- **Message attributes** — `EventType`, `TenantID`, `Source`, and `EventID` are always set as SNS message attributes to enable SQS subscription filter policies without deserialising the body.
+- **Message attributes** — `EventType`, `TenantID`, `Source`, `EventID`, and `Subject` (when non-empty) are set as SNS message attributes to enable SQS subscription filter policies without deserialising the body. `Actor` is not forwarded as an attribute — it is an audit-trail field, not a routing field.
 - **FIFO topics** — if `TopicARN` ends in `.fifo`, the publisher requires `MessageGroupID`; `MessageDeduplicationID` defaults to `Envelope.ID` (content-based deduplication must be disabled at the topic level).
 - **Batching** — `PublishBatch` uses `sns:PublishBatch` (max 10 per call); batches larger than 10 are automatically split.
 - **Retry** — caller is responsible for retry (the outbox runner handles this); the SNS adapter does not retry internally. `Publish` returns the raw AWS error for callers to inspect (`smithy.APIError`).

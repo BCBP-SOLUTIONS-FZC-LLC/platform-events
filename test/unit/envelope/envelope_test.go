@@ -162,6 +162,50 @@ func TestEnvelope_SchemaVersion_OmittedFromJSON_WhenEmpty(t *testing.T) {
 }
 
 // ----------------------------
+// WithSubject / WithActor
+// ----------------------------
+
+func TestWithSubject_SetsField(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`),
+		events.WithSubject("users/01926e4f-1234-7abc-8def-000000000001"),
+	)
+	assert.Equal(t, "users/01926e4f-1234-7abc-8def-000000000001", env.Subject)
+}
+
+func TestWithActor_SetsField(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`),
+		events.WithActor("admin@acme.com"),
+	)
+	assert.Equal(t, "admin@acme.com", env.Actor)
+}
+
+func TestEnvelope_SubjectActor_RoundTrip(t *testing.T) {
+	original := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{"id":"u1"}`),
+		events.WithTenantID("acme"),
+		events.WithSubject("users/u1"),
+		events.WithActor("svc-account"),
+	)
+
+	b, err := original.JSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"subject":"users/u1"`)
+	assert.Contains(t, string(b), `"actor":"svc-account"`)
+
+	parsed, err := events.ParseEnvelope[json.RawMessage](b)
+	require.NoError(t, err)
+	assert.Equal(t, "users/u1", parsed.Subject)
+	assert.Equal(t, "svc-account", parsed.Actor)
+}
+
+func TestEnvelope_SubjectActor_OmittedFromJSON_WhenEmpty(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`))
+	b, err := env.JSON()
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "subject")
+	assert.NotContains(t, string(b), "actor")
+}
+
+// ----------------------------
 // ParseEnvelope — timestamp zero check
 // ----------------------------
 

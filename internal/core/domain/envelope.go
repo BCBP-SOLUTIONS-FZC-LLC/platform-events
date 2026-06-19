@@ -22,6 +22,8 @@ type Envelope[T any] struct {
 	TenantID      string    `json:"tenant_id,omitempty"`
 	TraceID       string    `json:"trace_id,omitempty"`
 	CorrelationID string    `json:"correlation_id,omitempty"`
+	Subject       string    `json:"subject,omitempty"`
+	Actor         string    `json:"actor,omitempty"`
 	Timestamp     time.Time `json:"timestamp"`
 	Payload       T         `json:"payload"`
 }
