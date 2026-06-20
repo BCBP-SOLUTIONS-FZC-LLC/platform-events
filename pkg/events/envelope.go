@@ -25,6 +25,7 @@ type Envelope[T any] struct {
 	CorrelationID string    `json:"correlation_id,omitempty"`
 	Subject       string    `json:"subject,omitempty"`
 	Actor         string    `json:"actor,omitempty"`
+	SchemaID      string    `json:"schema_id,omitempty"`
 	Timestamp     time.Time `json:"timestamp"`
 	Payload       T         `json:"payload"`
 }
@@ -39,6 +40,7 @@ type envelopeConfig struct {
 	schemaVersion string
 	subject       string
 	actor         string
+	schemaID      string
 }
 
 // EnvelopeOpt is applied to a new Envelope at construction time.
@@ -93,6 +95,17 @@ func WithActor(actor string) EnvelopeOpt {
 	return func(c *envelopeConfig) { c.actor = actor }
 }
 
+// WithSchemaID sets the SchemaID field on the envelope — the schema registry
+// version identifier for the encoded payload (e.g. a Glue Schema Registry UUID).
+// This is distinct from SchemaVersion: SchemaID is the authoritative registry
+// pointer used by the codec for Avro/JSON deserialization; SchemaVersion ("1",
+// "2", …) is the human-readable semantic version consumers use to gate business
+// logic. When using AWS Glue Schema Registry, pass the UUID returned by the
+// codec's Encode call. Absent for NoopCodec (dev/test).
+func WithSchemaID(id string) EnvelopeOpt {
+	return func(c *envelopeConfig) { c.schemaID = id }
+}
+
 // NewEnvelope creates a new Envelope with UUID v7 ID and current UTC timestamp.
 // Pass WithTenantID and WithTraceID from the gincommon.RequestContext when
 // publishing from an HTTP handler.
@@ -117,6 +130,7 @@ func NewEnvelope[T any](eventType, source string, payload T, opts ...EnvelopeOpt
 	env.SchemaVersion = cfg.schemaVersion
 	env.Subject = cfg.subject
 	env.Actor = cfg.actor
+	env.SchemaID = cfg.schemaID
 	return env
 }
 

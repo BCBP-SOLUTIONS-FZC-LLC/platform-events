@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Envelope.SchemaID`** (`json:"schema_id,omitempty"`) — schema registry version identifier for the encoded payload (e.g. AWS Glue Schema Registry UUID). Set via `events.WithSchemaID(id string)`. Distinct from `SchemaVersion`: `SchemaID` is the technical registry pointer used by the codec for Avro/JSON deserialization; `SchemaVersion` (`"1"`, `"2"`, …) is the semantic version consumers use to gate business logic. Not forwarded as an SNS attribute.
+- `events.WithSchemaID(id string) EnvelopeOpt` — sets `SchemaID` on the envelope at construction time.
+
 ---
 
 ## [1.3.0] - 2026-06-19

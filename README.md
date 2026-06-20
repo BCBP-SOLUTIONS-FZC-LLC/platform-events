@@ -305,6 +305,7 @@ func main() {
   "correlation_id": "...",
   "subject":        "users/01926e4f-...",
   "actor":          "admin@acme.com",
+  "schema_id":      "550e8400-e29b-41d4-a716-446655440000",
   "timestamp":      "2026-05-27T12:00:00Z",
   "payload":        { ... }
 }
@@ -462,7 +463,7 @@ func route(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 
 ### Envelope compatibility guarantees
 
-The `id`, `type`, `source`, and `timestamp` fields are **stable** — always present, never removed or renamed, format frozen within `v1.x`. The remaining fields (`tenant_id`, `trace_id`, `correlation_id`, `schema_version`, `subject`, `actor`) are **contextual** — present when set, never removed. The library may add new optional fields in MINOR releases; existing consumers are unaffected. See [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field stability class table and the `v1.x` never-break list.
+The `id`, `type`, `source`, and `timestamp` fields are **stable** — always present, never removed or renamed, format frozen within `v1.x`. The remaining fields (`tenant_id`, `trace_id`, `correlation_id`, `schema_version`, `subject`, `actor`, `schema_id`) are **contextual** — present when set, never removed. The library may add new optional fields in MINOR releases; existing consumers are unaffected. See [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field stability class table and the `v1.x` never-break list.
 
 ---
 

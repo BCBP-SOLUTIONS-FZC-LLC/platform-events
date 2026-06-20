@@ -206,6 +206,55 @@ func TestEnvelope_SubjectActor_OmittedFromJSON_WhenEmpty(t *testing.T) {
 }
 
 // ----------------------------
+// WithSchemaID
+// ----------------------------
+
+func TestWithSchemaID_SetsField(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`),
+		events.WithSchemaID("550e8400-e29b-41d4-a716-446655440000"),
+	)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", env.SchemaID)
+}
+
+func TestEnvelope_SchemaID_RoundTrip(t *testing.T) {
+	original := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{"id":"u1"}`),
+		events.WithSchemaVersion("1"),
+		events.WithSchemaID("550e8400-e29b-41d4-a716-446655440000"),
+	)
+
+	b, err := original.JSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"schema_version":"1"`)
+	assert.Contains(t, string(b), `"schema_id":"550e8400-e29b-41d4-a716-446655440000"`)
+
+	parsed, err := events.ParseEnvelope[json.RawMessage](b)
+	require.NoError(t, err)
+	assert.Equal(t, "1", parsed.SchemaVersion)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", parsed.SchemaID)
+}
+
+func TestEnvelope_SchemaID_OmittedFromJSON_WhenEmpty(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`),
+		events.WithSchemaVersion("1"),
+	)
+	b, err := env.JSON()
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "schema_id")
+}
+
+func TestEnvelope_SchemaVersion_And_SchemaID_AreIndependent(t *testing.T) {
+	// schema_version is for consumer logic gating ("1", "2")
+	// schema_id is for the registry pointer (Glue UUID)
+	// setting one must not affect the other
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`),
+		events.WithSchemaVersion("2"),
+		events.WithSchemaID("glue-uuid-abc"),
+	)
+	assert.Equal(t, "2", env.SchemaVersion)
+	assert.Equal(t, "glue-uuid-abc", env.SchemaID)
+}
+
+// ----------------------------
 // ParseEnvelope — timestamp zero check
 // ----------------------------
 

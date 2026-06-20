@@ -130,6 +130,7 @@ func publicToDomain(e Envelope[json.RawMessage]) domain.Envelope[json.RawMessage
 		CorrelationID: e.CorrelationID,
 		Subject:       e.Subject,
 		Actor:         e.Actor,
+		SchemaID:      e.SchemaID,
 		Timestamp:     e.Timestamp,
 		Payload:       e.Payload,
 	}
@@ -147,6 +148,7 @@ func domainToPublic(e domain.Envelope[json.RawMessage]) Envelope[json.RawMessage
 		CorrelationID: e.CorrelationID,
 		Subject:       e.Subject,
 		Actor:         e.Actor,
+		SchemaID:      e.SchemaID,
 		Timestamp:     e.Timestamp,
 		Payload:       e.Payload,
 	}

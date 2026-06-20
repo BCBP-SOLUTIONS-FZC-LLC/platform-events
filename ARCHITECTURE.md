@@ -215,7 +215,7 @@ The library is organised in concentric Clean Architecture layers. Inner layers h
 ```mermaid
 graph TD
     subgraph pub["Public API  —  pkg/"]
-        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
+        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
         outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · ReprocessDeadLetters · PrunePublished"]
     end
 
@@ -342,8 +342,8 @@ graph LR
 
 | Symbol | Description |
 |--------|-------------|
-| `Envelope[T any]` | Typed event wrapper: `ID` (UUID v7), `Type`, `Source`, `SchemaVersion`, `TenantID`, `TraceID`, `CorrelationID`, `Subject`, `Actor`, `Timestamp`, `Payload T` |
-| `NewEnvelope[T](type, source, payload, opts...)` | Generates `ID` (UUID v7), sets `Timestamp = time.Now().UTC()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor` |
+| `Envelope[T any]` | Typed event wrapper: `ID` (UUID v7), `Type`, `Source`, `SchemaVersion`, `TenantID`, `TraceID`, `CorrelationID`, `Subject`, `Actor`, `SchemaID`, `Timestamp`, `Payload T` |
+| `NewEnvelope[T](type, source, payload, opts...)` | Generates `ID` (UUID v7), sets `Timestamp = time.Now().UTC()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor`, `WithSchemaID` |
 | `WithSchemaVersion(v)` | Sets `SchemaVersion` on the envelope. Use `"1"` at inception; increment on additive-only field additions. See [EVENT_SCHEMA_GOVERNANCE.md](../EVENT_SCHEMA_GOVERNANCE.md). |
 | `SystemTenantID` | String constant `"system"` — use for background jobs that publish across tenants |
 | `WithSystemTenant()` | `EnvelopeOpt` that sets `TenantID = "system"`; use for scheduled tasks and cross-tenant background jobs |
@@ -406,6 +406,7 @@ These guarantees apply to the envelope wrapper. Payload field stability is a sep
 | `schema_version` | **Contextual** | Present when set. Positive integer string (`"1"`, `"2"`, …). Absent means treat as `"1"` — this backward-compatibility rule is permanent. Will never be removed. |
 | `subject` | **Contextual** | Present when set via `WithSubject`. Opaque resource URI or identifier the event is about (e.g. `"users/01926e4f-..."`). Also forwarded as an SNS message attribute (`Subject`) to enable SQS subscription filter policies without body parsing. Will never be removed. |
 | `actor` | **Contextual** | Present when set via `WithActor`. Opaque identity string of the user or service that caused the event (e.g. a user UUID, a service-account name). Audit trail field — not forwarded as an SNS attribute. Will never be removed. |
+| `schema_id` | **Contextual** | Present when set via `WithSchemaID`. Opaque schema registry version identifier — typically the Glue Schema Registry UUID returned by the codec's `Encode` call. Distinct from `schema_version`: `schema_id` is the technical registry pointer used by the codec for Avro/JSON deserialization; `schema_version` is the human-readable semantic version consumers use to gate business logic. Not forwarded as an SNS attribute. Will never be removed. |
 | `payload` | **Externally governed** | Always present. Valid JSON (object, array, or scalar). Shape is defined by the publisher and governed per [EVENT_SCHEMA_GOVERNANCE.md](../EVENT_SCHEMA_GOVERNANCE.md). The library only validates it is well-formed JSON. |
 
 ### Stability definitions
