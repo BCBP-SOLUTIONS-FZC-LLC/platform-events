@@ -170,6 +170,41 @@ Both systems use the term "dead letter" but they refer to entirely different sto
 
 When an on-call alert fires on `outbox_dead_letters_total`, the fix is on the **publisher side** (SNS connectivity, payload validity, queue subscription). When the alert is on a high `ApproximateNumberOfMessagesNotVisible` or a growing SQS DLQ depth, the fix is on the **consumer handler side** (logic bug, downstream dependency failure, missing idempotency).
 
+### DLQ management flow
+
+> Source: [`docs/architecture/mermaid/dlq-management-flow.mmd`](docs/architecture/mermaid/dlq-management-flow.mmd)
+
+```mermaid
+flowchart TD
+    A([Dead-letter record in outbox_dead_letters\nevent_type · tenant_id · attempts · last_error · failed_at]) --> INSPECT
+
+    INSPECT["Step 1 — Inspect\nrunner.ListDeadLetters(ctx, DLQFilter{...}, limit)\nreturns []DeadLetterRecord ordered by failed_at ASC\n—no mutation, safe to call repeatedly—"]
+
+    INSPECT --> DECIDE{Root cause\nfixed?}
+
+    DECIDE -- "Yes — retry" --> REPLAY
+    DECIDE -- "Poison pill\n(payload invalid,\ntype decommissioned)" --> DISCARD
+    DECIDE -- "Not sure yet" --> INSPECT
+
+    REPLAY["Step 2a — Selective replay\nrunner.ReprocessDeadLettersWith(ctx, DLQFilter{\n    EventType:    optionalString,\n    TenantID:     optionalString,\n    FailedBefore: optionalTime,\n}, limit)\n\nOR — replay everything\nrunner.ReprocessDeadLetters(ctx, limit)"]
+
+    DISCARD["Step 2b — Permanent discard\nrunner.DiscardDeadLetters(ctx, DLQFilter{...}, limit)\n⚠️ irreversible — always ListDeadLetters first"]
+
+    REPLAY --> REQUEUE["Records moved back to outbox_events\nattempts reset to 0\noutbox_dead_letters_reprocessed_total++\nPicked up by runner on next poll cycle"]
+    DISCARD --> GONE["Records permanently deleted\noutbox_dead_letters_discarded_total++"]
+
+    REQUEUE --> RUNNER["Outbox Runner resumes normal\npoll cycle → Publisher.Publish → SNS"]
+    RUNNER -- success --> DONE([Event delivered])
+    RUNNER -- exceeds MaxAttempts again --> A
+
+    style INSPECT fill:#d0e8ff,stroke:#336699
+    style REPLAY fill:#d0ffd8,stroke:#2d8a4e
+    style DISCARD fill:#ffd0d0,stroke:#993333
+    style GONE fill:#ffd0d0,stroke:#993333
+    style REQUEUE fill:#d0ffd8,stroke:#2d8a4e
+    style DONE fill:#d0ffd8,stroke:#2d8a4e
+```
+
 ### Operational runbook
 
 | Symptom | Likely cause | Where to look | Fix |
@@ -238,7 +273,7 @@ The library is organised in concentric Clean Architecture layers. Inner layers h
 graph TD
     subgraph pub["Public API  —  pkg/"]
         events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
-        outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · ReprocessDeadLetters · PrunePublished"]
+        outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 
     subgraph cli["CLI  —  cmd/"]
@@ -248,15 +283,15 @@ graph TD
     subgraph adapters["Adapters  —  internal/adapter/outbound/"]
         sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption\nwrapIfRetryable"]
         sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nvisibility extension · drain\nper-call receive timeout"]
-        outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed\nLeasedCount · ReprocessDeadLetters · PrunePublished"]
-        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal\nOversizedEventTypeLabelTotal"]
+        outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed · PrunePublished\nLeasedCount · ListDeadLetters · ReprocessDeadLetters\nReprocessDeadLettersWith · DiscardDeadLetters"]
+        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal · OutboxDeadLettersDiscardedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal\nOversizedEventTypeLabelTotal"]
         logger_adp["logger\nZapLogger → port.Logger\n(map-based fields; gincommon-compatible)"]
     end
 
     subgraph core["Core  —  internal/core/"]
-        port_pkg["port\nPublisher · Consumer · Handler\nLogger · Clock\nOutboxStore · LeasedCount · ReprocessDeadLetters · PrunePublished\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
-        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge\nErrRetryable · RetryableError"]
-        service_pkg["service\nOutboxService · HMACService\nSign · Verify\nLeasedCount · ReprocessDeadLetters"]
+        port_pkg["port\nPublisher · Consumer · Handler\nLogger · Clock\nOutboxStore · LeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
+        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord · DLQFilter · DeadLetterRecord\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge\nErrRetryable · RetryableError"]
+        service_pkg["service\nOutboxService · HMACService\nSign · Verify\nLeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 
     subgraph infra["Infrastructure"]
@@ -400,10 +435,13 @@ graph LR
 | `Runner.Start(ctx)` | Starts the poll loop (immediate first poll, then per `PollInterval`); exponential backoff (1s→30s) on poll-cycle failure; blocks until `ctx` is cancelled |
 | `Runner.Stop()` | Graceful drain; waits up to `DrainTimeout` for the in-flight batch, then returns a non-nil error if it did not finish |
 | `Runner.Ready() <-chan struct{}` | Returns a channel closed after the first successful poll cycle; use to gate Kubernetes readiness probes — a closed channel confirms the DB connection is healthy and the outbox schema exists |
+| `Runner.ListDeadLetters(ctx, filter, limit)` | Returns up to `limit` dead-letter records matching `DLQFilter` (optional `EventType`, `TenantID`, `FailedBefore`), ordered oldest-first; returns an empty slice when no records match — safe to call repeatedly as an inspection step before replay or discard |
 | `Runner.ReprocessDeadLetters(ctx, limit)` | Moves up to `limit` records from `outbox_dead_letters` back to `outbox_events`, resetting attempt counters for redelivery; returns the count requeued |
+| `Runner.ReprocessDeadLettersWith(ctx, filter, limit)` | Same as `ReprocessDeadLetters` but restricts to records matching `DLQFilter`; use for targeted replay after fixing a root cause without replaying unrelated failures |
+| `Runner.DiscardDeadLetters(ctx, filter, limit)` | Permanently deletes up to `limit` dead-letter records matching `DLQFilter`; use for poison-pill records that can never succeed; returns `(int64, error)` — always call `ListDeadLetters` first to confirm the selection |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Deletes published records older than `olderThan` from `outbox_events` (batched to `limit` rows). Call periodically (e.g. daily) to prevent unbounded table growth; choose `olderThan ≥` the longest consumer idempotency window (minimum 7 days is safe for most workloads) |
 | `Enqueue(ctx, tx pgx.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; validates non-empty `ID`/`Type`/`Source`, non-zero `Timestamp`, and absence of null bytes in string fields; rejects payloads > 240 KB |
-| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`007` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
+| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`008` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index, DLQ filter index) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
 | `MigrationsTable` | Exported constant (`"outbox_migrations"`) — the golang-migrate tracking table used by `ApplySchema`; isolated from the consuming service's `schema_migrations` to prevent version-number collisions |
 
 ---
@@ -827,7 +865,7 @@ graph LR
         end
 
         subgraph arch_src["Architecture docs"]
-            mmd_files["docs/architecture/mermaid/\n8 × .mmd source diagrams"]
+            mmd_files["docs/architecture/mermaid/\n9 × .mmd source diagrams"]
             arch_md["ARCHITECTURE.md\nembeds mermaid blocks\n+ prose + symbol tables"]
         end
     end

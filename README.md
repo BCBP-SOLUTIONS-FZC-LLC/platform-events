@@ -1276,7 +1276,8 @@ Registered metrics:
 | `outbox_published_total` | Counter | `service`, `event_type`, `status` | Records published by the runner |
 | `outbox_attempts_total` | Counter | `service`, `event_type` | Total publish attempts by the runner |
 | `outbox_dead_letters_total` | Counter | `service`, `event_type` | Records moved to `outbox_dead_letters` after exhausting `MaxAttempts` — alert on `rate() > 0` |
-| `outbox_dead_letters_reprocessed_total` | Counter | `service` | Dead-letter records re-queued via `ReprocessDeadLetters` |
+| `outbox_dead_letters_reprocessed_total` | Counter | `service` | Dead-letter records re-queued via `ReprocessDeadLetters` or `ReprocessDeadLettersWith` |
+| `outbox_dead_letters_discarded_total` | Counter | `service` | Dead-letter records permanently deleted via `DiscardDeadLetters` |
 | `sqs_receive_errors_total` | Counter | `service`, `queue` | SQS `ReceiveMessage` errors (excludes context cancellation) — alert on `rate() > 0` |
 | `sqs_delete_errors_total` | Counter | `service`, `queue` | SQS `DeleteMessage` errors — a non-zero rate causes duplicate message delivery |
 | `sqs_visibility_extension_errors_total` | Counter | `service`, `queue` | SQS `ChangeMessageVisibility` errors — non-zero rate causes duplicate delivery for long-running handlers |

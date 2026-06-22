@@ -131,9 +131,12 @@ External dependencies (private modules):
 - `Runner.Start(ctx) error` — start the polling loop; blocks until `ctx` is cancelled.
 - `Runner.Stop() error` — graceful drain; waits for in-flight batch to complete before returning.
 - `Runner.PrunePublished(ctx, olderThan time.Duration, limit int) (int64, error)` — deletes published records older than `olderThan` from `outbox_events` (up to `limit` rows per call) to prevent unbounded table growth. Call periodically from a scheduled job. Applies a 30 s internal DB timeout.
+- `Runner.ListDeadLetters(ctx, filter DLQFilter, limit int) ([]DeadLetterRecord, error)` — returns up to `limit` dead-letter records matching filter (by `EventType`, `TenantID`, `FailedBefore`), oldest first; safe to call repeatedly as an inspection step; applies a 30 s internal DB timeout.
 - `Runner.ReprocessDeadLetters(ctx, limit int) (int, error)` — moves up to `limit` records from `outbox_dead_letters` back to `outbox_events` for retry; applies a 30 s internal DB timeout.
+- `Runner.ReprocessDeadLettersWith(ctx, filter DLQFilter, limit int) (int, error)` — same as `ReprocessDeadLetters` but filters by `DLQFilter`; use for targeted replay without touching unrelated failures.
+- `Runner.DiscardDeadLetters(ctx, filter DLQFilter, limit int) (int64, error)` — permanently deletes up to `limit` matching dead-letter records; always call `ListDeadLetters` first to confirm selection; applies a 30 s internal DB timeout.
 - `Enqueue(ctx, tx pgx.Tx, env Envelope[json.RawMessage]) error` — insert a serialised envelope into the `outbox_events` table within the caller's transaction. No publish happens at insert time — the runner delivers asynchronously. Callers should pass the `pgx.Tx` obtained from `pgcommon.RunInTx` so the enqueue and the business-logic write commit or roll back as a single unit.
-- `ApplySchema(ctx, runner *migrate.Runner) error` — convenience wrapper that calls `platform-pgcommon`'s `migrate.Runner` to apply the embedded `pkg/outbox/migrations/` SQL files (`001`–`007`). Call once at service startup before `Runner.Start`.
+- `ApplySchema(ctx, runner *migrate.Runner) error` — convenience wrapper that calls `platform-pgcommon`'s `migrate.Runner` to apply the embedded `pkg/outbox/migrations/` SQL files (`001`–`008`). Call once at service startup before `Runner.Start`.
 - Schema: `outbox_events(id UUID PK, event_type TEXT, payload JSONB, tenant_id TEXT, trace_id TEXT, attempts INT DEFAULT 0, last_error TEXT, created_at TIMESTAMPTZ, scheduled_at TIMESTAMPTZ, published_at TIMESTAMPTZ)`
 
 **Typical wiring with platform-pgcommon:**
