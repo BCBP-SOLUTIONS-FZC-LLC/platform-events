@@ -22,3 +22,5 @@ flowchart TD
     J -- no  --> D
     K --> D
     D -- done --> B
+
+    K -.->|"DLQ management\n(operator action)"|DLQ["runner.ListDeadLetters\nrunner.ReprocessDeadLetters\nrunner.ReprocessDeadLettersWith\nrunner.DiscardDeadLetters\n\nSee dlq-management-flow.mmd"]

@@ -82,10 +82,32 @@ t=30s attempts reaches MaxAttempts (default 5):
       → outbox_dead_letters_total.Inc()
 
       ── Recovery ─────────────────────────────────────────────────────────
-      Option A: runner.ReprocessDeadLetters(ctx, 50)
-                Moves records back to outbox_events; resets attempts to 0.
-      Option B: SQL — fix root cause, then:
-                UPDATE outbox_dead_letters SET ... → INSERT outbox_events → DELETE outbox_dead_letters
+      Step 1 — Inspect:
+        runner.ListDeadLetters(ctx, outbox.DLQFilter{TenantID: "acme"}, 50)
+        → returns []outbox.DeadLetterRecord  (ID, EventType, TenantID,
+                                              Attempts, LastError, FailedAt)
+
+      Step 2a — Replay all:
+        runner.ReprocessDeadLetters(ctx, 50)
+        → moves all records back to outbox_events; resets attempts to 0
+
+      Step 2b — Selective replay:
+        runner.ReprocessDeadLettersWith(ctx, outbox.DLQFilter{
+            EventType:    "billing.invoice.settled",
+            TenantID:     "acme",
+            FailedBefore: incidentEnd,
+        }, 100)
+        → only moves records matching ALL supplied filter fields
+
+      Step 2c — Discard poison pills:
+        runner.DiscardDeadLetters(ctx, outbox.DLQFilter{
+            EventType: "legacy.sync.requested",   // decommissioned type
+        }, 1000)
+        → permanently deletes; ALWAYS call ListDeadLetters first to verify
+
+      Option D: Raw SQL — for migrations or bulk corrections:
+        UPDATE outbox_dead_letters SET ... →
+          INSERT outbox_events → DELETE outbox_dead_letters
 ```
 
 **Key producer-side invariants:**
@@ -143,7 +165,7 @@ Both systems use the term "dead letter" but they refer to entirely different sto
 
 | Term | What it is | How to query | How to recover |
 |------|-----------|--------------|---------------|
-| **Outbox dead letters** | Postgres rows in `outbox_dead_letters` — publish failures that exhausted `MaxAttempts` | `SELECT * FROM outbox_dead_letters WHERE tenant_id = 'acme'` | `runner.ReprocessDeadLetters(ctx, n)` |
+| **Outbox dead letters** | Postgres rows in `outbox_dead_letters` — publish failures that exhausted `MaxAttempts` | `runner.ListDeadLetters(ctx, filter, n)` or `SELECT * FROM outbox_dead_letters WHERE tenant_id = 'acme'` | `runner.ReprocessDeadLettersWith(ctx, filter, n)` · `runner.ReprocessDeadLetters(ctx, n)` · `runner.DiscardDeadLetters(ctx, filter, n)` |
 | **SQS DLQ** | A separate SQS queue — consumer failures that exhausted `MaxReceiveCount` | SQS console or `aws sqs receive-message --queue-url $DLQ_URL` | SQS redrive policy (SQS console → Start DLQ redrive) |
 
 When an on-call alert fires on `outbox_dead_letters_total`, the fix is on the **publisher side** (SNS connectivity, payload validity, queue subscription). When the alert is on a high `ApproximateNumberOfMessagesNotVisible` or a growing SQS DLQ depth, the fix is on the **consumer handler side** (logic bug, downstream dependency failure, missing idempotency).
@@ -152,7 +174,7 @@ When an on-call alert fires on `outbox_dead_letters_total`, the fix is on the **
 
 | Symptom | Likely cause | Where to look | Fix |
 |---------|-------------|---------------|-----|
-| `outbox_dead_letters_total` rate > 0 | SNS publish failure or invalid payload | `outbox_dead_letters.last_error` | Fix root cause; call `ReprocessDeadLetters` |
+| `outbox_dead_letters_total` rate > 0 | SNS publish failure or invalid payload | `outbox_dead_letters.last_error` | Fix root cause; call `ListDeadLetters` to inspect, then `ReprocessDeadLettersWith` (selective) or `ReprocessDeadLetters` (all); call `DiscardDeadLetters` for poison pills |
 | `outbox_mark_published_errors_total` > 0 | DB write failed after SNS delivery succeeded — record will be re-published on next poll | `outbox_events.last_error`; DB connectivity | Investigate DB health; note: consumer **must be idempotent** — duplicate delivery is actively occurring |
 | `outbox_pending_total` growing, `outbox_published_total` flat | SNS throttling or outbox runner stopped | `outbox_events.last_error`; outbox runner logs | Check SNS quotas; ensure runner is running; retryable errors auto-recover |
 | `events_consumed_total{status=error}` growing | Handler returning errors repeatedly | Handler logs; downstream service health | Fix handler bug; SQS redrive once fixed |
@@ -215,7 +237,7 @@ The library is organised in concentric Clean Architecture layers. Inner layers h
 ```mermaid
 graph TD
     subgraph pub["Public API  —  pkg/"]
-        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
+        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
         outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · ReprocessDeadLetters · PrunePublished"]
     end
 
@@ -342,8 +364,8 @@ graph LR
 
 | Symbol | Description |
 |--------|-------------|
-| `Envelope[T any]` | Typed event wrapper: `ID` (UUID v7), `Type`, `Source`, `SchemaVersion`, `TenantID`, `TraceID`, `CorrelationID`, `Subject`, `Actor`, `Timestamp`, `Payload T` |
-| `NewEnvelope[T](type, source, payload, opts...)` | Generates `ID` (UUID v7), sets `Timestamp = time.Now().UTC()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor` |
+| `Envelope[T any]` | Typed event wrapper: `ID` (UUID v7), `Type`, `Source`, `SchemaVersion`, `TenantID`, `TraceID`, `CorrelationID`, `Subject`, `Actor`, `SchemaID`, `Timestamp`, `Payload T` |
+| `NewEnvelope[T](type, source, payload, opts...)` | Generates `ID` (UUID v7), sets `Timestamp = time.Now().UTC()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor`, `WithSchemaID` |
 | `WithSchemaVersion(v)` | Sets `SchemaVersion` on the envelope. Use `"1"` at inception; increment on additive-only field additions. See [EVENT_SCHEMA_GOVERNANCE.md](../EVENT_SCHEMA_GOVERNANCE.md). |
 | `SystemTenantID` | String constant `"system"` — use for background jobs that publish across tenants |
 | `WithSystemTenant()` | `EnvelopeOpt` that sets `TenantID = "system"`; use for scheduled tasks and cross-tenant background jobs |
@@ -406,6 +428,7 @@ These guarantees apply to the envelope wrapper. Payload field stability is a sep
 | `schema_version` | **Contextual** | Present when set. Positive integer string (`"1"`, `"2"`, …). Absent means treat as `"1"` — this backward-compatibility rule is permanent. Will never be removed. |
 | `subject` | **Contextual** | Present when set via `WithSubject`. Opaque resource URI or identifier the event is about (e.g. `"users/01926e4f-..."`). Also forwarded as an SNS message attribute (`Subject`) to enable SQS subscription filter policies without body parsing. Will never be removed. |
 | `actor` | **Contextual** | Present when set via `WithActor`. Opaque identity string of the user or service that caused the event (e.g. a user UUID, a service-account name). Audit trail field — not forwarded as an SNS attribute. Will never be removed. |
+| `schema_id` | **Contextual** | Present when set via `WithSchemaID`. Opaque schema registry version identifier — typically the Glue Schema Registry UUID returned by the codec's `Encode` call. Distinct from `schema_version`: `schema_id` is the technical registry pointer used by the codec for Avro/JSON deserialization; `schema_version` is the human-readable semantic version consumers use to gate business logic. Not forwarded as an SNS attribute. Will never be removed. |
 | `payload` | **Externally governed** | Always present. Valid JSON (object, array, or scalar). Shape is defined by the publisher and governed per [EVENT_SCHEMA_GOVERNANCE.md](../EVENT_SCHEMA_GOVERNANCE.md). The library only validates it is well-formed JSON. |
 
 ### Stability definitions

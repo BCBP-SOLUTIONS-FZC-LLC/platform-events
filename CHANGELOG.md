@@ -7,9 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`runner.ListDeadLetters(ctx, DLQFilter, limit) ([]DeadLetterRecord, error)`** — returns up to `limit` records from `outbox_dead_letters` matching the filter, ordered by `failed_at` ascending. Use to inspect failures before deciding to replay or discard. Returns an empty slice (not an error) when no records match.
+- **`runner.ReprocessDeadLettersWith(ctx, DLQFilter, limit) (int, error)`** — selective replay: moves up to `limit` filtered records from `outbox_dead_letters` back to `outbox_events`, resetting attempts to 0. Supports filtering by `EventType`, `TenantID`, and `FailedBefore`. Increments `outbox_dead_letters_reprocessed_total`.
+- **`runner.DiscardDeadLetters(ctx, DLQFilter, limit) (int64, error)`** — permanently deletes up to `limit` filtered records from `outbox_dead_letters`. For poison-pill records that can never be delivered. Increments `outbox_dead_letters_discarded_total`. Always call `ListDeadLetters` first to confirm the selection.
+- **`outbox.DLQFilter`** — public type (type alias for `domain.DLQFilter`) with fields `EventType string`, `TenantID string`, `FailedBefore time.Time`. All fields optional; zero value matches all records.
+- **`outbox.DeadLetterRecord`** — public type (type alias for `domain.DeadLetterRecord`) returned by `ListDeadLetters` with fields `ID`, `EventType`, `TenantID`, `TraceID`, `Attempts`, `LastError`, `CreatedAt`, `FailedAt`.
+- **`outbox_dead_letters_discarded_total`** Prometheus counter — incremented by `DiscardDeadLetters`. Alert on `rate() > 0` to confirm intentional operator action; unexpected discards are a data-loss signal.
+- **Migration 008** (`008_add_dead_letters_filter_index.up.sql`) — composite index `idx_outbox_dead_letters_event_type_tenant_id` on `(event_type, tenant_id)` so filter queries on `outbox_dead_letters` are index-scans, not full-table scans.
+- **`pkg/outbox/dlq.go`** — new file documenting the public DLQ API surface with usage examples.
+- **`docs/architecture/mermaid/dlq-management-flow.mmd`** — new Mermaid diagram illustrating the inspect → replay/discard decision flow for dead-letter management.
+
+### Changed
+
+- `outbox-poll-cycle.mmd` updated to reference the new DLQ management operations (dotted edge from the dead-letter box to the new diagram).
+- `ARCHITECTURE.md` operational runbook table and recovery options updated to include `ListDeadLetters`, `ReprocessDeadLettersWith`, and `DiscardDeadLetters`.
+- `README.md` § Dead letters expanded with a full DLQ management API reference and code examples for all three operations.
+
 ---
 
-## [1.3.0] - 2026-06-19
+## [1.3.1] - 2026-06-19
+
+### Added
+
+- **`Envelope.SchemaID`** (`json:"schema_id,omitempty"`) — schema registry version identifier for the encoded payload (e.g. AWS Glue Schema Registry UUID). Set via `events.WithSchemaID(id string)`. Distinct from `SchemaVersion`: `SchemaID` is the technical registry pointer used by the codec for Avro/JSON deserialization; `SchemaVersion` (`"1"`, `"2"`, …) is the semantic version consumers use to gate business logic. Not forwarded as an SNS attribute.
+- `events.WithSchemaID(id string) EnvelopeOpt` — sets `SchemaID` on the envelope at construction time.
+
+---
+
+## [1.3.0] - 2026-06-20
 
 ### Added
 

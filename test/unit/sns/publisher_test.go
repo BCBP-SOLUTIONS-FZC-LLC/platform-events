@@ -136,6 +136,16 @@ func TestNewWithClient_EmptyTopicARN_ReturnsError(t *testing.T) {
 	assert.Contains(t, err.Error(), "TopicARN")
 }
 
+func TestNewWithClient_InvalidARNFormat_ReturnsError(t *testing.T) {
+	// NewWithClient has its own ARN prefix check; calling New() short-circuits before
+	// reaching it. This test calls NewWithClient directly to cover that branch.
+	client := successClient()
+	_, err := internalsns.NewWithClient("not-an-arn", client, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "TopicARN")
+	assert.Contains(t, err.Error(), "not-an-arn")
+}
+
 // ----------------------------
 // Publish success
 // ----------------------------

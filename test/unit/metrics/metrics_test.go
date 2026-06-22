@@ -223,3 +223,31 @@ func TestRecordOutboxDeadLettersReprocessed_PositiveIncrements(t *testing.T) {
 		internalmetics.RecordOutboxDeadLettersReprocessed(3)
 	})
 }
+
+// ----------------------------
+// RecordOutboxDeadLettersDiscarded guard paths
+// ----------------------------
+
+func TestRecordOutboxDeadLettersDiscarded_ZeroIsNoOp(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	internalmetics.InitWithRegisterer("discard-zero-test", "v0.0.15", reg)
+	assert.NotPanics(t, func() {
+		internalmetics.RecordOutboxDeadLettersDiscarded(0)
+	})
+}
+
+func TestRecordOutboxDeadLettersDiscarded_NegativeIsNoOp(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	internalmetics.InitWithRegisterer("discard-neg-test", "v0.0.16", reg)
+	assert.NotPanics(t, func() {
+		internalmetics.RecordOutboxDeadLettersDiscarded(-1)
+	})
+}
+
+func TestRecordOutboxDeadLettersDiscarded_PositiveIncrements(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	internalmetics.InitWithRegisterer("discard-pos-test", "v0.0.17", reg)
+	assert.NotPanics(t, func() {
+		internalmetics.RecordOutboxDeadLettersDiscarded(5)
+	})
+}

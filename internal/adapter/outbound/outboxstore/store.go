@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -368,6 +369,156 @@ func (s *Store) PrunePublished(ctx context.Context, olderThan time.Duration, lim
 		deleted = tag.RowsAffected()
 		return nil
 	})
+	return deleted, err
+}
+
+// buildDLQWhere constructs the optional WHERE clause and its positional args for
+// DLQ filter operations. Returns an empty string when the filter is a zero value
+// (matches all rows). argOffset is the $N index to start numbering from.
+func buildDLQWhere(f domain.DLQFilter, argOffset int) (string, []any) {
+	var parts []string
+	var args []any
+	n := argOffset
+	if f.EventType != "" {
+		parts = append(parts, fmt.Sprintf("event_type = $%d", n))
+		args = append(args, f.EventType)
+		n++
+	}
+	if f.TenantID != "" {
+		parts = append(parts, fmt.Sprintf("tenant_id = $%d", n))
+		args = append(args, f.TenantID)
+		n++
+	}
+	if !f.FailedBefore.IsZero() {
+		parts = append(parts, fmt.Sprintf("failed_at < $%d", n))
+		args = append(args, f.FailedBefore.UTC())
+		n++ //nolint:ineffassign // n is unused after the last append, but kept for clarity
+	}
+	if len(parts) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(parts, " AND "), args
+}
+
+// ListDeadLetters returns up to limit records from outbox_dead_letters that
+// match filter, ordered by failed_at ascending (oldest failures first).
+func (s *Store) ListDeadLetters(ctx context.Context, filter domain.DLQFilter, limit int) ([]domain.DeadLetterRecord, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("outboxstore: ListDeadLetters limit must be positive (got %d)", limit)
+	}
+	ctx, cancel := context.WithTimeout(ctx, defaultPruneTimeout)
+	defer cancel()
+
+	where, args := buildDLQWhere(filter, 1)
+	args = append(args, limit)
+	query := fmt.Sprintf(`
+		SELECT id, event_type, tenant_id, trace_id, attempts, last_error, created_at, failed_at
+		FROM outbox_dead_letters%s
+		ORDER BY failed_at ASC
+		LIMIT $%d
+	`, where, len(args))
+
+	var records []domain.DeadLetterRecord
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		rows, err := conn.Query(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r domain.DeadLetterRecord
+			if err := rows.Scan(&r.ID, &r.EventType, &r.TenantID, &r.TraceID,
+				&r.Attempts, &r.LastError, &r.CreatedAt, &r.FailedAt); err != nil {
+				return err
+			}
+			records = append(records, r)
+		}
+		return rows.Err()
+	})
+	return records, err
+}
+
+// ReprocessDeadLettersWith moves up to limit records that match filter from
+// outbox_dead_letters back to outbox_events, resetting attempts to 0.
+// Returns the number of records re-queued.
+func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQFilter, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("outboxstore: ReprocessDeadLettersWith limit must be positive (got %d)", limit)
+	}
+	ctx, cancel := context.WithTimeout(ctx, defaultPruneTimeout)
+	defer cancel()
+
+	where, filterArgs := buildDLQWhere(filter, 1)
+	// LIMIT arg comes after filter args in the inner SELECT.
+	limitArg := len(filterArgs) + 1
+	filterArgs = append(filterArgs, limit)
+
+	query := fmt.Sprintf(`
+		WITH moved AS (
+			DELETE FROM outbox_dead_letters
+			WHERE id IN (
+				SELECT id FROM outbox_dead_letters%s
+				ORDER BY created_at ASC
+				LIMIT $%d
+			)
+			RETURNING id, event_type, payload, tenant_id, trace_id, created_at
+		)
+		INSERT INTO outbox_events
+			(id, event_type, payload, tenant_id, trace_id, attempts, created_at, scheduled_at)
+		SELECT id, event_type, payload, tenant_id, trace_id, 0, created_at, NOW()
+		FROM moved
+	`, where, limitArg)
+
+	var moved int
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		tag, err := conn.Exec(ctx, query, filterArgs...)
+		if err != nil {
+			return err
+		}
+		moved = int(tag.RowsAffected())
+		return nil
+	})
+	if err == nil && moved > 0 {
+		metrics.RecordOutboxDeadLettersReprocessed(moved)
+	}
+	return moved, err
+}
+
+// DiscardDeadLetters permanently deletes up to limit records that match filter
+// from outbox_dead_letters. Use for poison-pill records that will never succeed.
+// Returns the number of rows deleted.
+func (s *Store) DiscardDeadLetters(ctx context.Context, filter domain.DLQFilter, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, fmt.Errorf("outboxstore: DiscardDeadLetters limit must be positive (got %d)", limit)
+	}
+	ctx, cancel := context.WithTimeout(ctx, defaultPruneTimeout)
+	defer cancel()
+
+	where, filterArgs := buildDLQWhere(filter, 1)
+	limitArg := len(filterArgs) + 1
+	filterArgs = append(filterArgs, limit)
+
+	query := fmt.Sprintf(`
+		DELETE FROM outbox_dead_letters
+		WHERE id IN (
+			SELECT id FROM outbox_dead_letters%s
+			ORDER BY failed_at ASC
+			LIMIT $%d
+		)
+	`, where, limitArg)
+
+	var deleted int64
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		tag, err := conn.Exec(ctx, query, filterArgs...)
+		if err != nil {
+			return err
+		}
+		deleted = tag.RowsAffected()
+		return nil
+	})
+	if err == nil && deleted > 0 {
+		metrics.RecordOutboxDeadLettersDiscarded(deleted)
+	}
 	return deleted, err
 }
 

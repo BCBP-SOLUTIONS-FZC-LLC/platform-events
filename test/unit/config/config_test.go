@@ -443,3 +443,54 @@ func TestLoadOutbox_AllRemainingInvalidValuesProduceWarnings(t *testing.T) {
 	assert.True(t, hasTimeout, "expected warning for OUTBOX_PUBLISH_TIMEOUT")
 	assert.True(t, hasDrain, "expected warning for OUTBOX_DRAIN_TIMEOUT")
 }
+
+// ---------------------------------------------------------------------------
+// maskQueryParams: query part without "=" (covers the continue branch)
+// ---------------------------------------------------------------------------
+
+func TestMaskDSN_QueryPartWithoutEquals(t *testing.T) {
+	// "sslmode" has no "=" — maskQueryParams must skip it (eqIdx < 0 → continue).
+	// "password=secret" should still be masked.
+	cfg := config.OutboxConfigEnv{ //nolint:gosec
+		DatabaseURL: "postgres://user:pass@host/db?sslmode&password=secret", //nolint:gosec
+	}
+	s := cfg.String()
+	assert.NotContains(t, s, "secret", "password value must be masked")
+	assert.Contains(t, s, "***", "masked sentinel must appear")
+}
+
+// ---------------------------------------------------------------------------
+// maskKeyValueDSN: field without "=" (covers the continue branch)
+// ---------------------------------------------------------------------------
+
+func TestMaskDSN_KeyValueFieldWithoutEquals(t *testing.T) {
+	// "sslmode" has no "=" — maskKeyValueDSN must skip it (eqIdx < 0 → continue).
+	// "password=secret" should still be masked.
+	cfg := config.OutboxConfigEnv{ //nolint:gosec
+		// No "://" → maskDSN falls through to maskKeyValueDSN
+		DatabaseURL: "host=localhost sslmode dbname=test password=secret", //nolint:gosec
+	}
+	s := cfg.String()
+	assert.NotContains(t, s, "secret", "password value must be masked")
+	assert.Contains(t, s, "***", "masked sentinel must appear")
+}
+
+// ---------------------------------------------------------------------------
+// LoadOutbox: OUTBOX_MAX_ATTEMPTS invalid value produces a warning
+// ---------------------------------------------------------------------------
+
+func TestLoadOutbox_InvalidMaxAttempts_ProducesWarning(t *testing.T) {
+	t.Setenv("OUTBOX_MAX_ATTEMPTS", "not-a-number")
+
+	cfg := config.LoadOutbox()
+
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "OUTBOX_MAX_ATTEMPTS") {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected a warning for invalid OUTBOX_MAX_ATTEMPTS")
+	assert.Equal(t, 5, cfg.MaxAttempts, "should fall back to default of 5")
+}

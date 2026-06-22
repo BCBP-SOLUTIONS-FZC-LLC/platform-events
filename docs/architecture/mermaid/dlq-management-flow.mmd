@@ -1,0 +1,28 @@
+flowchart TD
+    A([Dead-letter record in outbox_dead_letters\nevent_type · tenant_id · attempts · last_error · failed_at]) --> INSPECT
+
+    INSPECT["Step 1 — Inspect\nrunner.ListDeadLetters(ctx, DLQFilter{...}, limit)\nreturns []DeadLetterRecord ordered by failed_at ASC\n—no mutation, safe to call repeatedly—"]
+
+    INSPECT --> DECIDE{Root cause\nfixed?}
+
+    DECIDE -- "Yes — retry" --> REPLAY
+    DECIDE -- "Poison pill\n(payload invalid,\ntype decommissioned)" --> DISCARD
+    DECIDE -- "Not sure yet" --> INSPECT
+
+    REPLAY["Step 2a — Selective replay\nrunner.ReprocessDeadLettersWith(ctx, DLQFilter{\n    EventType:    optionalString,\n    TenantID:     optionalString,\n    FailedBefore: optionalTime,\n}, limit)\n\nOR — replay everything\nrunner.ReprocessDeadLetters(ctx, limit)"]
+
+    DISCARD["Step 2b — Permanent discard\nrunner.DiscardDeadLetters(ctx, DLQFilter{...}, limit)\n⚠️ irreversible — always ListDeadLetters first"]
+
+    REPLAY --> REQUEUE["Records moved back to outbox_events\nattempts reset to 0\noutbox_dead_letters_reprocessed_total++\nPicked up by runner on next poll cycle"]
+    DISCARD --> GONE["Records permanently deleted\noutbox_dead_letters_discarded_total++"]
+
+    REQUEUE --> RUNNER["Outbox Runner resumes normal\npoll cycle → Publisher.Publish → SNS"]
+    RUNNER -- success --> DONE([Event delivered])
+    RUNNER -- exceeds MaxAttempts again --> A
+
+    style INSPECT fill:#d0e8ff,stroke:#336699
+    style REPLAY fill:#d0ffd8,stroke:#2d8a4e
+    style DISCARD fill:#ffd0d0,stroke:#993333
+    style GONE fill:#ffd0d0,stroke:#993333
+    style REQUEUE fill:#d0ffd8,stroke:#2d8a4e
+    style DONE fill:#d0ffd8,stroke:#2d8a4e

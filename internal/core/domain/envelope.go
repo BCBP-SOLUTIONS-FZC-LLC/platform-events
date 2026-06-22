@@ -24,6 +24,7 @@ type Envelope[T any] struct {
 	CorrelationID string    `json:"correlation_id,omitempty"`
 	Subject       string    `json:"subject,omitempty"`
 	Actor         string    `json:"actor,omitempty"`
+	SchemaID      string    `json:"schema_id,omitempty"`
 	Timestamp     time.Time `json:"timestamp"`
 	Payload       T         `json:"payload"`
 }

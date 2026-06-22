@@ -20,6 +20,7 @@ var (
 	OutboxAttemptsTotal               *prometheus.CounterVec
 	OutboxDeadLettersTotal            *prometheus.CounterVec
 	OutboxDeadLettersReprocessedTotal *prometheus.CounterVec
+	OutboxDeadLettersDiscardedTotal   *prometheus.CounterVec
 	OutboxLeasedTotal                 *prometheus.GaugeVec
 
 	// SQS-level infrastructure error counters.
@@ -170,6 +171,15 @@ func initMetricsWithRegisterer(serviceName, buildVersion string, reg prometheus.
 	OutboxDeadLettersReprocessedTotal = factory.NewCounterVec(prometheus.CounterOpts{
 		Name:        "outbox_dead_letters_reprocessed_total",
 		Help:        "Total number of outbox dead-letter records re-queued for redelivery.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{})
+
+	// OutboxDeadLettersDiscardedTotal counts records permanently deleted from
+	// outbox_dead_letters via DiscardDeadLetters. Alert on rate() > 0 to confirm
+	// intentional operator action; unexpected discards are a data-loss signal.
+	OutboxDeadLettersDiscardedTotal = factory.NewCounterVec(prometheus.CounterOpts{
+		Name:        "outbox_dead_letters_discarded_total",
+		Help:        "Total number of outbox dead-letter records permanently discarded.",
 		ConstLabels: prometheus.Labels{"service": serviceName},
 	}, []string{})
 
@@ -393,6 +403,20 @@ func RecordOutboxUnmarshalError() {
 	metricsMu.RUnlock()
 	if c != nil {
 		c.WithLabelValues().Inc()
+	}
+}
+
+// RecordOutboxDeadLettersDiscarded increments the discarded dead-letter counter by n.
+// Safe to call before Init — no-ops when metrics are not initialised.
+func RecordOutboxDeadLettersDiscarded(n int64) {
+	if n <= 0 {
+		return
+	}
+	metricsMu.RLock()
+	c := OutboxDeadLettersDiscardedTotal
+	metricsMu.RUnlock()
+	if c != nil {
+		c.WithLabelValues().Add(float64(n))
 	}
 }
 

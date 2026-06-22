@@ -823,6 +823,484 @@ func TestOutboxStore_PrunePublished_LimitBoundsDelete(t *testing.T) {
 	_ = count // pending count excludes published rows; just ensure no error
 }
 
+// makeRecordWithTenant creates an OutboxRecord with explicit tenant and event type.
+func makeRecordWithTenant(eventType, tenantID string) domain.OutboxRecord {
+	env := domain.NewEnvelope(eventType, "test-svc", json.RawMessage(`{"test":true}`))
+	payload, _ := json.Marshal(env)
+	now := time.Now().UTC()
+	return domain.OutboxRecord{
+		ID:          env.ID,
+		EventType:   eventType,
+		Payload:     payload,
+		TenantID:    tenantID,
+		TraceID:     "trace-dlq",
+		CreatedAt:   now,
+		ScheduledAt: now,
+	}
+}
+
+// enqueueAndDeadLetter is a test helper that enqueues a record and immediately
+// moves it to outbox_dead_letters via MarkFailed with maxAttempts=1.
+func enqueueAndDeadLetter(ctx context.Context, t *testing.T, store *outboxstore.Store, pool *pgcommon.Pool, rec domain.OutboxRecord) {
+	t.Helper()
+	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		return store.Enqueue(ctx, tx, rec)
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.MarkFailed(ctx, rec, "forced to dead letter", 1))
+}
+
+// ----------------------------
+// ListDeadLetters
+// ----------------------------
+
+func TestOutboxStore_ListDeadLetters_Empty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, _, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	records, err := store.ListDeadLetters(ctx, domain.DLQFilter{}, 50)
+	require.NoError(t, err)
+	assert.Empty(t, records)
+}
+
+func TestOutboxStore_ListDeadLetters_ReturnsAll(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "acme"))
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("billing.invoice.settled", "acme"))
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "beta"))
+
+	records, err := store.ListDeadLetters(ctx, domain.DLQFilter{}, 100)
+	require.NoError(t, err)
+	assert.Len(t, records, 3)
+}
+
+func TestOutboxStore_ListDeadLetters_FilterByEventType(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "acme"))
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("billing.invoice.settled", "acme"))
+
+	records, err := store.ListDeadLetters(ctx, domain.DLQFilter{EventType: "iam.user.created"}, 100)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, "iam.user.created", records[0].EventType)
+}
+
+func TestOutboxStore_ListDeadLetters_FilterByTenantID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "acme"))
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "beta"))
+
+	records, err := store.ListDeadLetters(ctx, domain.DLQFilter{TenantID: "beta"}, 100)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, "beta", records[0].TenantID)
+}
+
+func TestOutboxStore_ListDeadLetters_FilterByEventTypeAndTenant(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "acme"))
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "beta"))
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("billing.invoice.settled", "acme"))
+
+	records, err := store.ListDeadLetters(ctx, domain.DLQFilter{EventType: "iam.user.created", TenantID: "acme"}, 100)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, "iam.user.created", records[0].EventType)
+	assert.Equal(t, "acme", records[0].TenantID)
+}
+
+func TestOutboxStore_ListDeadLetters_FilterByFailedBefore(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "acme"))
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("billing.invoice.settled", "acme"))
+
+	// Backdate one record's failed_at to a known time in the past.
+	past := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		_, err := conn.Exec(ctx,
+			`UPDATE outbox_dead_letters SET failed_at = $1 WHERE event_type = 'iam.user.created'`, past)
+		return err
+	})
+	require.NoError(t, err)
+
+	cutoff := time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC)
+	records, err := store.ListDeadLetters(ctx, domain.DLQFilter{FailedBefore: cutoff}, 100)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, "iam.user.created", records[0].EventType)
+}
+
+func TestOutboxStore_ListDeadLetters_RespectsLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	for i := 0; i < 5; i++ {
+		enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "acme"))
+	}
+
+	records, err := store.ListDeadLetters(ctx, domain.DLQFilter{}, 3)
+	require.NoError(t, err)
+	assert.Len(t, records, 3)
+}
+
+func TestOutboxStore_ListDeadLetters_InvalidLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, _, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	for _, limit := range []int{0, -1, -100} {
+		_, err := store.ListDeadLetters(ctx, domain.DLQFilter{}, limit)
+		require.Error(t, err, "limit=%d should return error", limit)
+		assert.Contains(t, err.Error(), "limit must be positive")
+	}
+}
+
+func TestOutboxStore_ListDeadLetters_ContainsExpectedFields(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	rec := makeRecordWithTenant("iam.user.created", "acme")
+	rec.TraceID = "trace-xyz"
+	enqueueAndDeadLetter(ctx, t, store, pool, rec)
+
+	records, err := store.ListDeadLetters(ctx, domain.DLQFilter{}, 10)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+
+	r := records[0]
+	assert.Equal(t, rec.ID, r.ID)
+	assert.Equal(t, "iam.user.created", r.EventType)
+	assert.Equal(t, "acme", r.TenantID)
+	assert.Equal(t, "trace-xyz", r.TraceID)
+	assert.GreaterOrEqual(t, r.Attempts, 1)
+	assert.NotEmpty(t, r.LastError)
+	assert.False(t, r.CreatedAt.IsZero())
+	assert.False(t, r.FailedAt.IsZero())
+}
+
+// ----------------------------
+// ReprocessDeadLettersWith
+// ----------------------------
+
+func TestOutboxStore_ReprocessDeadLettersWith_AllRecords(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "acme"))
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("billing.invoice.settled", "acme"))
+
+	n, err := store.ReprocessDeadLettersWith(ctx, domain.DLQFilter{}, 100)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+
+	// Both records should be back in outbox_events.
+	var count int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_events WHERE published_at IS NULL").Scan(&count)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, count)
+
+	// Dead letters table must be empty.
+	var dlCount int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters").Scan(&dlCount)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 0, dlCount)
+}
+
+func TestOutboxStore_ReprocessDeadLettersWith_FilterByEventType(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	rec1 := makeRecordWithTenant("iam.user.created", "acme")
+	rec2 := makeRecordWithTenant("billing.invoice.settled", "acme")
+	enqueueAndDeadLetter(ctx, t, store, pool, rec1)
+	enqueueAndDeadLetter(ctx, t, store, pool, rec2)
+
+	n, err := store.ReprocessDeadLettersWith(ctx, domain.DLQFilter{EventType: "iam.user.created"}, 100)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	// Only rec1 should be back; rec2 stays dead-lettered.
+	var outboxCount int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_events WHERE id = $1", rec1.ID).Scan(&outboxCount)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, outboxCount)
+
+	var dlCount int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec2.ID).Scan(&dlCount)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, dlCount)
+}
+
+func TestOutboxStore_ReprocessDeadLettersWith_FilterByTenantID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	recAcme := makeRecordWithTenant("iam.user.created", "acme")
+	recBeta := makeRecordWithTenant("iam.user.created", "beta")
+	enqueueAndDeadLetter(ctx, t, store, pool, recAcme)
+	enqueueAndDeadLetter(ctx, t, store, pool, recBeta)
+
+	n, err := store.ReprocessDeadLettersWith(ctx, domain.DLQFilter{TenantID: "acme"}, 100)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	var acmeBack int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_events WHERE id = $1", recAcme.ID).Scan(&acmeBack)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, acmeBack, "acme record must be back in outbox_events")
+
+	var betaStill int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", recBeta.ID).Scan(&betaStill)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, betaStill, "beta record must remain in dead_letters")
+}
+
+func TestOutboxStore_ReprocessDeadLettersWith_ResetsAttempts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	rec := makeRecordWithTenant("iam.user.created", "acme")
+	enqueueAndDeadLetter(ctx, t, store, pool, rec)
+
+	n, err := store.ReprocessDeadLettersWith(ctx, domain.DLQFilter{}, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	var attempts int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT attempts FROM outbox_events WHERE id = $1", rec.ID).Scan(&attempts)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 0, attempts, "reprocessed record must have attempts reset to 0")
+}
+
+func TestOutboxStore_ReprocessDeadLettersWith_InvalidLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, _, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	for _, limit := range []int{0, -1} {
+		n, err := store.ReprocessDeadLettersWith(ctx, domain.DLQFilter{}, limit)
+		require.Error(t, err, "limit=%d should return error", limit)
+		assert.Equal(t, 0, n)
+		assert.Contains(t, err.Error(), "limit must be positive")
+	}
+}
+
+// ----------------------------
+// DiscardDeadLetters
+// ----------------------------
+
+func TestOutboxStore_DiscardDeadLetters_DeletesAll(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "acme"))
+	enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("billing.invoice.settled", "acme"))
+
+	n, err := store.DiscardDeadLetters(ctx, domain.DLQFilter{}, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), n)
+
+	var count int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters").Scan(&count)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 0, count, "all dead-letter records should be gone after DiscardDeadLetters")
+}
+
+func TestOutboxStore_DiscardDeadLetters_FilterByEventType(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	rec1 := makeRecordWithTenant("legacy.sync.requested", "acme")
+	rec2 := makeRecordWithTenant("iam.user.created", "acme")
+	enqueueAndDeadLetter(ctx, t, store, pool, rec1)
+	enqueueAndDeadLetter(ctx, t, store, pool, rec2)
+
+	n, err := store.DiscardDeadLetters(ctx, domain.DLQFilter{EventType: "legacy.sync.requested"}, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+
+	// rec1 must be gone; rec2 must remain.
+	var rec1Count int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec1.ID).Scan(&rec1Count)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 0, rec1Count, "discarded record must be gone")
+
+	var rec2Count int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec2.ID).Scan(&rec2Count)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, rec2Count, "non-matching record must remain")
+}
+
+func TestOutboxStore_DiscardDeadLetters_FilterByTenantID(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	recAcme := makeRecordWithTenant("iam.user.created", "acme")
+	recBeta := makeRecordWithTenant("iam.user.created", "beta")
+	enqueueAndDeadLetter(ctx, t, store, pool, recAcme)
+	enqueueAndDeadLetter(ctx, t, store, pool, recBeta)
+
+	n, err := store.DiscardDeadLetters(ctx, domain.DLQFilter{TenantID: "acme"}, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+
+	var betaCount int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", recBeta.ID).Scan(&betaCount)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 1, betaCount, "beta record must still be in dead_letters")
+}
+
+func TestOutboxStore_DiscardDeadLetters_RespectsLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	for i := 0; i < 5; i++ {
+		enqueueAndDeadLetter(ctx, t, store, pool, makeRecordWithTenant("iam.user.created", "acme"))
+	}
+
+	n, err := store.DiscardDeadLetters(ctx, domain.DLQFilter{}, 2)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), n)
+
+	var remaining int
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters").Scan(&remaining)
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 3, remaining, "3 records should remain after limit-2 discard")
+}
+
+func TestOutboxStore_DiscardDeadLetters_EmptyTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, _, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	n, err := store.DiscardDeadLetters(ctx, domain.DLQFilter{}, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n)
+}
+
+func TestOutboxStore_DiscardDeadLetters_InvalidLimit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	store, _, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	for _, limit := range []int{0, -1} {
+		n, err := store.DiscardDeadLetters(ctx, domain.DLQFilter{}, limit)
+		require.Error(t, err, "limit=%d should return error", limit)
+		assert.Equal(t, int64(0), n)
+		assert.Contains(t, err.Error(), "limit must be positive")
+	}
+}
+
 func TestOutboxStore_PrunePublished_RecentRecordsNotDeleted(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")

@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_outbox_dead_letters_event_type_tenant_id;

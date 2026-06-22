@@ -44,6 +44,15 @@ func (s *stubStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) 
 func (s *stubStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
 	return 0, nil
 }
+func (s *stubStore) ListDeadLetters(_ context.Context, _ domain.DLQFilter, _ int) ([]domain.DeadLetterRecord, error) {
+	return nil, nil
+}
+func (s *stubStore) ReprocessDeadLettersWith(_ context.Context, _ domain.DLQFilter, _ int) (int, error) {
+	return 0, nil
+}
+func (s *stubStore) DiscardDeadLetters(_ context.Context, _ domain.DLQFilter, _ int) (int64, error) {
+	return 0, nil
+}
 
 var _ port.OutboxStore = (*stubStore)(nil)
 

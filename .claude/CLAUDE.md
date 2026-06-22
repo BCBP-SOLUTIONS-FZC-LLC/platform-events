@@ -100,7 +100,7 @@ External dependencies (private modules):
 
 - **Envelope**
   - `Envelope[T any]` — typed event wrapper: `ID`, `Type`, `Source`, `TenantID`, `TraceID`, `Timestamp`, `Payload T`
-  - `NewEnvelope[T](eventType, source string, payload T, opts ...EnvelopeOpt) Envelope[T]` — generates `ID` (UUID v7), sets `Timestamp` to `time.Now()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor`. When publishing from an HTTP handler, pass `WithTenantID(rc.TenantID)`, `WithTraceID(rc.TraceID)`, and `WithSchemaVersion("1")` where `rc` is the `gincommon.RequestContext` extracted via `gincommon.GetRequestContext(c)`. Pass `WithSubject` to identify the resource the event is about (e.g. `"users/<id>"`); pass `WithActor` to record who triggered it.
+  - `NewEnvelope[T](eventType, source string, payload T, opts ...EnvelopeOpt) Envelope[T]` — generates `ID` (UUID v7), sets `Timestamp` to `time.Now()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor`, `WithSchemaID`. When publishing from an HTTP handler, pass `WithTenantID(rc.TenantID)`, `WithTraceID(rc.TraceID)`, and `WithSchemaVersion("1")` where `rc` is the `gincommon.RequestContext` extracted via `gincommon.GetRequestContext(c)`. Pass `WithSubject` to identify the resource the event is about (e.g. `"users/<id>"`); pass `WithActor` to record who triggered it.
   - `Envelope.JSON() ([]byte, error)` — canonical JSON serialisation (payload marshalled inline)
   - `ParseEnvelope[T](data []byte) (Envelope[T], error)` — deserialise and validate required fields
 
@@ -190,6 +190,7 @@ pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx
   "correlation_id": "...",             // optional: ties events in a saga/workflow
   "subject":        "users/01926e4f-...", // optional: resource the event is about; also an SNS filter attribute
   "actor":          "admin@acme.com",  // optional: identity that caused the event (audit trail)
+  "schema_id":      "550e8400-...",    // optional: Glue Schema Registry UUID — distinct from schema_version
   "timestamp":      "2026-05-27T...",  // RFC3339Nano, UTC
   "payload":        { ... }            // typed T, inlined (not base64)
 }
@@ -197,7 +198,9 @@ pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx
 
 `event_type` convention: `<domain>.<entity>.<past-tense-verb>[.v<N>]` (e.g. `iam.user.created`, `billing.invoice.settled`). The `.v<N>` suffix only appears for breaking payload changes — v1 is implicit (no suffix). Consumers match on prefix with `strings.HasPrefix` or exact equality — no glob or regex routing in the base library.
 
-`schema_version` field: set via `WithSchemaVersion("1")` on every new event type at inception. Increment on additive-only field additions. For breaking changes, mint a new event type (`.v2`) and reset `schema_version` back to `"1"`. See `EVENT_SCHEMA_GOVERNANCE.md` for full rules, migration window pattern, and the cross-service event type registry.
+`schema_version` field: set via `WithSchemaVersion("1")` on every new event type at inception. **This is a semantic consumer-branching version — always a small integer string (`"1"`, `"2"`).** Do NOT put a Glue Schema Registry UUID here; use `WithSchemaID` for that instead (see below).
+
+`schema_id` field: set via `WithSchemaID(schemaVersionID)` where `schemaVersionID` is the UUID returned by the Glue codec's `Encode` call. This is the authoritative registry pointer the codec uses for Avro/JSON deserialization. It is distinct from `schema_version` and must never be confused with it. The Glue UUID is also embedded in the encoded payload's 18-byte wire-format header, so `schema_id` in the envelope is for observability and traceability only. Increment on additive-only field additions. For breaking changes, mint a new event type (`.v2`) and reset `schema_version` back to `"1"`. See `EVENT_SCHEMA_GOVERNANCE.md` for full rules, migration window pattern, and the cross-service event type registry.
 
 ### SNS Publisher
 
