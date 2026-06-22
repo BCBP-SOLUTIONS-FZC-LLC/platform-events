@@ -775,6 +775,29 @@ func TestNewWithClient_MaxMessages_OutOfRange(t *testing.T) {
 	_ = c.Start(ctx)
 }
 
+func TestNewWithClient_MaxMessages_OutOfRange_WithLogger_Warns(t *testing.T) {
+	// When MaxMessages is out of range AND a logger is configured, NewWithClient must
+	// emit a WARN. This covers the `cfg.Logger != nil && maxMessages != 0` branch.
+	logger := &fixtures.MockLogger{}
+	client := &mockSQSClient{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil }
+	_, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, MaxMessages: 15, WaitSeconds: 1, Logger: logger},
+		client,
+		handler,
+	)
+	require.NoError(t, err)
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "WARN" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected WARN log when MaxMessages is out of range with a logger set")
+}
+
 // ----------------------------
 // Dead-letter routing via WithMaxReceiveCount + WithDeadLetterHandler
 // ----------------------------

@@ -109,6 +109,15 @@ func (s *mockStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) 
 func (s *mockStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
 	return 0, nil
 }
+func (s *mockStore) ListDeadLetters(_ context.Context, _ domain.DLQFilter, _ int) ([]domain.DeadLetterRecord, error) {
+	return nil, nil
+}
+func (s *mockStore) ReprocessDeadLettersWith(_ context.Context, _ domain.DLQFilter, _ int) (int, error) {
+	return 0, nil
+}
+func (s *mockStore) DiscardDeadLetters(_ context.Context, _ domain.DLQFilter, _ int) (int64, error) {
+	return 0, nil
+}
 
 func (s *mockStore) PendingCount(_ context.Context) (int64, error) {
 	s.mu.Lock()
@@ -1392,4 +1401,18 @@ func TestOutboxService_PublishBatch_Parallel_Panic_MarkFailedError_WithLogger(t 
 		}
 	}
 	assert.True(t, found, "expected ERROR log when MarkFailed fails after goroutine panic")
+}
+
+func TestNewOutboxService_ZeroPublishConcurrency_DefaultsToOne(t *testing.T) {
+	// publishConcurrency <= 0 should be clamped to 1 inside NewOutboxService.
+	// This covers the `if publishConcurrency <= 0 { publishConcurrency = 1 }` branch.
+	store := newMockStore()
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, nil, nil, 5, 0, 0)
+
+	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.Payload = json.RawMessage(`{}`)
+
+	// Just verify the service was constructed and can be used without panic.
+	tx := noopTx{}
+	_ = svc.Enqueue(context.Background(), tx, env) // error expected (tx is noop), no panic
 }

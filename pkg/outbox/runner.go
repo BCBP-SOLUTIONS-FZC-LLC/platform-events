@@ -368,6 +368,61 @@ func (r *Runner) ReprocessDeadLetters(ctx context.Context, limit int) (int, erro
 	return r.svc.ReprocessDeadLetters(ctx, limit)
 }
 
+// ListDeadLetters returns up to limit records from outbox_dead_letters that
+// match filter, ordered by failed_at ascending (oldest failures first).
+// Use this to inspect what is in the DLQ before deciding whether to reprocess
+// or discard. Returns an empty slice (not an error) when no records match.
+// Applies a 30 s internal DB timeout.
+//
+// Example — inspect failures for a single tenant:
+//
+//	records, err := runner.ListDeadLetters(ctx, outbox.DLQFilter{TenantID: "acme"}, 50)
+//	for _, r := range records {
+//	    log.Printf("id=%s type=%s attempts=%d error=%s", r.ID, r.EventType, r.Attempts, r.LastError)
+//	}
+func (r *Runner) ListDeadLetters(ctx context.Context, filter DLQFilter, limit int) ([]DeadLetterRecord, error) {
+	return r.svc.ListDeadLetters(ctx, filter, limit)
+}
+
+// ReprocessDeadLettersWith moves up to limit records that match filter from
+// outbox_dead_letters back to outbox_events, resetting their attempt counters
+// to zero so they are retried from scratch on the next poll cycle.
+// Returns the number of records re-queued and any database error.
+// Applies a 30 s internal DB timeout.
+//
+// Call this after fixing the root cause (SNS permission, invalid payload, etc.)
+// to resume delivery for a targeted subset of failures rather than all records.
+//
+// Example — replay only billing events for tenant "acme" that failed before a
+// known incident window:
+//
+//	n, err := runner.ReprocessDeadLettersWith(ctx, outbox.DLQFilter{
+//	    EventType:    "billing.invoice.settled",
+//	    TenantID:     "acme",
+//	    FailedBefore: incidentEnd,
+//	}, 200)
+func (r *Runner) ReprocessDeadLettersWith(ctx context.Context, filter DLQFilter, limit int) (int, error) {
+	return r.svc.ReprocessDeadLettersWith(ctx, filter, limit)
+}
+
+// DiscardDeadLetters permanently deletes up to limit records that match filter
+// from outbox_dead_letters. Use for poison-pill records that can never be
+// delivered (malformed payload, decommissioned event type, etc.).
+// Returns the number of rows deleted and any database error.
+// Applies a 30 s internal DB timeout.
+//
+// ⚠️ Discarded records are unrecoverable. Always call [Runner.ListDeadLetters]
+// first to confirm the selection before discarding.
+//
+// Example — purge an obsolete event type:
+//
+//	n, err := runner.DiscardDeadLetters(ctx, outbox.DLQFilter{
+//	    EventType: "legacy.sync.requested",
+//	}, 1000)
+func (r *Runner) DiscardDeadLetters(ctx context.Context, filter DLQFilter, limit int) (int64, error) {
+	return r.svc.DiscardDeadLetters(ctx, filter, limit)
+}
+
 // PrunePublished deletes published records from outbox_events that are older than
 // olderThan to prevent unbounded table growth. Batches the delete to at most limit
 // rows per call to keep lock hold time bounded.

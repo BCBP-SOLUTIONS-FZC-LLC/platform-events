@@ -39,6 +39,21 @@ type OutboxStore interface {
 	// to outbox_events for redelivery. Returns the number of records re-queued.
 	ReprocessDeadLetters(ctx context.Context, limit int) (int, error)
 
+	// ListDeadLetters returns up to limit records from outbox_dead_letters that
+	// match filter, ordered by failed_at ascending (oldest failures first).
+	// Returns an empty slice (not an error) when no records match.
+	ListDeadLetters(ctx context.Context, filter domain.DLQFilter, limit int) ([]domain.DeadLetterRecord, error)
+
+	// ReprocessDeadLettersWith moves up to limit records that match filter from
+	// outbox_dead_letters back to outbox_events, resetting attempts to 0.
+	// Returns the number of records re-queued.
+	ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQFilter, limit int) (int, error)
+
+	// DiscardDeadLetters permanently deletes up to limit records that match filter
+	// from outbox_dead_letters. Use for poison-pill records that will never succeed.
+	// Returns the number of rows deleted.
+	DiscardDeadLetters(ctx context.Context, filter domain.DLQFilter, limit int) (int64, error)
+
 	// PrunePublished deletes published records older than olderThan from outbox_events
 	// to prevent unbounded table growth. The delete is batched to at most limit rows
 	// per call. Callers should run this periodically (e.g. daily) with an olderThan

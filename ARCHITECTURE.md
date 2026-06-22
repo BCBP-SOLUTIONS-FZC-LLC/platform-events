@@ -82,10 +82,32 @@ t=30s attempts reaches MaxAttempts (default 5):
       → outbox_dead_letters_total.Inc()
 
       ── Recovery ─────────────────────────────────────────────────────────
-      Option A: runner.ReprocessDeadLetters(ctx, 50)
-                Moves records back to outbox_events; resets attempts to 0.
-      Option B: SQL — fix root cause, then:
-                UPDATE outbox_dead_letters SET ... → INSERT outbox_events → DELETE outbox_dead_letters
+      Step 1 — Inspect:
+        runner.ListDeadLetters(ctx, outbox.DLQFilter{TenantID: "acme"}, 50)
+        → returns []outbox.DeadLetterRecord  (ID, EventType, TenantID,
+                                              Attempts, LastError, FailedAt)
+
+      Step 2a — Replay all:
+        runner.ReprocessDeadLetters(ctx, 50)
+        → moves all records back to outbox_events; resets attempts to 0
+
+      Step 2b — Selective replay:
+        runner.ReprocessDeadLettersWith(ctx, outbox.DLQFilter{
+            EventType:    "billing.invoice.settled",
+            TenantID:     "acme",
+            FailedBefore: incidentEnd,
+        }, 100)
+        → only moves records matching ALL supplied filter fields
+
+      Step 2c — Discard poison pills:
+        runner.DiscardDeadLetters(ctx, outbox.DLQFilter{
+            EventType: "legacy.sync.requested",   // decommissioned type
+        }, 1000)
+        → permanently deletes; ALWAYS call ListDeadLetters first to verify
+
+      Option D: Raw SQL — for migrations or bulk corrections:
+        UPDATE outbox_dead_letters SET ... →
+          INSERT outbox_events → DELETE outbox_dead_letters
 ```
 
 **Key producer-side invariants:**
@@ -143,7 +165,7 @@ Both systems use the term "dead letter" but they refer to entirely different sto
 
 | Term | What it is | How to query | How to recover |
 |------|-----------|--------------|---------------|
-| **Outbox dead letters** | Postgres rows in `outbox_dead_letters` — publish failures that exhausted `MaxAttempts` | `SELECT * FROM outbox_dead_letters WHERE tenant_id = 'acme'` | `runner.ReprocessDeadLetters(ctx, n)` |
+| **Outbox dead letters** | Postgres rows in `outbox_dead_letters` — publish failures that exhausted `MaxAttempts` | `runner.ListDeadLetters(ctx, filter, n)` or `SELECT * FROM outbox_dead_letters WHERE tenant_id = 'acme'` | `runner.ReprocessDeadLettersWith(ctx, filter, n)` · `runner.ReprocessDeadLetters(ctx, n)` · `runner.DiscardDeadLetters(ctx, filter, n)` |
 | **SQS DLQ** | A separate SQS queue — consumer failures that exhausted `MaxReceiveCount` | SQS console or `aws sqs receive-message --queue-url $DLQ_URL` | SQS redrive policy (SQS console → Start DLQ redrive) |
 
 When an on-call alert fires on `outbox_dead_letters_total`, the fix is on the **publisher side** (SNS connectivity, payload validity, queue subscription). When the alert is on a high `ApproximateNumberOfMessagesNotVisible` or a growing SQS DLQ depth, the fix is on the **consumer handler side** (logic bug, downstream dependency failure, missing idempotency).
@@ -152,7 +174,7 @@ When an on-call alert fires on `outbox_dead_letters_total`, the fix is on the **
 
 | Symptom | Likely cause | Where to look | Fix |
 |---------|-------------|---------------|-----|
-| `outbox_dead_letters_total` rate > 0 | SNS publish failure or invalid payload | `outbox_dead_letters.last_error` | Fix root cause; call `ReprocessDeadLetters` |
+| `outbox_dead_letters_total` rate > 0 | SNS publish failure or invalid payload | `outbox_dead_letters.last_error` | Fix root cause; call `ListDeadLetters` to inspect, then `ReprocessDeadLettersWith` (selective) or `ReprocessDeadLetters` (all); call `DiscardDeadLetters` for poison pills |
 | `outbox_mark_published_errors_total` > 0 | DB write failed after SNS delivery succeeded — record will be re-published on next poll | `outbox_events.last_error`; DB connectivity | Investigate DB health; note: consumer **must be idempotent** — duplicate delivery is actively occurring |
 | `outbox_pending_total` growing, `outbox_published_total` flat | SNS throttling or outbox runner stopped | `outbox_events.last_error`; outbox runner logs | Check SNS quotas; ensure runner is running; retryable errors auto-recover |
 | `events_consumed_total{status=error}` growing | Handler returning errors repeatedly | Handler logs; downstream service health | Fix handler bug; SQS redrive once fixed |

@@ -443,6 +443,24 @@ func (s *OutboxService) ReprocessDeadLetters(ctx context.Context, limit int) (in
 	return s.store.ReprocessDeadLetters(ctx, limit)
 }
 
+// ListDeadLetters returns up to limit dead-letter records matching filter,
+// ordered by failed_at ascending (oldest failures first).
+func (s *OutboxService) ListDeadLetters(ctx context.Context, filter domain.DLQFilter, limit int) ([]domain.DeadLetterRecord, error) {
+	return s.store.ListDeadLetters(ctx, filter, limit)
+}
+
+// ReprocessDeadLettersWith moves up to limit filtered records from
+// outbox_dead_letters back to outbox_events, resetting their attempt counters.
+func (s *OutboxService) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQFilter, limit int) (int, error) {
+	return s.store.ReprocessDeadLettersWith(ctx, filter, limit)
+}
+
+// DiscardDeadLetters permanently deletes up to limit filtered records from
+// outbox_dead_letters. Returns the number of rows deleted.
+func (s *OutboxService) DiscardDeadLetters(ctx context.Context, filter domain.DLQFilter, limit int) (int64, error) {
+	return s.store.DiscardDeadLetters(ctx, filter, limit)
+}
+
 // PrunePublished deletes published records older than olderThan from outbox_events.
 func (s *OutboxService) PrunePublished(ctx context.Context, olderThan time.Duration, limit int) (int64, error) {
 	return s.store.PrunePublished(ctx, olderThan, limit)

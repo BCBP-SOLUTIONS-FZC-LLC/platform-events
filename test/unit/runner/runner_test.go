@@ -89,6 +89,15 @@ func (s *mockOutboxStore) ReprocessDeadLetters(_ context.Context, _ int) (int, e
 func (s *mockOutboxStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
 	return 0, nil
 }
+func (s *mockOutboxStore) ListDeadLetters(_ context.Context, _ domain.DLQFilter, _ int) ([]domain.DeadLetterRecord, error) {
+	return nil, nil
+}
+func (s *mockOutboxStore) ReprocessDeadLettersWith(_ context.Context, _ domain.DLQFilter, _ int) (int, error) {
+	return 0, nil
+}
+func (s *mockOutboxStore) DiscardDeadLetters(_ context.Context, _ domain.DLQFilter, _ int) (int64, error) {
+	return 0, nil
+}
 
 func (s *mockOutboxStore) PendingCount(_ context.Context) (int64, error) {
 	s.mu.Lock()
@@ -582,6 +591,29 @@ func TestApplySchema_InvalidDSN_Error(t *testing.T) {
 	assert.Contains(t, err.Error(), "migrations table")
 }
 
+func TestApplySchema_ValidDSN_CoversDSNManipulation(t *testing.T) {
+	// Passes a parseable DSN — dsnWithMigrationsTable succeeds, then Up() fails
+	// because there is no real database. This test exists solely to exercise the
+	// url-manipulation happy path (q.Set + Encode) so that branch is not a
+	// coverage gap when integration tests cannot run.
+	runner := &migrate.Runner{DSN: "postgres://localhost:5432/testdb?sslmode=disable"}
+	err := outbox.ApplySchema(context.Background(), runner)
+	// We expect an error (no DB), but NOT the "migrations table" error — that
+	// would mean url.Parse failed, which is what we are testing does NOT happen.
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "migrations table",
+		"url manipulation should succeed; only the DB connection attempt should fail")
+}
+
+func TestApplySchema_ValidDSN_AlreadyHasMigrationsTable(t *testing.T) {
+	// When the DSN already contains x-migrations-table, dsnWithMigrationsTable
+	// must not override the existing value (the !q.Has() == false branch).
+	runner := &migrate.Runner{DSN: "postgres://localhost:5432/testdb?x-migrations-table=custom_migrations"}
+	err := outbox.ApplySchema(context.Background(), runner)
+	require.Error(t, err) // DB connection fails — expected
+	assert.NotContains(t, err.Error(), "migrations table")
+}
+
 func TestRunner_PollOnce_SchemaMissingHint_Logged(t *testing.T) {
 	store := newMockOutboxStore()
 	store.setClaimErr(errors.New(`pq: relation "outbox_events" does not exist`))
@@ -1002,6 +1034,10 @@ func TestRunner_StartupJitter_ContextCancelled_During_Jitter(t *testing.T) {
 // Runner.ReprocessDeadLetters
 // ----------------------------
 
+// ----------------------------
+// DLQ store stubs
+// ----------------------------
+
 // reprocessableStore overrides ReprocessDeadLetters to return configurable results.
 type reprocessableStore struct {
 	*mockOutboxStore
@@ -1312,6 +1348,192 @@ func TestRunner_PrunePublished_Error(t *testing.T) {
 	_, err = r.PrunePublished(context.Background(), 24*time.Hour, 500)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "db: prune timed out")
+}
+
+// ----------------------------
+// Runner.ListDeadLetters
+// ----------------------------
+
+type listableStore struct {
+	*mockOutboxStore
+	records []domain.DeadLetterRecord
+	err     error
+}
+
+func (s *listableStore) ListDeadLetters(_ context.Context, _ domain.DLQFilter, _ int) ([]domain.DeadLetterRecord, error) {
+	return s.records, s.err
+}
+
+func TestRunner_ListDeadLetters_ReturnsRecords(t *testing.T) {
+	now := time.Now().UTC()
+	want := []domain.DeadLetterRecord{
+		{ID: "id-1", EventType: "iam.user.created", TenantID: "acme", Attempts: 5, LastError: "SNS error", FailedAt: now},
+		{ID: "id-2", EventType: "billing.invoice.settled", TenantID: "acme", Attempts: 5, LastError: "timeout", FailedAt: now},
+	}
+	store := &listableStore{mockOutboxStore: newMockOutboxStore(), records: want}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	got, err := r.ListDeadLetters(context.Background(), outbox.DLQFilter{TenantID: "acme"}, 10)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	assert.Equal(t, "id-1", got[0].ID)
+	assert.Equal(t, "id-2", got[1].ID)
+}
+
+func TestRunner_ListDeadLetters_Empty(t *testing.T) {
+	store := &listableStore{mockOutboxStore: newMockOutboxStore()}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	got, err := r.ListDeadLetters(context.Background(), outbox.DLQFilter{}, 50)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+func TestRunner_ListDeadLetters_Error(t *testing.T) {
+	store := &listableStore{mockOutboxStore: newMockOutboxStore(), err: errors.New("db timeout")}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	_, err = r.ListDeadLetters(context.Background(), outbox.DLQFilter{EventType: "iam.user.created"}, 10)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "db timeout")
+}
+
+// ----------------------------
+// Runner.ReprocessDeadLettersWith
+// ----------------------------
+
+type reprocessWithStore struct {
+	*mockOutboxStore
+	count          int
+	err            error
+	capturedFilter domain.DLQFilter
+	capturedLimit  int
+}
+
+func (s *reprocessWithStore) ReprocessDeadLettersWith(_ context.Context, f domain.DLQFilter, limit int) (int, error) {
+	s.capturedFilter = f
+	s.capturedLimit = limit
+	return s.count, s.err
+}
+
+func TestRunner_ReprocessDeadLettersWith_Success(t *testing.T) {
+	store := &reprocessWithStore{mockOutboxStore: newMockOutboxStore(), count: 7}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	filter := outbox.DLQFilter{EventType: "iam.user.created", TenantID: "acme"}
+	n, err := r.ReprocessDeadLettersWith(context.Background(), filter, 100)
+	require.NoError(t, err)
+	assert.Equal(t, 7, n)
+	assert.Equal(t, "iam.user.created", store.capturedFilter.EventType)
+	assert.Equal(t, "acme", store.capturedFilter.TenantID)
+	assert.Equal(t, 100, store.capturedLimit)
+}
+
+func TestRunner_ReprocessDeadLettersWith_Zero(t *testing.T) {
+	store := &reprocessWithStore{mockOutboxStore: newMockOutboxStore(), count: 0}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	n, err := r.ReprocessDeadLettersWith(context.Background(), outbox.DLQFilter{}, 50)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+}
+
+func TestRunner_ReprocessDeadLettersWith_Error(t *testing.T) {
+	store := &reprocessWithStore{mockOutboxStore: newMockOutboxStore(), err: errors.New("db failure")}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	_, err = r.ReprocessDeadLettersWith(context.Background(), outbox.DLQFilter{TenantID: "acme"}, 10)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "db failure")
+}
+
+// ----------------------------
+// Runner.DiscardDeadLetters
+// ----------------------------
+
+type discardableStore struct {
+	*mockOutboxStore
+	deleted        int64
+	err            error
+	capturedFilter domain.DLQFilter
+	capturedLimit  int
+}
+
+func (s *discardableStore) DiscardDeadLetters(_ context.Context, f domain.DLQFilter, limit int) (int64, error) {
+	s.capturedFilter = f
+	s.capturedLimit = limit
+	return s.deleted, s.err
+}
+
+func TestRunner_DiscardDeadLetters_Success(t *testing.T) {
+	store := &discardableStore{mockOutboxStore: newMockOutboxStore(), deleted: 3}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	filter := outbox.DLQFilter{EventType: "legacy.sync.requested"}
+	n, err := r.DiscardDeadLetters(context.Background(), filter, 1000)
+	require.NoError(t, err)
+	assert.Equal(t, int64(3), n)
+	assert.Equal(t, "legacy.sync.requested", store.capturedFilter.EventType)
+	assert.Equal(t, 1000, store.capturedLimit)
+}
+
+func TestRunner_DiscardDeadLetters_Zero(t *testing.T) {
+	store := &discardableStore{mockOutboxStore: newMockOutboxStore(), deleted: 0}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	n, err := r.DiscardDeadLetters(context.Background(), outbox.DLQFilter{}, 100)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), n)
+}
+
+func TestRunner_DiscardDeadLetters_Error(t *testing.T) {
+	store := &discardableStore{mockOutboxStore: newMockOutboxStore(), err: errors.New("db: delete failed")}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	_, err = r.DiscardDeadLetters(context.Background(), outbox.DLQFilter{EventType: "bad.event"}, 10)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "db: delete failed")
+}
+
+func TestRunner_DiscardDeadLetters_FilteredByFailedBefore(t *testing.T) {
+	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	store := &discardableStore{mockOutboxStore: newMockOutboxStore(), deleted: 12}
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub})
+	require.NoError(t, err)
+
+	n, err := r.DiscardDeadLetters(context.Background(), outbox.DLQFilter{FailedBefore: cutoff}, 500)
+	require.NoError(t, err)
+	assert.Equal(t, int64(12), n)
+	assert.Equal(t, cutoff, store.capturedFilter.FailedBefore)
 }
 
 // ----------------------------

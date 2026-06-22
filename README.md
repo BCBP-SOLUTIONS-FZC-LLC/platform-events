@@ -1104,16 +1104,56 @@ Failed outbox records that exhaust `MaxAttempts` move to `outbox_dead_letters` �
 SELECT * FROM outbox_dead_letters WHERE tenant_id = 'acme' ORDER BY failed_at DESC;
 ```
 
-Replay dead letters programmatically without SQL access:
+#### DLQ management API
+
+Three methods on `Runner` give full programmatic control over dead letters without requiring direct SQL access.
+
+**Step 1 — Inspect before acting.**
 
 ```go
-// Move up to 50 records from dead_letters back to outbox_events for redelivery.
-n, err := runner.ReprocessDeadLetters(ctx, 50)
-if err != nil {
-    logger.Error("dead-letter reprocess failed", map[string]any{"error": err.Error()})
+// List up to 50 failures for a specific tenant, oldest first.
+records, err := runner.ListDeadLetters(ctx, outbox.DLQFilter{TenantID: "acme"}, 50)
+for _, r := range records {
+    log.Printf("id=%s type=%s attempts=%d failed=%s error=%s",
+        r.ID, r.EventType, r.Attempts, r.FailedAt.Format(time.RFC3339), r.LastError)
 }
-logger.Info("dead letters requeued", map[string]any{"count": n})
 ```
+
+**Step 2a — Replay after fixing the root cause.**
+
+```go
+// Unfiltered: move ALL dead letters back to outbox_events (attempts reset to 0).
+n, err := runner.ReprocessDeadLetters(ctx, 100)
+
+// Filtered: replay only a specific event type for one tenant.
+n, err := runner.ReprocessDeadLettersWith(ctx, outbox.DLQFilter{
+    EventType: "billing.invoice.settled",
+    TenantID:  "acme",
+}, 100)
+
+// Time-bounded: replay only records that failed before an incident window ended.
+n, err := runner.ReprocessDeadLettersWith(ctx, outbox.DLQFilter{
+    FailedBefore: incidentEndTime,
+}, 500)
+```
+
+**Step 2b — Discard poison pills that can never succeed.**
+
+```go
+// ⚠️ Always call ListDeadLetters first to confirm the selection.
+n, err := runner.DiscardDeadLetters(ctx, outbox.DLQFilter{
+    EventType: "legacy.sync.requested", // decommissioned event type
+}, 1000)
+log.Printf("discarded %d irrecoverable dead letters", n)
+```
+
+`DLQFilter` fields are all optional (zero value = match all):
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `EventType` | `string` | Exact event type match (`""` = all types) |
+| `TenantID` | `string` | Exact tenant match (`""` = all tenants) |
+| `FailedBefore` | `time.Time` | Only records where `failed_at < FailedBefore` (zero = no bound) |
 
 **Retryable failures** (SNS throttling: `ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`) do not count toward `MaxAttempts` — the outbox uses `threshold = MaxAttempts+1` for these errors. A period of SNS unavailability will not dead-letter records that are otherwise healthy.
 
