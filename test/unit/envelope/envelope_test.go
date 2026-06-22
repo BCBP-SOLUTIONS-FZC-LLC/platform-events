@@ -60,21 +60,21 @@ func TestEnvelope_JSON_RoundTrip(t *testing.T) {
 }
 
 func TestParseEnvelope_MissingID(t *testing.T) {
-	data := `{"type":"test.event","source":"svc","timestamp":"2026-01-01T00:00:00Z","payload":{}}`
+	data := `{"type":"test.event","source":"svc","time":"2026-01-01T00:00:00Z","data":{}}`
 	_, err := events.ParseEnvelope[json.RawMessage]([]byte(data))
 	require.Error(t, err)
 	assert.ErrorIs(t, err, events.ErrEnvelopeIDRequired)
 }
 
 func TestParseEnvelope_MissingType(t *testing.T) {
-	data := `{"id":"01926e4f-1234-7abc-8def-000000000001","source":"svc","timestamp":"2026-01-01T00:00:00Z","payload":{}}`
+	data := `{"id":"01926e4f-1234-7abc-8def-000000000001","source":"svc","time":"2026-01-01T00:00:00Z","data":{}}`
 	_, err := events.ParseEnvelope[json.RawMessage]([]byte(data))
 	require.Error(t, err)
 	assert.ErrorIs(t, err, events.ErrEnvelopeTypeRequired)
 }
 
 func TestParseEnvelope_MissingSource(t *testing.T) {
-	data := `{"id":"01926e4f-1234-7abc-8def-000000000001","type":"test.event","timestamp":"2026-01-01T00:00:00Z","payload":{}}`
+	data := `{"id":"01926e4f-1234-7abc-8def-000000000001","type":"test.event","time":"2026-01-01T00:00:00Z","data":{}}`
 	_, err := events.ParseEnvelope[json.RawMessage]([]byte(data))
 	require.Error(t, err)
 	assert.ErrorIs(t, err, events.ErrEnvelopeSourceRequired)
@@ -146,7 +146,7 @@ func TestEnvelope_SchemaVersion_RoundTrip(t *testing.T) {
 
 	b, err := original.JSON()
 	require.NoError(t, err)
-	assert.Contains(t, string(b), `"schema_version":"2"`)
+	assert.Contains(t, string(b), `"specversion":"2"`)
 
 	parsed, err := events.ParseEnvelope[json.RawMessage](b)
 	require.NoError(t, err)
@@ -158,7 +158,7 @@ func TestEnvelope_SchemaVersion_OmittedFromJSON_WhenEmpty(t *testing.T) {
 	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`))
 	b, err := env.JSON()
 	require.NoError(t, err)
-	assert.NotContains(t, string(b), "schema_version")
+	assert.NotContains(t, string(b), "specversion")
 }
 
 // ----------------------------
@@ -224,8 +224,8 @@ func TestEnvelope_SchemaID_RoundTrip(t *testing.T) {
 
 	b, err := original.JSON()
 	require.NoError(t, err)
-	assert.Contains(t, string(b), `"schema_version":"1"`)
-	assert.Contains(t, string(b), `"schema_id":"550e8400-e29b-41d4-a716-446655440000"`)
+	assert.Contains(t, string(b), `"specversion":"1"`)
+	assert.Contains(t, string(b), `"dataschema":"550e8400-e29b-41d4-a716-446655440000"`)
 
 	parsed, err := events.ParseEnvelope[json.RawMessage](b)
 	require.NoError(t, err)
@@ -239,7 +239,7 @@ func TestEnvelope_SchemaID_OmittedFromJSON_WhenEmpty(t *testing.T) {
 	)
 	b, err := env.JSON()
 	require.NoError(t, err)
-	assert.NotContains(t, string(b), "schema_id")
+	assert.NotContains(t, string(b), "dataschema")
 }
 
 func TestEnvelope_SchemaVersion_And_SchemaID_AreIndependent(t *testing.T) {
@@ -258,10 +258,67 @@ func TestEnvelope_SchemaVersion_And_SchemaID_AreIndependent(t *testing.T) {
 // ParseEnvelope — timestamp zero check
 // ----------------------------
 
-func TestParseEnvelope_MissingTimestamp(t *testing.T) {
-	// Valid id, type, source, but no timestamp field
-	data := `{"id":"01926e4f-1234-7abc-8def-000000000001","type":"test.event","source":"svc","tenant_id":"acme","payload":{}}`
+func TestParseEnvelope_MissingTime(t *testing.T) {
+	// Valid id, type, source, but no time field
+	data := `{"id":"01926e4f-1234-7abc-8def-000000000001","type":"test.event","source":"svc","tenant_id":"acme","data":{}}`
 	_, err := events.ParseEnvelope[json.RawMessage]([]byte(data))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "timestamp")
+	assert.Contains(t, err.Error(), "'time'")
 }
+
+// ----------------------------
+// WithIPAddress / WithUserAgent
+// ----------------------------
+
+func TestWithIPAddress_SetsField(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`),
+		events.WithIPAddress("203.0.113.42"),
+	)
+	assert.Equal(t, "203.0.113.42", env.IPAddress)
+}
+
+func TestWithUserAgent_SetsField(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`),
+		events.WithUserAgent("Mozilla/5.0 (compatible; XPert/1.0)"),
+	)
+	assert.Equal(t, "Mozilla/5.0 (compatible; XPert/1.0)", env.UserAgent)
+}
+
+func TestEnvelope_IPAddressUserAgent_RoundTrip(t *testing.T) {
+	original := events.NewEnvelope("iam.user.login", "platform-iam", json.RawMessage(`{"ok":true}`),
+		events.WithTenantID("acme"),
+		events.WithIPAddress("203.0.113.42"),
+		events.WithUserAgent("Go-http-client/2.0"),
+	)
+
+	b, err := original.JSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"ip_address":"203.0.113.42"`)
+	assert.Contains(t, string(b), `"user_agent":"Go-http-client/2.0"`)
+
+	parsed, err := events.ParseEnvelope[json.RawMessage](b)
+	require.NoError(t, err)
+	assert.Equal(t, "203.0.113.42", parsed.IPAddress)
+	assert.Equal(t, "Go-http-client/2.0", parsed.UserAgent)
+}
+
+func TestEnvelope_IPAddressUserAgent_OmittedFromJSON_WhenEmpty(t *testing.T) {
+	env := events.NewEnvelope("iam.user.created", "platform-iam", json.RawMessage(`{}`))
+	b, err := env.JSON()
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "ip_address")
+	assert.NotContains(t, string(b), "user_agent")
+}
+
+// ----------------------------
+// CloudEvents "data" field rename
+// ----------------------------
+
+func TestEnvelope_JSON_UsesDataKey(t *testing.T) {
+	env := events.NewEnvelope("test.event", "svc", json.RawMessage(`{"x":1}`))
+	b, err := env.JSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(b), `"data":`)
+	assert.NotContains(t, string(b), `"payload":`)
+}
+

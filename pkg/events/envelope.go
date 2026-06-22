@@ -19,15 +19,57 @@ type Envelope[T any] struct {
 	ID            string    `json:"id"`
 	Type          string    `json:"type"`
 	Source        string    `json:"source"`
-	SchemaVersion string    `json:"schema_version,omitempty"`
+	SchemaVersion string    `json:"specversion,omitempty"`
 	TenantID      string    `json:"tenant_id,omitempty"`
 	TraceID       string    `json:"trace_id,omitempty"`
 	CorrelationID string    `json:"correlation_id,omitempty"`
 	Subject       string    `json:"subject,omitempty"`
 	Actor         string    `json:"actor,omitempty"`
-	SchemaID      string    `json:"schema_id,omitempty"`
-	Timestamp     time.Time `json:"timestamp"`
-	Payload       T         `json:"payload"`
+	IPAddress     string    `json:"ip_address,omitempty"`
+	UserAgent     string    `json:"user_agent,omitempty"`
+	SchemaID      string    `json:"dataschema,omitempty"`
+	Timestamp     time.Time `json:"time"`
+	Payload       T         `json:"data"`
+}
+
+// UnmarshalJSON decodes an Envelope from its canonical JSON representation.
+func (e *Envelope[T]) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		ID            string          `json:"id"`
+		Type          string          `json:"type"`
+		Source        string          `json:"source"`
+		SchemaVersion string          `json:"specversion"`
+		TenantID      string          `json:"tenant_id"`
+		TraceID       string          `json:"trace_id"`
+		CorrelationID string          `json:"correlation_id"`
+		Subject       string          `json:"subject"`
+		Actor         string          `json:"actor"`
+		IPAddress     string          `json:"ip_address"`
+		UserAgent     string          `json:"user_agent"`
+		SchemaID      string          `json:"dataschema"`
+		Timestamp     time.Time       `json:"time"`
+		Data          json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	e.ID = raw.ID
+	e.Type = raw.Type
+	e.Source = raw.Source
+	e.SchemaVersion = raw.SchemaVersion
+	e.TenantID = raw.TenantID
+	e.TraceID = raw.TraceID
+	e.CorrelationID = raw.CorrelationID
+	e.Subject = raw.Subject
+	e.Actor = raw.Actor
+	e.IPAddress = raw.IPAddress
+	e.UserAgent = raw.UserAgent
+	e.SchemaID = raw.SchemaID
+	e.Timestamp = raw.Timestamp
+	if len(raw.Data) > 0 {
+		return json.Unmarshal(raw.Data, &e.Payload)
+	}
+	return nil
 }
 
 // envelopeConfig collects all optional envelope fields set via EnvelopeOpt.
@@ -40,6 +82,8 @@ type envelopeConfig struct {
 	schemaVersion string
 	subject       string
 	actor         string
+	ipAddress     string
+	userAgent     string
 	schemaID      string
 }
 
@@ -95,6 +139,19 @@ func WithActor(actor string) EnvelopeOpt {
 	return func(c *envelopeConfig) { c.actor = actor }
 }
 
+// WithIPAddress sets the IPAddress field — the client IP at the time the event
+// was triggered. Pass r.RemoteAddr (or the X-Forwarded-For value after
+// validation) from the HTTP handler. Omit for background/system events.
+func WithIPAddress(ip string) EnvelopeOpt {
+	return func(c *envelopeConfig) { c.ipAddress = ip }
+}
+
+// WithUserAgent sets the UserAgent field — the HTTP User-Agent header value
+// from the request that triggered the event. Omit for background/system events.
+func WithUserAgent(ua string) EnvelopeOpt {
+	return func(c *envelopeConfig) { c.userAgent = ua }
+}
+
 // WithSchemaID sets the SchemaID field on the envelope — the schema registry
 // version identifier for the encoded payload (e.g. a Glue Schema Registry UUID).
 // This is distinct from SchemaVersion: SchemaID is the authoritative registry
@@ -130,6 +187,8 @@ func NewEnvelope[T any](eventType, source string, payload T, opts ...EnvelopeOpt
 	env.SchemaVersion = cfg.schemaVersion
 	env.Subject = cfg.subject
 	env.Actor = cfg.actor
+	env.IPAddress = cfg.ipAddress
+	env.UserAgent = cfg.userAgent
 	env.SchemaID = cfg.schemaID
 	return env
 }
@@ -164,7 +223,7 @@ func ParseEnvelope[T any](data []byte) (Envelope[T], error) {
 		return env, ErrEnvelopeSourceRequired
 	}
 	if env.Timestamp.IsZero() {
-		return env, fmt.Errorf("events: envelope missing required field 'timestamp'")
+		return env, fmt.Errorf("events: envelope missing required field 'time'")
 	}
 	return env, nil
 }

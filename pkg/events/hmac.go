@@ -31,15 +31,17 @@ type hmacEnvelope struct {
 	ID            string          `json:"id"`
 	Type          string          `json:"type"`
 	Source        string          `json:"source"`
-	SchemaVersion string          `json:"schema_version"`
+	SchemaVersion string          `json:"specversion"`
 	TenantID      string          `json:"tenant_id"`
 	TraceID       string          `json:"trace_id"`
 	CorrelationID string          `json:"correlation_id"`
 	Subject       string          `json:"subject"`
 	Actor         string          `json:"actor"`
-	SchemaID      string          `json:"schema_id"`
-	Timestamp     time.Time       `json:"timestamp"`
-	Payload       json.RawMessage `json:"payload"`
+	IPAddress     string          `json:"ip_address"`
+	UserAgent     string          `json:"user_agent"`
+	SchemaID      string          `json:"dataschema"`
+	Timestamp     time.Time       `json:"time"`
+	Payload       json.RawMessage `json:"data"`
 }
 
 // canonicalHMACBytes returns a deterministic JSON encoding of env suitable for

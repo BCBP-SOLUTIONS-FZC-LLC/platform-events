@@ -272,7 +272,7 @@ The library is organised in concentric Clean Architecture layers. Inner layers h
 ```mermaid
 graph TD
     subgraph pub["Public API  —  pkg/"]
-        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
+        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
         outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 
@@ -399,8 +399,8 @@ graph LR
 
 | Symbol | Description |
 |--------|-------------|
-| `Envelope[T any]` | Typed event wrapper: `ID` (UUID v7), `Type`, `Source`, `SchemaVersion`, `TenantID`, `TraceID`, `CorrelationID`, `Subject`, `Actor`, `SchemaID`, `Timestamp`, `Payload T` |
-| `NewEnvelope[T](type, source, payload, opts...)` | Generates `ID` (UUID v7), sets `Timestamp = time.Now().UTC()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor`, `WithSchemaID` |
+| `Envelope[T any]` | Typed event wrapper: `ID` (UUID v7), `Type`, `Source`, `SchemaVersion`, `TenantID`, `TraceID`, `CorrelationID`, `Subject`, `Actor`, `IPAddress`, `UserAgent`, `SchemaID`, `Timestamp`, `Payload T` |
+| `NewEnvelope[T](type, source, payload, opts...)` | Generates `ID` (UUID v7), sets `Timestamp = time.Now().UTC()`. Options: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor`, `WithIPAddress`, `WithUserAgent`, `WithSchemaID` |
 | `WithSchemaVersion(v)` | Sets `SchemaVersion` on the envelope. Use `"1"` at inception; increment on additive-only field additions. See [EVENT_SCHEMA_GOVERNANCE.md](../EVENT_SCHEMA_GOVERNANCE.md). |
 | `SystemTenantID` | String constant `"system"` — use for background jobs that publish across tenants |
 | `WithSystemTenant()` | `EnvelopeOpt` that sets `TenantID = "system"`; use for scheduled tasks and cross-tenant background jobs |
@@ -459,15 +459,17 @@ These guarantees apply to the envelope wrapper. Payload field stability is a sep
 | `id` | **Stable** | Always present. UUID v7 string format. `ParseEnvelope` rejects envelopes missing this field. Will never be removed, renamed, or change format within `v1.x`. |
 | `type` | **Stable** | Always present. Dot-separated lowercase string. `ParseEnvelope` rejects envelopes missing this field. Will never be removed or renamed. The naming convention (including `.v<N>` suffix) is additive — existing type strings are valid forever. |
 | `source` | **Stable** | Always present. Opaque string identifying the emitting service. `ParseEnvelope` rejects envelopes missing this field. Will never be removed or renamed. |
-| `timestamp` | **Stable** | Always present. RFC3339Nano UTC string. Will never be removed or change format. `ParseEnvelope` rejects envelopes with a zero timestamp. |
+| `time` | **Stable** | Always present. RFC3339Nano UTC string. CloudEvents `time` attribute. `ParseEnvelope` rejects envelopes with a zero value. Will never be removed or change format. |
 | `tenant_id` | **Contextual** | Present when set. Opaque string identifying the tenant scope, or the `"system"` sentinel from `WithSystemTenant()`. Empty string means no tenant context. Will never be removed. |
 | `trace_id` | **Contextual** | Present when set. Hex-encoded OTel trace ID (32 chars) when populated from a live trace. Empty string means no trace context. Will never be removed. |
 | `correlation_id` | **Contextual** | Present when set. Opaque string — no format constraint. Consumers must store and forward it as-is without interpretation. Will never be removed. |
-| `schema_version` | **Contextual** | Present when set. Positive integer string (`"1"`, `"2"`, …). Absent means treat as `"1"` — this backward-compatibility rule is permanent. Will never be removed. |
+| `specversion` | **Contextual** | Present when set. Positive integer string (`"1"`, `"2"`, …) — the payload schema version. Aligns with CloudEvents `specversion` attribute name. Absent means treat as `"1"` — this backward-compatibility rule is permanent. Will never be removed. |
 | `subject` | **Contextual** | Present when set via `WithSubject`. Opaque resource URI or identifier the event is about (e.g. `"users/01926e4f-..."`). Also forwarded as an SNS message attribute (`Subject`) to enable SQS subscription filter policies without body parsing. Will never be removed. |
 | `actor` | **Contextual** | Present when set via `WithActor`. Opaque identity string of the user or service that caused the event (e.g. a user UUID, a service-account name). Audit trail field — not forwarded as an SNS attribute. Will never be removed. |
-| `schema_id` | **Contextual** | Present when set via `WithSchemaID`. Opaque schema registry version identifier — typically the Glue Schema Registry UUID returned by the codec's `Encode` call. Distinct from `schema_version`: `schema_id` is the technical registry pointer used by the codec for Avro/JSON deserialization; `schema_version` is the human-readable semantic version consumers use to gate business logic. Not forwarded as an SNS attribute. Will never be removed. |
-| `payload` | **Externally governed** | Always present. Valid JSON (object, array, or scalar). Shape is defined by the publisher and governed per [EVENT_SCHEMA_GOVERNANCE.md](../EVENT_SCHEMA_GOVERNANCE.md). The library only validates it is well-formed JSON. |
+| `ip_address` | **Contextual** | Present when set via `WithIPAddress`. Client IP at the time the event was triggered. Pass `r.RemoteAddr` or a validated `X-Forwarded-For` value from the HTTP handler. Omit for background/system events. Audit trail field — not forwarded as an SNS attribute. Will never be removed. |
+| `user_agent` | **Contextual** | Present when set via `WithUserAgent`. HTTP `User-Agent` header value from the request that triggered the event. Omit for background/system events. Audit trail field — not forwarded as an SNS attribute. Will never be removed. |
+| `dataschema` | **Contextual** | Present when set via `WithSchemaID`. Aligns with CloudEvents `dataschema` attribute. Opaque schema registry version identifier — typically the Glue Schema Registry UUID returned by the codec's `Encode` call. Distinct from `specversion`: `dataschema` is the technical registry pointer used by the codec for Avro/JSON deserialization; `specversion` is the human-readable semantic version consumers use to gate business logic. Not forwarded as an SNS attribute. Will never be removed. |
+| `data` | **Externally governed** | Always present. Valid JSON (object, array, or scalar). CloudEvents `data` attribute. Shape is defined by the publisher and governed per [EVENT_SCHEMA_GOVERNANCE.md](../EVENT_SCHEMA_GOVERNANCE.md). The library only validates it is well-formed JSON. |
 
 ### Stability definitions
 
@@ -503,10 +505,10 @@ Consumers that do not deserialise into `Envelope[T]` directly (e.g. they parse r
 - Remove or rename any existing envelope field.
 - Change a currently-optional field to required.
 - Change the JSON type of any existing field.
-- Change the format of `id` (UUID v7) or `timestamp` (RFC3339Nano UTC).
+- Change the format of `id` (UUID v7) or `time` (RFC3339Nano UTC).
 - Re-introduce empty `tenant_id` as a valid wire value — use `"system"` via `WithSystemTenant()` instead.
 - Change the meaning of `tenant_id = "system"`.
-- Change the backward-compatibility rule that `schema_version = ""` means `"1"`.
+- Change the backward-compatibility rule that `specversion = ""` means `"1"`.
 
 Any violation of these guarantees constitutes a MAJOR version bump (`v2.0.0`).
 

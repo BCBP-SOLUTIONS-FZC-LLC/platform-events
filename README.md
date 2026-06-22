@@ -299,15 +299,17 @@ func main() {
   "id":             "01926e4f-...",
   "type":           "iam.user.created",
   "source":         "platform-iam",
-  "schema_version": "1",
+  "specversion":    "1",
   "tenant_id":      "acme",
   "trace_id":       "4bf92f3577b34da6a3ce929d0e0e4736",
   "correlation_id": "...",
   "subject":        "users/01926e4f-...",
   "actor":          "admin@acme.com",
-  "schema_id":      "550e8400-e29b-41d4-a716-446655440000",
-  "timestamp":      "2026-05-27T12:00:00Z",
-  "payload":        { ... }
+  "ip_address":     "203.0.113.42",
+  "user_agent":     "Mozilla/5.0 (compatible; XPert/1.0)",
+  "dataschema":     "550e8400-e29b-41d4-a716-446655440000",
+  "time":           "2026-05-27T12:00:00Z",
+  "data":           { ... }
 }
 ```
 

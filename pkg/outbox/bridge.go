@@ -32,6 +32,11 @@ func (b *publisherBridge) Publish(ctx context.Context, env domain.Envelope[json.
 		TenantID:      env.TenantID,
 		TraceID:       env.TraceID,
 		CorrelationID: env.CorrelationID,
+		Subject:       env.Subject,
+		Actor:         env.Actor,
+		IPAddress:     env.IPAddress,
+		UserAgent:     env.UserAgent,
+		SchemaID:      env.SchemaID,
 		Timestamp:     env.Timestamp,
 		Payload:       env.Payload,
 	}
@@ -57,6 +62,11 @@ func (b *publisherBridge) PublishBatch(ctx context.Context, envs []domain.Envelo
 			TenantID:      e.TenantID,
 			TraceID:       e.TraceID,
 			CorrelationID: e.CorrelationID,
+			Subject:       e.Subject,
+			Actor:         e.Actor,
+			IPAddress:     e.IPAddress,
+			UserAgent:     e.UserAgent,
+			SchemaID:      e.SchemaID,
 			Timestamp:     e.Timestamp,
 			Payload:       e.Payload,
 		}
