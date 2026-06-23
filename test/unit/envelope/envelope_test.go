@@ -321,4 +321,3 @@ func TestEnvelope_JSON_UsesDataKey(t *testing.T) {
 	assert.Contains(t, string(b), `"data":`)
 	assert.NotContains(t, string(b), `"payload":`)
 }
-
