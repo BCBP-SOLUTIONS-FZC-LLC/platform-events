@@ -29,11 +29,17 @@ jobs:
     uses: ./.github/workflows/quality.yml
     with:
       ref: ${{ inputs.ref }}
-    secrets: inherit
+    # Explicit forwarding, not `secrets: inherit` — this job's own secrets context
+    # only ever contains what ci.yml/release.yml passed to *this* (validate.yml)
+    # workflow_call, so forward that value by name rather than relying on a second
+    # level of `inherit` to reach across two hops.
+    secrets:
+      GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
 
   test:
     name: Test
     uses: ./.github/workflows/test.yml
     with:
       ref: ${{ inputs.ref }}
-    secrets: inherit
+    secrets:
+      GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
