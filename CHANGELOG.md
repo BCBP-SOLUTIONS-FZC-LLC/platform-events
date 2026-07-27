@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Outbox writes under `PGBouncerMode: true`** — `OutboxRecord.Payload` was `[]byte`; `platform-pgcommon`'s `PGBouncerMode` sets pgx's `DefaultQueryExecMode` to `SimpleProtocol`, which encodes parameters client-side using pgx's default codec for the Go type with no server round-trip to describe the target column. A plain `[]byte` defaults to the `bytea` codec, and binding that to the `payload` `JSONB` column failed with `invalid input syntax for type json` (`SQLSTATE 22P02`) — even though the underlying bytes were valid JSON. `OutboxRecord.Payload` is now `json.RawMessage`, which pgx encodes with its JSON codec instead. Affects `outbox.Enqueue`, `OutboxService.Enqueue`, `ClaimBatch`, and the dead-letter insert path in `MarkFailed`. No public API changes — `outbox.Enqueue` and `Runner` callers are unaffected.
+- **`govulncheck` findings** — bumped the Go toolchain requirement to `1.26.5` (fixes `GO-2026-5856`, an Encrypted Client Hello privacy leak in `crypto/tls`) and `golang.org/x/text` to `v0.40.0` (fixes `GO-2026-5970`, an infinite loop on invalid input in `golang.org/x/text/unicode/norm`, reached transitively through `platform-pgcommon`'s migration runner). No source changes required.
+
 ---
 
 ## [1.3.0] - 2026-06-23

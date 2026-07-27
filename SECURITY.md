@@ -44,6 +44,7 @@ This library publishes to AWS SNS and consumes from AWS SQS using credentials su
 | HMAC keys passed to `Sign` / `Verify` are sourced from a secrets manager | Keys < 32 bytes are rejected at call time (`ErrKeyTooShort`). Rotate keys using versioned secrets. |
 | `Envelope.TenantID` and `Envelope.TraceID` originate from a trusted `RequestContext` (e.g. platform-gincommon) | If these fields are populated from untrusted input without validation, GUC injection and trace linking can be spoofed. |
 | SQS messages are delivered by AWS infrastructure | The library does not verify message authenticity beyond JSON parsing. Use `VerifyEnvelope` with a shared HMAC key for cross-service authentication when required. |
+| The `Envelope` wire format is a cross-language contract with `platform-eventcommon` (Python) | A change that desynchronises the two implementations' JSON encoding or HMAC canonicalisation is a correctness and security issue, not just a compatibility one — see the `interop` CI job. |
 
 ## Scope
 
@@ -54,5 +55,6 @@ The following are in scope for vulnerability reports:
 - Outbox GUC injection spoofing through unsanitised `Envelope.TenantID` values
 - Denial-of-service conditions in the outbox runner or SQS consumer loop
 - RLS bypass through incorrect GUC lifecycle management in the SQS consumer context
+- Deserialisation vulnerabilities in `ParseEnvelope` or payload parsing
 
 Out of scope: theoretical attacks requiring full control of AWS infrastructure or the Postgres server, issues in transitive dependencies unrelated to this library's functionality, and issues in the `cmd/platform-events` reference CLI.

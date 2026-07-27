@@ -9,5 +9,10 @@
 # Public API surface — extra scrutiny.
 pkg/ @BCBP-SOLUTIONS-FZC-LLC/platform-team
 
+# Wire-format contract shared with platform-eventcommon (Python) — changes here can break
+# cross-language interop and need careful review.
+pkg/events/envelope.go @BCBP-SOLUTIONS-FZC-LLC/platform-team
+pkg/events/hmac.go @BCBP-SOLUTIONS-FZC-LLC/platform-team
+
 # Outbox migrations affect all consumers — schema changes need careful review.
 pkg/outbox/migrations/ @BCBP-SOLUTIONS-FZC-LLC/platform-team
