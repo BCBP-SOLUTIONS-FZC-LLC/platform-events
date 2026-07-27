@@ -1301,6 +1301,76 @@ func TestOutboxStore_DiscardDeadLetters_InvalidLimit(t *testing.T) {
 	}
 }
 
+// ----------------------------
+// PGBouncerMode / QueryExecModeSimpleProtocol regression
+//
+// Under PGBouncerMode, platform-pgcommon sets pgx's DefaultQueryExecMode to
+// SimpleProtocol, which encodes each parameter client-side using pgx's
+// default codec for its Go type (no server round-trip to describe the target
+// column). OutboxRecord.Payload must be json.RawMessage — not []byte — or
+// pgx selects the bytea codec and Postgres rejects the payload JSONB column
+// insert with "invalid input syntax for type json" (22P02).
+// ----------------------------
+
+func TestOutboxStore_PGBouncerMode_EnqueueAndClaimBatch(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	pool, cleanup := fixtures.NewTestDBWithConfig(ctx, t, func(cfg *pgcommon.Config) {
+		cfg.PGBouncerMode = true
+	})
+	defer cleanup()
+	store := outboxstore.New(pool, nil, 0)
+
+	rec := makeRecord("pgbouncer.order.created")
+
+	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		return store.Enqueue(ctx, tx, rec)
+	})
+	require.NoError(t, err, "Enqueue must not fail under SimpleProtocol exec mode")
+
+	records, err := store.ClaimBatch(ctx, 10)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+	assert.Equal(t, rec.ID, records[0].ID)
+	assert.JSONEq(t, string(rec.Payload), string(records[0].Payload),
+		"payload must round-trip byte-for-byte through the JSONB column")
+}
+
+func TestOutboxStore_PGBouncerMode_MarkFailed_MovesToDeadLetter(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	ctx := context.Background()
+	pool, cleanup := fixtures.NewTestDBWithConfig(ctx, t, func(cfg *pgcommon.Config) {
+		cfg.PGBouncerMode = true
+	})
+	defer cleanup()
+	store := outboxstore.New(pool, nil, 0)
+
+	rec := makeRecord("pgbouncer.invoice.settled")
+	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		return store.Enqueue(ctx, tx, rec)
+	})
+	require.NoError(t, err)
+
+	// maxAttempts=1 moves the record straight to outbox_dead_letters, exercising
+	// the INSERT INTO outbox_dead_letters(..., payload, ...) path under
+	// SimpleProtocol as well.
+	err = store.MarkFailed(ctx, rec, "fatal error", 1)
+	require.NoError(t, err, "MarkFailed dead-letter insert must not fail under SimpleProtocol exec mode")
+
+	var dlPayload []byte
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+		return conn.QueryRow(ctx,
+			"SELECT payload FROM outbox_dead_letters WHERE id = $1", rec.ID,
+		).Scan(&dlPayload)
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t, string(rec.Payload), string(dlPayload))
+}
+
 func TestOutboxStore_PrunePublished_RecentRecordsNotDeleted(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")

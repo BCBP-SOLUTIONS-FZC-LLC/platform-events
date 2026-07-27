@@ -22,6 +22,17 @@ import (
 // The test is skipped automatically when testing.Short() is true.
 func NewTestDB(ctx context.Context, t *testing.T) (*pgcommon.Pool, func()) {
 	t.Helper()
+	return NewTestDBWithConfig(ctx, t, func(*pgcommon.Config) {})
+}
+
+// NewTestDBWithConfig starts a throwaway Postgres 16 container, applies the
+// outbox schema, then builds the *pgcommon.Pool from a Config that configure
+// may mutate (e.g. setting PGBouncerMode: true to reproduce SimpleProtocol
+// exec-mode behaviour) before connecting.
+//
+// The test is skipped automatically when testing.Short() is true.
+func NewTestDBWithConfig(ctx context.Context, t *testing.T, configure func(cfg *pgcommon.Config)) (*pgcommon.Pool, func()) {
+	t.Helper()
 
 	if testing.Short() {
 		t.Skip("skipping integration test: -short flag is set (Docker not required)")
@@ -45,19 +56,19 @@ func NewTestDB(ctx context.Context, t *testing.T) (*pgcommon.Pool, func()) {
 		Started:          true,
 	})
 	if err != nil {
-		t.Fatalf("fixtures.NewTestDB: failed to start container: %v", err)
+		t.Fatalf("fixtures.NewTestDBWithConfig: failed to start container: %v", err)
 	}
 
 	host, err := container.Host(ctx)
 	if err != nil {
 		_ = container.Terminate(ctx)
-		t.Fatalf("fixtures.NewTestDB: failed to get container host: %v", err)
+		t.Fatalf("fixtures.NewTestDBWithConfig: failed to get container host: %v", err)
 	}
 
 	mappedPort, err := container.MappedPort(ctx, "5432")
 	if err != nil {
 		_ = container.Terminate(ctx)
-		t.Fatalf("fixtures.NewTestDB: failed to get mapped port: %v", err)
+		t.Fatalf("fixtures.NewTestDBWithConfig: failed to get mapped port: %v", err)
 	}
 
 	dsn := fmt.Sprintf("postgres://postgres:postgres@%s:%s/testdb?sslmode=disable",
@@ -67,13 +78,16 @@ func NewTestDB(ctx context.Context, t *testing.T) (*pgcommon.Pool, func()) {
 	runner := &migrate.Runner{DSN: dsn}
 	if err := outbox.ApplySchema(ctx, runner); err != nil {
 		_ = container.Terminate(ctx)
-		t.Fatalf("fixtures.NewTestDB: failed to apply outbox schema: %v", err)
+		t.Fatalf("fixtures.NewTestDBWithConfig: failed to apply outbox schema: %v", err)
 	}
 
-	pool, err := pgcommon.NewPool(ctx, pgcommon.Config{DSN: dsn})
+	cfg := pgcommon.Config{DSN: dsn}
+	configure(&cfg)
+
+	pool, err := pgcommon.NewPool(ctx, cfg)
 	if err != nil {
 		_ = container.Terminate(ctx)
-		t.Fatalf("fixtures.NewTestDB: failed to create pool: %v", err)
+		t.Fatalf("fixtures.NewTestDBWithConfig: failed to create pool: %v", err)
 	}
 
 	cleanup := func() {

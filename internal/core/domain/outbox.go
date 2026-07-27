@@ -1,12 +1,20 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // OutboxRecord represents an event persisted to the outbox_events table.
 type OutboxRecord struct {
-	ID          string
-	EventType   string
-	Payload     []byte
+	ID        string
+	EventType string
+	// Payload must be json.RawMessage, not []byte: pgx picks its wire codec by
+	// Go type when it cannot ask Postgres for the parameter's column type (see
+	// pgcommon.Config.PGBouncerMode, which forces QueryExecModeSimpleProtocol).
+	// A plain []byte defaults to the bytea codec; binding that to the payload
+	// JSONB column fails with "invalid input syntax for type json" (22P02).
+	Payload     json.RawMessage
 	TenantID    string
 	TraceID     string
 	Attempts    int
