@@ -31,15 +31,29 @@ Provide a clear description of the changes.
 - [ ] No debug logs / commented-out code
 - [ ] Exported symbols have godoc comments
 
+---
+
+### Wire contract & safety (IMPORTANT for this library)
+- [ ] Any change to `pkg/events/envelope.go` or `pkg/events/hmac.go` was cross-checked against `platform-eventcommon`'s Python implementation — a mismatch breaks cross-language interop
+- [ ] Cross-language interop tests (`platform-interop-tests`) considered/updated if the wire format changed
+- [ ] Outbox schema changes have a corresponding migration and don't break in-flight rows
+
+---
+
 ### Database / Migrations
 - [ ] New migrations have matching `.up.sql` and `.down.sql`
 - [ ] Down migration correctly reverses the up migration
 - [ ] RLS policies tested with `FORCE ROW LEVEL SECURITY` where applicable
 
+---
+
 ### Security
 - [ ] No secrets or DSNs hardcoded
 - [ ] GUC values are not logged (no credential leakage in slow-query output)
+- [ ] No changes weaken HMAC signature verification or allow signature bypass
 - [ ] New config fields documented in README env-vars table
+
+---
 
 ### Documentation
 - [ ] README updated (if public API or env vars changed)
