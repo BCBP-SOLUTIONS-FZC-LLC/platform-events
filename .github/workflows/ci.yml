@@ -103,3 +103,73 @@ jobs:
           name: platform-events-linux-amd64
           path: bin/platform-events
           if-no-files-found: error
+
+  interop:
+    name: Cross-language compatibility
+    needs: build
+    uses: BCBP-SOLUTIONS-FZC-LLC/platform-interop-tests/.github/workflows/interop.yml@main
+    with:
+      # This repo's own PR/branch ref; the other five default to their main branch (see
+      # platform-interop-tests/README.md for why — this job exists to catch *this* repo's
+      # changes breaking a cross-language contract, not to re-test the other five on every PR).
+      platform_events_ref: ${{ github.head_ref || github.ref_name }}
+    secrets:
+      # GO_PRIVATE_TOKEN fallback: this repo doesn't define GH_PRIVATE_TOKEN today (only the
+      # three Python repos do) — see interop.yml's `secrets.gh_private_token` description for
+      # why either works for a plain repo-read checkout. Add GH_PRIVATE_TOKEN as a secret here
+      # (or org-wide) to drop the fallback once confirmed.
+      gh_private_token: ${{ secrets.GH_PRIVATE_TOKEN || secrets.GO_PRIVATE_TOKEN }}
+
+  pr-summary:
+    name: PR summary
+    runs-on: ubuntu-latest
+    needs: [validate, coverage, build, interop]
+    if: always() && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post summary comment
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const results = {
+              'Validate (Quality + Test)': '${{ needs.validate.result }}',
+              'Coverage': '${{ needs.coverage.result }}',
+              'Build': '${{ needs.build.result }}',
+              'Cross-language compatibility': '${{ needs.interop.result }}',
+            };
+            const icon = (r) => (r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌');
+            const rows = Object.entries(results)
+              .map(([name, result]) => `| ${name} | ${icon(result)} ${result} |`)
+              .join('\n');
+            const body = [
+              '### CI summary',
+              '',
+              '| Check | Result |',
+              '|---|---|',
+              rows,
+            ].join('\n');
+
+            const marker = '<!-- pr-summary-bot -->';
+            const fullBody = `${marker}\n${body}`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find((c) => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+            }

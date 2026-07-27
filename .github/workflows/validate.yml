@@ -1,4 +1,10 @@
-# Reusable validation workflow for platform-events — called by ci.yml and release.yml.
+# Reusable workflow — called by ci.yml and release.yml as a job named "Validate".
+# Fans out into two nested reusable-workflow calls, producing two required status
+# checks (per the org's protect-main-branch ruleset):
+#   "Validate / Quality / quality"  <- quality.yml
+#   "Validate / Test / test"        <- test.yml
+# (GitHub names a reusable-workflow-call check as "<calling job> / <called job>" at each
+# level of nesting — this file is the middle level.)
 name: Validate
 
 "on":
@@ -9,66 +15,25 @@ name: Validate
         type: string
         required: false
         default: ''
+    secrets:
+      GO_PRIVATE_TOKEN:
+        description: 'Token for downloading private BCBP-SOLUTIONS-FZC-LLC Go modules'
+        required: true
 
 permissions:
   contents: read
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-  GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-
 jobs:
-  validate:
-    name: Validate
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-          persist-credentials: false
+  quality:
+    name: Quality
+    uses: ./.github/workflows/quality.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            go.mod
-
-      - name: Configure private module access
-        run: |
-          git config --global credential.helper store
-          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
-          chmod 600 ~/.git-credentials
-
-      - name: Download modules
-        run: go mod download
-
-      - name: Clean up credentials
-        if: always()
-        run: rm -f ~/.git-credentials
-
-      - name: Verify modules
-        run: go mod verify
-
-      - name: Format check
-        run: make fmt-check
-
-      - name: Tidy check
-        run: |
-          make tidy
-          git diff --exit-code go.mod go.sum
-
-      - name: Vet
-        run: make vet
-
-      - name: Lint
-        run: make lint
-
-      - name: Vulnerability check
-        run: make vuln-check
-
-      - name: Test (race detector)
-        run: make test-ci
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
+    with:
+      ref: ${{ inputs.ref }}
+    secrets: inherit
