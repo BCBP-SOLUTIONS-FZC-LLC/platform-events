@@ -77,6 +77,15 @@ func WithMaxReceiveCount(n int) ConsumerOption {
 	return internalsqs.WithMaxReceiveCount(n)
 }
 
+// WithConsumerCodec sets the Codec used to decode incoming envelope payloads
+// whose SchemaID is non-empty. Unset (nil), all messages are treated as
+// plain JSON exactly as before this option existed. Named distinctly from
+// the publisher's WithCodec because both option constructors live in this
+// package and Go forbids two functions with the same name.
+func WithConsumerCodec(codec Codec) ConsumerOption {
+	return internalsqs.WithCodec(codec)
+}
+
 // SQSClientLike is the subset of the AWS SQS client API used by the consumer.
 // *sqs.Client from aws-sdk-go-v2 satisfies this interface. Implement it in
 // tests to inject a mock SQS client without real AWS credentials.

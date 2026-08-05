@@ -44,7 +44,7 @@ pkg/            ← Public API (consumers import these — SemVer applies)
   outbox/       ← Transactional outbox runner, Enqueue, ApplySchema
 internal/
   core/domain/  ← Entities: Envelope, OutboxRecord, errors (no external deps)
-  core/port/    ← Interfaces owned by the use-case layer (Publisher, Consumer, Logger, Clock)
+  core/port/    ← Interfaces owned by the use-case layer (Publisher, Consumer, Codec, Logger, Clock)
   core/service/ ← Use cases: OutboxService, HMACService
   adapter/outbound/  ← SNS publisher, SQS consumer, Postgres outbox store, Zap logger, metrics
   config/       ← Env-var loading
@@ -81,6 +81,15 @@ See [EVENT_SCHEMA_GOVERNANCE.md](./EVENT_SCHEMA_GOVERNANCE.md) for the full rule
 1. Implement `port.Consumer` in `internal/adapter/outbound/kinesis/`.
 2. Expose via `pkg/events/`. The `Handler` signature is shared — no changes to calling code.
 3. Inject `pgcommon.WithGUCSet` into the handler context so `platform-pgcommon` GUC injection works transparently.
+
+## Adding a new Codec implementation (e.g. AWS Glue Schema Registry)
+
+`platform-events` defines the `port.Codec` interface (aliased as `events.Codec`) but ships no concrete implementation and adds no schema-registry SDK dependency — this keeps every consuming service's dependency tree free of AWS Glue (or any other registry) unless it actually uses one, mirroring how `port.Logger` works with `platform-gincommon`'s `ZapLogger`.
+
+1. Implement `port.Codec` (`Encode`/`Decode`) in the consuming service, or in a separate shared package if multiple services need the same registry client — **not** inside `platform-events`.
+2. Inject it via `events.WithCodec(codec)` on the SNS publisher and `events.WithConsumerCodec(codec)` on the SQS consumer.
+3. `Encode` must return plain-JSON-compatible bytes only through the library's wrapping (`domain.WrapCodecPayload` handles base64-encoding internally) — never assign raw binary bytes to `Envelope.Payload` yourself.
+4. Do not add a new AWS SDK service dependency (e.g. `aws-sdk-go-v2/service/glue`) to this module's `go.mod` for this purpose.
 
 ## Adding a new outbox migration
 

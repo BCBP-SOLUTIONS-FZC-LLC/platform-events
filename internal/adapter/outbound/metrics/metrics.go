@@ -15,6 +15,10 @@ var (
 	EventsPublishDuration             *prometheus.HistogramVec
 	EventsConsumedTotal               *prometheus.CounterVec
 	EventsConsumeDuration             *prometheus.HistogramVec
+	CodecEncodeTotal                  *prometheus.CounterVec
+	CodecEncodeDuration               *prometheus.HistogramVec
+	CodecDecodeTotal                  *prometheus.CounterVec
+	CodecDecodeDuration               *prometheus.HistogramVec
 	OutboxPendingTotal                *prometheus.GaugeVec
 	OutboxPublishedTotal              *prometheus.CounterVec
 	OutboxAttemptsTotal               *prometheus.CounterVec
@@ -137,6 +141,34 @@ func initMetricsWithRegisterer(serviceName, buildVersion string, reg prometheus.
 		Buckets:     []float64{.025, .05, .1, .25, .5, 1, 2.5, 5, 10, 20, 30},
 	}, []string{"queue", "event_type"})
 
+	// Codec metrics — only ever incremented when a WithCodec/WithConsumerCodec
+	// option is configured; absent that, encode/decode is never invoked.
+	CodecEncodeTotal = factory.NewCounterVec(prometheus.CounterOpts{
+		Name:        "events_codec_encode_total",
+		Help:        "Total number of Codec.Encode invocations by outcome (success/noop/error).",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{"topic", "event_type", "status"})
+
+	CodecEncodeDuration = factory.NewHistogramVec(prometheus.HistogramOpts{
+		Name:        "events_codec_encode_duration_seconds",
+		Help:        "Duration of Codec.Encode calls in seconds.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+		Buckets:     []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+	}, []string{"topic", "event_type"})
+
+	CodecDecodeTotal = factory.NewCounterVec(prometheus.CounterOpts{
+		Name:        "events_codec_decode_total",
+		Help:        "Total number of Codec.Decode invocations by outcome (success/error).",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{"queue", "event_type", "status"})
+
+	CodecDecodeDuration = factory.NewHistogramVec(prometheus.HistogramOpts{
+		Name:        "events_codec_decode_duration_seconds",
+		Help:        "Duration of Codec.Decode calls in seconds.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+		Buckets:     []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+	}, []string{"queue", "event_type"})
+
 	OutboxPendingTotal = factory.NewGaugeVec(prometheus.GaugeOpts{
 		Name:        "outbox_pending_total",
 		Help:        "Number of pending (unpublished) outbox records. -1 indicates a stale/error reading.",
@@ -257,6 +289,36 @@ func RecordPublish(topic, eventType, status string, durSeconds float64) {
 func RecordConsume(queue, eventType, status string, durSeconds float64) {
 	metricsMu.RLock()
 	ct, cd := EventsConsumedTotal, EventsConsumeDuration
+	metricsMu.RUnlock()
+	et := SanitizeEventType(eventType)
+	if ct != nil {
+		ct.WithLabelValues(queue, et, status).Inc()
+	}
+	if cd != nil {
+		cd.WithLabelValues(queue, et).Observe(durSeconds)
+	}
+}
+
+// RecordCodecEncode increments codec-encode counters and records duration.
+// Safe to call before Init — no-ops when metrics are not initialised.
+func RecordCodecEncode(topic, eventType, status string, durSeconds float64) {
+	metricsMu.RLock()
+	ct, cd := CodecEncodeTotal, CodecEncodeDuration
+	metricsMu.RUnlock()
+	et := SanitizeEventType(eventType)
+	if ct != nil {
+		ct.WithLabelValues(topic, et, status).Inc()
+	}
+	if cd != nil {
+		cd.WithLabelValues(topic, et).Observe(durSeconds)
+	}
+}
+
+// RecordCodecDecode increments codec-decode counters and records duration.
+// Safe to call before Init — no-ops when metrics are not initialised.
+func RecordCodecDecode(queue, eventType, status string, durSeconds float64) {
+	metricsMu.RLock()
+	ct, cd := CodecDecodeTotal, CodecDecodeDuration
 	metricsMu.RUnlock()
 	et := SanitizeEventType(eventType)
 	if ct != nil {

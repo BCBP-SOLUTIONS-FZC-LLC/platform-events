@@ -9,7 +9,13 @@ sequenceDiagram
     Publisher ->>+ SNSAdp: snsPublisher.Publish(ctx, env)
 
     SNSAdp ->> SNSAdp: validate env.ID · env.Type · env.Source (non-empty)
-    Note over SNSAdp: returns error immediately if any field is empty<br/>prevents invalid Prometheus label cardinality
+    Note over SNSAdp: returns error immediately if any field is empty — prevents invalid Prometheus label cardinality
+
+    opt WithCodec configured
+        SNSAdp ->> SNSAdp: Codec.Encode(ctx, env.Type, env.Payload) → encoded bytes, schemaID
+        SNSAdp ->> SNSAdp: env.Payload = base64(encoded) as JSON string; env.SchemaID = schemaID
+        Note over SNSAdp: encode error returns before the SNS API call — CodecEncodeTotal{status=error}.Inc()
+    end
 
     SNSAdp ->> SNSAdp: json.Marshal(env) → message body
     SNSAdp ->> SNSAdp: set attributes: EventType · TenantID · Source · EventID · Subject (if set)
@@ -27,7 +33,7 @@ sequenceDiagram
         SNSAdp ->> SNSAdp: wrapIfRetryable → &RetryableError{Cause: err}
         SNSAdp ->> OTel: span.RecordError + codes.Error
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
-        Note over SNSAdp: caller (OutboxService) checks errors.Is(err, ErrRetryable)<br/>and does NOT count toward MaxAttempts
+        Note over SNSAdp: caller (OutboxService) checks errors.Is(err, ErrRetryable) — does NOT count toward MaxAttempts
     else permanent error
         SNSAdp ->> OTel: span.RecordError + codes.Error
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()

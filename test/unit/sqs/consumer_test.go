@@ -19,6 +19,7 @@ import (
 
 	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
@@ -2052,4 +2053,369 @@ func TestWithDrainTimeout_NegativeWithLogger_Warns(t *testing.T) {
 	warns := warnMessages(logger)
 	require.NotEmpty(t, warns, "expect a Warn log when drain timeout is negative")
 	assert.Contains(t, warns[0], "WithDrainTimeout")
+}
+
+// ----------------------------
+// WithCodec
+// ----------------------------
+
+// fakeCodec is a minimal port.Codec test double.
+type fakeCodec struct {
+	decodeFn func(ctx context.Context, schemaID string, encoded []byte) (json.RawMessage, error)
+}
+
+func (f *fakeCodec) Encode(_ context.Context, _ string, payload json.RawMessage) ([]byte, string, error) {
+	return payload, "", nil
+}
+
+func (f *fakeCodec) Decode(ctx context.Context, schemaID string, encoded []byte) (json.RawMessage, error) {
+	return f.decodeFn(ctx, schemaID, encoded)
+}
+
+var _ port.Codec = (*fakeCodec)(nil)
+
+func reverseBytes(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		out[len(b)-1-i] = c
+	}
+	return out
+}
+
+// makeCodecEncodedEnvelope builds an envelope whose Payload holds the
+// reversed-and-base64-wrapped form of plainPayload, with SchemaID set —
+// mirroring what the SNS publisher's WithCodec encode step produces.
+func makeCodecEncodedEnvelope(t *testing.T, eventType, schemaID string, plainPayload json.RawMessage) domain.Envelope[json.RawMessage] {
+	t.Helper()
+	env := domain.NewEnvelope(eventType, "svc", json.RawMessage(nil))
+	wrapped, err := domain.WrapCodecPayload(reverseBytes(plainPayload))
+	require.NoError(t, err)
+	env.Payload = wrapped
+	env.SchemaID = schemaID
+	return env
+}
+
+func reversingDecodeCodec() *fakeCodec {
+	return &fakeCodec{
+		decodeFn: func(_ context.Context, _ string, encoded []byte) (json.RawMessage, error) {
+			return reverseBytes(encoded), nil
+		},
+	}
+}
+
+func TestDispatch_WithCodec_SchemaIDEmpty_SkipsDecode(t *testing.T) {
+	plainPayload := json.RawMessage(`{"x":1}`)
+	env := domain.NewEnvelope("test.event", "svc", plainPayload)
+	msg := makeSQSMessage(env)
+
+	decodeCalled := atomic.Bool{}
+	codec := &fakeCodec{
+		decodeFn: func(_ context.Context, _ string, _ []byte) (json.RawMessage, error) {
+			decodeCalled.Store(true)
+			return nil, errors.New("Decode should never be called when SchemaID is empty")
+		},
+	}
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	var receivedPayload json.RawMessage
+	handlerCalled := make(chan struct{}, 1)
+	handler := func(_ context.Context, e domain.Envelope[json.RawMessage]) error {
+		receivedPayload = e.Payload
+		handlerCalled <- struct{}{}
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+		internalsqs.WithCodec(codec),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	select {
+	case <-handlerCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not called")
+	}
+	cancel()
+
+	assert.False(t, decodeCalled.Load(), "Decode must not be invoked when SchemaID is empty")
+	assert.Equal(t, string(plainPayload), string(receivedPayload))
+}
+
+func TestDispatch_WithCodec_DecodesBeforeHandler(t *testing.T) {
+	plainPayload := json.RawMessage(`{"x":1}`)
+	env := makeCodecEncodedEnvelope(t, "test.event", "fake-schema-v1", plainPayload)
+	msg := makeSQSMessage(env)
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	var receivedPayload json.RawMessage
+	handlerCalled := make(chan struct{}, 1)
+	handler := func(_ context.Context, e domain.Envelope[json.RawMessage]) error {
+		receivedPayload = e.Payload
+		handlerCalled <- struct{}{}
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+		internalsqs.WithCodec(reversingDecodeCodec()),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	select {
+	case <-handlerCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler was not called")
+	}
+	cancel()
+
+	assert.Equal(t, string(plainPayload), string(receivedPayload), "handler should receive the decoded plain-JSON payload")
+}
+
+func TestDispatch_WithCodec_DecodeError_LeavesMessageVisible(t *testing.T) {
+	env := makeCodecEncodedEnvelope(t, "test.event", "fake-schema-v1", json.RawMessage(`{"x":1}`))
+	msg := makeSQSMessage(env)
+
+	failing := &fakeCodec{
+		decodeFn: func(_ context.Context, _ string, _ []byte) (json.RawMessage, error) {
+			return nil, errors.New("registry unavailable")
+		},
+	}
+
+	var deleteCount int32
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		deleteMessageFn: func(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			atomic.AddInt32(&deleteCount, 1)
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+	}
+
+	handlerCalled := atomic.Bool{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		handlerCalled.Store(true)
+		return nil
+	}
+
+	logger := &fixtures.MockLogger{}
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1, Logger: logger},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+		internalsqs.WithCodec(failing),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	assert.False(t, handlerCalled.Load(), "handler must not be invoked when codec decode fails")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&deleteCount), "message must be left visible for retry on decode failure")
+
+	found := false
+	for _, e := range logger.Entries() {
+		if e.Level == "ERROR" {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected an ERROR log on codec decode failure")
+}
+
+func TestDispatch_WithCodec_MalformedCodecPayload_LeavesMessageVisible(t *testing.T) {
+	// SchemaID is set (codec-encoded), but Payload is not a base64 JSON string
+	// (e.g. a corrupted message) — this must be treated as a decode failure,
+	// exercising the UnwrapCodecPayload error branch of decodeCodecPayload.
+	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{"x":1}`))
+	env.SchemaID = "fake-schema-v1"
+	msg := makeSQSMessage(env)
+
+	var deleteCount int32
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		deleteMessageFn: func(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			atomic.AddInt32(&deleteCount, 1)
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+	}
+
+	handlerCalled := atomic.Bool{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		handlerCalled.Store(true)
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+		internalsqs.WithCodec(reversingDecodeCodec()),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	assert.False(t, handlerCalled.Load())
+	assert.Equal(t, int32(0), atomic.LoadInt32(&deleteCount), "malformed codec payload must leave the message visible for retry, not delete it")
+}
+
+func TestDispatch_WithCodec_SchemaIDSetButNoCodecConfigured_LeavesMessageVisible(t *testing.T) {
+	env := makeCodecEncodedEnvelope(t, "test.event", "fake-schema-v1", json.RawMessage(`{"x":1}`))
+	msg := makeSQSMessage(env)
+
+	var deleteCount int32
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		deleteMessageFn: func(_ context.Context, _ *sqs.DeleteMessageInput, _ ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			atomic.AddInt32(&deleteCount, 1)
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+	}
+
+	handlerCalled := atomic.Bool{}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		handlerCalled.Store(true)
+		return nil
+	}
+
+	// No WithCodec option — consumer has no codec, but the message requires one.
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	assert.False(t, handlerCalled.Load())
+	assert.Equal(t, int32(0), atomic.LoadInt32(&deleteCount))
+}
+
+func TestDispatch_WithCodec_DeadLetterHandler_ReceivesDecodedPayload(t *testing.T) {
+	plainPayload := json.RawMessage(`{"x":1}`)
+	env := makeCodecEncodedEnvelope(t, "test.event", "fake-schema-v1", plainPayload)
+	msg := makeSQSMessage(env)
+	msg.Attributes = map[string]string{
+		string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount): "10",
+	}
+
+	receiveCallCount := 0
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			receiveCallCount++
+			if receiveCallCount == 1 {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{msg}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+
+	var dlhPayload json.RawMessage
+	dlhCalled := make(chan struct{}, 1)
+	dlh := func(_ context.Context, e domain.Envelope[json.RawMessage]) error {
+		dlhPayload = e.Payload
+		dlhCalled <- struct{}{}
+		return nil
+	}
+	handler := func(_ context.Context, _ domain.Envelope[json.RawMessage]) error {
+		t.Fatal("normal handler should not be invoked when receive count exceeds threshold")
+		return nil
+	}
+
+	c, err := internalsqs.NewWithClient(
+		internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1},
+		client,
+		handler,
+		internalsqs.WithDrainTimeout(2*time.Second),
+		internalsqs.WithDeadLetterHandler(dlh),
+		internalsqs.WithMaxReceiveCount(3),
+		internalsqs.WithCodec(reversingDecodeCodec()),
+	)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+
+	select {
+	case <-dlhCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dead-letter handler was not called")
+	}
+	cancel()
+
+	assert.Equal(t, string(plainPayload), string(dlhPayload), "dead-letter handler should receive the decoded payload, not the raw base64 string")
 }

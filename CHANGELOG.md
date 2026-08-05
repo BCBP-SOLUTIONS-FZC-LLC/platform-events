@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`events.Codec`** (aliased from `port.Codec`) — pluggable hook for encoding/decoding an envelope's JSON `Payload` into a schema-registry-specific wire format (e.g. AWS Glue Schema Registry). `platform-events` ships no concrete implementation and adds no schema-registry SDK dependency — consuming services implement `Codec` against their own registry client, mirroring the existing `port.Logger` pattern.
+- **`events.NoopCodec`** (aliased from `port.NoopCodec`) — identity/reference `Codec` implementation.
+- `events.WithCodec(codec Codec) PublisherOption` — encodes the payload immediately before SNS publish. Unset (the default), behaviour is unchanged: `Payload` stays plain JSON and `SchemaID` stays empty.
+- `events.WithConsumerCodec(codec Codec) ConsumerOption` — decodes incoming payloads whose `SchemaID` is non-empty, before the message reaches the handler or `WithDeadLetterHandler`. `SchemaID` empty means the message was never codec-encoded and is left as plain JSON.
+- `events_codec_encode_total` / `events_codec_encode_duration_seconds` / `events_codec_decode_total` / `events_codec_decode_duration_seconds` Prometheus metrics.
+
 ---
 
 ## [1.3.1] - 2026-07-28

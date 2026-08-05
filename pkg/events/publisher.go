@@ -65,6 +65,13 @@ func WithAttributes(attrs map[string]string) PublisherOption {
 	return sns.WithAttributes(attrs)
 }
 
+// WithCodec sets the Codec used to encode outgoing envelope payloads before
+// publish. Unset (nil), Publish/PublishBatch behave exactly as before this
+// option existed: Payload stays plain JSON and SchemaID stays empty.
+func WithCodec(codec Codec) PublisherOption {
+	return sns.WithCodec(codec)
+}
+
 // NewPublisherFromPort wraps any internal port.Publisher as a public events.Publisher.
 // Useful in tests or when injecting a custom publisher implementation.
 func NewPublisherFromPort(inner port.Publisher) Publisher {
