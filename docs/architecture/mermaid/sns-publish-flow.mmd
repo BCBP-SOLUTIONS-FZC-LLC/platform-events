@@ -13,7 +13,8 @@ sequenceDiagram
 
     opt WithCodec configured
         SNSAdp ->> SNSAdp: Codec.Encode(ctx, env.Type, env.Payload) → encoded bytes, schemaID
-        SNSAdp ->> SNSAdp: env.Payload = base64(encoded) as JSON string; env.SchemaID = schemaID
+        SNSAdp ->> SNSAdp: env.Payload = base64(encoded) as JSON string
+        SNSAdp ->> SNSAdp: env.SchemaID = schemaID
         Note over SNSAdp: encode error returns before the SNS API call — CodecEncodeTotal{status=error}.Inc()
     end
 
