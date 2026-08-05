@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.4.0] - 2026-08-05
+
 ### Added
 
 - **`events.Codec`** (aliased from `port.Codec`) — pluggable hook for encoding/decoding an envelope's JSON `Payload` into a schema-registry-specific wire format (e.g. AWS Glue Schema Registry). `platform-events` ships no concrete implementation and adds no schema-registry SDK dependency — consuming services implement `Codec` against their own registry client, mirroring the existing `port.Logger` pattern.
