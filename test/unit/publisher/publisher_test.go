@@ -147,6 +147,16 @@ func TestWithAttributes_NotNil(t *testing.T) {
 	assert.NotNil(t, opt)
 }
 
+func TestWithCodec_NotNil(t *testing.T) {
+	opt := events.WithCodec(events.NoopCodec{})
+	assert.NotNil(t, opt)
+}
+
+func TestWithConsumerCodec_NotNil(t *testing.T) {
+	opt := events.WithConsumerCodec(events.NoopCodec{})
+	assert.NotNil(t, opt)
+}
+
 // ----------------------------
 // NewSQSConsumer validation
 // ----------------------------
@@ -250,6 +260,52 @@ func TestWithMessageGroupID_CallsDomainToPublic(t *testing.T) {
 	err = evtPub.Publish(context.Background(), env)
 	require.NoError(t, err)
 	assert.Equal(t, "group-acme", capturedGroupID)
+}
+
+// echoSchemaCodec is a minimal port.Codec test double whose Encode leaves
+// payload bytes untouched but reports a fixed schemaID, so the test can
+// assert the public events.Codec alias plumbs through to the internal SNS
+// adapter with no translation layer (unlike WithMessageGroupID/WithAttributes,
+// which need a domainToPublic-converting closure).
+type echoSchemaCodec struct{}
+
+func (echoSchemaCodec) Encode(_ context.Context, _ string, payload json.RawMessage) ([]byte, string, error) {
+	return payload, "echo-schema", nil
+}
+
+func (echoSchemaCodec) Decode(_ context.Context, _ string, encoded []byte) (json.RawMessage, error) {
+	return json.RawMessage(encoded), nil
+}
+
+var _ port.Codec = echoSchemaCodec{}
+
+func TestEventsWithCodec_PlumbsThroughPublicWrapper(t *testing.T) {
+	var capturedMessage string
+	mockClient := &snsMockClient{
+		publishFn: func(_ context.Context, params *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			capturedMessage = aws.ToString(params.Message)
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+
+	pub, err := internalsns.NewWithClient(
+		"arn:aws:sns:us-east-1:123:test",
+		mockClient,
+		nil,
+		events.WithCodec(echoSchemaCodec{}),
+	)
+	require.NoError(t, err)
+
+	evtPub := events.NewPublisherFromPort(pub)
+	env := events.NewEnvelope("test.event", "svc", json.RawMessage(`{"x":1}`), events.WithTenantID("acme"))
+	err = evtPub.Publish(context.Background(), env)
+	require.NoError(t, err)
+
+	var wire struct {
+		SchemaID string `json:"dataschema"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(capturedMessage), &wire))
+	assert.Equal(t, "echo-schema", wire.SchemaID)
 }
 
 func TestWithMessageDeduplicationID_CallsDomainToPublic(t *testing.T) {

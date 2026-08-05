@@ -80,6 +80,14 @@ func WithAttributes(attrs map[string]string) PublisherOption {
 	return func(p *snsPublisher) { p.extraAttributes = attrs }
 }
 
+// WithCodec sets an optional schema-registry codec applied to the JSON
+// payload immediately before SNS publish. Unset (nil, the default), Payload
+// is published as plain JSON exactly as before this option existed — zero
+// behaviour change. See port.Codec for the Encode contract.
+func WithCodec(codec port.Codec) PublisherOption {
+	return func(p *snsPublisher) { p.codec = codec }
+}
+
 type snsPublisher struct {
 	client            SNSClientAPI
 	topicARN          string
@@ -87,6 +95,7 @@ type snsPublisher struct {
 	messageGroupIDFn  func(domain.Envelope[json.RawMessage]) string
 	deduplicationIDFn func(domain.Envelope[json.RawMessage]) string
 	extraAttributes   map[string]string
+	codec             port.Codec
 }
 
 // Config holds the parameters for constructing an SNS publisher.
@@ -184,6 +193,18 @@ func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.Raw
 		attribute.String("events.event_type", env.Type),
 		attribute.String("events.event_id", env.ID),
 	)
+
+	env, err := p.encodeEnvelopePayload(ctx, env)
+	if err != nil {
+		if p.logger != nil {
+			p.logger.Error("sns: codec encode failed", map[string]any{
+				"topic":      p.topicARN,
+				"event_type": env.Type,
+				"error":      err.Error(),
+			})
+		}
+		return err
+	}
 
 	body, err := json.Marshal(env)
 	if err != nil {
@@ -354,6 +375,18 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 			marshalErr.Failures = append(marshalErr.Failures, BatchFailure{
 				ID:      env.ID,
 				Code:    "InvalidEnvelope",
+				Message: err.Error(),
+			})
+			continue
+		}
+		env, err := p.encodeEnvelopePayload(ctx, env)
+		if err != nil {
+			if marshalErr == nil {
+				marshalErr = &BatchError{}
+			}
+			marshalErr.Failures = append(marshalErr.Failures, BatchFailure{
+				ID:      env.ID,
+				Code:    "CodecEncodeError",
 				Message: err.Error(),
 			})
 			continue
@@ -559,6 +592,37 @@ func wrapIfRetryable(err error) error {
 		return &domain.RetryableError{Cause: err}
 	}
 	return err
+}
+
+// encodeEnvelopePayload runs the configured codec (if any) on env's payload.
+// If no codec is configured, env is returned unchanged. If Encode returns a
+// non-empty schemaID, Payload is replaced with a base64-wrapped JSON string
+// and SchemaID is set to schemaID; a schemaID of "" (e.g. a NoopCodec) leaves
+// the envelope untouched — no wire format change.
+func (p *snsPublisher) encodeEnvelopePayload(ctx context.Context, env domain.Envelope[json.RawMessage]) (domain.Envelope[json.RawMessage], error) {
+	if p.codec == nil {
+		return env, nil
+	}
+	start := time.Now()
+	encoded, schemaID, err := p.codec.Encode(ctx, env.Type, env.Payload)
+	dur := time.Since(start)
+	if err != nil {
+		metrics.RecordCodecEncode(p.topicARN, env.Type, "error", dur.Seconds())
+		return env, fmt.Errorf("sns: codec encode failed: %w", err)
+	}
+	if schemaID == "" {
+		metrics.RecordCodecEncode(p.topicARN, env.Type, "noop", dur.Seconds())
+		return env, nil
+	}
+	wrapped, err := domain.WrapCodecPayload(encoded)
+	if err != nil {
+		metrics.RecordCodecEncode(p.topicARN, env.Type, "error", dur.Seconds())
+		return env, fmt.Errorf("sns: %w", err)
+	}
+	env.Payload = wrapped
+	env.SchemaID = schemaID
+	metrics.RecordCodecEncode(p.topicARN, env.Type, "success", dur.Seconds())
+	return env, nil
 }
 
 func validateEnvelopeFields(env domain.Envelope[json.RawMessage]) error {

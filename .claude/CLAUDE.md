@@ -108,7 +108,7 @@ External dependencies (private modules):
   - `Publisher` interface — `Publish(ctx, Envelope[json.RawMessage]) error`; `PublishBatch(ctx, []Envelope[json.RawMessage]) error`
   - `NewSNSPublisher(cfg SNSConfig, opts ...PublisherOption) (Publisher, error)` — constructs the SNS implementation; returns an error if `TopicARN` is empty (prevents invalid label cardinality in metrics)
   - `SNSConfig{TopicARN, Region, EndpointURL, Logger}` — `TopicARN` required. `Logger` accepts any `port.Logger` implementation — pass the `ZapLogger` from `platform-gincommon` directly.
-  - `PublisherOption` — `WithMessageGroupID(fn)`, `WithMessageDeduplicationID(fn)` (FIFO topics), `WithAttributes(map)`
+  - `PublisherOption` — `WithMessageGroupID(fn)`, `WithMessageDeduplicationID(fn)` (FIFO topics), `WithAttributes(map)`, `WithCodec(codec)` (schema-registry hook — see "Codec" below)
   - `MockPublisher` (in `pkg/events/mock`) — in-memory, thread-safe; `Published() []Envelope[json.RawMessage]`
 
 - **Consumer**
@@ -116,7 +116,7 @@ External dependencies (private modules):
   - `NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Consumer, error)` — constructs the SQS long-poll loop
   - `SQSConfig{QueueURL, Region, EndpointURL, MaxMessages, WaitSeconds, Logger}` — `QueueURL` required; `MaxMessages` default 10; `WaitSeconds` default 20. `Logger` accepts any `port.Logger` — pass `platform-gincommon`'s `ZapLogger` directly.
   - `Handler` — `func(ctx context.Context, env Envelope[json.RawMessage]) error`; returning a non-nil error skips deletion (message becomes visible again after visibility timeout). The `ctx` passed to each handler has a `platform-gincommon`-compatible `RequestContext` injected (populated from `env.TenantID`, `env.TraceID`) so downstream calls to pgcommon pool helpers (e.g. `pool.WithTx`) pick up the correct GUC values automatically.
-  - `ConsumerOption` — `WithConcurrency(n)` (default 1), `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`
+  - `ConsumerOption` — `WithConcurrency(n)` (default 1), `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`, `WithConsumerCodec(codec)` (schema-registry hook — see "Codec" below)
   - `MockConsumer` (in `pkg/events/mock`) — in-memory queue; `Inject(env)` delivers messages synchronously
 
 - **HMAC helpers**
@@ -203,7 +203,7 @@ pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx
 
 `schema_version` field: set via `WithSchemaVersion("1")` on every new event type at inception. **This is a semantic consumer-branching version — always a small integer string (`"1"`, `"2"`).** Do NOT put a Glue Schema Registry UUID here; use `WithSchemaID` for that instead (see below).
 
-`schema_id` field: set via `WithSchemaID(schemaVersionID)` where `schemaVersionID` is the UUID returned by the Glue codec's `Encode` call. This is the authoritative registry pointer the codec uses for Avro/JSON deserialization. It is distinct from `schema_version` and must never be confused with it. The Glue UUID is also embedded in the encoded payload's 18-byte wire-format header, so `schema_id` in the envelope is for observability and traceability only. Increment on additive-only field additions. For breaking changes, mint a new event type (`.v2`) and reset `schema_version` back to `"1"`. See `EVENT_SCHEMA_GOVERNANCE.md` for full rules, migration window pattern, and the cross-service event type registry.
+`schema_id` field: set via `WithSchemaID(schemaVersionID)` where `schemaVersionID` is the UUID returned by the Glue codec's `Encode` call. This is the authoritative registry pointer the codec uses for Avro/JSON deserialization. It is distinct from `schema_version` and must never be confused with it. The Glue UUID is also embedded in the encoded payload's 18-byte wire-format header, so `schema_id` in the envelope is for observability and traceability only. Increment on additive-only field additions. For breaking changes, mint a new event type (`.v2`) and reset `schema_version` back to `"1"`. See `EVENT_SCHEMA_GOVERNANCE.md` for full rules, migration window pattern, and the cross-service event type registry. As of the `Codec`/`WithCodec` addition (see "Codec" below), `schema_id` is set automatically by the SNS publisher when a codec is configured — manual `WithSchemaID` calls are unnecessary (and will be overwritten) once a codec is wired in.
 
 ### SNS Publisher
 
@@ -236,6 +236,23 @@ Start() →
 - **OTel** — each message dispatch creates a child span `sqs.receive` with `messaging.system=aws_sqs`, `messaging.destination`, `messaging.message_id`, `messaging.operation=process`. The span is linked to the publisher's trace via `Envelope.TraceID`, giving end-to-end visibility across the SNS/SQS boundary in Tempo/Grafana. OTel must be initialised by the consuming service via `gincommon.InitTracingFromEnv()` before starting the consumer.
 - **RLS GUC propagation** — the handler `ctx` has `env.TenantID` and `env.TraceID` injected so that `pgcommon.Pool` GUC injection (via `platform-pgcommon`'s `RLSMiddleware` / `GUCProvider`) correctly scopes all DB queries inside the handler to the event's tenant without any extra wiring by the caller.
 
+### Codec (optional schema-registry hook)
+
+`events.Codec` (aliased from `port.Codec`) is a pluggable hook for encoding/decoding an envelope's JSON `Payload` into a schema-registry-specific wire format (e.g. AWS Glue Schema Registry). **`platform-events` ships no concrete implementation and adds no schema-registry SDK dependency** — a consuming service implements `Codec` against its own registry client and injects it via `WithCodec` (publisher) / `WithConsumerCodec` (consumer), the same pattern used for `port.Logger`.
+
+```go
+type Codec interface {
+    Encode(ctx context.Context, eventType string, payload json.RawMessage) (encoded []byte, schemaID string, err error)
+    Decode(ctx context.Context, schemaID string, encoded []byte) (payload json.RawMessage, err error)
+}
+```
+
+- **Wire format** — `Encode`'s output bytes are base64-encoded and marshalled as a JSON *string*, then substituted into `Envelope.Payload`; `SchemaID` is set to the returned `schemaID`. This keeps the envelope always-valid JSON (required for SNS's UTF-8-only `Message` field) regardless of the codec's native binary format.
+- **`SchemaID` is the decode signal** — empty means `Payload` is already plain JSON (legacy producer, `NoopCodec`, or `WithCodec` never configured on the publisher); the SQS consumer skips `Decode` entirely in that case. Non-empty means `Decode` runs before the message reaches the handler (and before `WithDeadLetterHandler` routing).
+- **Decode failures are treated like handler errors, not malformed JSON** — a schema-registry outage can be transient, so a decode failure leaves the message visible for SQS's own `MaxReceiveCount`/redrive-policy retry rather than deleting it immediately.
+- **No outbox involvement** — encoding happens transiently inside `Publish`/`PublishBatch`; `pkg/outbox` always stores the canonical plain-JSON envelope and is unaffected by `WithCodec`.
+- `NoopCodec` (in `pkg/events`, aliased from `port.NoopCodec`) is the identity reference implementation — `Encode` returns the payload unchanged with an empty `schemaID`.
+
 ### Outbox Runner
 
 The outbox pattern eliminates the dual-write problem: services write the event *inside their business transaction* (via `outbox.Enqueue`), and the runner publishes asynchronously with at-least-once delivery.
@@ -266,6 +283,10 @@ HMAC keys must be ≥ 32 bytes; `Sign` returns an error (not a panic) if the key
 - `outbox_pending_total{service}` — gauge (set each poll cycle)
 - `outbox_published_total{service, event_type, status}` — counter
 - `outbox_attempts_total{service, event_type}` — counter
+- `events_codec_encode_total{service, topic, event_type, status}` — counter (`status`: `success`/`noop`/`error`); only incremented when `WithCodec` is configured
+- `events_codec_encode_duration_seconds{service, topic, event_type}` — histogram
+- `events_codec_decode_total{service, queue, event_type, status}` — counter (`status`: `success`/`error`); only incremented when `WithConsumerCodec` is configured
+- `events_codec_decode_duration_seconds{service, queue, event_type}` — histogram
 - `events_oversized_event_type_label_total{service}` — counter; incremented by `SanitizeEventType` when an `event_type` value exceeds 128 bytes and is replaced with `"__oversized__"`; alert on `rate() > 0`
 
 `InitWithRegisterer(serviceName, buildVersion, prometheus.Registerer)` — for isolated test registries; bypasses `sync.Once`.
@@ -356,6 +377,8 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 **Outbox transactions compose with `pgcommon.RunInTx`** — `outbox.Enqueue` accepts a raw `pgx.Tx` rather than a pool so callers control the transaction boundary. The idiomatic pattern is `pgcommon.RunInTx(ctx, pool, opts, fn)` where `fn` performs the business write and calls `outbox.Enqueue(ctx, tx, env)` — both commit or both roll back. This avoids a second `BEGIN` inside `Enqueue` and keeps the dual-write window at zero.
 
+**`Codec` is optional and pluggable, not implemented in this library** — mirrors `port.Logger`: the interface and a `NoopCodec` identity reference live here; a consuming service implements it against its own schema-registry client (e.g. AWS Glue) and injects it via `WithCodec`/`WithConsumerCodec`. Absent, behaviour is byte-for-byte identical to pre-`Codec` releases — the encode/decode hooks are gated on `codec != nil` and `SchemaID != ""` respectively, both unreachable no-ops for existing callers.
+
 ## CI/CD
 
 GitHub Actions runs three workflows. This is a **private module** — there is no production server deployment; CI validates library quality and publishes Go module versions via git tags.
@@ -387,5 +410,6 @@ GitHub Actions runs three workflows. This is a **private module** — there is n
 - **New outbox store backend** (e.g. DynamoDB): implement `port.OutboxStore` in `internal/core/port/outboxstore.go`, place in `internal/adapter/outbound/dynamooutbox/`, inject via `Runner.Store`. The Postgres implementation should remain the default — only swap if `platform-pgcommon` is not available in the consuming service.
 - **New outbox migration:** add `NNN_description.up.sql` / `NNN_description.down.sql` to `pkg/outbox/migrations/`. The embedded FS is recompiled on next build; `outbox.ApplySchema` picks it up automatically via `platform-pgcommon`'s `migrate.Runner`.
 - **Replace logger:** the `port.Logger` interface is deliberately kept identical to `platform-gincommon`'s. Do not change method signatures — consuming services pass a single `ZapLogger` instance to both libraries.
+- **New Codec implementation** (e.g. AWS Glue Schema Registry): implement `port.Codec` (aliased as `events.Codec`) in the consuming service — this library does not implement one or depend on `aws-sdk-go-v2/service/glue`. Inject via `WithCodec` (publisher) / `WithConsumerCodec` (consumer).
 - **New metrics:** add counters/histograms inside `initMetricsWithRegisterer` in `internal/adapter/outbound/metrics/metrics.go`.
 - **New use case:** add to `internal/core/service/`, depending only on `domain/` types and `port/` interfaces.

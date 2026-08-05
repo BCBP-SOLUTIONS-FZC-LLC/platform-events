@@ -159,6 +159,13 @@ func WithUserAgent(ua string) EnvelopeOpt {
 // "2", …) is the human-readable semantic version consumers use to gate business
 // logic. When using AWS Glue Schema Registry, pass the UUID returned by the
 // codec's Encode call. Absent for NoopCodec (dev/test).
+//
+// When a codec-enabled publisher is used (see WithCodec, pkg/events/codec.go),
+// SchemaID is normally set automatically by the SNS publisher from the
+// codec's Encode return value — do not call WithSchemaID yourself in that
+// case, since the encode step overwrites it at publish time. WithSchemaID
+// remains useful for manual/advanced construction (e.g. republishing an
+// already-encoded payload) or non-codec informational tagging.
 func WithSchemaID(id string) EnvelopeOpt {
 	return func(c *envelopeConfig) { c.schemaID = id }
 }

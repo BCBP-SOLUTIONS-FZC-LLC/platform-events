@@ -272,7 +272,7 @@ The library is organised in concentric Clean Architecture layers. Inner layers h
 ```mermaid
 graph TD
     subgraph pub["Public API  —  pkg/"]
-        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
+        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nCodec · NoopCodec · WithCodec · WithConsumerCodec\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
         outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 
@@ -281,16 +281,16 @@ graph TD
     end
 
     subgraph adapters["Adapters  —  internal/adapter/outbound/"]
-        sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption\nwrapIfRetryable"]
-        sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nvisibility extension · drain\nper-call receive timeout"]
+        sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption · WithCodec\nencodeEnvelopePayload · wrapIfRetryable"]
+        sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nConsumerOption · WithCodec · decodeCodecPayload\nvisibility extension · drain\nper-call receive timeout"]
         outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed · PrunePublished\nLeasedCount · ListDeadLetters · ReprocessDeadLetters\nReprocessDeadLettersWith · DiscardDeadLetters"]
-        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal · OutboxDeadLettersDiscardedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal\nOversizedEventTypeLabelTotal"]
+        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nCodecEncodeTotal · CodecEncodeDuration · CodecDecodeTotal · CodecDecodeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal · OutboxDeadLettersDiscardedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal\nOversizedEventTypeLabelTotal"]
         logger_adp["logger\nZapLogger → port.Logger\n(map-based fields; gincommon-compatible)"]
     end
 
     subgraph core["Core  —  internal/core/"]
-        port_pkg["port\nPublisher · Consumer · Handler\nLogger · Clock\nOutboxStore · LeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
-        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord · DLQFilter · DeadLetterRecord\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge\nErrRetryable · RetryableError"]
+        port_pkg["port\nPublisher · Consumer · Handler\nCodec · NoopCodec\nLogger · Clock\nOutboxStore · LeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
+        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord · DLQFilter · DeadLetterRecord\nWrapCodecPayload · UnwrapCodecPayload\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge\nErrRetryable · RetryableError"]
         service_pkg["service\nOutboxService · HMACService\nSign · Verify\nLeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 
@@ -410,13 +410,15 @@ graph LR
 | `Publisher` | Interface: `Publish(ctx, Envelope[json.RawMessage]) error`; `PublishBatch(ctx, []Envelope[json.RawMessage]) error` |
 | `NewSNSPublisher(cfg, opts...)` | Constructs the SNS implementation; returns error on empty `TopicARN` |
 | `SNSConfig` | `TopicARN` (required), `Region`, `EndpointURL`, `Logger` |
-| `PublisherOption` | `WithMessageGroupID(fn)`, `WithMessageDeduplicationID(fn)`, `WithAttributes(map)` |
+| `PublisherOption` | `WithMessageGroupID(fn)`, `WithMessageDeduplicationID(fn)`, `WithAttributes(map)`, `WithCodec(codec)` |
 | `Consumer` | Interface: `Start(ctx) error`; `Stop() error` |
 | `Handler` | `func(ctx context.Context, env Envelope[json.RawMessage]) error` |
 | `NewSQSConsumer(cfg, handler, opts...)` | Constructs the SQS long-poll loop; returns error on empty `QueueURL` or `VisibilityTimeout > 12h` |
 | `SQSConfig` | `QueueURL` (required), `Region`, `EndpointURL`, `MaxMessages`, `WaitSeconds`, `Logger` |
-| `ConsumerOption` | `WithConcurrency(n)`, `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`, `WithMaxReceiveCount(n)`, `WithDrainTimeout(d)` |
+| `ConsumerOption` | `WithConcurrency(n)`, `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`, `WithMaxReceiveCount(n)`, `WithDrainTimeout(d)`, `WithConsumerCodec(codec)` |
 | `SQSClientLike` | Interface mirroring the SQS client API — inject in tests via `NewSQSConsumerWithClient` without importing internal packages |
+| `Codec` | Interface: `Encode(ctx, eventType, payload) (encoded []byte, schemaID string, err error)`; `Decode(ctx, schemaID, encoded) (payload json.RawMessage, err error)`. Ships as an interface only — no concrete implementation or schema-registry SDK dependency. |
+| `NoopCodec` | Identity reference `Codec`: `Encode` returns the payload unchanged with an empty `schemaID`; `Decode` returns its input unchanged |
 | `Sign(key, payload)` | Hex-encoded HMAC-SHA256 signature |
 | `Verify(key, payload, sig)` | Constant-time comparison; returns `false` on any error |
 | `SignEnvelope(key, env)` | Signs canonical JSON of envelope |
@@ -468,8 +470,8 @@ These guarantees apply to the envelope wrapper. Payload field stability is a sep
 | `actor` | **Contextual** | Present when set via `WithActor`. Opaque identity string of the user or service that caused the event (e.g. a user UUID, a service-account name). Audit trail field — not forwarded as an SNS attribute. Will never be removed. |
 | `ip_address` | **Contextual** | Present when set via `WithIPAddress`. Client IP at the time the event was triggered. Pass `r.RemoteAddr` or a validated `X-Forwarded-For` value from the HTTP handler. Omit for background/system events. Audit trail field — not forwarded as an SNS attribute. Will never be removed. |
 | `user_agent` | **Contextual** | Present when set via `WithUserAgent`. HTTP `User-Agent` header value from the request that triggered the event. Omit for background/system events. Audit trail field — not forwarded as an SNS attribute. Will never be removed. |
-| `dataschema` | **Contextual** | Present when set via `WithSchemaID`. Aligns with CloudEvents `dataschema` attribute. Opaque schema registry version identifier — typically the Glue Schema Registry UUID returned by the codec's `Encode` call. Distinct from `specversion`: `dataschema` is the technical registry pointer used by the codec for Avro/JSON deserialization; `specversion` is the human-readable semantic version consumers use to gate business logic. Not forwarded as an SNS attribute. Will never be removed. |
-| `data` | **Externally governed** | Always present. Valid JSON (object, array, or scalar). CloudEvents `data` attribute. Shape is defined by the publisher and governed per [EVENT_SCHEMA_GOVERNANCE.md](../EVENT_SCHEMA_GOVERNANCE.md). The library only validates it is well-formed JSON. |
+| `dataschema` | **Contextual** | Present when set via `WithSchemaID`, or automatically by the SNS publisher when `WithCodec` is configured (the publisher's value wins if both are set). Aligns with CloudEvents `dataschema` attribute. Opaque schema registry version identifier — typically the Glue Schema Registry UUID returned by the codec's `Encode` call. Distinct from `specversion`: `dataschema` is the technical registry pointer used by the codec for Avro/JSON deserialization; `specversion` is the human-readable semantic version consumers use to gate business logic. Also doubles as the consumer-side signal for whether `data` is codec-encoded (see below). Not forwarded as an SNS attribute. Will never be removed. |
+| `data` | **Externally governed** | Always present. Valid JSON (object, array, or scalar). CloudEvents `data` attribute. Shape is defined by the publisher and governed per [EVENT_SCHEMA_GOVERNANCE.md](../EVENT_SCHEMA_GOVERNANCE.md). The library only validates it is well-formed JSON. **When `WithCodec` is configured on the publisher and `dataschema` is non-empty**, `data` is a base64-encoded JSON *string* (the codec's encoded bytes), not the inline payload object — `NewSQSConsumer` with `WithConsumerCodec` decodes it back to plain JSON before the handler sees it; a consumer without a matching `Codec` receiving a `dataschema`-tagged message will not be able to interpret `data` directly. |
 
 ### Stability definitions
 
@@ -551,6 +553,12 @@ sequenceDiagram
     SNSAdp ->> SNSAdp: validate env.ID · env.Type · env.Source (non-empty)
     Note over SNSAdp: returns error immediately if any field is empty — prevents invalid Prometheus label cardinality
 
+    opt WithCodec configured
+        SNSAdp ->> SNSAdp: Codec.Encode(ctx, env.Type, env.Payload) → encoded bytes, schemaID
+        SNSAdp ->> SNSAdp: env.Payload = base64(encoded) as JSON string; env.SchemaID = schemaID
+        Note over SNSAdp: encode error returns before the SNS API call — CodecEncodeTotal{status=error}.Inc()
+    end
+
     SNSAdp ->> SNSAdp: json.Marshal(env) → message body
     SNSAdp ->> SNSAdp: set attributes: EventType · TenantID · Source · EventID · Subject (if set)
 
@@ -606,6 +614,17 @@ sequenceDiagram
                 Note over SQSAdp: [Worker Goroutine Scope Starts]
                 SQSAdp ->> pgcommon: WithGUCSet(ctx, GUCSet{TenantID})
                 SQSAdp ->> SQSAdp: WithEnvelopeTraceID(ctx, env.TraceID)
+
+                opt env.SchemaID non-empty
+                    SQSAdp ->> SQSAdp: Codec.Decode(ctx, env.SchemaID, env.Payload) → plain JSON
+                    alt decode error (no Codec configured, or Decode failed)
+                        SQSAdp ->> SQSAdp: CodecDecodeTotal{status=error}.Inc()
+                        Note over SQSAdp: leave visible for retry — NOT deleted like malformed JSON (registry outage may be transient)
+                    else decode success
+                        SQSAdp ->> SQSAdp: env.Payload = decoded plain JSON
+                    end
+                end
+
                 SQSAdp ->>+ OTel: Start span "sqs.receive"
                 OTel -->>- SQSAdp: handler ctx + span
                 

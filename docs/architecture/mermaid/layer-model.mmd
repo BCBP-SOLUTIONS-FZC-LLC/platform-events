@@ -1,6 +1,6 @@
 graph TD
     subgraph pub["Public API  —  pkg/"]
-        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
+        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nCodec · NoopCodec · WithCodec · WithConsumerCodec\nSQSClientLike\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.MockPublisher · mock.MockConsumer"]
         outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 
@@ -9,16 +9,16 @@ graph TD
     end
 
     subgraph adapters["Adapters  —  internal/adapter/outbound/"]
-        sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption\nwrapIfRetryable"]
-        sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nvisibility extension · drain\nper-call receive timeout"]
+        sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption · WithCodec\nencodeEnvelopePayload · wrapIfRetryable"]
+        sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nConsumerOption · WithCodec · decodeCodecPayload\nvisibility extension · drain\nper-call receive timeout"]
         outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed · PrunePublished\nLeasedCount · ListDeadLetters · ReprocessDeadLetters\nReprocessDeadLettersWith · DiscardDeadLetters"]
-        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal · OutboxDeadLettersDiscardedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal\nOversizedEventTypeLabelTotal"]
+        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nCodecEncodeTotal · CodecEncodeDuration · CodecDecodeTotal · CodecDecodeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal · OutboxDeadLettersDiscardedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal\nOversizedEventTypeLabelTotal"]
         logger_adp["logger\nZapLogger → port.Logger\n(map-based fields; gincommon-compatible)"]
     end
 
     subgraph core["Core  —  internal/core/"]
-        port_pkg["port\nPublisher · Consumer · Handler\nLogger · Clock\nOutboxStore · LeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
-        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord · DLQFilter · DeadLetterRecord\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge\nErrRetryable · RetryableError"]
+        port_pkg["port\nPublisher · Consumer · Handler\nCodec · NoopCodec\nLogger · Clock\nOutboxStore · LeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
+        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord · DLQFilter · DeadLetterRecord\nWrapCodecPayload · UnwrapCodecPayload\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge\nErrRetryable · RetryableError"]
         service_pkg["service\nOutboxService · HMACService\nSign · Verify\nLeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 

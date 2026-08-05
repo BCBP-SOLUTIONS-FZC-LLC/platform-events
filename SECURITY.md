@@ -45,6 +45,7 @@ This library publishes to AWS SNS and consumes from AWS SQS using credentials su
 | `Envelope.TenantID` and `Envelope.TraceID` originate from a trusted `RequestContext` (e.g. platform-gincommon) | If these fields are populated from untrusted input without validation, GUC injection and trace linking can be spoofed. |
 | SQS messages are delivered by AWS infrastructure | The library does not verify message authenticity beyond JSON parsing. Use `VerifyEnvelope` with a shared HMAC key for cross-service authentication when required. |
 | The `Envelope` wire format is a cross-language contract with `platform-eventcommon` (Python) | A change that desynchronises the two implementations' JSON encoding or HMAC canonicalisation is a correctness and security issue, not just a compatibility one — see the `interop` CI job. |
+| `Codec` implementations (`WithCodec`/`WithConsumerCodec`) are supplied entirely by the consuming service | `platform-events` ships no concrete `Codec` and does not vet, sandbox, or bound the caller's `Encode`/`Decode` implementation. It runs synchronously inside `Publish`/`PublishBatch` and the SQS `dispatch` loop with no internal timeout — a `Codec` that calls an external schema registry must apply its own `context.WithTimeout`, the same responsibility already placed on `Handler`. A `Codec` bug that corrupts or misencodes payload bytes is outside this library's ability to detect. |
 
 ## Scope
 
@@ -57,4 +58,4 @@ The following are in scope for vulnerability reports:
 - RLS bypass through incorrect GUC lifecycle management in the SQS consumer context
 - Deserialisation vulnerabilities in `ParseEnvelope` or payload parsing
 
-Out of scope: theoretical attacks requiring full control of AWS infrastructure or the Postgres server, issues in transitive dependencies unrelated to this library's functionality, and issues in the `cmd/platform-events` reference CLI.
+Out of scope: theoretical attacks requiring full control of AWS infrastructure or the Postgres server, issues in transitive dependencies unrelated to this library's functionality, issues in the `cmd/platform-events` reference CLI, and vulnerabilities in a consuming service's own `Codec` implementation (`WithCodec`/`WithConsumerCodec`) — that code is supplied and owned entirely by the consuming service, not this library.

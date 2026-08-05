@@ -2,6 +2,7 @@ package sns_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	internalsns "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
@@ -1277,4 +1279,204 @@ func TestPublish_TooManyAttributes_WithLogger_LogsError(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected ERROR log when attribute count exceeds SNS limit")
+}
+
+// ----------------------------
+// WithCodec
+// ----------------------------
+
+// fakeCodec is a minimal port.Codec test double. reverseCodec below builds one
+// that reverses the payload bytes — a stand-in for a real schema-registry codec.
+type fakeCodec struct {
+	encodeFn func(ctx context.Context, eventType string, payload json.RawMessage) ([]byte, string, error)
+	decodeFn func(ctx context.Context, schemaID string, encoded []byte) (json.RawMessage, error)
+}
+
+func (f *fakeCodec) Encode(ctx context.Context, eventType string, payload json.RawMessage) ([]byte, string, error) {
+	return f.encodeFn(ctx, eventType, payload)
+}
+
+func (f *fakeCodec) Decode(ctx context.Context, schemaID string, encoded []byte) (json.RawMessage, error) {
+	return f.decodeFn(ctx, schemaID, encoded)
+}
+
+var _ port.Codec = (*fakeCodec)(nil)
+
+func reverseBytes(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		out[len(b)-1-i] = c
+	}
+	return out
+}
+
+// reversingCodec reverses payload bytes on Encode and un-reverses on Decode,
+// returning the fixed schemaID "fake-schema-v1".
+func reversingCodec() *fakeCodec {
+	return &fakeCodec{
+		encodeFn: func(_ context.Context, _ string, payload json.RawMessage) ([]byte, string, error) {
+			return reverseBytes(payload), "fake-schema-v1", nil
+		},
+		decodeFn: func(_ context.Context, _ string, encoded []byte) (json.RawMessage, error) {
+			return reverseBytes(encoded), nil
+		},
+	}
+}
+
+// wireEnvelope mirrors the subset of the envelope's JSON shape needed to
+// assert on "data"/"dataschema" without depending on domain.Envelope's
+// custom UnmarshalJSON (which decodes Data eagerly into a generic type).
+type wireEnvelope struct {
+	Data     json.RawMessage `json:"data"`
+	SchemaID string          `json:"dataschema"`
+}
+
+func TestPublish_NoCodec_WireFormatUnchanged(t *testing.T) {
+	var capturedInput *sns.PublishInput
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, params *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			capturedInput = params
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, nil)
+	require.NoError(t, err)
+
+	err = pub.Publish(context.Background(), makeEnv("test.event"))
+	require.NoError(t, err)
+
+	require.NotNil(t, capturedInput)
+	var wire wireEnvelope
+	require.NoError(t, json.Unmarshal([]byte(aws.ToString(capturedInput.Message)), &wire))
+	assert.Empty(t, wire.SchemaID)
+	assert.True(t, bytesLooksLikeJSONObject(wire.Data), "data should remain a JSON object without a codec")
+}
+
+func bytesLooksLikeJSONObject(b json.RawMessage) bool {
+	for _, c := range b {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+			continue
+		case '{':
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func TestWithCodec_WrapsPayloadAsBase64String(t *testing.T) {
+	var capturedInput *sns.PublishInput
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, params *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			capturedInput = params
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	pub, err := internalsns.NewWithClient(
+		"arn:aws:sns:us-east-1:123:test", client, nil,
+		internalsns.WithCodec(reversingCodec()),
+	)
+	require.NoError(t, err)
+
+	env := makeEnv("test.event")
+	err = pub.Publish(context.Background(), env)
+	require.NoError(t, err)
+
+	require.NotNil(t, capturedInput)
+	var wire wireEnvelope
+	require.NoError(t, json.Unmarshal([]byte(aws.ToString(capturedInput.Message)), &wire))
+	assert.Equal(t, "fake-schema-v1", wire.SchemaID)
+
+	var b64 string
+	require.NoError(t, json.Unmarshal(wire.Data, &b64), "data should be a base64 JSON string when a codec is configured")
+	raw, err := base64.StdEncoding.DecodeString(b64)
+	require.NoError(t, err)
+	assert.Equal(t, string(env.Payload), string(reverseBytes(raw)))
+}
+
+func TestWithCodec_NoopSchemaID_NoWireChange(t *testing.T) {
+	var capturedInput *sns.PublishInput
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, params *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			capturedInput = params
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	noop := &fakeCodec{
+		encodeFn: func(_ context.Context, _ string, payload json.RawMessage) ([]byte, string, error) {
+			return payload, "", nil
+		},
+	}
+	pub, err := internalsns.NewWithClient(
+		"arn:aws:sns:us-east-1:123:test", client, nil,
+		internalsns.WithCodec(noop),
+	)
+	require.NoError(t, err)
+
+	err = pub.Publish(context.Background(), makeEnv("test.event"))
+	require.NoError(t, err)
+
+	require.NotNil(t, capturedInput)
+	var wire wireEnvelope
+	require.NoError(t, json.Unmarshal([]byte(aws.ToString(capturedInput.Message)), &wire))
+	assert.Empty(t, wire.SchemaID)
+	assert.True(t, bytesLooksLikeJSONObject(wire.Data))
+}
+
+func TestWithCodec_EncodeError_ReturnsErrorBeforeAPICall(t *testing.T) {
+	publishCalled := false
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, _ *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			publishCalled = true
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	failing := &fakeCodec{
+		encodeFn: func(_ context.Context, _ string, _ json.RawMessage) ([]byte, string, error) {
+			return nil, "", fmt.Errorf("registry unavailable")
+		},
+	}
+	pub, err := internalsns.NewWithClient(
+		"arn:aws:sns:us-east-1:123:test", client, nil,
+		internalsns.WithCodec(failing),
+	)
+	require.NoError(t, err)
+
+	err = pub.Publish(context.Background(), makeEnv("test.event"))
+	require.Error(t, err)
+	assert.False(t, publishCalled, "SNS Publish must not be called when codec Encode fails")
+}
+
+func TestWithCodec_PublishBatch_PerEntryCodecFailureIsolated(t *testing.T) {
+	client := successClient()
+	callCount := 0
+	flaky := &fakeCodec{
+		encodeFn: func(_ context.Context, eventType string, payload json.RawMessage) ([]byte, string, error) {
+			callCount++
+			if eventType == "batch.bad" {
+				return nil, "", fmt.Errorf("encode failed for %s", eventType)
+			}
+			return reverseBytes(payload), "fake-schema-v1", nil
+		},
+	}
+	pub, err := internalsns.NewWithClient(
+		"arn:aws:sns:us-east-1:123:test", client, nil,
+		internalsns.WithCodec(flaky),
+	)
+	require.NoError(t, err)
+
+	envs := []domain.Envelope[json.RawMessage]{
+		makeEnv("batch.good"),
+		makeEnv("batch.bad"),
+	}
+	err = pub.PublishBatch(context.Background(), envs)
+	require.Error(t, err)
+
+	var batchErr *internalsns.BatchError
+	require.ErrorAs(t, err, &batchErr)
+	require.Len(t, batchErr.Failures, 1)
+	assert.Equal(t, "CodecEncodeError", batchErr.Failures[0].Code)
+	assert.Equal(t, 2, callCount)
 }

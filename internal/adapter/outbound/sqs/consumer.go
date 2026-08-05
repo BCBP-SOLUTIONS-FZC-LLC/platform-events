@@ -77,6 +77,14 @@ func WithMaxReceiveCount(n int) ConsumerOption {
 	return func(c *sqsConsumer) { c.maxReceiveCount = n }
 }
 
+// WithCodec sets an optional schema-registry codec used to decode incoming
+// messages whose Envelope.SchemaID is non-empty. Unset (nil, the default),
+// all messages are treated as plain JSON exactly as before this option
+// existed. See port.Codec for the Decode contract.
+func WithCodec(codec port.Codec) ConsumerOption {
+	return func(c *sqsConsumer) { c.codec = codec }
+}
+
 // WithDrainTimeout sets how long Stop() waits for in-flight handlers to finish.
 // A negative duration is ignored and the default (30s) is preserved.
 // A zero duration disables the drain window entirely — in-flight handler contexts
@@ -122,6 +130,7 @@ type sqsConsumer struct {
 	visibilityTimeout time.Duration
 	deadLetterHandler port.Handler
 	drainTimeout      time.Duration
+	codec             port.Codec
 
 	maxReceiveCount int
 	cancelFn        context.CancelFunc
@@ -485,6 +494,34 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	handlerBase := pgcommon.WithGUCSet(context.WithoutCancel(loopCtx), pgdomain.GUCSet{TenantID: env.TenantID})
 	handlerBase = port.WithEnvelopeTraceID(handlerBase, env.TraceID)
 
+	// Codec decode — SchemaID is the signal: empty means Payload is already
+	// plain JSON (legacy producer, NoopCodec, or WithCodec never configured
+	// on the publisher). A decode failure (registry outage, corrupt payload,
+	// or SchemaID set with no codec configured here) is treated like a normal
+	// handler error, NOT like the malformed-JSON case above: it may be
+	// transient, so the message is left visible for retry via SQS's own
+	// MaxReceiveCount/redrive-policy mechanics rather than deleted immediately.
+	if env.SchemaID != "" {
+		decodeStart := time.Now()
+		decoded, decErr := decodeCodecPayload(loopCtx, c.codec, env.SchemaID, env.Payload)
+		dur := time.Since(decodeStart)
+		if decErr != nil {
+			metrics.RecordCodecDecode(c.queueURL, env.Type, "error", dur.Seconds())
+			if c.logger != nil {
+				c.logger.Error("sqs: codec decode failed — message left visible for retry", map[string]any{
+					"message_id": aws.ToString(msg.MessageId),
+					"event_type": env.Type,
+					"schema_id":  env.SchemaID,
+					"queue":      c.queueURL,
+					"error":      decErr.Error(),
+				})
+			}
+			return
+		}
+		env.Payload = decoded
+		metrics.RecordCodecDecode(c.queueURL, env.Type, "success", dur.Seconds())
+	}
+
 	// Route to dead-letter handler when ApproximateReceiveCount reaches the threshold.
 	// The message is deleted only if the dead-letter handler succeeds; on failure it
 	// is left visible for retry, matching the semantics of the normal handler.
@@ -671,6 +708,24 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	}
 
 	metrics.RecordConsume(c.queueURL, env.Type, status, dur.Seconds())
+}
+
+// decodeCodecPayload reverses the SNS publisher's codec-encode step. Returns
+// an error if the message requires a codec (non-empty schemaID) but none is
+// configured on this consumer.
+func decodeCodecPayload(ctx context.Context, codec port.Codec, schemaID string, payload json.RawMessage) (json.RawMessage, error) {
+	if codec == nil {
+		return nil, fmt.Errorf("sqs: message has schema_id %q but no Codec is configured (see WithCodec)", schemaID)
+	}
+	raw, err := domain.UnwrapCodecPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := codec.Decode(ctx, schemaID, raw)
+	if err != nil {
+		return nil, fmt.Errorf("sqs: codec Decode failed: %w", err)
+	}
+	return decoded, nil
 }
 
 // approxReceiveCount parses the ApproximateReceiveCount system attribute from SQS.
