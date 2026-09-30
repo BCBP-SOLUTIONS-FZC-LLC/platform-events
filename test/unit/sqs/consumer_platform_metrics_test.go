@@ -184,3 +184,12 @@ func TestConsumerPlatformMetrics_DecodeFailure(t *testing.T) {
 	assert.InDelta(t, 1, counterValue(t, reg, "platform_retry_total", map[string]string{"operation": "consume", "event_type": "iam.user.created"}), 0)
 	assert.Equal(t, uint64(1), histogramCount(t, reg, "platform_dependency_request_seconds", map[string]string{"dependency": "codec", "operation": "decode", "outcome": "error"}))
 }
+
+// Propagation is creation → first receipt: a redelivery is not observed.
+func TestConsumerPlatformMetrics_PropagationFirstReceiptOnly(t *testing.T) {
+	reg := initPlatformMetrics(t)
+	env := domain.NewEnvelope("iam.user.created", "svc", json.RawMessage(`{}`))
+	deletes, _ := consumeOnce(t, withReceiveCount(makeSQSMessage(env), "2"), nil)
+	eventually(t, func() bool { return deletes() == 1 }, "processed")
+	assert.Zero(t, histogramCount(t, reg, "platform_event_propagation_seconds", map[string]string{"queue": testQueue}))
+}

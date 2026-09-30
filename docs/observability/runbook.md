@@ -4,7 +4,7 @@ One section per alert in [`monitoring/prometheus/platform-events.rules.yml`](../
 
 ## PlatformEventsConsumerErrorBudgetBurn
 
-**Meaning:** more than 1.44% of messages received on a queue failed over both the last hour and the last 5 minutes. At that rate the 99.9% monthly consumption SLO is exhausted in about two days.
+**Meaning:** more than 1.44% of messages received on a queue failed over both the last hour and the last 5 minutes, on a queue receiving at least 1 message per minute. At that rate the 99.9% monthly consumption SLO is exhausted in about two days. Quieter queues are excluded because a single failure is already a large ratio there; watch them with [PlatformEventsConsumerStalled](#platformeventsconsumerstalled) and [PlatformEventsMessagesDeadLettered](#platformeventsmessagesdeadlettered).
 
 **Triage:**
 1. Break failures down by reason: `sum by (reason) (rate(platform_messages_failed_total{service="…",queue="…"}[5m]))`.
@@ -33,9 +33,9 @@ One section per alert in [`monitoring/prometheus/platform-events.rules.yml`](../
 
 ## PlatformEventsMessagesDeadLettered
 
-**Meaning:** messages were moved to dead-letter storage in the last 15 minutes. `operation="consume"`: forwarded to the queue's SQS DLQ. `operation="outbox_publish"`: moved to `outbox_dead_letters` after `OUTBOX_MAX_ATTEMPTS` failed publishes.
+**Meaning:** messages were moved to dead-letter storage in the last 15 minutes for a reason other than `explicit` (a handler dead-lettering on purpose is expected and does not alert; graph `platform_dlq_messages_total{reason="explicit"}` if its volume matters). `operation="consume"`: forwarded to the queue's SQS DLQ. `operation="outbox_publish"`: moved to `outbox_dead_letters` after `OUTBOX_MAX_ATTEMPTS` failed publishes.
 
-**Triage by reason:** `max_receive_count` — the handler kept failing (see the consumer error budget). `decode_error` / `malformed` — see above. `explicit` — the service dead-lettered on purpose. `max_attempts` — SNS publishing failed repeatedly; check `events_published_total{status="error"}` and IAM (`sns:Publish`).
+**Triage by reason:** `max_receive_count` — the handler kept failing (see the consumer error budget). `decode_error` / `malformed` — see above. `max_attempts` — SNS publishing failed repeatedly; check `events_published_total{status="error"}` and IAM (`sns:Publish`).
 
 **Mitigation:** SQS DLQ — replay with `StartMessageMoveTask` after the fix. Outbox — inspect with `Runner.ListDeadLetters`, then `ReprocessDeadLettersWith` (or `DiscardDeadLetters` for records that must never be sent).
 

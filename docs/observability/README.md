@@ -34,7 +34,7 @@ Every Tier 1 metric carries `domain`, `service` and `environment`. They are **in
 - **Approved labels.** Additional labels come only from each metric's approved vocabulary: `queue`, `topic`, `event_type`, `reason`, `operation`, `dependency`, `outcome`, `label`, `library`, `library_version`. The allowed values and cardinality bounds are in [metrics-registry.md](metrics-registry.md#label-vocabulary).
 - **`queue` / `topic` values.** These are the queue or topic *name*, never the URL or ARN (which carry the AWS account ID).
 - **Prohibited labels.** `user_id`, `email`, `tenant_id`, `request_id`, `event_id`, `session_id` are banned, as are the equally unbounded `message_id`, `trace_id`, `span_id`, `correlation_id`, `subject` and `actor`.
-- **`event_type` values.** These are capped at 128 bytes (longer values become `__oversized__` and are counted). An `event_type` is taken only from a complete envelope; anything else is `unknown`.
+- **`event_type` values are bounded in-process.** At most 200 distinct values are recorded per process (set with `events.WithEventTypeLimit`); further ones become `__other__`. Values over 128 bytes become `__oversized__`. An `event_type` is taken only from a complete envelope; anything else is `unknown`. Every replacement is counted in `platform_telemetry_label_overflow_total`, so a producer sending unbounded event types cannot explode cardinality. Size the limit above the number of event types the service really handles.
 
 ## Wiring
 
@@ -58,7 +58,7 @@ pgWarnings, err := pgmetrics.InitWithIdentity(pgmetrics.Identity(id), registry)
 
 - **Registerer wrappers are fine.** A registerer that already injects some identity labels (e.g. `prometheus.WrapRegistererWith`, platform-gincommon's `WrapRegistererWith`) works: each label is applied once and the wrapper's value wins.
 - **gincommon interop.** `events.MetricsIdentityFromLabels(gincommon.MetricsConstLabels())` reuses the service's own label values.
-- **Deprecated entry points.** `events.Init` / `events.InitWithRegisterer` still register the legacy metrics only, and staticcheck reports `SA1019` on them. Replacing them with `InitMetrics` is a one-line change.
+- **Deprecated entry points.** `events.Init` / `events.InitWithRegisterer` still register the legacy metrics only, and staticcheck reports `SA1019` on them. Replacing them with `InitMetrics` is a one-line change. A leftover `events.Init` after `InitMetrics` is a no-op, so it can't switch the Tier 1 metrics off. `InitWithRegisterer` is the test-isolation reset and does clear them.
 
 ## Semantics that matter for dashboards
 
@@ -69,7 +69,8 @@ pgWarnings, err := pgmetrics.InitWithIdentity(pgmetrics.Identity(id), registry)
 - **A dead-lettered message is counted once**, whoever forwarded it: `WithDLQForwarding`, the dead-letter handler, or a handler calling `SendToDLQ` and returning `nil`. The consumer passes the reason (`malformed`, `decode_error`, `max_receive_count`, `explicit`) to the DLQ publisher through the handler context. A handler that dead-letters explicitly is **not** also counted as processed.
 - **Inbox duplicates are also counted as processed.** `platform_duplicate_messages_total` counts redeliveries acknowledged by the inbox without running the handler. Those deliveries still count as processed, since the wrapper returned `nil`, so the duplicate ratio is `duplicates / received`.
 - **Outbox dead letters use the same metric.** `platform_dlq_messages_total{operation="outbox_publish",reason="max_attempts"}` counts events moved to `outbox_dead_letters`, so one dead-letter panel covers both flows.
-- **Propagation includes producer clock skew.** `platform_event_propagation_seconds` is `receipt time − envelope time`; negative skew is clamped to 0.
+- **Propagation is measured to the first receipt only.** `platform_event_propagation_seconds` is `first receipt − envelope time`, so redeliveries don't add their retry delay. It includes producer clock skew; negative skew is clamped to 0.
+- **SQS receive latency includes long-polling.** `platform_dependency_request_seconds{operation="receive_message"}` includes up to `WaitTimeSeconds` (20 s) of waiting on an empty queue. Exclude it from latency panels (`operation!="receive_message"`); keep it for error rates.
 
 ## Compatibility period (Backward Compatibility, steps 1–8)
 

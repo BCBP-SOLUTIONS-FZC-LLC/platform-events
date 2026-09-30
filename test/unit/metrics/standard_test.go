@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -559,4 +560,45 @@ func TestStandard_LegacyInitPanicsOnConflict(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(prometheus.NewCounterVec(prometheus.CounterOpts{Name: "events_published_total", Help: "clash"}, []string{"other"}))
 	assert.Panics(t, func() { internalmetrics.InitWithRegisterer("svc", "v1", reg) })
+}
+
+// TestStandard_LegacyInitDoesNotDisableTier1: a leftover events.Init (old
+// bootstrap, shared helper) after InitMetrics must not switch the Tier 1
+// metrics off.
+func TestStandard_LegacyInitDoesNotDisableTier1(t *testing.T) {
+	isolatePlatform(t)
+	reg := prometheus.NewRegistry()
+	_, err := events.InitMetrics(testIdentity, reg)
+	require.NoError(t, err)
+	p := internalmetrics.CurrentPlatform()
+	require.NotNil(t, p)
+
+	events.Init("legacy-helper", "v0") //nolint:staticcheck // exercises the deprecated API
+	assert.Same(t, p, internalmetrics.CurrentPlatform(), "Init must be a no-op once InitMetrics ran")
+	internalmetrics.IncProcessed(testQueueURL, "iam.user.created")
+	assert.InDelta(t, 1, testutil.ToFloat64(p.MessagesProcessed.WithLabelValues("orders", "iam.user.created")), 0)
+	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
+}
+
+// TestStandard_EventTypeCardinalityCap: the byte cap alone does not bound
+// cardinality — distinct values beyond the limit collapse into __other__.
+func TestStandard_EventTypeCardinalityCap(t *testing.T) {
+	isolatePlatform(t)
+	t.Cleanup(func() { internalmetrics.SetEventTypeLimit(0) })
+	reg := prometheus.NewRegistry()
+	_, err := events.InitMetrics(testIdentity, reg, events.WithEventTypeLimit(3), events.WithoutLegacyMetrics())
+	require.NoError(t, err)
+	p := internalmetrics.CurrentPlatform()
+
+	for _, et := range []string{"a.b.one", "a.b.two", "a.b.three", "a.b.four", "a.b.five", "a.b.one"} {
+		internalmetrics.IncProcessed(testQueueURL, et)
+	}
+	assert.InDelta(t, 2, testutil.ToFloat64(p.MessagesProcessed.WithLabelValues("orders", "a.b.one")), 0, "admitted values keep their label")
+	assert.InDelta(t, 2, testutil.ToFloat64(p.MessagesProcessed.WithLabelValues("orders", internalmetrics.EventTypeOther)), 0)
+	assert.Equal(t, 4, testutil.CollectAndCount(p.MessagesProcessed), "3 admitted values + __other__")
+	assert.InDelta(t, 2, testutil.ToFloat64(p.LabelOverflow.WithLabelValues("event_type")), 0)
+
+	assert.Equal(t, internalmetrics.EventTypeUnknown, internalmetrics.SanitizeEventType(""))
+	assert.Equal(t, internalmetrics.EventTypeOversized, internalmetrics.SanitizeEventType(strings.Repeat("x", 129)))
+	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }

@@ -176,7 +176,7 @@ const (
 
 	TopicLabelRule = "SNS topic name — the last segment of the topic ARN (e.g. `iam-events`, `orders.fifo`), never the full ARN. Bounded by the topics a service publishes to (typically 1–3)."
 
-	EventTypeLabelRule = "Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`."
+	EventTypeLabelRule = "Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total."
 
 	LibraryVersionLabelRule = "The platform-events module version the service was built with (e.g. `v1.6.0`), `devel` for an unreleased build, `unknown` when build info is unavailable. One value per deployment; changes only on a library upgrade."
 )
@@ -290,11 +290,11 @@ func Registry() []RegistryEntry {
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_dependency_request_seconds",
 			Type:               TypeHistogram,
-			SemanticDefinition: "Client-observed wall time of one call to an external dependency — SNS (publish, publish_batch), SQS (receive_message, delete_message, change_message_visibility, send_message, get_queue_attributes, get_queue_url) or the configured schema-registry codec (encode, decode) — by outcome. The _count series counts calls.",
+			SemanticDefinition: "Client-observed wall time of one call to an external dependency — SNS (publish, publish_batch), SQS (receive_message, delete_message, change_message_visibility, send_message, get_queue_attributes, get_queue_url) or the configured schema-registry codec (encode, decode) — by outcome. The _count series counts calls. receive_message is a long poll: its duration includes up to WaitTimeSeconds (default 20 s) of waiting on an empty queue, so exclude it from latency views (it stays meaningful for error rates).",
 			ApprovedLabels:     []string{"dependency", "operation", "outcome"},
 			LabelValues:        map[string][]string{"dependency": DependencyValues, "operation": DependencyOperationValues, "outcome": OutcomeValues},
 			Cardinality:        "dependency × operation (10 valid pairs) × outcome (2) × 12 buckets.",
-			AggregationNotes:   `Error ratio: sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count{outcome="error"}[5m])) / sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count[5m])). p99: histogram_quantile(0.99, sum by (le, domain, service, dependency, operation) (rate(platform_dependency_request_seconds_bucket[5m]))).`,
+			AggregationNotes:   `Error ratio: sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count{outcome="error"}[5m])) / sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count[5m])). p99 (long-poll receives excluded): histogram_quantile(0.99, sum by (le, domain, service, dependency, operation) (rate(platform_dependency_request_seconds_bucket{operation!="receive_message"}[5m]))).`,
 			Supersedes: []string{
 				"events_publish_duration_seconds", "events_codec_encode_total", "events_codec_encode_duration_seconds",
 				"events_codec_decode_total", "events_codec_decode_duration_seconds",
@@ -305,7 +305,7 @@ func Registry() []RegistryEntry {
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_event_propagation_seconds",
 			Type:               TypeHistogram,
-			SemanticDefinition: "Time from an event's creation (envelope `time`, set by the producer) to its receipt by a consumer — end-to-end propagation delay through the outbox, SNS and SQS. Negative clock skew is clamped to 0.",
+			SemanticDefinition: "Time from an event's creation (envelope `time`, set by the producer) to its FIRST receipt by a consumer (ApproximateReceiveCount ≤ 1) — end-to-end propagation delay through the outbox, SNS and SQS. Redeliveries are not observed, so retry delay does not inflate it. Negative clock skew is clamped to 0.",
 			ApprovedLabels:     []string{"queue", "event_type"},
 			LabelValueRules:    queueAndType,
 			Cardinality:        "queue (≤5) × event_type (≤30) × 14 buckets.",
@@ -386,7 +386,7 @@ func Registry() []RegistryEntry {
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_telemetry_label_overflow_total",
 			Type:               TypeCounter,
-			SemanticDefinition: "A label value the library replaced because it exceeded its cardinality bound (event_type over 128 bytes → `__oversized__`). Non-zero means a misconfigured or adversarial producer.",
+			SemanticDefinition: "A label value the library replaced because it exceeded its cardinality bound: event_type over 128 bytes → `__oversized__`, or a new distinct event_type beyond the per-process limit (default 200) → `__other__`. Counts replacements. Non-zero means a misconfigured or adversarial producer, or a limit set below the service's real number of event types.",
 			ApprovedLabels:     []string{"label"},
 			LabelValues:        map[string][]string{"label": OverflowLabelValues},
 			Cardinality:        "label (1).",

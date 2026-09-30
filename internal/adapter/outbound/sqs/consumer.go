@@ -570,7 +570,11 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	handlerBase = port.WithSourceMessage(handlerBase, func() port.SourceMessage { return sourceMessage(c.queueURL, msg) })
 	receiveCount := approxReceiveCount(msg.Attributes)
 	overThreshold := c.maxReceiveCount > 0 && receiveCount > c.maxReceiveCount
-	metrics.ObservePropagation(c.queueURL, env.Type, env.Timestamp, receivedAt)
+	// Propagation is creation → FIRST receipt; a redelivery's age would add
+	// retry delay. A missing receive count (0) is treated as a first receipt.
+	if receiveCount <= 1 {
+		metrics.ObservePropagation(c.queueURL, env.Type, env.Timestamp, receivedAt)
+	}
 
 	// Codec decode — SchemaID is the signal: empty means Payload is already
 	// plain JSON (legacy producer, NoopCodec, or WithCodec never configured

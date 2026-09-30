@@ -63,7 +63,7 @@ A label name means the same thing on every metric that uses it; each entry below
 | `environment` | required (Tier 1) | Deployment environment, lowercase — `APP_ENV`, then `ENVIRONMENT`, else `dev` when `MetricsIdentity.Environment` is empty (same precedence as platform-gincommon and platform-pgcommon). Canonical spellings (`prod` vs `production`) are pending governance |
 | `queue` | approved | SQS queue name — the last path segment of the queue URL (e.g. `orders`, `orders.fifo`), never the full URL (it carries the account ID). Bounded by the queues a service consumes (typically 1–5). `unknown` when the queue cannot be determined (e.g. the inbox wrapper used outside the SQS consumer). |
 | `topic` | requested | SNS topic name — the last segment of the topic ARN (e.g. `iam-events`, `orders.fifo`), never the full ARN. Bounded by the topics a service publishes to (typically 1–3). |
-| `event_type` | approved | Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`. |
+| `event_type` | approved | Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total. |
 | `reason` | approved | failures: `malformed`, `decode_error`, `handler_error`, `handler_panic`, `dead_letter_error`; dead-letters: `malformed`, `decode_error`, `max_receive_count`, `explicit`, `max_attempts` |
 | `operation` | approved | message flow: `consume`, `outbox_publish`; dependency calls: `publish`, `publish_batch`, `receive_message`, `delete_message`, `change_message_visibility`, `send_message`, `get_queue_attributes`, `get_queue_url`, `encode`, `decode`; outbox errors: `poll`, `unmarshal`, `mark_published`, `pending_count`, `leased_count`; dead-letter actions: `reprocess`, `discard` |
 | `dependency` | approved | `codec` → `encode`, `decode`; `sns` → `publish`, `publish_batch`; `sqs` → `receive_message`, `delete_message`, `change_message_visibility`, `send_message`, `get_queue_attributes`, `get_queue_url` |
@@ -97,7 +97,7 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `queue`, `event_type`
   - `queue`: SQS queue name — the last path segment of the queue URL (e.g. `orders`, `orders.fifo`), never the full URL (it carries the account ID). Bounded by the queues a service consumes (typically 1–5). `unknown` when the queue cannot be determined (e.g. the inbox wrapper used outside the SQS consumer).
-  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`.
+  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total.
 - **Cardinality:** queue (≤5) × event_type (registered types a service consumes, typically ≤30).
 - **Aggregation:** Success ratio: sum by (domain, service) (rate(platform_messages_processed_total[5m])) / sum by (domain, service) (rate(platform_messages_received_total[5m])).
 - **Supersedes:** `events_consumed_total`
@@ -110,7 +110,7 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `queue`, `event_type`, `reason`
   - `queue`: SQS queue name — the last path segment of the queue URL (e.g. `orders`, `orders.fifo`), never the full URL (it carries the account ID). Bounded by the queues a service consumes (typically 1–5). `unknown` when the queue cannot be determined (e.g. the inbox wrapper used outside the SQS consumer).
-  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`.
+  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total.
   - `reason`: `malformed`, `decode_error`, `handler_error`, `handler_panic`, `dead_letter_error`
 - **Cardinality:** queue (≤5) × event_type (≤30) × reason (5); malformed always has event_type=unknown.
 - **Aggregation:** Failure ratio: sum by (domain, service) (rate(platform_messages_failed_total[5m])) / sum by (domain, service) (rate(platform_messages_received_total[5m])). Poison producers: sum by (domain, service, queue) (rate(platform_messages_failed_total{reason="malformed"}[15m])).
@@ -124,7 +124,7 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `operation`, `event_type`
   - `operation`: `consume`, `outbox_publish`
-  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`.
+  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total.
 - **Cardinality:** operation (2) × event_type (≤30).
 - **Aggregation:** Retry pressure per service: sum by (domain, service, operation) (rate(platform_retry_total[5m])).
 - **Supersedes:** `outbox_attempts_total`
@@ -137,7 +137,7 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `operation`, `event_type`, `reason`
   - `operation`: `consume`, `outbox_publish`
-  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`.
+  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total.
   - `reason`: `malformed`, `decode_error`, `max_receive_count`, `explicit`, `max_attempts`
 - **Cardinality:** operation (2) × event_type (≤30) × reason (5).
 - **Aggregation:** Dead-letter inflow: sum by (domain, service, operation, reason) (increase(platform_dlq_messages_total[15m])). Any sustained non-zero rate needs attention.
@@ -154,7 +154,7 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `queue`, `event_type`
   - `queue`: SQS queue name — the last path segment of the queue URL (e.g. `orders`, `orders.fifo`), never the full URL (it carries the account ID). Bounded by the queues a service consumes (typically 1–5). `unknown` when the queue cannot be determined (e.g. the inbox wrapper used outside the SQS consumer).
-  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`.
+  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total.
 - **Cardinality:** queue (≤5) × event_type (≤30).
 - **Aggregation:** Duplicate ratio: sum by (domain, service) (rate(platform_duplicate_messages_total[15m])) / sum by (domain, service) (rate(platform_messages_received_total[15m])).
 - **Supersedes:** `events_inbox_duplicates_total`
@@ -163,25 +163,25 @@ A label name means the same thing on every metric that uses it; each entry below
 ### `platform_dependency_request_seconds`
 
 - **Type:** histogram · **Tier:** platform · **Status:** proposed
-- **Semantic definition:** Client-observed wall time of one call to an external dependency — SNS (publish, publish_batch), SQS (receive_message, delete_message, change_message_visibility, send_message, get_queue_attributes, get_queue_url) or the configured schema-registry codec (encode, decode) — by outcome. The _count series counts calls.
+- **Semantic definition:** Client-observed wall time of one call to an external dependency — SNS (publish, publish_batch), SQS (receive_message, delete_message, change_message_visibility, send_message, get_queue_attributes, get_queue_url) or the configured schema-registry codec (encode, decode) — by outcome. The _count series counts calls. receive_message is a long poll: its duration includes up to WaitTimeSeconds (default 20 s) of waiting on an empty queue, so exclude it from latency views (it stays meaningful for error rates).
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `dependency`, `operation`, `outcome`
   - `dependency`: `sns`, `sqs`, `codec`
   - `operation`: `publish`, `publish_batch`, `receive_message`, `delete_message`, `change_message_visibility`, `send_message`, `get_queue_attributes`, `get_queue_url`, `encode`, `decode`
   - `outcome`: `success`, `error`
 - **Cardinality:** dependency × operation (10 valid pairs) × outcome (2) × 12 buckets.
-- **Aggregation:** Error ratio: sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count{outcome="error"}[5m])) / sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count[5m])). p99: histogram_quantile(0.99, sum by (le, domain, service, dependency, operation) (rate(platform_dependency_request_seconds_bucket[5m]))).
+- **Aggregation:** Error ratio: sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count{outcome="error"}[5m])) / sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count[5m])). p99 (long-poll receives excluded): histogram_quantile(0.99, sum by (le, domain, service, dependency, operation) (rate(platform_dependency_request_seconds_bucket{operation!="receive_message"}[5m]))).
 - **Supersedes:** `events_publish_duration_seconds`, `events_codec_encode_total`, `events_codec_encode_duration_seconds`, `events_codec_decode_total`, `events_codec_decode_duration_seconds`, `sqs_receive_errors_total`, `sqs_delete_errors_total`, `sqs_visibility_extension_errors_total`
 - **Governance notes:** Registry-proposed example in the standard. IAM services register this name with conflicting label sets ({target_service,endpoint} vs {dependency,operation,outcome}); platform-events uses {dependency,operation,outcome}. Where a service's registry already holds another shape the metric is disabled with a RegistrationWarning (fail-soft).
 
 ### `platform_event_propagation_seconds`
 
 - **Type:** histogram · **Tier:** platform · **Status:** proposed
-- **Semantic definition:** Time from an event's creation (envelope `time`, set by the producer) to its receipt by a consumer — end-to-end propagation delay through the outbox, SNS and SQS. Negative clock skew is clamped to 0.
+- **Semantic definition:** Time from an event's creation (envelope `time`, set by the producer) to its FIRST receipt by a consumer (ApproximateReceiveCount ≤ 1) — end-to-end propagation delay through the outbox, SNS and SQS. Redeliveries are not observed, so retry delay does not inflate it. Negative clock skew is clamped to 0.
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `queue`, `event_type`
   - `queue`: SQS queue name — the last path segment of the queue URL (e.g. `orders`, `orders.fifo`), never the full URL (it carries the account ID). Bounded by the queues a service consumes (typically 1–5). `unknown` when the queue cannot be determined (e.g. the inbox wrapper used outside the SQS consumer).
-  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`.
+  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total.
 - **Cardinality:** queue (≤5) × event_type (≤30) × 14 buckets.
 - **Aggregation:** p95 propagation per consumer: histogram_quantile(0.95, sum by (le, domain, service, queue) (rate(platform_event_propagation_seconds_bucket[5m]))). Includes producer clock skew.
 - **Supersedes:** —
@@ -194,7 +194,7 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `topic`, `event_type`, `outcome`
   - `topic`: SNS topic name — the last segment of the topic ARN (e.g. `iam-events`, `orders.fifo`), never the full ARN. Bounded by the topics a service publishes to (typically 1–3).
-  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`.
+  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total.
   - `outcome`: `success`, `error`
 - **Cardinality:** topic (≤3) × event_type (≤30) × outcome (2).
 - **Aggregation:** Publish error ratio: sum by (domain, service, topic) (rate(platform_messages_published_total{outcome="error"}[5m])) / sum by (domain, service, topic) (rate(platform_messages_published_total[5m])).
@@ -208,7 +208,7 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `queue`, `event_type`
   - `queue`: SQS queue name — the last path segment of the queue URL (e.g. `orders`, `orders.fifo`), never the full URL (it carries the account ID). Bounded by the queues a service consumes (typically 1–5). `unknown` when the queue cannot be determined (e.g. the inbox wrapper used outside the SQS consumer).
-  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`.
+  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total.
 - **Cardinality:** queue (≤5) × event_type (≤30) × 14 buckets.
 - **Aggregation:** p99 handler latency: histogram_quantile(0.99, sum by (le, domain, service, queue) (rate(platform_message_processing_duration_seconds_bucket[5m]))).
 - **Supersedes:** `events_consume_duration_seconds`
@@ -242,7 +242,7 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Semantic definition:** One attempt by the outbox runner to publish a claimed outbox event, by outcome.
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `event_type`, `outcome`
-  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), bounded by the event-type registry in EVENT_SCHEMA_GOVERNANCE.md. Values over 128 bytes are replaced with `__oversized__` (counted in platform_telemetry_label_overflow_total); an empty or unparseable type is `unknown`.
+  - `event_type`: Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total.
   - `outcome`: `success`, `error`
 - **Cardinality:** event_type (≤30) × outcome (2).
 - **Aggregation:** Outbox publish error ratio: sum by (domain, service) (rate(platform_outbox_publish_attempts_total{outcome="error"}[5m])) / sum by (domain, service) (rate(platform_outbox_publish_attempts_total[5m])).
@@ -276,7 +276,7 @@ A label name means the same thing on every metric that uses it; each entry below
 ### `platform_telemetry_label_overflow_total`
 
 - **Type:** counter · **Tier:** platform · **Status:** proposed
-- **Semantic definition:** A label value the library replaced because it exceeded its cardinality bound (event_type over 128 bytes → `__oversized__`). Non-zero means a misconfigured or adversarial producer.
+- **Semantic definition:** A label value the library replaced because it exceeded its cardinality bound: event_type over 128 bytes → `__oversized__`, or a new distinct event_type beyond the per-process limit (default 200) → `__other__`. Counts replacements. Non-zero means a misconfigured or adversarial producer, or a limit set below the service's real number of event types.
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `label`
   - `label`: `event_type`

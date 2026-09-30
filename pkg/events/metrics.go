@@ -42,7 +42,10 @@ type RegistrationWarning = metrics.RegistrationWarning
 // MetricsOption configures InitMetrics.
 type MetricsOption func(*metricsOptions)
 
-type metricsOptions struct{ legacy bool }
+type metricsOptions struct {
+	legacy         bool
+	eventTypeLimit int
+}
 
 // WithoutLegacyMetrics stops registering the Deprecated events_* / outbox_* /
 // sqs_* metrics. Use it once a service has migrated its dashboards, alerts,
@@ -50,6 +53,15 @@ type metricsOptions struct{ legacy bool }
 // (Backward Compatibility steps 7–8).
 func WithoutLegacyMetrics() MetricsOption {
 	return func(o *metricsOptions) { o.legacy = false }
+}
+
+// WithEventTypeLimit sets how many distinct event_type label values the
+// process records (default 200). Further distinct values are recorded as
+// "__other__" and counted in platform_telemetry_label_overflow_total, so a
+// producer sending unbounded event types cannot explode metric cardinality.
+// Size it above the number of event types the service legitimately handles.
+func WithEventTypeLimit(n int) MetricsOption {
+	return func(o *metricsOptions) { o.eventTypeLimit = n }
 }
 
 // InitMetrics registers the Tier 1 platform_* metrics with id's
@@ -83,6 +95,7 @@ func InitMetrics(id MetricsIdentity, reg prometheus.Registerer, opts ...MetricsO
 	if reg == nil {
 		reg = prometheus.DefaultRegisterer
 	}
+	metrics.SetEventTypeLimit(o.eventTypeLimit)
 	source := ""
 	if id.Environment == "" {
 		id.Environment, source = metrics.Environment()

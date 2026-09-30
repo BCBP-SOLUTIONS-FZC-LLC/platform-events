@@ -267,6 +267,8 @@ With `WithDLQForwarding` the consumer forwards the **original raw body and attri
 
 `Start` resolves the DLQ before polling and **returns an error** (wrapping `ErrDLQNotConfigured` / `ErrDLQInvalidRedrivePolicy`) when the queue has no usable `RedrivePolicy` — otherwise every forward would fail and, with no `RedrivePolicy`, SQS would never move the message either, leaving it redelivered until retention expires. A transient resolution failure is logged at WARN and the consumer starts. Each forward is bounded by 30 s, capped at half of `WithVisibilityTimeout` (minimum 1 s), so the message cannot become visible and be forwarded twice mid-flight.
 
+**Forward in one place only.** With `WithDLQForwarding` on, the consumer already forwards messages that pass the threshold. A dead-letter handler that also calls `SendToDLQ` puts the message in the DLQ **twice**, and it is counted twice. Use the handler for side effects (alerting, compensation), or drop `WithDLQForwarding` and forward from the handler, but don't do both.
+
 When both a dead-letter handler and forwarding are set, the handler runs first; if it fails nothing is forwarded, and if the forward then fails the handler runs again on the next delivery — keep it idempotent.
 
 **From a handler — poison message:** forward the original transport message from `events.SourceMessageFromContext`, not `env.JSON()` — a re-serialised envelope has lost the message attributes and, with `WithConsumerCodec`, holds the *decoded* payload under a still-set `SchemaID`, so a redrive would fail to decode it.

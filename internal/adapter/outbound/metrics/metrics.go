@@ -126,26 +126,81 @@ var (
 // maxEventTypeLabelLen is the maximum byte length of an event_type label value.
 const maxEventTypeLabelLen = 128
 
-// SanitizeEventType caps event_type to maxEventTypeLabelLen bytes, returning
-// "__oversized__" (and counting it) for longer values and "unknown" for an
-// empty one, so a producer cannot mint unbounded label values.
-func SanitizeEventType(s string) string {
-	if utf8.RuneCountInString(s) == 0 {
-		return "unknown"
+// DefaultEventTypeLimit is the default number of distinct event_type label
+// values a process records; see SetEventTypeLimit.
+const DefaultEventTypeLimit = 200
+
+// Replacement values for event_type labels outside the bounds.
+const (
+	EventTypeUnknown   = "unknown"
+	EventTypeOversized = "__oversized__"
+	EventTypeOther     = "__other__"
+)
+
+// eventTypes remembers the distinct event_type values admitted so far. The
+// byte cap alone does not bound cardinality: a producer could send an
+// unlimited number of short distinct types. Once limit values have been
+// admitted, new ones are recorded as "__other__".
+var eventTypes = struct {
+	sync.RWMutex
+	seen  map[string]struct{}
+	limit int
+}{seen: map[string]struct{}{}, limit: DefaultEventTypeLimit}
+
+// SetEventTypeLimit sets how many distinct event_type values the process
+// records (n <= 0 restores DefaultEventTypeLimit) and forgets the values
+// admitted so far.
+func SetEventTypeLimit(n int) {
+	if n <= 0 {
+		n = DefaultEventTypeLimit
 	}
-	if len(s) <= maxEventTypeLabelLen {
-		return s
-	}
-	recordOversizedLabel()
-	return "__oversized__"
+	eventTypes.Lock()
+	eventTypes.limit = n
+	eventTypes.seen = map[string]struct{}{}
+	eventTypes.Unlock()
 }
 
-func recordOversizedLabel() {
-	metricsMu.RLock()
-	c := OversizedEventTypeLabelTotal
-	metricsMu.RUnlock()
-	if c != nil {
-		c.WithLabelValues().Inc()
+// SanitizeEventType bounds an event_type label value: "unknown" for an empty
+// value, "__oversized__" for one over 128 bytes, and "__other__" once the
+// process has already admitted its limit of distinct values (default 200).
+// Every replacement is counted in platform_telemetry_label_overflow_total
+// (and the legacy events_oversized_event_type_label_total for oversized ones),
+// so a misconfigured or adversarial producer cannot explode cardinality.
+func SanitizeEventType(s string) string {
+	if utf8.RuneCountInString(s) == 0 {
+		return EventTypeUnknown
+	}
+	if len(s) > maxEventTypeLabelLen {
+		recordLabelOverflow(true)
+		return EventTypeOversized
+	}
+	eventTypes.RLock()
+	_, ok := eventTypes.seen[s]
+	eventTypes.RUnlock()
+	if ok {
+		return s
+	}
+	eventTypes.Lock()
+	defer eventTypes.Unlock()
+	if _, ok := eventTypes.seen[s]; ok {
+		return s
+	}
+	if len(eventTypes.seen) >= eventTypes.limit {
+		recordLabelOverflow(false)
+		return EventTypeOther
+	}
+	eventTypes.seen[s] = struct{}{}
+	return s
+}
+
+func recordLabelOverflow(oversized bool) {
+	if oversized {
+		metricsMu.RLock()
+		c := OversizedEventTypeLabelTotal
+		metricsMu.RUnlock()
+		if c != nil {
+			c.WithLabelValues().Inc()
+		}
 	}
 	if p := platform.Load(); p != nil && p.LabelOverflow != nil {
 		p.LabelOverflow.WithLabelValues("event_type").Inc()
@@ -177,19 +232,27 @@ func TopicName(topicARN string) string {
 
 // Init registers the legacy metrics using the default registerer. Panics if
 // serviceName is empty. Idempotent — only the first call registers.
+//
+// A no-op once InitWithIdentity has installed the Tier 1 set: a leftover
+// legacy Init (an old bootstrap or shared helper) must never silently disable
+// the platform_* metrics, and InitWithIdentity already registered the legacy
+// metrics when they are wanted.
 func Init(serviceName, buildVersion string) {
 	if serviceName == "" {
 		panic("platform-events: metrics.Init requires a non-empty serviceName")
 	}
+	if platform.Load() != nil {
+		return
+	}
 	initOnce.Do(func() {
 		installLegacyOrPanic(serviceName, buildVersion, prometheus.DefaultRegisterer)
-		platform.Store(nil)
 	})
 }
 
 // InitWithRegisterer registers the legacy metrics on reg, bypassing the
-// sync.Once guard (test isolation). Panics if serviceName is empty. Clears
-// any Tier 1 set: this is the legacy-only path.
+// sync.Once guard. Panics if serviceName is empty. It is the test-isolation
+// reset: it clears any Tier 1 set, making the process legacy-only. Production
+// code uses InitWithIdentity.
 func InitWithRegisterer(serviceName, buildVersion string, reg prometheus.Registerer) {
 	if serviceName == "" {
 		panic("platform-events: metrics.InitWithRegisterer requires a non-empty serviceName")

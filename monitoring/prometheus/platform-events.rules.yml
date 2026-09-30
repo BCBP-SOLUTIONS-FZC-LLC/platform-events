@@ -36,6 +36,9 @@ groups:
       - record: platform_events:messages_received:rate5m
         expr: sum by (domain, service, environment, queue) (rate(platform_messages_received_total[5m]))
 
+      - record: platform_events:messages_received:rate1h
+        expr: sum by (domain, service, environment, queue) (rate(platform_messages_received_total[1h]))
+
       - record: platform_events:messages_failure_ratio:rate5m
         expr: |
           sum by (domain, service, environment, queue) (rate(platform_messages_failed_total[5m]))
@@ -81,11 +84,15 @@ groups:
       # SLO: 99.9% of received messages are processed without failure
       # (error budget 0.1%). Fast burn: 14.4× budget over 1h and 5m
       # (2% of a 30-day budget in 1 hour) — Google SRE multi-window pattern.
+      # Minimum-traffic guard: below 1 message/minute a single failure is
+      # already a large ratio, so a quiet queue would page on noise.
       - alert: PlatformEventsConsumerErrorBudgetBurn
         expr: |
           platform_events:messages_failure_ratio:rate1h > (14.4 * 0.001)
             and
           platform_events:messages_failure_ratio:rate5m > (14.4 * 0.001)
+            and
+          platform_events:messages_received:rate1h > (1 / 60)
         for: 2m
         labels:
           severity: critical
@@ -116,8 +123,10 @@ groups:
           description: "Messages that are not valid event envelopes arrived in the last 15 minutes — a producer or subscription is misconfigured."
           runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsmalformedmessages"
 
+      # reason="explicit" is excluded: a handler dead-lettering on purpose
+      # (SendToDLQ, then nil) is expected behaviour, not an incident.
       - alert: PlatformEventsMessagesDeadLettered
-        expr: platform_events:dlq_messages:increase15m > 0
+        expr: platform_events:dlq_messages:increase15m{reason!="explicit"} > 0
         labels:
           severity: warning
         annotations:

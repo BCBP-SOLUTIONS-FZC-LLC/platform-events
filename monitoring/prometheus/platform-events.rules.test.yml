@@ -36,6 +36,19 @@ tests:
         alertname: PlatformEventsConsumerStalled
         exp_alerts: []
 
+  # A quiet queue (1 message / 5 min, 50% failing) is below the traffic
+  # guard and does not page.
+  - interval: 1m
+    input_series:
+      - series: 'platform_messages_received_total{domain="iam",service="event-consumer",environment="prod",queue="quiet"}'
+        values: '0+0.2x90'
+      - series: 'platform_messages_failed_total{domain="iam",service="event-consumer",environment="prod",queue="quiet",event_type="iam.user.created",reason="handler_error"}'
+        values: '0+0.1x90'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: PlatformEventsConsumerErrorBudgetBurn
+        exp_alerts: []
+
   # Deliveries with no successful processing for 15 minutes.
   - interval: 1m
     input_series:
@@ -68,6 +81,9 @@ tests:
         values: '0 0 0 1 1 1'
       - series: 'platform_dlq_messages_total{domain="iam",service="event-consumer",environment="prod",operation="consume",event_type="unknown",reason="malformed"}'
         values: '0 0 0 1 1 1'
+      # Intentional dead-lettering does not alert.
+      - series: 'platform_dlq_messages_total{domain="iam",service="event-consumer",environment="prod",operation="consume",event_type="iam.user.created",reason="explicit"}'
+        values: '0 0 0 5 5 5'
     alert_rule_test:
       - eval_time: 5m
         alertname: PlatformEventsMalformedMessages

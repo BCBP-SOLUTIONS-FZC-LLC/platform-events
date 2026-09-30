@@ -304,7 +304,9 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
   - A handler that calls `SendToDLQ` and returns nil is not counted as processed.
 - **Label rules.**
   - `queue` / `topic` = name, never URL/ARN (`metrics.QueueName` / `TopicName`).
-  - `event_type` goes through `SanitizeEventType` (128 bytes, `__oversized__`).
+  - `event_type` goes through `SanitizeEventType`: ≤200 distinct values per process (`WithEventTypeLimit`, then `__other__`), ≤128 bytes (`__oversized__`), empty → `unknown`; replacements counted in `platform_telemetry_label_overflow_total`.
+  - Propagation is observed on the first receipt only (`ApproximateReceiveCount ≤ 1`). SQS `receive_message` latency includes long-poll wait; exclude it from latency views.
+  - A leftover legacy `Init` after `InitMetrics` is a no-op; `InitWithRegisterer` is the test reset (clears Tier 1).
   - Prohibited: `tenant_id`, `event_id`, `user_id`, `email`, `request_id`, `session_id`, `message_id`, `trace_id`, `span_id`, `correlation_id`, `subject`, `actor`.
 - **CI.**
   - `make metrics-lint` (in `Validate / Quality` and `make ci`) registers the real collectors and enforces tiers, naming (`_total` / `_seconds`), required labels, vocabulary and registry parity.

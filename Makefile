@@ -119,7 +119,10 @@ pin-base-images:
 	   Dockerfile && rm -f Dockerfile.bak && \
 	 echo "golang:1.26.6-alpine $$GOLANG_DIGEST" > .docker-digests && \
 	 echo "gcr.io/distroless/static-debian13:nonroot $$DISTROLESS_DIGEST" >> .docker-digests && \
-	 echo "Digests written to .docker-digests — commit both Dockerfile and .docker-digests"
+	 PROMETHEUS_DIGEST=$$(docker buildx imagetools inspect prom/prometheus:v3.5.0 --format '{{.Manifest.Digest}}') && \
+	 sed -i.bak -E "s|^PROMETHEUS_IMAGE \?= prom/prometheus:v3.5.0(@sha256:[a-f0-9]+)?|PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0@$$PROMETHEUS_DIGEST|" Makefile && rm -f Makefile.bak && \
+	 echo "prom/prometheus:v3.5.0 $$PROMETHEUS_DIGEST" >> .docker-digests && \
+	 echo "Digests written to .docker-digests — commit Dockerfile, Makefile and .docker-digests"
 
 # docker-build: build the reference-CLI image the way CI does. Needs a GitHub
 # token with read access to the private BCBP modules in GO_PRIVATE_TOKEN
@@ -316,7 +319,8 @@ metrics-doc:
 	$(GO) test -count=1 -run TestInventory ./test/unit/metrics/ -update
 
 # rules-check: promtool syntax check + alert unit tests (requires Docker).
-PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0
+# Digest-pinned like the Dockerfile base images; refreshed by pin-base-images.
+PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
 
 .PHONY: rules-check
 rules-check:
