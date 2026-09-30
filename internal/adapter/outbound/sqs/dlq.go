@@ -81,7 +81,7 @@ var ErrNilDLQClient = errors.New("sqs: DLQ publisher client is required")
 // DLQConfig holds the parameters for constructing a DLQ publisher.
 type DLQConfig struct {
 	Region      string
-	EndpointURL string // optional — set to LocalStack URL for testing
+	EndpointURL string // optional — set to an AWS emulator (floci) URL for local runs and tests
 	// ConsumerName, when set, is attached to every forwarded message as the
 	// ConsumerName attribute so operators can tell which consumer gave up.
 	ConsumerName string

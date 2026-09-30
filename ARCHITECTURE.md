@@ -51,8 +51,8 @@ graph TD
     subgraph tests["Tests  —  test/"]
         test_unit["unit/\nno Docker · pure Go"]
         test_int["integration/\ntestcontainers-go · tag: integration"]
-        test_e2e["e2e/\nLocalStack + Postgres · tag: e2e\nfull outbox + SNS/SQS pipeline"]
-        fixtures["fixtures/\nMockLogger · MockPublisher · MockConsumer\nFakeClock · LocalStack bootstrap · NewTestDB"]
+        test_e2e["e2e/\nfloci + Postgres · tag: e2e\nfull outbox + SNS/SQS pipeline"]
+        fixtures["fixtures/\nMockLogger · MockPublisher · MockConsumer\nFakeClock · floci bootstrap · NewTestDB"]
     end
 
     events_pkg    --> port_pkg
@@ -1129,7 +1129,7 @@ graph LR
 ## Testing strategy
 
 - **Unit** (`test/unit/`, no Docker) — one package per concern: `envelope`, `hmac`, `domain`, `port`, `clock`, `config`, `logger`, `metrics`, `mock`, `publisher` / `sns` (attribute building, batch split, retryable classification, codec encode), `sqs` (consumer loop: retry-vs-delete, visibility extension, drain, dead-letter routing on `ApproximateReceiveCount > n`; and the DLQ publisher: `RedrivePolicy` parsing, ARN resolution, caching, error classification, attribute limits, FIFO identity), `outbox` / `runner` / `enqueue` (claim, mark, backoff, shutdown release), `inbox`, `glue`. White-box tests for `internal/core/service` live beside the source.
-- **Integration** (`test/integration/`, `-tags=integration`, testcontainers-go — real LocalStack SNS/SQS + Postgres) — `sns_test.go` / `sqs_test.go` (round trips), `outboxstore_test.go` / `outboxstore_errors_test.go` (claiming, attempt counting, dead-lettering, error paths), `outbox_test.go`, `inbox_test.go`, `codec_test.go`, `dlq_test.go` (a real `RedrivePolicy` resolved and a message forwarded to it).
+- **Integration** (`test/integration/`, `-tags=integration`, testcontainers-go — real floci SNS/SQS + Postgres) — `sns_test.go` / `sqs_test.go` (round trips), `outboxstore_test.go` / `outboxstore_errors_test.go` (claiming, attempt counting, dead-lettering, error paths), `outbox_test.go`, `inbox_test.go`, `codec_test.go`, `dlq_test.go` (a real `RedrivePolicy` resolved and a message forwarded to it).
 - **E2E** (`test/e2e/`, `-tags=e2e`) — the full pipeline Postgres → runner → SNS → SQS → consumer, including `TestOutbox_RollbackDoesNotPublish`.
 - **Smoke** (`test/smoke/`, `-tags=smoke`, live AWS) — manual only, before the first deploy to a new AWS account; excluded from CI and from lint.
 - **Interop** — `platform-interop-tests` (CI job `interop`) runs Go and Python probes against shared fixtures and compares envelope JSON and HMAC output byte-for-byte.
@@ -1304,7 +1304,7 @@ flowchart TD
 |---|---|---|
 | Package docs | `make godoc` → http://localhost:8080 | Every exported symbol is documented; pkgsite renders the `doc.go` package overviews |
 | Diagrams | `docs/architecture/mermaid/*.mmd` | Render on GitHub, in a Mermaid-aware IDE, or at [mermaid.live](https://mermaid.live) — see [docs/README.md](docs/README.md) |
-| Local AWS | `make docker-up` | LocalStack (SNS + SQS) on :4566 and Postgres on :5432 for manual testing — walkthrough in [README § Testing events locally](README.md#testing-events-locally) |
+| Local AWS | `make docker-up` | floci (SNS + SQS, demo topology provisioned) on :4574, floci-ui on :4505 and Postgres on :5538 for manual testing — walkthrough in [README § Testing events locally](README.md#testing-events-locally) |
 | Test doubles | `pkg/events/mock` | `Publisher`, `Consumer`, `DLQPublisher` for consuming-service unit tests |
 | Loop-level fakes | `NewSQSConsumerWithClient`, `NewSQSDLQPublisherWithClient` | Inject a fake SQS client to test consumer-loop or DLQ-resolution behaviour without AWS |
 | Reference CLI | `make build` → `bin/platform-events` | Prints version info — proves the module builds as a binary |
@@ -1316,7 +1316,7 @@ flowchart TD
 
 Judgment calls where the requirements left an internals-only detail open. Each is also documented at its point of impact in the code.
 
-1. **DLQ resolution calls `GetQueueUrl` instead of building the URL from the ARN.** The DLQ is named by `RedrivePolicy.deadLetterTargetArn`, and a queue URL could be derived from the source queue's host plus the ARN's account and name — but URL shapes differ between AWS regions/partitions and LocalStack endpoints (`http://localhost:4566/000000000000/q` vs. `sqs.us-east-1.localhost.localstack.cloud:4566/...`). One extra IAM permission (`sqs:GetQueueUrl`) buys a resolution that is correct on every endpoint.
+1. **DLQ resolution calls `GetQueueUrl` instead of building the URL from the ARN.** The DLQ is named by `RedrivePolicy.deadLetterTargetArn`, and a queue URL could be derived from the source queue's host plus the ARN's account and name — but URL shapes differ between AWS regions/partitions and emulator endpoints (floci returns `http://localhost:4566/000000000000/q`, or its `FLOCI_HOSTNAME` host). One extra IAM permission (`sqs:GetQueueUrl`) buys a resolution that is correct on every endpoint.
 2. **The DLQ lookup cache stores successes only and never expires.** A queue whose `RedrivePolicy` is added after a failed lookup is picked up on the next call; a policy retargeted to a *different* DLQ is picked up on restart. Concurrent cold-cache lookups may duplicate the two attribute calls — harmless, and it avoids holding a lock across network I/O.
 3. **One error type with a `Kind`, not one type per failure.** `*DLQError` unwraps to both its `Kind` sentinel and its AWS cause (`Unwrap() []error`), so callers branch with `errors.Is(err, events.ErrDLQNotConfigured)` and `errors.Is(err, events.ErrRetryable)` independently, and still reach the SDK error with `errors.As`. `ErrRetryable` was exported for this; it had been internal.
 4. **Too many message attributes is rejected, not truncated.** SQS allows 10; the DLQ publisher reserves 4–5. Silently dropping caller attributes would lose diagnostics without anyone noticing, so the call fails with `ErrDLQInvalidMessage` before any AWS request — the caller still holds the original message.

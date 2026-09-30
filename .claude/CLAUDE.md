@@ -44,15 +44,15 @@ make rules-check     # promtool check + alert unit tests for monitoring/promethe
 make test            # All tests (unit + integration), excludes smoke
 make test-ci         # All tests with race detector (used in CI)
 make test-unit       # Unit tests only
-make test-int        # Integration tests (requires LocalStack via testcontainers)
+make test-int        # Integration tests (floci + Postgres via testcontainers)
 make test-smoke      # Smoke tests (requires live AWS resources at SNS_TOPIC_ARN / SQS_QUEUE_URL)
 make race            # All tests with -race flag
 make build           # Compile reference CLI to bin/platform-events
 make cover           # Coverage HTML report (measures ./internal/... ./pkg/...)
 make cover-func      # Coverage summary by function (terminal)
 make ci              # tidy + fmt-check + vet + lint + metrics-lint + test-ci + build (full CI pipeline)
-make docker-up       # Start LocalStack (SNS + SQS + Postgres for outbox)
-make docker-down     # Stop LocalStack
+make docker-up       # Start floci (SNS/SQS, :4574) + floci-ui (http://localhost:4505) + Postgres (:5538); demo topology via scripts/init-floci.sh
+make docker-down     # Stop the local containers
 make clean           # Remove bin/ artefacts
 ```
 
@@ -64,7 +64,7 @@ go test ./test/integration/...     -run TestSNSPublishRoundTrip -v
 
 **Coverage note:** tests live under `test/` (a separate package tree from sources). Always use `-coverpkg=./internal/...,./pkg/...` to get meaningful numbers; running `go test ./...` without it shows 0% for source packages. `make cover` and `make cover-func` handle this correctly.
 
-**Testcontainers note:** integration tests spin up LocalStack (SNS + SQS) and Postgres via `testcontainers-go`. Docker must be running locally. Pass `-short` to skip integration tests without a Docker daemon.
+**Testcontainers note:** integration tests spin up floci (`floci/floci:2.1.0` — open-source, always-free AWS emulator, the platform's LocalStack replacement, same as iam-org-membership; fixture `test/fixtures/floci.go`) and Postgres via `testcontainers-go`. Docker must be running locally. Pass `-short` to skip integration tests without a Docker daemon.
 
 ## Architecture
 
@@ -90,7 +90,7 @@ internal/
   config/          ← Environment variable loading
 test/
   unit/            ← Isolated unit tests per package
-  integration/     ← Tests against LocalStack + Postgres containers
+  integration/     ← Tests against floci + Postgres containers
   fixtures/        ← Shared helpers (MockPublisher, MockConsumer, MockLogger, fake clock)
   testenv/         ← Loads .env-example for tests
 
@@ -343,7 +343,7 @@ Defined in `.env-example` (copy to `.env` via `make setup`):
 ```
 APP_NAME, APP_ENV, BUILD_VERSION
 AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY  # use instance role / IRSA in production
-AWS_ENDPOINT_URL                                       # set to http://localhost:4566 for LocalStack
+AWS_ENDPOINT_URL                                       # http://localhost:4574 for the local floci stack (make docker-up)
 SNS_TOPIC_ARN
 SQS_QUEUE_URL
 SQS_MAX_MESSAGES, SQS_WAIT_SECONDS, SQS_VISIBILITY_TIMEOUT, SQS_CONCURRENCY
@@ -357,14 +357,14 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 ## Test Layout
 
 - `test/unit/` — isolated unit tests per package (envelope, hmac, outbox service, config, metrics, mock publisher/consumer)
-- `test/integration/` — tests against LocalStack (SNS publish round-trip, SQS consume loop, outbox runner end-to-end) and Postgres (outbox enqueue/publish/dead-letter)
+- `test/integration/` — tests against floci (SNS publish round-trip, SQS consume loop, outbox runner end-to-end) and Postgres (outbox enqueue/publish/dead-letter)
 - `test/smoke/` — optional; requires live AWS resources (`SMOKE_SNS_TOPIC_ARN`, `SMOKE_SQS_QUEUE_URL`)
-- `test/fixtures/` — shared helpers (`MockPublisher`, `MockConsumer`, `MockLogger`, `FakeClock`, LocalStack bootstrap)
+- `test/fixtures/` — shared helpers (`MockPublisher`, `MockConsumer`, `MockLogger`, `FakeClock`, floci bootstrap `StartFloci`)
 - `test/testenv/` — loads `.env-example` for tests
 
 ## Key Design Decisions
 
-**`Publisher` and `Consumer` are interfaces, not concrete types** — consumers of this library inject the interface, enabling `MockPublisher`/`MockConsumer` in unit tests without LocalStack. SNS/SQS constructors return the interface, not a pointer to a struct.
+**`Publisher` and `Consumer` are interfaces, not concrete types** — consumers of this library inject the interface, enabling `MockPublisher`/`MockConsumer` in unit tests without an AWS emulator (floci). SNS/SQS constructors return the interface, not a pointer to a struct.
 
 **Envelope ID is UUID v7** — UUIDs v7 are time-ordered and collation-friendly in Postgres B-tree indexes. The outbox `SELECT ... ORDER BY id` scan is therefore an index scan, not a seq scan, as the table grows.
 

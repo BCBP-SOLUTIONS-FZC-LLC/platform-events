@@ -40,7 +40,7 @@ type SQSConfig struct {
 	// QueueURL is required.
 	QueueURL    string
 	Region      string
-	EndpointURL string // optional — LocalStack endpoint for testing
+	EndpointURL string // optional — AWS emulator (floci) endpoint for local runs and tests
 	MaxMessages int32  // 1-10; defaults to 10
 	WaitSeconds int32  // long-poll duration; defaults to 20
 	Logger      port.Logger

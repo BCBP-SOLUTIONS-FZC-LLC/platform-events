@@ -282,7 +282,7 @@ See [Validation and errors](#validation-and-errors). For what a handler should r
 
 ### 9. Testing in your service
 
-Use `pkg/events/mock` — no LocalStack needed: [Testing in consuming services](docs/guides/testing-in-services.md). To test consumer-loop behaviour itself, inject a fake client with `NewSQSConsumerWithClient` — [Testing with an injected client](docs/guides/consuming.md#testing-with-an-injected-client).
+Use `pkg/events/mock` — no AWS emulator needed: [Testing in consuming services](docs/guides/testing-in-services.md). To test consumer-loop behaviour itself, inject a fake client with `NewSQSConsumerWithClient` — [Testing with an injected client](docs/guides/consuming.md#testing-with-an-injected-client).
 
 ### 10. Background work you should schedule
 
@@ -302,7 +302,7 @@ Production defaults, backpressure tuning and the service adoption checklist: [Op
 ### Prerequisites
 
 - Go 1.26.6+
-- Docker — testcontainers-go starts LocalStack + Postgres for the integration and e2e suites; `make docker-up` for manual runs
+- Docker — testcontainers-go starts floci (`floci/floci:2.1.0`) + Postgres for the integration and e2e suites; `make docker-up` for manual runs
 - `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (`GONOSUMDB` too) and an SSH key registered with the BCBP org — the Makefile exports both
 
 ### Setup
@@ -313,7 +313,7 @@ cd platform-events
 make setup       # copies .env-example → .env and installs .githooks/pre-commit (run once)
 make tidy        # go mod tidy
 make test-unit   # no Docker needed
-make docker-up   # optional: LocalStack (SNS + SQS) on :4566 + Postgres on :5432
+make docker-up   # optional: floci (SNS + SQS) on :4574, floci-ui on :4505, Postgres on :5538
 ```
 
 ### Common commands
@@ -333,14 +333,14 @@ make docker-up   # optional: LocalStack (SNS + SQS) on :4566 + Postgres on :5432
 | `make test` | Unit + integration in parallel (Docker required; e2e is separate) |
 | `make test-ci` | Unit + integration + e2e in parallel with `-race`; per-suite profiles in `.coverage/`, merged into `coverage.out` (used in CI) |
 | `make test-unit` | Unit tests only, no Docker |
-| `make test-integration` (alias `test-int`) | Integration tests — LocalStack + Postgres via testcontainers |
+| `make test-integration` (alias `test-int`) | Integration tests — floci + Postgres via testcontainers |
 | `make test-e2e` | Full outbox pipeline: Postgres → runner → SNS → SQS → consumer |
 | `make test-smoke` | Live AWS (`SMOKE_SNS_TOPIC_ARN` / `SMOKE_SQS_QUEUE_URL`) — manual, never in CI |
 | `make race` | All three suites with `-race`, no coverage merge |
 | `make build` | Compile `bin/platform-events` and verify library packages compile |
 | `make cover` / `make cover-func` | Coverage HTML report / per-function summary (runs `test-ci`) |
 | `make ci` | `tidy` + `fmt-check` + `vet` + `lint` + `test-ci` + `build` |
-| `make docker-up` / `make docker-down` | Start/stop LocalStack + Postgres |
+| `make docker-up` / `make docker-down` | Start/stop floci + floci-ui + Postgres (demo topology provisioned) |
 | `make docker-build` | Build the reference-CLI image the way CI does (needs `GO_PRIVATE_TOKEN`) |
 | `make pin-base-images` | Re-pin the Dockerfile base-image digests (updates `Dockerfile` + `.docker-digests`) |
 | `make godoc` | Serve package docs via pkgsite at http://localhost:8080 |
@@ -382,38 +382,51 @@ service write ──(same pgcommon.Tx)──▶ outbox_events (Postgres)
 ### Step 1 — Start infrastructure
 
 ```bash
-make docker-up    # LocalStack (SNS + SQS) on :4566, Postgres (platform_events_dev) on :5432
+make docker-up    # floci (SNS + SQS) on :4574, floci-ui on http://localhost:4505, Postgres (platform_events_dev) on :5538
 ```
 
-### Step 2 — Create a topic, queue and subscription
+[floci](https://floci.io) is the open-source (MIT), always-free AWS emulator the platform uses instead of LocalStack, the same as iam-org-membership. Its ready hook, `scripts/init-floci.sh`, provisions a demo topology that `.env-example` already points at:
+
+| Resource | Name |
+|---|---|
+| SNS topic | `platform-events-demo` (`SNS_TOPIC_ARN`) |
+| SQS queue | `platform-events-demo-q` (`SQS_QUEUE_URL`), subscribed with `RawMessageDelivery=true` |
+| DLQ | `platform-events-demo-q-dlq`, the demo queue's `RedrivePolicy` target (`maxReceiveCount=5`), for exercising `DLQPublisher` / `WithDLQForwarding` |
+
+The host ports are unique across the org's local stacks, so platform-events runs alongside any IAM service. Override them with `FLOCI_PORT`, `FLOCI_UI_PORT` and `POSTGRES_PORT`.
+
+### Step 2 — Verify the topology
 
 ```bash
-export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566
-TOPIC=$(aws sns create-topic --name demo-events --query TopicArn --output text)
-QUEUE=$(aws sqs create-queue --queue-name demo-q --query QueueUrl --output text)
-QARN=$(aws sqs get-queue-attributes --queue-url "$QUEUE" --attribute-names QueueArn --query Attributes.QueueArn --output text)
-aws sns subscribe --topic-arn "$TOPIC" --protocol sqs --notification-endpoint "$QARN" \
-  --attributes RawMessageDelivery=true
+docker compose exec floci aws --region us-east-1 sns list-topics
+docker compose exec floci aws --region us-east-1 sqs list-queues
 ```
 
-### Step 3 — Give the queue a DLQ (to exercise `DLQPublisher`)
+`--region` is required: the CLI in the floci image defaults to `us-east-1`, and floci treats region as an isolation boundary. From the host, use `AWS_ENDPOINT_URL=http://localhost:4574` with credentials `test` / `test`.
+
+### Step 3 — Watch delivery in the browser (floci-ui)
+
+Open **http://localhost:4505** → **Integration → SQS**. The **Messages** column shows live counts per queue. Publish a test event and refresh to see it land on `platform-events-demo-q`:
 
 ```bash
-DLQ=$(aws sqs create-queue --queue-name demo-q-dlq --query QueueUrl --output text)
-DLQARN=$(aws sqs get-queue-attributes --queue-url "$DLQ" --attribute-names QueueArn --query Attributes.QueueArn --output text)
-aws sqs set-queue-attributes --queue-url "$QUEUE" \
-  --attributes "{\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"$DLQARN\\\",\\\"maxReceiveCount\\\":\\\"5\\\"}\"}"
+docker compose exec floci aws --region us-east-1 sns publish \
+  --topic-arn arn:aws:sns:us-east-1:000000000000:platform-events-demo \
+  --message '{"id":"demo-1","type":"demo.thing.happened"}' \
+  --message-attributes 'EventType={DataType=String,StringValue=demo.thing.happened}'
 ```
+
+floci-ui shows queue and topic metadata, not message bodies. Use the CLI in Step 4 for those.
 
 ### Step 4 — Inspect messages
 
 ```bash
+Q=http://floci:4566/000000000000/platform-events-demo-q
 # Peek without deleting — the message becomes visible again after the visibility timeout.
-aws sqs receive-message --queue-url "$QUEUE" --max-number-of-messages 10 --message-attribute-names All \
-  | jq -r '.Messages[] | .Body | fromjson'
+docker compose exec floci aws --region us-east-1 sqs receive-message --queue-url "$Q" \
+  --max-number-of-messages 10 --message-attribute-names All
 
 # Forwarded poison messages carry DLQReason / OriginalQueue / FailedAt / ConsumerName.
-aws sqs receive-message --queue-url "$DLQ" --message-attribute-names All
+docker compose exec floci aws --region us-east-1 sqs receive-message --queue-url "$Q-dlq" --message-attribute-names All
 ```
 
 ### Step 5 — Inspect the outbox
@@ -443,7 +456,7 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 - **`test/e2e/outbox_test.go`** — the full outbox pipeline end to end, including `TestOutbox_RollbackDoesNotPublish`: a rolled-back transaction's event must never be published.
 - **`test/integration/outboxstore_test.go`** — claiming, attempt counting and dead-lettering against real Postgres.
 - **`test/unit/sqs/consumer_test.go`** — consumer-loop semantics: retry-vs-delete, visibility extension, drain, and dead-letter routing on `ApproximateReceiveCount > n`.
-- **`test/unit/sqs/dlq_test.go`** + **`test/integration/dlq_test.go`** — `RedrivePolicy` parsing, ARN resolution, caching, error classification, and a real LocalStack forward.
+- **`test/unit/sqs/dlq_test.go`** + **`test/integration/dlq_test.go`** — `RedrivePolicy` parsing, ARN resolution, caching, error classification, and a real forward against floci.
 - **Interop** — `platform-interop-tests` checks `Envelope` JSON and HMAC canonicalisation byte-for-byte against the Python library.
 
 ### Coverage
@@ -459,7 +472,7 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 | Variable | Default | Purpose |
 |---|---|---|
 | `AWS_REGION` | `us-east-1` | SNS and SQS clients |
-| `AWS_ENDPOINT_URL` | — | `http://localhost:4566` for LocalStack |
+| `AWS_ENDPOINT_URL` | — | `http://localhost:4574` for the local floci stack |
 | `SNS_TOPIC_ARN` | — | Required for the SNS publisher |
 | `SQS_QUEUE_URL` | — | Required for the SQS consumer |
 | `SQS_MAX_MESSAGES` / `SQS_WAIT_SECONDS` | `10` / `20` | Batch size (1–10) / long-poll duration |
@@ -568,10 +581,11 @@ Five workflow files, mirroring `iam-org-membership` — the org's reference pipe
 
 | Container | Image | Host port | Purpose |
 |---|---|---|---|
-| `localstack` | `localstack/localstack:4` | `4566` | SNS + SQS (`us-east-1`, credentials `test` / `test`) |
-| `postgres` | `postgres:16-alpine` | `5432` | Outbox / inbox store (`postgres` / `postgres`, DB `platform_events_dev`) |
+| `floci` | `floci/floci:2.1.0-compat` | `4574` (`FLOCI_PORT`) | SNS + SQS (`us-east-1`, account `000000000000`, credentials `test` / `test`); `scripts/init-floci.sh` provisions the demo topic, queue and DLQ |
+| `floci-ui` | `floci/floci-ui:0.5.0` | `4505` (`FLOCI_UI_PORT`) | Web console for floci: queues, topics, live message counts |
+| `postgres` | `postgres:16-alpine` | `5538` (`POSTGRES_PORT`) | Outbox / inbox store (`postgres` / `postgres`, DB `platform_events_dev`) |
 
-`make docker-up` / `make docker-down` start and stop both. The integration and e2e suites do **not** need them — testcontainers-go starts its own isolated containers per run (the Makefile exports `DOCKER_HOST` for Docker Desktop's user socket).
+`make docker-up` / `make docker-down` start and stop them. Host ports are unique across the org's local stacks, so this runs alongside pgcommon's and every IAM service's. The integration and e2e suites do **not** need them — testcontainers-go starts its own isolated containers per run (the Makefile exports `DOCKER_HOST` for Docker Desktop's user socket).
 
 ### The reference-CLI image
 

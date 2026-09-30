@@ -14,7 +14,7 @@ This document explains the test layout, how to run each layer, and patterns for 
 
 **Unit tests** have no external dependencies — no Docker, no network. They use mock implementations from `test/fixtures/`.
 
-**Integration tests** spin up LocalStack (SNS + SQS) and Postgres containers via [testcontainers-go](https://testcontainers.com/guides/getting-started-with-testcontainers-for-go/). Docker must be running locally. Pass `-short` to skip them when Docker is unavailable.
+**Integration tests** spin up [floci](https://floci.io) (`floci/floci:2.1.0` — the open-source, always-free AWS emulator the platform uses instead of LocalStack; SNS + SQS on :4566, no auth token) and Postgres containers via [testcontainers-go](https://testcontainers.com/guides/getting-started-with-testcontainers-for-go/). Docker must be running locally. Pass `-short` to skip them when Docker is unavailable.
 
 **Smoke tests** target live AWS resources at `SMOKE_SNS_TOPIC_ARN` and `SMOKE_SQS_QUEUE_URL`. They are not part of the standard CI gate.
 
@@ -80,19 +80,23 @@ clk := &fixtures.FakeClock{T: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 // clk.Advance(5 * time.Second) to move time forward
 ```
 
-### LocalStack
+### floci
 
-`fixtures.LocalStack(ctx, t)` starts a LocalStack container and returns an `*aws.Config` pre-configured for the local endpoint. The test is automatically skipped when `-short` is passed.
+`fixtures.StartFloci(ctx, t)` starts a floci container (region `fixtures.FlociRegion` = `us-east-1`, account `000000000000`, static `test` / `test` credentials) and returns a `*fixtures.Floci` with ready SNS and SQS clients, the mapped `EndpointURL`, and helpers `CreateTopic`, `CreateQueue` and `SubscribeQueueToTopic` (raw delivery, as production requires). The container is terminated on `t.Cleanup`, and the test is skipped under `-short`.
 
 ```go
 //go:build integration
 
 func TestSNSPublish(t *testing.T) {
     ctx := context.Background()
-    awsCfg := fixtures.LocalStack(ctx, t)
-    // use awsCfg to create SNS/SQS clients
+    emu := fixtures.StartFloci(ctx, t)
+    topicARN := emu.CreateTopic(ctx, t, "orders")
+    pub, err := events.NewSNSPublisher(events.SNSConfig{TopicARN: topicARN, Region: fixtures.FlociRegion, EndpointURL: emu.EndpointURL})
+    // …
 }
 ```
+
+Use `fixtures.FlociRegion` for every client: floci treats region as an isolation boundary, so a resource created in one region is invisible from another. For manual runs against a long-lived emulator, use `make docker-up` (floci on :4574, floci-ui on http://localhost:4505, demo topology provisioned by `scripts/init-floci.sh`) instead.
 
 ---
 
@@ -127,7 +131,7 @@ func TestNewEnvelope_IDIsSet(t *testing.T) {
 
 1. Create or add to a file under `test/integration/`.
 2. Add `//go:build integration` at the top of the file.
-3. Use `fixtures.LocalStack(ctx, t)` for SNS/SQS, or a Postgres testcontainer for outbox tests.
+3. Use `fixtures.StartFloci(ctx, t)` for SNS/SQS, or `fixtures.NewTestDB(ctx, t)` (Postgres testcontainer) for outbox and inbox tests.
 4. Apply outbox migrations with `outbox.ApplySchema(ctx, runner)` when the test requires the schema.
 5. Always `defer cleanup()` immediately after starting containers.
 
@@ -149,9 +153,11 @@ import (
 
 func TestSNSPublishRoundTrip(t *testing.T) {
     ctx := context.Background()
-    awsCfg := fixtures.LocalStack(ctx, t)
-    _ = awsCfg
-    // create topic, publish, receive, assert
+    emu := fixtures.StartFloci(ctx, t)
+    topicARN := emu.CreateTopic(ctx, t, "orders")
+    queueURL := emu.CreateQueue(ctx, t, "orders-q")
+    emu.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
+    // publish with events.NewSNSPublisher(EndpointURL: emu.EndpointURL), receive, assert
 }
 ```
 

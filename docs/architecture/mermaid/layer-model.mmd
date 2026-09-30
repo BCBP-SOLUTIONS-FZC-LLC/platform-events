@@ -30,8 +30,8 @@ graph TD
     subgraph tests["Tests  —  test/"]
         test_unit["unit/\nno Docker · pure Go"]
         test_int["integration/\ntestcontainers-go · tag: integration"]
-        test_e2e["e2e/\nLocalStack + Postgres · tag: e2e\nfull outbox + SNS/SQS pipeline"]
-        fixtures["fixtures/\nMockLogger · MockPublisher · MockConsumer\nFakeClock · LocalStack bootstrap · NewTestDB"]
+        test_e2e["e2e/\nfloci + Postgres · tag: e2e\nfull outbox + SNS/SQS pipeline"]
+        fixtures["fixtures/\nMockLogger · MockPublisher · MockConsumer\nFakeClock · floci bootstrap · NewTestDB"]
     end
 
     events_pkg    --> port_pkg

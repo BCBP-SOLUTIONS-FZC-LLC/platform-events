@@ -93,7 +93,7 @@ Common mistakes that cause silent failures, data loss, or broken tenant isolatio
 publisher, err := events.NewSNSPublisher(events.SNSConfig{
     TopicARN:    os.Getenv("SNS_TOPIC_ARN"), // required — returns error if empty or invalid ARN format
     Region:      os.Getenv("AWS_REGION"),
-    EndpointURL: os.Getenv("AWS_ENDPOINT_URL"), // set to http://localhost:4566 for LocalStack
+    EndpointURL: os.Getenv("AWS_ENDPOINT_URL"), // e.g. http://localhost:4574 for the local floci stack (make docker-up)
     Logger:      logger,
 })
 ```

@@ -16,7 +16,7 @@ import (
 type SNSConfigEnv struct {
 	TopicARN    string
 	Region      string
-	EndpointURL string // AWS_ENDPOINT_URL (e.g. http://localhost:4566 for LocalStack)
+	EndpointURL string // AWS_ENDPOINT_URL (e.g. http://localhost:4574 for the local floci stack)
 }
 
 // SQSConfigEnv holds environment-derived SQS consumer configuration.

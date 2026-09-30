@@ -34,7 +34,7 @@ defer consumer.Stop()    // graceful drain — waits up to 30s for in-flight han
 
 ### Testing with an injected client
 
-`NewSQSConsumerWithClient` builds the same consumer as `NewSQSConsumer` but takes an `events.SQSClientLike` instead of constructing a real `*sqs.Client` — use it to unit-test consumer-loop behaviour (retry, visibility extension, dead-letter routing, concurrency) against a hand-rolled fake, without LocalStack or AWS credentials. This is different from `mock.Consumer` (see [Testing in consuming services](testing-in-services.md#testing-in-consuming-services)), which stubs out the whole `Consumer` interface and skips the SQS loop entirely — reach for `NewSQSConsumerWithClient` when the behaviour under test is the loop itself, and `mock.Consumer` when it's your handler's side effects.
+`NewSQSConsumerWithClient` builds the same consumer as `NewSQSConsumer` but takes an `events.SQSClientLike` instead of constructing a real `*sqs.Client` — use it to unit-test consumer-loop behaviour (retry, visibility extension, dead-letter routing, concurrency) against a hand-rolled fake, without an AWS emulator (floci) or AWS credentials. This is different from `mock.Consumer` (see [Testing in consuming services](testing-in-services.md#testing-in-consuming-services)), which stubs out the whole `Consumer` interface and skips the SQS loop entirely — reach for `NewSQSConsumerWithClient` when the behaviour under test is the loop itself, and `mock.Consumer` when it's your handler's side effects.
 
 ```go
 type fakeSQSClient struct {

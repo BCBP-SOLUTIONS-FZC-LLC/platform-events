@@ -108,10 +108,10 @@ See [EVENT_SCHEMA_GOVERNANCE.md](EVENT_SCHEMA_GOVERNANCE.md) for the full rulese
 | Layer | Location | Build tag | Docker | Notes |
 |-------|----------|-----------|--------|-------|
 | Unit | `test/unit/` | *(none)* | No | Fully isolated; mock deps only |
-| Integration | `test/integration/` | `integration` | Yes | LocalStack + Postgres via testcontainers |
+| Integration | `test/integration/` | `integration` | Yes | floci + Postgres via testcontainers |
 | Smoke | `test/smoke/` | `smoke` | — | Targets live AWS resources; optional |
 
-All unit tests must pass without Docker (`make test-unit`). Integration tests spin up LocalStack (SNS + SQS) and Postgres containers automatically.
+All unit tests must pass without Docker (`make test-unit`). Integration tests spin up floci (open-source AWS emulator: SNS + SQS) and Postgres containers automatically.
 
 ## PR checklist
 

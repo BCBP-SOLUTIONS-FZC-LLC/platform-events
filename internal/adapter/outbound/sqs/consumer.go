@@ -132,7 +132,7 @@ type Config struct {
 	// QueueURL is required.
 	QueueURL    string
 	Region      string
-	EndpointURL string // optional — set to LocalStack URL for testing
+	EndpointURL string // optional — set to an AWS emulator (floci) URL for local runs and tests
 	MaxMessages int32  // 1-10; defaults to 10
 	WaitSeconds int32  // long-poll duration; defaults to 20
 	Logger      port.Logger

@@ -39,6 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **floci replaces LocalStack** as the AWS emulator, matching iam-org-membership. [floci](https://floci.io) is open-source (MIT) and always free: SNS, SQS and Glue Schema Registry with no Pro tier or auth token.
+  - The integration and e2e suites start `floci/floci:2.1.0` through the new `test/fixtures/floci.go`: `StartFloci`, `FlociRegion`, `FlociAccount`, and the `CreateTopic` / `CreateQueue` / `SubscribeQueueToTopic` helpers, with static `test` credentials. The fixture replaces `localstack.go`. Every suite passes unchanged.
+  - `make docker-up` starts `floci/floci:2.1.0-compat`, the `floci/floci-ui:0.5.0` web console and Postgres. `scripts/init-floci.sh` provisions a demo topology (`platform-events-demo` topic, `platform-events-demo-q` queue with raw delivery, and `-dlq` via `RedrivePolicy`), and `.env-example` now points at it.
+  - Host ports are unique across the org's local stacks (floci `4574`, floci-ui `4505`, Postgres `5538`; overridable with `FLOCI_PORT` / `FLOCI_UI_PORT` / `POSTGRES_PORT`), so the stack runs alongside pgcommon's and every IAM service's.
+  - Docs updated: README (local walkthrough with floci-ui, Docker table), `test/README.md`, CONTRIBUTING, ARCHITECTURE and diagrams, guides, CLAUDE.md, and code comments.
+- `.env-example`: `DATABASE_URL` now matches the compose Postgres (database `platform_events_dev`, `sslmode=disable` locally). It previously named `platform_dev` with `sslmode=require` and could not connect.
 - **Tracing and logging configuration belong to the consuming service.** platform-events reads no `OTEL_*` or log variables, like platform-pgcommon. It uses the global tracer provider installed by platform-gincommon's `InitTracingFromEnv`, and logs through the injected `port.Logger`.
   - `config.LoadOTel` / `config.OTelConfigEnv` are **deprecated**. Nothing in the library used them, and their parsing had diverged from gincommon's: no `APP_NAME` fallback for `OTEL_SERVICE_NAME`, `yes`/`no` rejected, `APP_ENV` case-folded, sampler and baggage variables ignored. They will be removed in the next major version.
   - The reference CLI no longer prints an OTel config.

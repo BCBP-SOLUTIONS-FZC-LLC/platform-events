@@ -25,16 +25,16 @@ func TestSNSPublishRoundTrip(t *testing.T) {
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 
 	ctx := context.Background()
-	ls := fixtures.StartLocalStack(ctx, t)
+	emu := fixtures.StartFloci(ctx, t)
 
-	topicARN := ls.CreateTopic(ctx, t, "test-topic")
-	queueURL := ls.CreateQueue(ctx, t, "test-queue")
-	ls.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
+	topicARN := emu.CreateTopic(ctx, t, "test-topic")
+	queueURL := emu.CreateQueue(ctx, t, "test-queue")
+	emu.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
 
 	pub, err := events.NewSNSPublisher(events.SNSConfig{
 		TopicARN:    topicARN,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 	})
 	require.NoError(t, err)
 
@@ -46,7 +46,7 @@ func TestSNSPublishRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 
 	// Receive from the subscribed SQS queue.
-	out, err := ls.SQSClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+	out, err := emu.SQSClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(queueURL),
 		MaxNumberOfMessages: 1,
 		WaitTimeSeconds:     5,

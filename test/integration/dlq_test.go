@@ -31,17 +31,17 @@ func TestDLQPublisher_ForwardsToRedriveTarget(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
-	dlqURL := ls.CreateQueue(ctx, t, "dlq-it-orders-dlq")
-	sourceURL := ls.CreateQueue(ctx, t, "dlq-it-orders")
-	bareURL := ls.CreateQueue(ctx, t, "dlq-it-no-redrive")
+	emu := fixtures.StartFloci(ctx, t)
+	dlqURL := emu.CreateQueue(ctx, t, "dlq-it-orders-dlq")
+	sourceURL := emu.CreateQueue(ctx, t, "dlq-it-orders")
+	bareURL := emu.CreateQueue(ctx, t, "dlq-it-no-redrive")
 
-	dlqAttrs, err := ls.SQSClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+	dlqAttrs, err := emu.SQSClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
 		QueueUrl:       aws.String(dlqURL),
 		AttributeNames: []sqstypes.QueueAttributeName{sqstypes.QueueAttributeNameQueueArn},
 	})
 	require.NoError(t, err)
-	_, err = ls.SQSClient.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{
+	_, err = emu.SQSClient.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{
 		QueueUrl: aws.String(sourceURL),
 		Attributes: map[string]string{
 			"RedrivePolicy": `{"deadLetterTargetArn":"` + dlqAttrs.Attributes["QueueArn"] + `","maxReceiveCount":"3"}`,
@@ -51,7 +51,7 @@ func TestDLQPublisher_ForwardsToRedriveTarget(t *testing.T) {
 
 	pub, err := events.NewSQSDLQPublisher(events.DLQConfig{
 		Region:       "us-east-1",
-		EndpointURL:  ls.EndpointURL,
+		EndpointURL:  emu.EndpointURL,
 		ConsumerName: "it-consumer",
 	})
 	require.NoError(t, err)
@@ -65,7 +65,7 @@ func TestDLQPublisher_ForwardsToRedriveTarget(t *testing.T) {
 
 	// DLQ forwarding on a queue without a RedrivePolicy fails at Start rather
 	// than leaving poison messages redelivered until retention expires.
-	bareConsumer, err := events.NewSQSConsumer(events.SQSConfig{QueueURL: bareURL, Region: "us-east-1", EndpointURL: ls.EndpointURL, WaitSeconds: 1},
+	bareConsumer, err := events.NewSQSConsumer(events.SQSConfig{QueueURL: bareURL, Region: "us-east-1", EndpointURL: emu.EndpointURL, WaitSeconds: 1},
 		func(context.Context, events.Envelope[json.RawMessage]) error { return nil }, events.WithDLQForwarding(pub))
 	require.NoError(t, err)
 	require.ErrorIs(t, bareConsumer.Start(ctx), events.ErrDLQNotConfigured)
@@ -75,7 +75,7 @@ func TestDLQPublisher_ForwardsToRedriveTarget(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, pub.SendToDLQ(ctx, sourceURL, body, map[string]string{"TenantID": "acme"}, "unprocessable"))
 
-	out, err := ls.SQSClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+	out, err := emu.SQSClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:              aws.String(dlqURL),
 		MessageAttributeNames: []string{"All"},
 		WaitTimeSeconds:       5,
@@ -107,15 +107,15 @@ func TestConsumer_WithDLQForwarding_MalformedMessage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
-	dlqURL := ls.CreateQueue(ctx, t, "dlqfwd-it-dlq")
-	sourceURL := ls.CreateQueue(ctx, t, "dlqfwd-it-source")
-	dlqAttrs, err := ls.SQSClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+	emu := fixtures.StartFloci(ctx, t)
+	dlqURL := emu.CreateQueue(ctx, t, "dlqfwd-it-dlq")
+	sourceURL := emu.CreateQueue(ctx, t, "dlqfwd-it-source")
+	dlqAttrs, err := emu.SQSClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
 		QueueUrl:       aws.String(dlqURL),
 		AttributeNames: []sqstypes.QueueAttributeName{sqstypes.QueueAttributeNameQueueArn},
 	})
 	require.NoError(t, err)
-	_, err = ls.SQSClient.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{
+	_, err = emu.SQSClient.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{
 		QueueUrl: aws.String(sourceURL),
 		Attributes: map[string]string{
 			"RedrivePolicy": `{"deadLetterTargetArn":"` + dlqAttrs.Attributes["QueueArn"] + `","maxReceiveCount":"10"}`,
@@ -123,7 +123,7 @@ func TestConsumer_WithDLQForwarding_MalformedMessage(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	_, err = ls.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{
+	_, err = emu.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:    aws.String(sourceURL),
 		MessageBody: aws.String("definitely not an envelope"),
 		MessageAttributes: map[string]sqstypes.MessageAttributeValue{
@@ -132,9 +132,9 @@ func TestConsumer_WithDLQForwarding_MalformedMessage(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	pub, err := events.NewSQSDLQPublisher(events.DLQConfig{Region: "us-east-1", EndpointURL: ls.EndpointURL, ConsumerName: "it-consumer"})
+	pub, err := events.NewSQSDLQPublisher(events.DLQConfig{Region: "us-east-1", EndpointURL: emu.EndpointURL, ConsumerName: "it-consumer"})
 	require.NoError(t, err)
-	consumer, err := events.NewSQSConsumer(events.SQSConfig{QueueURL: sourceURL, Region: "us-east-1", EndpointURL: ls.EndpointURL, WaitSeconds: 1},
+	consumer, err := events.NewSQSConsumer(events.SQSConfig{QueueURL: sourceURL, Region: "us-east-1", EndpointURL: emu.EndpointURL, WaitSeconds: 1},
 		func(context.Context, events.Envelope[json.RawMessage]) error { return nil },
 		events.WithDLQForwarding(pub), events.WithDrainTimeout(5*time.Second))
 	require.NoError(t, err)
@@ -144,7 +144,7 @@ func TestConsumer_WithDLQForwarding_MalformedMessage(t *testing.T) {
 
 	var msg sqstypes.Message
 	require.Eventually(t, func() bool {
-		out, err := ls.SQSClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+		out, err := emu.SQSClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 			QueueUrl:              aws.String(dlqURL),
 			MessageAttributeNames: []string{"All"},
 			WaitTimeSeconds:       1,
@@ -165,7 +165,7 @@ func TestConsumer_WithDLQForwarding_MalformedMessage(t *testing.T) {
 
 	// The original was deleted after the forward: nothing left in flight or visible.
 	require.Eventually(t, func() bool {
-		attrs, err := ls.SQSClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		attrs, err := emu.SQSClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
 			QueueUrl: aws.String(sourceURL),
 			AttributeNames: []sqstypes.QueueAttributeName{
 				sqstypes.QueueAttributeNameApproximateNumberOfMessages,
@@ -190,21 +190,21 @@ func TestConsumer_QueueDepthMetrics(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
-	dlqURL := ls.CreateQueue(ctx, t, "depth-it-dlq")
-	sourceURL := ls.CreateQueue(ctx, t, "depth-it-source")
-	dlqAttrs, err := ls.SQSClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+	emu := fixtures.StartFloci(ctx, t)
+	dlqURL := emu.CreateQueue(ctx, t, "depth-it-dlq")
+	sourceURL := emu.CreateQueue(ctx, t, "depth-it-source")
+	dlqAttrs, err := emu.SQSClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
 		QueueUrl:       aws.String(dlqURL),
 		AttributeNames: []sqstypes.QueueAttributeName{sqstypes.QueueAttributeNameQueueArn},
 	})
 	require.NoError(t, err)
-	_, err = ls.SQSClient.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{
+	_, err = emu.SQSClient.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{
 		QueueUrl:   aws.String(sourceURL),
 		Attributes: map[string]string{"RedrivePolicy": `{"deadLetterTargetArn":"` + dlqAttrs.Attributes["QueueArn"] + `","maxReceiveCount":"5"}`},
 	})
 	require.NoError(t, err)
 	for range 2 {
-		_, err = ls.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: aws.String(dlqURL), MessageBody: aws.String("dead")})
+		_, err = emu.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: aws.String(dlqURL), MessageBody: aws.String("dead")})
 		require.NoError(t, err)
 	}
 
@@ -214,7 +214,7 @@ func TestConsumer_QueueDepthMetrics(t *testing.T) {
 	_, err = events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "it", Environment: "test"}, reg, events.WithoutLegacyMetrics())
 	require.NoError(t, err)
 
-	consumer, err := events.NewSQSConsumer(events.SQSConfig{QueueURL: sourceURL, Region: "us-east-1", EndpointURL: ls.EndpointURL, WaitSeconds: 1},
+	consumer, err := events.NewSQSConsumer(events.SQSConfig{QueueURL: sourceURL, Region: "us-east-1", EndpointURL: emu.EndpointURL, WaitSeconds: 1},
 		func(context.Context, events.Envelope[json.RawMessage]) error { return nil },
 		events.WithQueueDepthMetrics(10*time.Second), events.WithDrainTimeout(2*time.Second))
 	require.NoError(t, err)

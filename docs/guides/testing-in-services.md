@@ -6,7 +6,7 @@ Mocks for `Publisher`, `Consumer` and `DLQPublisher`, and wiring them in tests. 
 
 ## Testing in consuming services
 
-`pkg/events/mock` ships ready-made, thread-safe test doubles so consuming services never need to stand up LocalStack or SNS just to run a unit test.
+`pkg/events/mock` ships ready-made, thread-safe test doubles so consuming services never need to stand up an AWS emulator (floci) or SNS just to run a unit test.
 
 ```go
 import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events/mock"

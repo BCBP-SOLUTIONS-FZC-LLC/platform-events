@@ -87,18 +87,18 @@ help:
 	@echo "  make test             - unit + integration tests in parallel (requires Docker)"
 	@echo "  make test-ci          - unit + integration + e2e with race detector + merged coverage (used in CI)"
 	@echo "  make test-unit        - unit tests only (no Docker required)"
-	@echo "  make test-integration - integration tests (requires Docker / LocalStack); alias: test-int"
-	@echo "  make test-e2e         - e2e tests (requires Docker / LocalStack)"
+	@echo "  make test-integration - integration tests (Docker; floci + Postgres via testcontainers); alias: test-int"
+	@echo "  make test-e2e         - e2e tests (Docker; floci + Postgres via testcontainers)"
 	@echo "  make test-smoke       - smoke tests (requires live AWS resources)"
 	@echo "  make race             - unit + integration + e2e with -race flag"
 	@echo "  make build            - compile reference CLI to bin/"
 	@echo "  make cover            - coverage HTML report (runs test-ci)"
 	@echo "  make cover-func       - coverage summary by function (runs test-ci)"
 	@echo "  make ci               - tidy + fmt-check + vet + lint + metrics-lint + test-ci + build"
-	@echo "  make docker-up        - start LocalStack (SNS + SQS + Postgres)"
+	@echo "  make docker-up        - start floci (SNS/SQS, :4574) + floci-ui (http://localhost:4505) + Postgres (:5538)"
 	@echo "  make docker-build     - build the reference-CLI image as CI does (needs GO_PRIVATE_TOKEN)"
 	@echo "  make pin-base-images  - fetch + pin SHA digests for Dockerfile base images"
-	@echo "  make docker-down      - stop LocalStack"
+	@echo "  make docker-down      - stop the local containers"
 	@echo "  make mod-verify       - go mod verify (check module download integrity)"
 	@echo "  make vuln-check       - govulncheck on internal + pkg"
 	@echo "  make godoc            - serve local godoc/pkgsite at http://localhost:8080"
@@ -278,17 +278,18 @@ build:
 	$(GO) build ./internal/... ./pkg/...
 
 # -----------------------------
-# DOCKER (LOCAL LOCALSTACK)
+# DOCKER (LOCAL FLOCI)
 # -----------------------------
 
 .PHONY: docker-up
 docker-up:
-	@echo "Starting LocalStack (SNS + SQS + Postgres)..."
-	docker compose up -d
+	@echo "Starting floci (SNS/SQS, always free) + floci-ui (http://localhost:$${FLOCI_UI_PORT:-4505}) + Postgres..."
+	docker compose up -d --wait floci floci-ui postgres
+	@echo "Demo topology ready (scripts/init-floci.sh): topic platform-events-demo, queue platform-events-demo-q (+ -dlq)"
 
 .PHONY: docker-down
 docker-down:
-	@echo "Stopping LocalStack..."
+	@echo "Stopping local containers..."
 	docker compose down
 
 # -----------------------------

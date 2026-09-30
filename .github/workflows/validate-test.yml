@@ -32,7 +32,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     # make test-ci runs unit/integration/e2e in parallel; integration and e2e
-    # each start their own LocalStack + Postgres containers (testcontainers-go).
+    # each start their own floci + Postgres containers (testcontainers-go).
     # A full local run takes ~3 min; 30 min leaves headroom for cold image pulls.
     timeout-minutes: 30
     outputs:

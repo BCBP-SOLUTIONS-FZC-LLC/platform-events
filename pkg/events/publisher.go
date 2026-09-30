@@ -39,7 +39,7 @@ type SNSConfig struct {
 	// TopicARN is required. NewSNSPublisher returns an error if empty.
 	TopicARN    string
 	Region      string
-	EndpointURL string // optional — LocalStack endpoint for testing
+	EndpointURL string // optional — AWS emulator (floci) endpoint for local runs and tests
 	Logger      port.Logger
 }
 

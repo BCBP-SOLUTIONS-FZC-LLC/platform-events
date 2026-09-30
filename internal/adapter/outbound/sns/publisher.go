@@ -103,7 +103,7 @@ type Config struct {
 	// TopicARN is required. Panics on empty string.
 	TopicARN    string
 	Region      string
-	EndpointURL string // optional — set to LocalStack URL for testing
+	EndpointURL string // optional — set to an AWS emulator (floci) URL for local runs and tests
 	Logger      port.Logger
 }
 

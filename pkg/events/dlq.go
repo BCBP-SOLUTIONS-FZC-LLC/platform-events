@@ -79,7 +79,7 @@ func SourceMessageFromContext(ctx context.Context) (SourceMessage, bool) {
 // kms:Decrypt when the DLQ uses a customer-managed KMS key).
 type DLQConfig struct {
 	Region      string
-	EndpointURL string // optional — LocalStack endpoint for testing
+	EndpointURL string // optional — AWS emulator (floci) endpoint for local runs and tests
 	// ConsumerName is attached to every forwarded message as ConsumerName.
 	ConsumerName string
 	Logger       port.Logger
