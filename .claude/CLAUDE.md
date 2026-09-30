@@ -346,8 +346,7 @@ SQS_MAX_MESSAGES, SQS_WAIT_SECONDS, SQS_VISIBILITY_TIMEOUT, SQS_CONCURRENCY
 OUTBOX_POLL_INTERVAL, OUTBOX_BATCH_SIZE, OUTBOX_MAX_ATTEMPTS
 DATABASE_URL                                           # outbox runner DSN — read by platform-pgcommon's ConfigFromEnv (or PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DBNAME/PG_SSLMODE; plus PG_MAX_CONNS, PG_STATEMENT_TIMEOUT, PG_LOCK_TIMEOUT, PG_BOUNCER_MODE, …)
 MIGRATION_DATABASE_URL                                 # optional DDL-role DSN for ApplySchema (pgcommon.MigrationDSNFromEnv)
-OTEL_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT
-OTEL_EXPORTER_OTLP_INSECURE
+# No OTEL_* / log variables: tracing and logging are configured by the consuming service (platform-gincommon).
 SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against real AWS
 ```
 
