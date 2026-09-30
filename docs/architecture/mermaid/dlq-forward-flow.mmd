@@ -1,0 +1,52 @@
+sequenceDiagram
+    participant Consumer as Consumer code (handler or dead-letter handler)
+    participant DLQPub as pkg/events.DLQPublisher
+    participant SQSAdp as adapter/outbound/sqs (DLQPublisher)
+    participant SQS as AWS SQS
+
+    Consumer ->>+ DLQPub: SendToDLQ(ctx, sourceQueueURL, body, attrs, reason)
+    DLQPub ->>+ SQSAdp: SendToDLQ(...)
+
+    SQSAdp ->> SQSAdp: validate input — source URL, non-empty UTF-8 body, non-empty reason
+    Note over SQSAdp: invalid input returns ErrDLQInvalidMessage before any AWS call
+
+    SQSAdp ->> SQSAdp: build attributes — caller attrs + EventType · DLQReason · OriginalQueue · FailedAt · ConsumerName
+    Note over SQSAdp: more than 10 attributes (the SQS limit) returns ErrDLQInvalidMessage
+
+    alt DLQ cached for sourceQueueURL
+        SQSAdp ->> SQSAdp: reuse cached DLQ URL and ARN
+    else cache miss
+        SQSAdp ->>+ SQS: GetQueueAttributes(sourceQueueURL, RedrivePolicy)
+        SQS -->>- SQSAdp: RedrivePolicy or error
+        alt call failed
+            SQSAdp -->> Consumer: ErrDLQUnresolved (plus ErrRetryable if transient)
+        else no RedrivePolicy
+            SQSAdp -->> Consumer: ErrDLQNotConfigured
+        else unparseable JSON or not an SQS ARN
+            SQSAdp -->> Consumer: ErrDLQInvalidRedrivePolicy
+        end
+        SQSAdp ->> SQSAdp: parse deadLetterTargetArn → queue name + account ID
+        SQSAdp ->>+ SQS: GetQueueUrl(QueueName, QueueOwnerAWSAccountId)
+        SQS -->>- SQSAdp: DLQ URL or error
+        Note over SQSAdp: failure returns ErrDLQUnresolved — only successful lookups are cached
+    end
+
+    opt DLQ name ends in .fifo
+        SQSAdp ->> SQSAdp: MessageGroupId = MessageDeduplicationId = envelope ID (else SHA-256 of body)
+    end
+
+    SQSAdp ->>+ SQS: SendMessage(DLQ URL, body verbatim, attributes)
+    SQS -->>- SQSAdp: MessageId or error
+
+    alt success
+        SQSAdp ->> SQSAdp: events_dlq_forwarded_total{status=success}.Inc() · WARN log
+    else throttling · service unavailable · network timeout
+        SQSAdp ->> SQSAdp: ErrDLQSendFailed + ErrRetryable · events_dlq_forwarded_total{status=error}.Inc()
+    else permanent error (access denied · KMS · invalid parameter)
+        SQSAdp ->> SQSAdp: ErrDLQSendFailed · events_dlq_forwarded_total{status=error}.Inc()
+    end
+
+    SQSAdp -->>- DLQPub: nil or *DLQError
+    DLQPub -->>- Consumer: nil or *DLQError
+
+    Note over Consumer: nil → return nil so the consumer deletes the original. Error → return it so the original stays on the source queue.

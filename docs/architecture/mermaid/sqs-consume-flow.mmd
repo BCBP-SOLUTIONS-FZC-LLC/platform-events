@@ -31,6 +31,13 @@ sequenceDiagram
                     end
                 end
 
+                opt WithDeadLetterHandler set and ApproximateReceiveCount > WithMaxReceiveCount(n)
+                    SQSAdp ->>+ Handler: deadLetterHandler(ctx, Envelope)
+                    Note over Handler: may forward via DLQPublisher.SendToDLQ — see dlq-forward-flow.mmd
+                    Handler -->>- SQSAdp: nil or error
+                    Note over SQSAdp: nil → DeleteMessage · error → leave visible — EventsConsumedTotal{status=dlq_success or dlq_error}.Inc() — normal handler is skipped
+                end
+
                 SQSAdp ->>+ OTel: Start span "sqs.receive"
                 OTel -->>- SQSAdp: handler ctx + span
 

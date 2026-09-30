@@ -1,0 +1,39 @@
+erDiagram
+    outbox_events {
+        uuid id PK "Envelope.ID (UUID v7)"
+        text event_type "Envelope.Type"
+        jsonb payload "full serialised Envelope (json.RawMessage — PGBouncerMode safe)"
+        text tenant_id "copied from Envelope for filtering, default empty"
+        text trace_id "copied from Envelope, default empty"
+        int attempts "incremented by MarkFailed"
+        text last_error "truncated to 512 chars"
+        timestamptz created_at
+        timestamptz scheduled_at "next eligible poll time — doubles as the claim lease"
+        timestamptz published_at "NULL until MarkPublished"
+    }
+    outbox_dead_letters {
+        uuid id PK "same id as the outbox_events row it replaced"
+        text event_type
+        jsonb payload
+        text tenant_id
+        text trace_id
+        int attempts "value when dead-lettered"
+        text last_error
+        timestamptz created_at "original enqueue time"
+        timestamptz failed_at "dead-letter time"
+    }
+    processed_events {
+        uuid event_id PK "Envelope.ID"
+        text consumer PK "Store consumer name — composite PK"
+        timestamptz processed_at "Prune cut-off"
+    }
+    outbox_migrations {
+        bigint version PK "golang-migrate tracking for pkg/outbox (001–008)"
+        boolean dirty
+    }
+    inbox_migrations {
+        bigint version PK "golang-migrate tracking for pkg/inbox (001)"
+        boolean dirty
+    }
+    outbox_events ||--o| outbox_dead_letters : "moved after MaxAttempts (INSERT + DELETE, one tx)"
+    outbox_dead_letters ||--o| outbox_events : "ReprocessDeadLetters* moves back, attempts reset to 0"

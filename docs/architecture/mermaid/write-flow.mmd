@@ -1,0 +1,45 @@
+sequenceDiagram
+    participant H as Service handler (caller code)
+    participant TX as pgcommon.RunInTx
+    participant DB as Service tables (caller schema)
+    participant ENQ as pkg/outbox.Enqueue
+    participant OB as outbox_events
+    participant R as outbox.Runner
+    participant PUB as events.Publisher (SNS adapter)
+    participant SNS as AWS SNS
+
+    Note over H,TX: Example — an HTTP write that must emit order.placed
+
+    H ->>+ TX: RunInTx(ctx, func(tx))
+    TX ->>+ DB: INSERT / UPDATE business rows
+    DB -->>- TX: ok
+    TX ->>+ ENQ: Enqueue(ctx, tx, NewEnvelope(type, source, payload, WithTenantID, WithTraceID))
+    Note over ENQ: validate id · type · source · time non-empty<br/>reject null bytes in string fields<br/>reject serialised envelope > 240 KB
+    ENQ ->>+ OB: INSERT outbox_events (id, event_type, payload JSONB, tenant_id, trace_id)
+    OB -->>- ENQ: inserted
+    ENQ -->>- TX: nil
+    alt any step fails
+        TX -->> H: error — ROLLBACK, neither business row nor outbox row persists
+    else all steps succeed
+        TX ->> DB: COMMIT
+        TX -->>- H: nil — business row and outbox row are both durable
+    end
+
+    Note over R: later, independently — no SNS call ever happens inside the caller transaction
+
+    loop every PollInterval (first poll immediately after StartupJitter)
+        R ->>+ OB: SELECT … WHERE published_at IS NULL AND scheduled_at ≤ NOW() FOR UPDATE SKIP LOCKED LIMIT BatchSize
+        OB -->>- R: claimed rows
+        R ->> OB: UPDATE scheduled_at = NOW() + ClaimLeaseDuration (lease)
+        R ->>+ PUB: PublishBatch (PublishConcurrency=1) or parallel Publish
+        PUB ->>+ SNS: Publish / PublishBatch
+        SNS -->>- PUB: MessageId or error
+        PUB -->>- R: nil, *BatchError, RetryableError or error
+        alt published
+            R ->> OB: MarkPublished — published_at = NOW()
+        else retryable (throttling, service unavailable)
+            R ->> OB: MarkFailed with threshold MaxAttempts+1 — never dead-letters
+        else permanent
+            R ->> OB: MarkFailed — attempts++ — at MaxAttempts move to outbox_dead_letters
+        end
+    end

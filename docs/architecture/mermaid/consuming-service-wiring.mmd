@@ -7,6 +7,7 @@ graph LR
         metrics_init["pkg/events.Init\nregisters Prometheus metrics"]
         sns_new["pkg/events.NewSNSPublisher\nreturns error on empty or invalid TopicARN"]
         sqs_new["pkg/events.NewSQSConsumer\ninjects GUCSet · links OTel trace"]
+        dlq_new["pkg/events.NewSQSDLQPublisher\nforwards to the queue's RedrivePolicy DLQ\nno SQS SDK import in the service"]
         outbox_new["pkg/outbox.NewRunner\nrequires *pgcommon.Pool\nreturns (*Runner, error)"]
         apply_schema["pkg/outbox.ApplySchema\nembedded SQL migrations\ntable: outbox_migrations"]
         enqueue["pkg/outbox.Enqueue\nINSERT inside caller's pgx.Tx"]
@@ -30,6 +31,8 @@ graph LR
     zap_logger -->|"port.Logger"| sns_new
     zap_logger -->|"port.Logger"| sqs_new
     zap_logger -->|"port.Logger"| outbox_new
+    zap_logger -->|"port.Logger"| dlq_new
+    dlq_new -->|"DLQPublisher (used in handler / dead-letter handler)"| sqs_new
     main --> pool_new
     pool_new -->|"*pgcommon.Pool"| outbox_new
     main -->|"DATABASE_URL"| mig_run

@@ -1,0 +1,75 @@
+# Quick start
+
+End-to-end wiring of the publisher, outbox and consumer in a service. One of the detailed guides linked from the [project README](../../README.md#contributing).
+
+---
+
+## Quick start
+
+```go
+import (
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+)
+
+func main() {
+    ctx := context.Background()
+
+    // 1. Register Prometheus metrics once.
+    events.Init(os.Getenv("APP_NAME"), os.Getenv("BUILD_VERSION"))
+
+    // 2. Open the connection pool for the outbox runner.
+    pool, err := pgcommon.NewPool(ctx, pgcommon.Config{
+        DSN:         os.Getenv("DATABASE_URL"),
+        GUCProvider: pgcommon.GUCSetFromContext,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer pool.Close()
+
+    // 3. Apply the outbox schema migration.
+    migrateRunner := &migrate.Runner{DSN: os.Getenv("DATABASE_URL")}
+    if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
+        log.Fatal(err)
+    }
+
+    // 4. Construct the SNS publisher.
+    snsEnv := config.LoadSNS()
+    publisher, err := events.NewSNSPublisher(config.SNSConfigFromEnv(snsEnv, logger))
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // 5. Start the outbox runner (delivers events asynchronously).
+    outboxEnv := config.LoadOutbox()
+    config.LogWarnings(outboxEnv.Warnings)
+    runner, err := outbox.NewRunner(config.RunnerConfigFromEnv(outboxEnv, pool, publisher, logger))
+    if err != nil {
+        log.Fatal(err)
+    }
+    go runner.Start(ctx)
+    defer runner.Stop()
+
+    // 6. Construct and start the SQS consumer.
+    sqsEnv := config.LoadSQS()
+    config.LogWarnings(sqsEnv.Warnings)
+    consumer, err := events.NewSQSConsumer(
+        config.SQSConfigFromEnv(sqsEnv, logger),
+        func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+            // handle event...
+            return nil
+        },
+        config.SQSConsumerOptions(sqsEnv)...,
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    go consumer.Start(ctx)
+    defer consumer.Stop()
+}
+```
+

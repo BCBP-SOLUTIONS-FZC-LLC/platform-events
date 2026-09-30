@@ -1,6 +1,6 @@
 # Versioning and releases
 
-This repository is a **Go module** consumed by platform services. Versions are published with **Git tags** and described in [CHANGELOG.md](./CHANGELOG.md).
+This repository is a **Go module** consumed by platform services. Versions are published with **Git tags** and described in [CHANGELOG.md](CHANGELOG.md).
 
 ## Semantic versioning (SemVer)
 
@@ -41,7 +41,7 @@ The `Envelope` JSON wire format has its own stability contract, independent of G
 
 Any violation of these wire format guarantees — removing a stable field or changing `id` format — constitutes a MAJOR bump even if the Go API is unchanged.
 
-See [ARCHITECTURE.md § Envelope compatibility guarantees](./ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field specification.
+See [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field specification.
 
 ## Supported releases
 
@@ -60,7 +60,7 @@ This is a **private module**. Before running `go get`, configure Go to bypass th
 go env -w GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*
 ```
 
-Set the same variable in CI pipelines that build consuming services. See [README.md § Adding to a consumer service](./README.md#adding-to-a-consumer-service) for full authentication setup (SSH key vs PAT).
+Set the same variable in CI pipelines that build consuming services. See [README.md § Integrating into a service](./README.md#1-prerequisites) for full authentication setup (SSH key vs PAT).
 
 Pin in your service `go.mod`:
 
@@ -122,8 +122,8 @@ Consumer services must use the same or newer Go toolchain as stated in this modu
 
 | File | Purpose |
 |------|---------|
-| [CHANGELOG.md](./CHANGELOG.md) | User-facing history per version |
-| [README.md](./README.md#versioning-and-releases) | Summary table and quick links |
-| [CONTRIBUTING.md](./CONTRIBUTING.md) | Development guide and PR checklist |
-| [.github/workflows/release.yml](./.github/workflows/release.yml) | Automated release pipeline |
-| [go.mod](./go.mod) | Module path and minimum Go version |
+| [CHANGELOG.md](CHANGELOG.md) | User-facing history per version |
+| [README.md](#versioning-and-releases) | Summary table and quick links |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Development guide and PR checklist |
+| [.github/workflows/release.yml](.github/workflows/release.yml) | Automated release pipeline |
+| [go.mod](go.mod) | Module path and minimum Go version |

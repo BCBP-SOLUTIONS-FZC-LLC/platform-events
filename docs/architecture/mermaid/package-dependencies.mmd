@@ -2,6 +2,7 @@ graph LR
     cmd(["cmd/platform-events"])
     events_pkg(["pkg/events"])
     outbox_pkg(["pkg/outbox"])
+    inbox_pkg(["pkg/inbox"])
     sns(["adapter/outbound/sns"])
     sqs(["adapter/outbound/sqs"])
     outboxstore(["adapter/outbound/outboxstore"])
@@ -19,6 +20,8 @@ graph LR
     events_pkg   --> sns
     events_pkg   --> sqs
     events_pkg   --> metrics
+    inbox_pkg    --> events_pkg
+    inbox_pkg    --> metrics
     outbox_pkg   --> port
     outbox_pkg   --> domain
     outbox_pkg   --> service

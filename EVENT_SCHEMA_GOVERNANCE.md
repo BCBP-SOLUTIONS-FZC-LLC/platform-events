@@ -8,7 +8,7 @@ It applies to:
 - The `schema_version` envelope field
 - The cross-service event type registry
 
-> **Envelope wrapper stability** (field names, types, presence rules) is a library-level guarantee documented in [ARCHITECTURE.md § Envelope compatibility guarantees](./ARCHITECTURE.md#envelope-compatibility-guarantees). This document governs payload content, not the wrapper.
+> **Envelope wrapper stability** (field names, types, presence rules) is a library-level guarantee documented in [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees). This document governs payload content, not the wrapper.
 
 ---
 
@@ -21,7 +21,7 @@ It applies to:
 - [Schema version field](#schema-version-field)
 - [Payload evolution rules](#payload-evolution-rules)
   - [Payload content anti-patterns](#payload-content-anti-patterns)
-- [Breaking vs non-breaking changes](#breaking-vs-non-breaking-changes)
+- [Breaking vs non-breaking changes](#breaking-vs-non-breaking-changes-decision-tree)
 - [Migration window pattern](#migration-window-pattern)
 - [Consumer compatibility contract](#consumer-compatibility-contract)
 - [Event type registry](#event-type-registry)
@@ -34,7 +34,7 @@ It applies to:
 ## Core principles
 
 1. **Events are facts, not commands.** An event records something that already happened — it is an immutable statement of past truth, not an instruction. Name event types in the past tense (`user.created`, not `create.user`). Producers do not direct consumers; consumers decide independently how to react. This has two concrete implications: (a) consumers must be resilient to receiving the same fact more than once — idempotency is not optional; (b) a consumer can be added, removed, or changed without any producer modification — the producer has no knowledge of who is listening.
-2. **Use the outbox for any event tied to a database write.** Calling `publisher.Publish` directly for transactional events introduces a silent crash window — the DB write commits but the event is lost if the process dies before SNS receives it. See [README § Publishing rules](./README.md#publishing-rules) for the full decision table.
+2. **Use the outbox for any event tied to a database write.** Calling `publisher.Publish` directly for transactional events introduces a silent crash window — the DB write commits but the event is lost if the process dies before SNS receives it. See [Publishing guide § Publishing rules](docs/guides/publishing.md#publishing-rules) for the full decision table.
 3. **Consumers ignore unknown fields by default (Go JSON behaviour). This is a safety guarantee — do not disable it.** Go's `encoding/json` silently discards unrecognised fields; a new optional field from the producer is a no-op. `json.Decoder.DisallowUnknownFields()` removes this safety net and turns every Tier 1 producer addition into a consumer runtime error.
 4. **Producers must not silently change field semantics.** Renaming, removing, or changing the type of a field is always a breaking change, regardless of whether JSON serialisation succeeds.
 5. **Breaking changes require a new versioned event type.** Never mutate an existing event type in an incompatible way. Mint a new type (e.g. `iam.user.created.v2`) and run both in parallel during the migration window.
@@ -115,7 +115,7 @@ When in doubt, **mint a new event type**. Running two event types in parallel fo
 | Topic | Where |
 |-------|-------|
 | Naming format (`iam.user.created.v2`) | [Event type naming](#event-type-naming) |
-| What counts as breaking | [Payload evolution rules](#payload-evolution-rules) · [Breaking vs non-breaking changes](#breaking-vs-non-breaking-changes) |
+| What counts as breaking | [Payload evolution rules](#payload-evolution-rules) · [Breaking vs non-breaking changes](#breaking-vs-non-breaking-changes-decision-tree) |
 | How to migrate consumers safely | [Migration window pattern](#migration-window-pattern) |
 | `schema_version` field usage | [Schema version field](#schema-version-field) |
 | Deprecating old event types | [Deprecation and sunset process](#deprecation-and-sunset-process) |
@@ -320,7 +320,7 @@ type OrderShippedPayload struct {
 }
 ```
 
-See [README § Payload size guidelines](./README.md#payload-size-guidelines) for the size limits and the S3 reference pattern for large binary payloads.
+See [Outbox guide § Payload size guidelines](docs/guides/outbox.md#payload-size-guidelines) for the size limits and the S3 reference pattern for large binary payloads.
 
 ---
 
@@ -375,7 +375,7 @@ Consumers must follow these rules to remain resilient to future producer changes
 | Handle unknown enum values | Use a `default` case or skip-unknown pattern. |
 | Assert `schema_version` only when necessary | Check it when a field introduced in schema N is required for correctness. |
 | Do not assume event ordering | Events may arrive out-of-order across the SNS/SQS boundary. Do not use `Envelope.Timestamp` for strict ordering across services — clock skew between producer hosts means timestamps from different services have no guaranteed order relationship. For strict ordering, use FIFO queues with a stable `MessageGroupID`. `Envelope.Timestamp` is acceptable for approximate display-level sorting within a single service's events. |
-| Idempotency on `Envelope.ID` | The outbox runner guarantees at-least-once delivery. A handler may be called more than once for the same event. Use `env.ID` as the idempotency key — the recommended pattern is `INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING` inside the same transaction as the side-effect write. See [README § Implementing idempotency](./README.md#implementing-idempotency). |
+| Idempotency on `Envelope.ID` | The outbox runner guarantees at-least-once delivery. A handler may be called more than once for the same event. Use `env.ID` as the idempotency key — the recommended pattern is `INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING` inside the same transaction as the side-effect write. See [Consuming guide § Implementing idempotency](docs/guides/consuming.md#implementing-idempotency). |
 
 ---
 
@@ -416,7 +416,7 @@ Fields:
 | Owner defined | Ownership determines who is accountable for payload stability, migration windows, and deprecation notices — an ownerless type has no one to notify consumers of breaking changes |
 | `schema_version` set | An absent `schema_version` is ambiguously treated as `"1"` — acceptable for existing events in the wild, but a new type published without it cannot be distinguished from a legacy pre-governance event |
 
-**Enforcement in code review:** the [PR checklist in CONTRIBUTING.md](./CONTRIBUTING.md#pr-checklist) includes a registry check. Reviewers must reject any PR that introduces a new `NewEnvelope(eventType, ...)` call site without a corresponding registry entry in this file within the same PR.
+**Enforcement in code review:** the [PR checklist in CONTRIBUTING.md](CONTRIBUTING.md#pr-checklist) includes a registry check. Reviewers must reject any PR that introduces a new `NewEnvelope(eventType, ...)` call site without a corresponding registry entry in this file within the same PR.
 
 ### To register a new event type
 
@@ -460,9 +460,9 @@ A deprecated event type receives no further schema changes. If a fix is required
 
 | File | Purpose |
 |------|---------|
-| [README.md](./README.md#event-envelope) | Event envelope API reference |
-| [ARCHITECTURE.md § Envelope compatibility guarantees](./ARCHITECTURE.md#envelope-compatibility-guarantees) | Field stability classes, what the library reserves, `v1.x` never-break list |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | Wire format, invariants, observable signals |
-| [VERSIONING.md](./VERSIONING.md) | Library SemVer rules (separate from event schema versioning) |
-| [CONTRIBUTING.md](./CONTRIBUTING.md) | PR checklist includes schema governance steps |
-| [CHANGELOG.md](./CHANGELOG.md) | Per-version library changes |
+| [README.md](docs/guides/envelope.md#event-envelope) | Event envelope API reference |
+| [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees) | Field stability classes, what the library reserves, `v1.x` never-break list |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Wire format, invariants, observable signals |
+| [VERSIONING.md](VERSIONING.md) | Library SemVer rules (separate from event schema versioning) |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | PR checklist includes schema governance steps |
+| [CHANGELOG.md](CHANGELOG.md) | Per-version library changes |

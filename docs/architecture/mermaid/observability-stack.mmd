@@ -1,0 +1,44 @@
+flowchart LR
+    subgraph lib["platform-events (in the consuming service's process)"]
+        pub["SNS adapter\nsns.publish span (producer)\ninjects OTel propagation headers\ninto message attributes"]
+        con["SQS adapter\nsqs.receive span (consumer)\nLINKED to the producer span\nbaggage → handler ctx"]
+        dlq["DLQPublisher\nWARN log on forward\nERROR log on failure"]
+        run["outbox.Runner\npoll / publish / mark"]
+        m["adapter/outbound/metrics\nevents_* · outbox_* · sqs_*\nevery metric: const label service"]
+        lg["port.Logger\n(ZapLogger adapter or gincommon ZapLogger)"]
+    end
+
+    subgraph svc["Consuming service wiring"]
+        init["events.Init(service, version)\nonce at startup"]
+        otel["OTel TracerProvider + propagator\n(e.g. gincommon.InitTracingFromEnv)\nnone registered → spans are no-ops"]
+        reg["Prometheus registerer\n/metrics endpoint"]
+    end
+
+    subgraph backends["Backends"]
+        prom["Prometheus"]
+        coll["OTLP collector"]
+        logs["Log pipeline (Loki)"]
+    end
+
+    init --> m
+    m --> reg --> prom
+    pub --> otel
+    con --> otel
+    otel --> coll
+    pub --> m
+    con --> m
+    run --> m
+    dlq --> m
+    con --> lg
+    run --> lg
+    dlq --> lg
+    lg --> logs
+
+    subgraph alerts["Alert on (day one)"]
+        a1["outbox_dead_letters_total rate > 0 — publish-side primary alert"]
+        a2["events_consumed_total{status=error} rising · status=malformed > 0"]
+        a3["events_dlq_forwarded_total{status=error} > 0 — poison messages cycling"]
+        a4["sqs_delete_errors_total > 0 — duplicate delivery in progress"]
+        a5["outbox_pending_total sustained growth — runner stalled or SNS throttled"]
+    end
+    prom --> a1 & a2 & a3 & a4 & a5

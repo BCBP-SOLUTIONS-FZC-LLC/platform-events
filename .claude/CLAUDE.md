@@ -12,6 +12,7 @@ Core capabilities:
 - **Outbox runner** — transactional outbox pattern over a Postgres table; guarantees at-least-once delivery without 2PC
 - **Inbox** (`pkg/inbox`) — consumer-side dedup: `processed_events` ledger (`ApplySchema`, `Store`, `Handler` wrapper, `Prune`), metric `events_inbox_duplicates_total`
 - **`GlueDecodeCodec`** — decode-only codec stripping the Glue Schema Registry wire header
+- **`DLQPublisher`** — forwards failed messages to the source queue's `RedrivePolicy` DLQ (`SendToDLQ`, `ResolveDLQ`); the only sanctioned SQS path for consumer services (they must not import the SQS SDK). Typed `*DLQError` + `ErrRetryable`; `mock.DLQPublisher`; metric `events_dlq_forwarded_total`
 - **Event-envelope types** — versioned, typed `Envelope[T]` carrying metadata (event ID, type, source, tenant, trace ID, timestamp) plus JSON-serialised payload
 - **HMAC helpers** — SHA-256 HMAC signing and verification for webhook and cross-service event authentication
 
