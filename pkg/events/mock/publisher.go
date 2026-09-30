@@ -1,4 +1,4 @@
-// Package mock provides in-memory test doubles for Publisher and Consumer.
+// Package mock provides in-memory test doubles for Publisher, Consumer and DLQPublisher.
 package mock
 
 import (

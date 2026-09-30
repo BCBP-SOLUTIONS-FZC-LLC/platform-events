@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -250,4 +251,12 @@ func TestRecordOutboxDeadLettersDiscarded_PositiveIncrements(t *testing.T) {
 	assert.NotPanics(t, func() {
 		internalmetics.RecordOutboxDeadLettersDiscarded(5)
 	})
+}
+
+func TestRecordDLQForward_AfterInit(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	internalmetics.InitWithRegisterer("record-dlq-test", "v0.0.6", reg)
+	internalmetics.RecordDLQForward("https://sqs.us-east-1.amazonaws.com/123/q", "order.placed", "success")
+	internalmetics.RecordDLQForward("https://sqs.us-east-1.amazonaws.com/123/q", "order.placed", "success")
+	assert.InDelta(t, 2, testutil.ToFloat64(internalmetics.DLQForwardedTotal.WithLabelValues("https://sqs.us-east-1.amazonaws.com/123/q", "order.placed", "success")), 0)
 }

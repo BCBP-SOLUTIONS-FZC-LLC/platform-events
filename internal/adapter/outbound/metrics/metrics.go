@@ -35,6 +35,9 @@ var (
 	// InboxDuplicatesTotal counts redeliveries the inbox ledger filtered.
 	InboxDuplicatesTotal *prometheus.CounterVec
 
+	// DLQForwardedTotal counts messages forwarded to a source queue's DLQ.
+	DLQForwardedTotal *prometheus.CounterVec
+
 	// Outbox infrastructure error counters.
 	OutboxPollErrorsTotal          *prometheus.CounterVec
 	OutboxUnmarshalErrorsTotal     *prometheus.CounterVec
@@ -271,6 +274,12 @@ func initMetricsWithRegisterer(serviceName, buildVersion string, reg prometheus.
 		ConstLabels: prometheus.Labels{"service": serviceName},
 	}, []string{"consumer"})
 
+	DLQForwardedTotal = factory.NewCounterVec(prometheus.CounterOpts{
+		Name:        "events_dlq_forwarded_total",
+		Help:        "Total messages forwarded to a source queue's configured dead-letter queue via the DLQ publisher, by outcome.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{"queue", "event_type", "status"})
+
 	OversizedEventTypeLabelTotal = factory.NewCounterVec(prometheus.CounterOpts{
 		Name:        "events_oversized_event_type_label_total",
 		Help:        "Total event_type values that exceeded the label length cap and were replaced with __oversized__. A non-zero rate indicates misconfigured or adversarial producers.",
@@ -435,6 +444,17 @@ func RecordInboxDuplicate(consumer string) {
 	metricsMu.RUnlock()
 	if c != nil {
 		c.WithLabelValues(consumer).Inc()
+	}
+}
+
+// RecordDLQForward increments the DLQ forward counter for the source queue.
+// Safe to call before Init — no-ops when metrics are not initialised.
+func RecordDLQForward(queue, eventType, status string) {
+	metricsMu.RLock()
+	c := DLQForwardedTotal
+	metricsMu.RUnlock()
+	if c != nil {
+		c.WithLabelValues(queue, SanitizeEventType(eventType), status).Inc()
 	}
 }
 

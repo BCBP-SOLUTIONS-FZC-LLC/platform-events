@@ -115,3 +115,40 @@ func TestMockPublisher_PublishBatch_Error(t *testing.T) {
 	err := m.PublishBatch(context.Background(), envs)
 	require.Error(t, err)
 }
+
+func TestMockDLQPublisher_RecordsAndIsolatesInputs(t *testing.T) {
+	m := &mock.DLQPublisher{}
+	body := []byte(`{"id":"1"}`)
+	attrs := map[string]string{"k": "v"}
+
+	require.NoError(t, m.SendToDLQ(context.Background(), "q", body, attrs, "bad payload"))
+	body[0] = 'X'
+	attrs["k"] = "changed"
+
+	sent := m.Sent()
+	require.Len(t, sent, 1)
+	assert.Equal(t, "q", sent[0].SourceQueueURL)
+	assert.JSONEq(t, `{"id":"1"}`, string(sent[0].Body), "body must be copied")
+	assert.Equal(t, "v", sent[0].Attrs["k"], "attrs must be copied")
+	assert.Equal(t, "bad payload", sent[0].Reason)
+
+	url, err := m.ResolveDLQ(context.Background(), "q")
+	require.NoError(t, err)
+	assert.Equal(t, "mock://dlq", url)
+	m.DLQURL = "custom"
+	url, _ = m.ResolveDLQ(context.Background(), "q")
+	assert.Equal(t, "custom", url)
+}
+
+func TestMockDLQPublisher_SetErrorAndReset(t *testing.T) {
+	m := &mock.DLQPublisher{}
+	m.SetError(events.ErrDLQNotConfigured)
+	require.ErrorIs(t, m.SendToDLQ(context.Background(), "q", []byte("x"), nil, "r"), events.ErrDLQNotConfigured)
+	_, err := m.ResolveDLQ(context.Background(), "q")
+	require.ErrorIs(t, err, events.ErrDLQNotConfigured)
+	assert.Empty(t, m.Sent())
+
+	m.Reset()
+	require.NoError(t, m.SendToDLQ(context.Background(), "q", []byte("x"), nil, "r"))
+	assert.Len(t, m.Sent(), 1)
+}

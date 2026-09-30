@@ -23,6 +23,14 @@
 // Handlers must be idempotent — SQS delivers messages at least once.
 // Use [Envelope.ID] (UUID v7) as the idempotency key for all side effects.
 //
+// # Dead-letter forwarding
+//
+// [NewSQSDLQPublisher] returns a [DLQPublisher] that forwards a message a
+// consumer has given up on to the DLQ configured on the source queue's
+// RedrivePolicy. Errors are [*DLQError]; use errors.Is with the ErrDLQ*
+// sentinels and [ErrRetryable] to tell configuration problems from transient
+// transport failures.
+//
 // # HMAC helpers
 //
 // [Sign], [Verify], [SignEnvelope], and [VerifyEnvelope] provide HMAC-SHA256 signing
