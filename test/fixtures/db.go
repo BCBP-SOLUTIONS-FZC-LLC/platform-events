@@ -11,6 +11,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/inbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
@@ -79,6 +80,10 @@ func NewTestDBWithConfig(ctx context.Context, t *testing.T, configure func(cfg *
 	if err := outbox.ApplySchema(ctx, runner); err != nil {
 		_ = container.Terminate(ctx)
 		t.Fatalf("fixtures.NewTestDBWithConfig: failed to apply outbox schema: %v", err)
+	}
+	if err := inbox.ApplySchema(ctx, runner); err != nil {
+		_ = container.Terminate(ctx)
+		t.Fatalf("fixtures.NewTestDBWithConfig: failed to apply inbox schema: %v", err)
 	}
 
 	cfg := pgcommon.Config{DSN: dsn}

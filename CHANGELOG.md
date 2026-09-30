@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`pkg/inbox`** — consumer-side deduplication, the counterpart of `pkg/outbox`: an embedded `processed_events` schema (`ApplySchema`, own `inbox_migrations` tracking table; `CREATE TABLE IF NOT EXISTS`, so it adopts an identically-shaped existing table), a `Store` on a `pgcommon.Pool` (`IsProcessed`, `MarkProcessed`, batched `Prune`), and `Handler(ledger, next)` which skips already-recorded envelope IDs and records an ID only after the handler succeeds. New metric `events_inbox_duplicates_total{consumer}`.
+- **`events.GlueDecodeCodec`** — decode-only `Codec` that strips the AWS Glue Schema Registry wire header (no registry client needed), for consumers of Glue-encoded events; rejects compressed payloads explicitly.
+
 ---
 
 ## [1.4.0] - 2026-08-05

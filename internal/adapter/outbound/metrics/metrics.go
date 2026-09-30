@@ -32,6 +32,9 @@ var (
 	SQSDeleteErrorsTotal     *prometheus.CounterVec
 	SQSVisibilityErrorsTotal *prometheus.CounterVec
 
+	// InboxDuplicatesTotal counts redeliveries the inbox ledger filtered.
+	InboxDuplicatesTotal *prometheus.CounterVec
+
 	// Outbox infrastructure error counters.
 	OutboxPollErrorsTotal          *prometheus.CounterVec
 	OutboxUnmarshalErrorsTotal     *prometheus.CounterVec
@@ -262,6 +265,12 @@ func initMetricsWithRegisterer(serviceName, buildVersion string, reg prometheus.
 		ConstLabels: prometheus.Labels{"service": serviceName},
 	}, []string{})
 
+	InboxDuplicatesTotal = factory.NewCounterVec(prometheus.CounterOpts{
+		Name:        "events_inbox_duplicates_total",
+		Help:        "Total redelivered messages acknowledged without handling because the inbox ledger (processed_events) already recorded their envelope ID.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+	}, []string{"consumer"})
+
 	OversizedEventTypeLabelTotal = factory.NewCounterVec(prometheus.CounterOpts{
 		Name:        "events_oversized_event_type_label_total",
 		Help:        "Total event_type values that exceeded the label length cap and were replaced with __oversized__. A non-zero rate indicates misconfigured or adversarial producers.",
@@ -416,6 +425,17 @@ func HasOutboxLeasedMetric() bool {
 	g := OutboxLeasedTotal
 	metricsMu.RUnlock()
 	return g != nil
+}
+
+// RecordInboxDuplicate increments the inbox duplicate counter for consumer.
+// Safe to call before Init — no-ops when metrics are not initialised.
+func RecordInboxDuplicate(consumer string) {
+	metricsMu.RLock()
+	c := InboxDuplicatesTotal
+	metricsMu.RUnlock()
+	if c != nil {
+		c.WithLabelValues(consumer).Inc()
+	}
 }
 
 // RecordSQSReceiveError increments the SQS ReceiveMessage error counter.
