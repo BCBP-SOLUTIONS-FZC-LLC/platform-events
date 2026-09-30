@@ -321,7 +321,7 @@ func TestOutboxConfigEnv_String_KeyValueNonPassword(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// LoadOTel
+// LoadOTel (deprecated — kept until the next major version)
 // ---------------------------------------------------------------------------
 
 func TestLoadOTel_Defaults(t *testing.T) {
@@ -330,7 +330,7 @@ func TestLoadOTel_Defaults(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "")
 
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.Equal(t, "localhost:4317", cfg.ExporterEndpoint)
 	assert.False(t, cfg.Insecure)
 	assert.Empty(t, cfg.Warnings)
@@ -341,7 +341,7 @@ func TestLoadOTel_DevEnvSetsInsecure(t *testing.T) {
 		t.Run(env, func(t *testing.T) {
 			t.Setenv("APP_ENV", env)
 			t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "")
-			cfg := config.LoadOTel()
+			cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 			assert.True(t, cfg.Insecure)
 		})
 	}
@@ -350,7 +350,7 @@ func TestLoadOTel_DevEnvSetsInsecure(t *testing.T) {
 func TestLoadOTel_InsecureEnvTrue(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "true")
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.True(t, cfg.Insecure)
 	assert.Empty(t, cfg.Warnings)
 }
@@ -358,7 +358,7 @@ func TestLoadOTel_InsecureEnvTrue(t *testing.T) {
 func TestLoadOTel_InsecureEnvFalse(t *testing.T) {
 	t.Setenv("APP_ENV", "dev")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "false")
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.False(t, cfg.Insecure)
 	assert.Empty(t, cfg.Warnings)
 }
@@ -366,18 +366,18 @@ func TestLoadOTel_InsecureEnvFalse(t *testing.T) {
 func TestLoadOTel_InsecureEnvNumeric(t *testing.T) {
 	t.Setenv("APP_ENV", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "1")
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.True(t, cfg.Insecure)
 
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "0")
-	cfg = config.LoadOTel()
+	cfg = config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.False(t, cfg.Insecure)
 }
 
 func TestLoadOTel_InvalidInsecureEnvProducesWarning(t *testing.T) {
 	t.Setenv("APP_ENV", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "maybe")
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	require.NotEmpty(t, cfg.Warnings)
 	assert.Contains(t, cfg.Warnings[0], "OTEL_EXPORTER_OTLP_INSECURE")
 }
@@ -388,7 +388,7 @@ func TestLoadOTel_CustomEndpoint(t *testing.T) {
 	t.Setenv("OTEL_SERVICE_NAME", "my-service")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4317")
 
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.Equal(t, "my-service", cfg.ServiceName)
 	assert.Equal(t, "collector:4317", cfg.ExporterEndpoint)
 }

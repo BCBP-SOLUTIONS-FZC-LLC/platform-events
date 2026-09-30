@@ -87,7 +87,6 @@ internal/
       sqs/         ← SQS Consumer implementation (long-poll loop)
       outboxstore/ ← Postgres outbox store (pgx via platform-pgcommon Pool + RunInTx)
       metrics/     ← Prometheus counters + OTel spans
-      logger/      ← Zap logger adapter (same as platform-gincommon's adapter)
   config/          ← Environment variable loading
 test/
   unit/            ← Isolated unit tests per package
@@ -149,9 +148,10 @@ External dependencies (private modules):
 
 **Typical wiring with platform-pgcommon:**
 ```go
-// 0. Logger — call Sync() on shutdown to flush buffered entries.
-logger, _ := logger.NewLogger(os.Getenv("APP_ENV"))
-defer func() { _ = logger.Sync() }()
+// 0. Logger and tracing are owned by the service (platform-gincommon), never
+//    by this library: gincommon.InitTracingFromEnv() reads OTEL_*, and its
+//    ZapLogger satisfies port.Logger — pass it to every Config.Logger below.
+logger := newServiceLogger() // e.g. platform-gincommon's ZapLogger; call Sync() on shutdown
 
 // 1. Apply outbox schema via pgcommon migrate runner
 migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv(), Logger: logger}
@@ -326,11 +326,11 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 | `OUTBOX_POLL_INTERVAL` | `5s` | Parsed as `time.Duration` |
 | `OUTBOX_BATCH_SIZE` | `50` | Records per poll cycle |
 | `OUTBOX_MAX_ATTEMPTS` | `5` | Before moving to dead-letter |
-| `OTEL_SERVICE_NAME` | — | OTel resource attribute |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `localhost:4317` | |
-| `OTEL_EXPORTER_OTLP_INSECURE` | `false` unless `APP_ENV=dev` | |
+| `APP_ENV` → `ENVIRONMENT` | `dev` | Metrics `environment` label when `MetricsIdentity.Environment` is empty (same precedence as platform-pgcommon) |
+| `APP_NAME` | — | Metrics `service` via `events.MetricsIdentityFromEnv` |
+| `OTEL_*` | — | **Not read by this library.** Read by platform-gincommon's `InitTracingFromEnv` in the consuming service; platform-events only uses the global tracer provider/propagator it installs. `config.LoadOTel` is deprecated (its parsing diverges from gincommon's). |
 
-`APP_ENV=dev/development/local` sets `OTEL_EXPORTER_OTLP_INSECURE=true` automatically. An unset `APP_ENV` is treated as production (TLS on, 10% trace sampling).
+Logging has no env configuration here either: every component logs through the `port.Logger` the service injects (e.g. gincommon's `ZapLogger`), nil-safe.
 
 ## Key Environment Variables
 

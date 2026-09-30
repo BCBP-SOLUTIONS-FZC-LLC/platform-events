@@ -46,7 +46,6 @@ func main() {
 	snsCfg := config.LoadSNS()
 	sqsCfg := config.LoadSQS()
 	outboxCfg := config.LoadOutbox()
-	otelCfg := config.LoadOTel()
 
 	config.LogWarnings(sqsCfg.Warnings)
 	config.LogWarnings(outboxCfg.Warnings)
@@ -85,10 +84,11 @@ func main() {
 		fmt.Fprintln(os.Stdout, "  ClaimLeaseDuration: 10m (store default when OUTBOX_CLAIM_LEASE_DURATION unset)")
 	}
 
-	fmt.Fprintln(os.Stdout, "\n=== OTel Config ===")
-	fmt.Fprintf(os.Stdout, "  ServiceName:      %s\n", otelCfg.ServiceName)
-	fmt.Fprintf(os.Stdout, "  ExporterEndpoint: %s\n", otelCfg.ExporterEndpoint)
-	fmt.Fprintf(os.Stdout, "  Insecure:         %v\n", otelCfg.Insecure)
+	// Tracing and logging are configured by the consuming service, never by
+	// this library: OTEL_* is read by platform-gincommon's InitTracingFromEnv,
+	// and the logger is the port.Logger the service injects.
+	fmt.Fprintln(os.Stdout, "\n=== OTel / logging ===")
+	fmt.Fprintln(os.Stdout, "  Owned by the consuming service: call gincommon.InitTracingFromEnv() (reads OTEL_*) and inject its ZapLogger as Logger.")
 
 	if len(problems) > 0 {
 		fmt.Fprintln(os.Stderr, "\n=== Configuration problems ===")

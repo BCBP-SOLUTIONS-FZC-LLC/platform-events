@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Tracing and logging configuration belong to the consuming service.** platform-events reads no `OTEL_*` or log variables, like platform-pgcommon. It uses the global tracer provider installed by platform-gincommon's `InitTracingFromEnv`, and logs through the injected `port.Logger`.
+  - `config.LoadOTel` / `config.OTelConfigEnv` are **deprecated**. Nothing in the library used them, and their parsing had diverged from gincommon's: no `APP_NAME` fallback for `OTEL_SERVICE_NAME`, `yes`/`no` rejected, `APP_ENV` case-folded, sampler and baggage variables ignored. They will be removed in the next major version.
+  - The reference CLI no longer prints an OTel config.
 - **Metrics: legacy metrics are Deprecated.** `events_*`, `outbox_*`, `sqs_*` and `platform_events_build_info` are unchanged and still emitted, but are marked Deprecated in their help text and the registry, each with a Tier 1 successor. Sunset is not before 2027-04-01. `events.Init` / `events.InitWithRegisterer` are deprecated (legacy metrics only) in favour of `events.InitMetrics`.
 - The reference CLI initialises metrics with `InitMetrics` (`domain="platform"`).
 - CI no longer skips the pipeline for changes under `docs/observability/`: those files are checked by `make metrics-lint`.
@@ -45,6 +48,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SendToDLQ` trims excess attributes *before* validating, then validates everything SQS would reject before any AWS call — characters outside the SQS-allowed set in the body or attribute values, attribute names (`AWS.`/`Amazon.` prefixes, disallowed characters, periods, > 256 chars), and body + attributes over 1 MiB — returning `ErrDLQInvalidMessage`. `SendMessage` rejections of the message itself (`InvalidParameterValue`, `InvalidMessageContents`, `InvalidAttributeName`, `InvalidAttributeValue`) are now `ErrDLQInvalidMessage` instead of `ErrDLQSendFailed`. `DLQReason` characters SQS rejects are replaced with U+FFFD.
 - `mock.DLQPublisher.SendToDLQ` applies the same input validation as the SQS publisher, so a call that fails in production fails in tests.
 - `events.DLQPublisher` is now a type alias of the internal port interface (same method set — source compatible).
+
+### Removed
+
+- The unexported `internal/adapter/outbound/logger` zap adapter. No consuming module could import it, but the documented wiring (`logger.NewLogger(os.Getenv("APP_ENV"))`) told services to. Inject platform-gincommon's `ZapLogger` (or any `port.Logger`) instead. `go.uber.org/zap` is no longer a dependency of the library packages; it remains in `go.mod` only indirectly, through the golangci-lint tool. platform-pgcommon removed its equivalent adapter in v1.4.0.
 
 ### Fixed
 

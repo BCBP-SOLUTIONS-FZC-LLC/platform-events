@@ -112,7 +112,7 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 
 ### `pkg/config` — environment wiring
 
-`LoadSNS` / `LoadSQS` / `LoadOutbox` / `LoadOTel` · `SNSConfigFromEnv` · `SQSConfigFromEnv` · `SQSConsumerOptions` · `RunnerConfigFromEnv` · `LogWarnings` / `LogWarningsTo` — see [Environment variables](#environment-variables).
+`LoadSNS` / `LoadSQS` / `LoadOutbox` · `SNSConfigFromEnv` · `SQSConfigFromEnv` · `SQSConsumerOptions` · `RunnerConfigFromEnv` · `LogWarnings` / `LogWarningsTo` — see [Environment variables](#environment-variables).
 
 ---
 
@@ -182,8 +182,7 @@ platform-events/
 │       ├── sns/                       # SNS publisher, batch split, retryable-error classification
 │       ├── sqs/                       # SQS consumer loop + DLQ publisher (RedrivePolicy resolution + cache)
 │       ├── outboxstore/               # Postgres outbox store (platform-pgcommon only)
-│       ├── metrics/                   # Tier 1 platform_* + legacy metrics; registry.go = Platform Observability Registry entry
-│       └── logger/                    # Zap → port.Logger adapter
+│       └── metrics/                   # Tier 1 platform_* + legacy metrics; registry.go = Platform Observability Registry entry
 ├── docs/
 │   ├── architecture/mermaid/          # 13 × .mmd diagram sources (embedded in ARCHITECTURE.md)
 │   ├── guides/                        # Detailed how-to guides (linked throughout this README)
@@ -455,7 +454,7 @@ CI (`ci.yml` → `make cover-func`) fails below **95%** total, measured over `./
 
 ## Environment variables
 
-Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox` / `LoadOTel`). The library reads nothing implicitly — services opt in by calling the loaders.
+Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings via platform-pgcommon's `ConfigFromEnv`). The library reads nothing implicitly — services opt in by calling the loaders. The two exceptions follow platform-pgcommon exactly: `InitMetrics` fills an empty metrics `environment` from `APP_ENV` → `ENVIRONMENT` → `dev`, and `MetricsIdentityFromEnv` takes `service` from `APP_NAME`. **Tracing and logging are configured by the service, not this library:** the `OTEL_*` variables are read by platform-gincommon's `InitTracingFromEnv` (platform-events only uses the global tracer provider it installs), and every component logs through the `port.Logger` the service injects (e.g. gincommon's `ZapLogger`). `config.LoadOTel` is deprecated.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -473,7 +472,8 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox` / `LoadOTel`). The li
 | `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_DRAIN_TIMEOUT` | `1` / `10s` / `30s` | `1` uses SNS `PublishBatch`; per-record timeout; `Stop()` wait bound |
 | `DATABASE_URL` | — | Postgres DSN for the outbox runner. Read by platform-pgcommon's `ConfigFromEnv` (exposed as `config.LoadOutbox().DB`); alternatively `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE`. Pool tuning (`PG_MAX_CONNS`, `PG_STATEMENT_TIMEOUT`, `PG_LOCK_TIMEOUT`, `PG_BOUNCER_MODE`, …) per platform-pgcommon |
 | `MIGRATION_DATABASE_URL` | `DATABASE_URL` | DDL-role DSN for `ApplySchema`, connecting directly (not via PgBouncer) — `config.LoadOutbox().MigrationDatabaseURL` |
-| `OTEL_SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_INSECURE` | — / `localhost:4317` / `false` | Insecure is forced `true` when `APP_ENV` is `dev` / `development` / `local` |
+| `APP_ENV` → `ENVIRONMENT` / `APP_NAME` | `dev` / — | Metrics `environment` / `service` labels when not set on `MetricsIdentity` (same as platform-pgcommon) |
+| `OTEL_*` | — | Not read by platform-events — platform-gincommon's `InitTracingFromEnv` in the service reads them (`config.LoadOTel` is deprecated) |
 | `APP_ENV` | — | Environment gate for OTel insecure mode |
 | `SMOKE_SNS_TOPIC_ARN` / `SMOKE_SQS_QUEUE_URL` | — | `make test-smoke` only |
 

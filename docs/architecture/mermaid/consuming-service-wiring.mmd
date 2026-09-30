@@ -21,13 +21,13 @@ graph LR
 
     subgraph gincommon_lib["platform-gincommon"]
         otel_init["gincommon.InitTracingFromEnv\ninitialises OTel provider"]
-        zap_logger["logger.NewLogger\n→ port.Logger (gincommon-compatible)"]
+        zap_logger["service logger\ne.g. platform-gincommon ZapLogger\n→ port.Logger"]
         req_ctx["gincommon.RequestContext\nrc.TenantID · rc.TraceID"]
     end
 
     main -->|"APP_NAME + BUILD_VERSION"| metrics_init
     main --> otel_init
-    main -->|"*zap.Logger"| zap_logger
+    main -->|"constructs"| zap_logger
     zap_logger -->|"port.Logger"| sns_new
     zap_logger -->|"port.Logger"| sqs_new
     zap_logger -->|"port.Logger"| outbox_new

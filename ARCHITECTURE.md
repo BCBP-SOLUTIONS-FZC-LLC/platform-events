@@ -35,7 +35,6 @@ graph TD
         sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nConsumerOption · WithCodec · decodeCodecPayload\nvisibility extension · drain\nper-call receive timeout\nDLQPublisher · ResolveDLQ · SendToDLQ\nRedrivePolicy lookup + cache · classifySQSError"]
         outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed · PrunePublished\nLeasedCount · ListDeadLetters · ReprocessDeadLetters\nReprocessDeadLettersWith · DiscardDeadLetters"]
         metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nCodecEncodeTotal · CodecEncodeDuration · CodecDecodeTotal · CodecDecodeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal · OutboxDeadLettersDiscardedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nDLQForwardedTotal · InboxDuplicatesTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal\nOversizedEventTypeLabelTotal"]
-        logger_adp["logger\nZapLogger → port.Logger\n(map-based fields; gincommon-compatible)"]
     end
 
     subgraph core["Core  —  internal/core/"]
@@ -45,7 +44,7 @@ graph TD
     end
 
     subgraph infra["Infrastructure"]
-        config_pkg["pkg/config\nLoadSNS · LoadSQS · LoadOutbox · LoadOTel\nRunnerConfigFromEnv · SQSConsumerOptions"]
+        config_pkg["pkg/config\nLoadSNS · LoadSQS · LoadOutbox\nRunnerConfigFromEnv · SQSConsumerOptions"]
         migs_pkg["pkg/outbox/migrations\nembed.FS  (*.sql)"]
     end
 
@@ -76,7 +75,6 @@ graph TD
     sqs_adp       --> metrics_adp
     outboxstore_adp --> port_pkg
     outboxstore_adp --> domain_pkg
-    logger_adp    --> port_pkg
     service_pkg   --> port_pkg
     service_pkg   --> domain_pkg
     cmd           --> config_pkg
@@ -111,7 +109,6 @@ graph LR
     sqs(["adapter/outbound/sqs"])
     outboxstore(["adapter/outbound/outboxstore"])
     metrics(["adapter/outbound/metrics"])
-    logger(["adapter/outbound/logger"])
     service(["core/service"])
     port(["core/port"])
     domain(["core/domain  (internal)"])
@@ -139,7 +136,6 @@ graph LR
     sqs          --> metrics
     outboxstore  --> port
     outboxstore  --> domain
-    logger       --> port
     service      --> port
     service      --> domain
 ```
@@ -1106,13 +1102,13 @@ graph LR
 
     subgraph gincommon_lib["platform-gincommon"]
         otel_init["gincommon.InitTracingFromEnv\ninitialises OTel provider"]
-        zap_logger["logger.NewLogger\n→ port.Logger (gincommon-compatible)"]
+        zap_logger["service logger\ne.g. platform-gincommon ZapLogger\n→ port.Logger"]
         req_ctx["gincommon.RequestContext\nrc.TenantID · rc.TraceID"]
     end
 
     main -->|"APP_NAME + BUILD_VERSION"| metrics_init
     main --> otel_init
-    main -->|"*zap.Logger"| zap_logger
+    main -->|"constructs"| zap_logger
     zap_logger -->|"port.Logger"| sns_new
     zap_logger -->|"port.Logger"| sqs_new
     zap_logger -->|"port.Logger"| outbox_new

@@ -133,6 +133,12 @@ func maskKeyValueDSN(dsn string) string {
 }
 
 // OTelConfigEnv holds environment-derived OpenTelemetry configuration.
+//
+// Deprecated: platform-events never initialises OpenTelemetry — it uses the
+// global tracer provider and propagator the consuming service installs with
+// platform-gincommon's InitTracingFromEnv, which owns the OTEL_* variables.
+// This struct duplicates (and already diverges from) that parsing; it will be
+// removed in the next major version.
 type OTelConfigEnv struct {
 	ServiceName      string
 	ExporterEndpoint string
@@ -269,6 +275,12 @@ func LoadOutbox() OutboxConfigEnv {
 }
 
 // LoadOTel loads OpenTelemetry configuration from environment variables.
+//
+// Deprecated: nothing in platform-events uses it, and its parsing differs from
+// the tracer the service actually runs (OTEL_SERVICE_NAME has no APP_NAME
+// fallback, "yes"/"no" are rejected, APP_ENV is case-folded, sampler and
+// baggage variables are ignored). Initialise tracing with platform-gincommon's
+// InitTracingFromEnv and read its configuration there.
 func LoadOTel() OTelConfigEnv {
 	var warnings []string
 	appEnv := strings.ToLower(os.Getenv("APP_ENV"))
