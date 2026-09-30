@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`.githooks/pre-commit`** (from `iam-org-membership`) — runs `make tidy`, `make fmt-check` and `make lint` before every commit, the first checks of CI's `Validate / Quality` job. Unlike the reference, it also fails when `go mod tidy` changed `go.mod`/`go.sum`, since that fix is not part of the commit until staged and CI rejects the drift. Installed by `make setup` or `make install-hooks`; bypass once with `git commit --no-verify`.
+
 ---
 
 ## [1.5.0] - 2026-09-30

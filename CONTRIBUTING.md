@@ -13,7 +13,7 @@ This is an internal shared library for BCBP Solutions platform services. This gu
 ```bash
 git clone https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events
 cd platform-events
-make setup   # copies .env-example → .env
+make setup   # copies .env-example → .env and installs .githooks/pre-commit
 make tidy    # go mod tidy
 make lint    # verify linter passes
 make test    # run all tests (requires Docker)

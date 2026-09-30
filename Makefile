@@ -53,7 +53,16 @@ GOVULNCHECK_VERSION ?= v1.1.4
 .PHONY: setup
 setup:
 	@test -f .env || cp .env-example .env
+	@mkdir -p .git/hooks
+	@test -f .githooks/pre-commit && cp .githooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit || true
 	@echo "Environment ready (.env)"
+
+.PHONY: install-hooks
+install-hooks:
+	@mkdir -p .git/hooks
+	@cp .githooks/pre-commit .git/hooks/pre-commit
+	@chmod +x .git/hooks/pre-commit
+	@echo "Installed git hooks"
 
 # godoc: serve package documentation locally using pkgsite.
 # Opens http://localhost:8080 — browse to the module path in the UI.
@@ -65,7 +74,8 @@ godoc:
 .PHONY: help
 help:
 	@echo "Available commands:"
-	@echo "  make setup            - copy .env-example to .env if missing"
+	@echo "  make setup            - copy .env-example to .env if missing; install git hooks"
+	@echo "  make install-hooks    - install .githooks/pre-commit into .git/hooks"
 	@echo "  make tidy             - go mod tidy"
 	@echo "  make fmt              - gofmt -w the whole module"
 	@echo "  make fmt-check        - verify gofmt formatting (mirrors CI)"

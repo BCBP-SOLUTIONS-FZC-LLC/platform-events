@@ -190,6 +190,7 @@ platform-events/
 ├── scripts/merge_coverage.py          # Merges per-suite coverage profiles (max-count)
 ├── .github/workflows/ + scripts/      # CI: ci, validate-test, validate-quality, changelog-check, release
 ├── Dockerfile · .docker-digests       # Reference-CLI image (digest-pinned) for CI build / Trivy / smoke
+├── .githooks/pre-commit               # tidy (+ drift check) + fmt-check + lint; installed via `make setup`
 └── test/                              # unit/ (no Docker), integration/ + e2e/ (testcontainers), smoke/ (live AWS), fixtures/
 ```
 
@@ -308,7 +309,7 @@ Production defaults, backpressure tuning and the service adoption checklist: [Op
 ```bash
 git clone https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events
 cd platform-events
-make setup       # copies .env-example → .env (run once)
+make setup       # copies .env-example → .env and installs .githooks/pre-commit (run once)
 make tidy        # go mod tidy
 make test-unit   # no Docker needed
 make docker-up   # optional: LocalStack (SNS + SQS) on :4566 + Postgres on :5432
@@ -318,7 +319,8 @@ make docker-up   # optional: LocalStack (SNS + SQS) on :4566 + Postgres on :5432
 
 | Command | Description |
 |---|---|
-| `make setup` | Copy `.env-example` → `.env` |
+| `make setup` | Copy `.env-example` → `.env` and install `.githooks/pre-commit` |
+| `make install-hooks` | (Re)install `.githooks/pre-commit` into `.git/hooks` — tidy (fails on `go.mod`/`go.sum` drift) + `fmt-check` + `lint` before every commit |
 | `make tidy` / `make fmt` / `make fmt-check` | Go basics; `fmt-check` mirrors CI and does not modify files |
 | `make vet` | `go vet` — default build plus every test build tag (`integration`, `e2e`) |
 | `make lint` | `golangci-lint` via `go tool` — default build plus every test build tag |

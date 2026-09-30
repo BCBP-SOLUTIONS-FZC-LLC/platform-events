@@ -32,7 +32,8 @@ See [`ARCHITECTURE.md`](../ARCHITECTURE.md) for detailed flow diagrams and invar
 ## Common Commands
 
 ```bash
-make setup           # Copy .env-example → .env (run once before anything else)
+make setup           # Copy .env-example → .env + install .githooks/pre-commit (run once before anything else)
+make install-hooks   # Re-install .githooks/pre-commit (tidy + drift check, fmt-check, lint)
 make tidy            # go mod tidy
 make fmt             # go fmt ./...
 make vet             # go vet ./...
