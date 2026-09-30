@@ -88,6 +88,18 @@ func WithDLQForwarding(p DLQPublisher) ConsumerOption {
 	return internalsqs.WithDLQPublisher(p)
 }
 
+// WithQueueDepthMetrics samples the queue's backlog, and that of the DLQ its
+// RedrivePolicy points at, into platform_queue_depth / platform_dlq_depth
+// every interval (minimum 10s; 0 disables) while the consumer runs. Services
+// cannot read queue attributes themselves (no SQS SDK), so this is how queue
+// depth reaches Prometheus. Each replica polls — one or two
+// sqs:GetQueueAttributes calls per interval; grant that permission on the
+// queue and its DLQ. Both metrics are Proposed: graph them, but don't alert,
+// build SLOs or scale on them until they are ratified.
+func WithQueueDepthMetrics(interval time.Duration) ConsumerOption {
+	return internalsqs.WithQueueDepthMetrics(interval)
+}
+
 // WithDrainTimeout sets how long Stop() waits for in-flight handlers to finish.
 func WithDrainTimeout(d time.Duration) ConsumerOption {
 	return internalsqs.WithDrainTimeout(d)

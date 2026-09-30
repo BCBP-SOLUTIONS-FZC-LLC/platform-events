@@ -91,6 +91,9 @@ func SQSConsumerOptions(env SQSConfigEnv) []events.ConsumerOption {
 	if env.MaxReceiveCount > 0 {
 		opts = append(opts, events.WithMaxReceiveCount(env.MaxReceiveCount))
 	}
+	if env.QueueDepthInterval > 0 {
+		opts = append(opts, events.WithQueueDepthMetrics(env.QueueDepthInterval))
+	}
 	return opts
 }
 

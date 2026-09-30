@@ -80,6 +80,8 @@ func exerciseAll() {
 	}
 	internalmetrics.IncDuplicate(testQueueURL, et)
 	internalmetrics.IncDuplicate("", et) // inbox outside the SQS consumer → queue="unknown"
+	internalmetrics.SetQueueDepth(testQueueURL, 42)
+	internalmetrics.SetDLQDepth(testQueueURL, 3)
 	for dep, ops := range internalmetrics.DependencyOperations {
 		for _, op := range ops {
 			internalmetrics.ObserveDependency(dep, op, nil, time.Millisecond)

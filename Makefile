@@ -311,7 +311,7 @@ ci: tidy fmt-check vet lint metrics-lint test-ci build
 # See docs/observability/README.md.
 .PHONY: metrics-lint
 metrics-lint:
-	$(GO) test -count=1 -run 'TestStandard_|TestRules_|TestInventory_|TestWrapCollision' ./test/unit/metrics/
+	$(GO) test -count=1 -run 'TestStandard_|TestRules_|TestMonitoring_|TestInventory_|TestWrapCollision' ./test/unit/metrics/
 
 # metrics-doc: regenerate docs/observability/metrics-registry.md from the registry.
 .PHONY: metrics-doc

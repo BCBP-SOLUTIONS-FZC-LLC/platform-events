@@ -151,6 +151,8 @@ type sqsConsumer struct {
 	dlq               port.DLQPublisher
 	drainTimeout      time.Duration
 	codec             port.Codec
+	// queueDepthInterval > 0 enables the platform_queue_depth / platform_dlq_depth sampler.
+	queueDepthInterval time.Duration
 
 	maxReceiveCount int
 	cancelFn        context.CancelFunc
@@ -286,6 +288,14 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 	thisDoneCh := make(chan struct{})
 	c.doneCh = thisDoneCh
 	c.mu.Unlock()
+
+	// Queue-depth sampler (opt-in): stops with loopCtx; Start does not return
+	// until it has exited.
+	waitDepthPoller := c.startQueueDepthPoller(loopCtx)
+	defer func() {
+		cancel()
+		waitDepthPoller()
+	}()
 
 	// Reset running and signal Stop() when this Start() goroutine exits.
 	defer func() {

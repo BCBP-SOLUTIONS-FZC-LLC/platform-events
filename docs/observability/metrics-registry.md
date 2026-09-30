@@ -17,6 +17,8 @@ platform-events' entry in the Platform Observability Registry (Enterprise Platfo
 | `platform_duplicate_messages_total` | counter | platform | proposed | `domain`, `service`, `environment`, `queue`, `event_type` | `events_inbox_duplicates_total` |
 | `platform_dependency_request_seconds` | histogram | platform | proposed | `domain`, `service`, `environment`, `dependency`, `operation`, `outcome` | `events_publish_duration_seconds`, `events_codec_encode_total`, `events_codec_encode_duration_seconds`, `events_codec_decode_total`, `events_codec_decode_duration_seconds`, `sqs_receive_errors_total`, `sqs_delete_errors_total`, `sqs_visibility_extension_errors_total` |
 | `platform_event_propagation_seconds` | histogram | platform | proposed | `domain`, `service`, `environment`, `queue`, `event_type` | — |
+| `platform_queue_depth` | gauge | platform | proposed | `domain`, `service`, `environment`, `queue` | — |
+| `platform_dlq_depth` | gauge | platform | proposed | `domain`, `service`, `environment`, `queue` | — |
 | `platform_messages_published_total` | counter | platform | proposed | `domain`, `service`, `environment`, `topic`, `event_type`, `outcome` | `events_published_total` |
 | `platform_message_processing_duration_seconds` | histogram | platform | proposed | `domain`, `service`, `environment`, `queue`, `event_type` | `events_consume_duration_seconds` |
 | `platform_outbox_pending_events` | gauge | platform | proposed | `domain`, `service`, `environment` | `outbox_pending_total` |
@@ -186,6 +188,30 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Aggregation:** p95 propagation per consumer: histogram_quantile(0.95, sum by (le, domain, service, queue) (rate(platform_event_propagation_seconds_bucket[5m]))). Includes producer clock skew.
 - **Supersedes:** —
 - **Governance notes:** Registry-proposed example in the standard. New signal (no legacy predecessor).
+
+### `platform_queue_depth`
+
+- **Type:** gauge · **Tier:** platform · **Status:** proposed
+- **Semantic definition:** Messages waiting on a consumer's queue to be received (SQS ApproximateNumberOfMessages — visible, not in flight or delayed), sampled by the consumer every WithQueueDepthMetrics interval. Approximate by SQS design.
+- **Required labels:** `domain`, `service`, `environment`
+- **Approved labels:** `queue`
+  - `queue`: SQS queue name — the last path segment of the queue URL (e.g. `orders`, `orders.fifo`), never the full URL (it carries the account ID). Bounded by the queues a service consumes (typically 1–5). `unknown` when the queue cannot be determined (e.g. the inbox wrapper used outside the SQS consumer).
+- **Cardinality:** queue (≤5 per service).
+- **Aggregation:** Every replica samples the same queue, so aggregate with max, not sum: max by (domain, service, queue) (platform_queue_depth). The natural HPA/KEDA scaling signal once ratified.
+- **Supersedes:** —
+- **Governance notes:** Registry-proposed example in the standard. Emitted by platform-events because consuming services may not use the SQS SDK themselves (depguard); opt-in (WithQueueDepthMetrics) since each replica polls sqs:GetQueueAttributes.
+
+### `platform_dlq_depth`
+
+- **Type:** gauge · **Tier:** platform · **Status:** proposed
+- **Semantic definition:** Messages sitting in the dead-letter queue attached to a consumer's queue by its RedrivePolicy (SQS ApproximateNumberOfMessages of the DLQ), sampled with platform_queue_depth. queue is the SOURCE queue's name, so the gauge joins with the consumer's other queue metrics.
+- **Required labels:** `domain`, `service`, `environment`
+- **Approved labels:** `queue`
+  - `queue`: SQS queue name — the last path segment of the queue URL (e.g. `orders`, `orders.fifo`), never the full URL (it carries the account ID). Bounded by the queues a service consumes (typically 1–5). `unknown` when the queue cannot be determined (e.g. the inbox wrapper used outside the SQS consumer).
+- **Cardinality:** queue (≤5 per service).
+- **Aggregation:** max by (domain, service, queue) (platform_dlq_depth) > 0 — messages awaiting investigation or replay. Complements platform_dlq_messages_total (inflow) with the backlog.
+- **Supersedes:** —
+- **Governance notes:** Registry-proposed example in the standard. Not emitted when the queue has no RedrivePolicy.
 
 ### `platform_messages_published_total`
 

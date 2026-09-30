@@ -307,6 +307,8 @@ default:
 | `ErrDLQUnresolved` | `GetQueueAttributes` / `GetQueueUrl` failed, or `SendMessage` found the DLQ deleted (cache entry evicted; the next call re-resolves) | Also matches `ErrRetryable` if transient |
 | `ErrDLQSendFailed` | `SendMessage` failed | Also matches `ErrRetryable` if transient |
 
+**Queue depth (optional):** `events.WithQueueDepthMetrics(time.Minute)` samples the queue's backlog and its DLQ's into `platform_queue_depth` / `platform_dlq_depth`. It needs `sqs:GetQueueAttributes` on both queues. See [docs/observability](../observability/README.md#tier-classification).
+
 **IAM:** `sqs:GetQueueAttributes` on the source queue; `sqs:GetQueueUrl` and `sqs:SendMessage` on the DLQ; `kms:GenerateDataKey` + `kms:Decrypt` if the DLQ uses a customer-managed KMS key.
 
 **Not in scope:** the library does not create DLQs, read or replay them, or redrive messages — use the SQS console / `StartMessageMoveTask` for redrive. Messages forwarded here are in the **SQS DLQ**, not `outbox_dead_letters`.

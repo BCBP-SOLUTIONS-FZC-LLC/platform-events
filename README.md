@@ -187,7 +187,7 @@ platform-events/
 │   ├── architecture/mermaid/          # 13 × .mmd diagram sources (embedded in ARCHITECTURE.md)
 │   ├── guides/                        # Detailed how-to guides (linked throughout this README)
 │   └── observability/                 # Observability standard: model, generated metrics registry, runbook
-├── monitoring/prometheus/             # Reference recording rules, SLO + alerts, promtool tests
+├── monitoring/                        # Reference bundle: prometheus/ (rules, SLO, alerts, promtool tests), grafana/ (dashboard), kubernetes/ (KEDA)
 ├── scripts/merge_coverage.py          # Merges per-suite coverage profiles (max-count)
 ├── .github/workflows/ + scripts/      # CI: ci, validate-test, validate-quality, changelog-check, release
 ├── Dockerfile · .docker-digests       # Reference-CLI image (digest-pinned) for CI build / Trivy / smoke
@@ -325,7 +325,7 @@ make docker-up   # optional: LocalStack (SNS + SQS) on :4566 + Postgres on :5432
 | `make tidy` / `make fmt` / `make fmt-check` | Go basics; `fmt-check` mirrors CI and does not modify files |
 | `make vet` | `go vet` — default build plus every test build tag (`integration`, `e2e`) |
 | `make lint` | `golangci-lint` via `go tool` — default build plus every test build tag |
-| `make metrics-lint` | Observability Standard gate: registered-collector conformance (tiers, naming, required labels, vocabulary, registry parity), rule-file governance, inventory drift |
+| `make metrics-lint` | Observability Standard gate: registered-collector conformance (tiers, naming, required labels, vocabulary, registry parity), governance of rule files, dashboards and autoscaling manifests, inventory drift |
 | `make metrics-doc` | Regenerate `docs/observability/metrics-registry.md` from the metrics registry |
 | `make rules-check` | `promtool check rules` + alert unit tests for `monitoring/prometheus/` (Docker) |
 | `make mod-verify` | `go mod verify` |
@@ -507,11 +507,11 @@ warnings, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Servic
 ```
 
 - **Consume (Canonical):** `platform_messages_received_total{queue}`, `platform_messages_processed_total{queue,event_type}`, `platform_messages_failed_total{queue,event_type,reason}`, `platform_retry_total{operation,event_type}`, `platform_dlq_messages_total{operation,event_type,reason}`. Each delivery is received once and ends processed, failed or dead-lettered, and a dead-lettered message is counted once whoever forwarded it.
-- **Proposed** (shadow-emitted until ratified): `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}` (SNS, SQS and codec calls), `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
+- **Proposed** (shadow-emitted until ratified): `platform_queue_depth` / `platform_dlq_depth` (opt-in: `WithQueueDepthMetrics`, the only way services can get SQS depth into Prometheus), `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}` (SNS, SQS and codec calls), `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
 - **Legacy** (Deprecated, emitted in parallel until `WithoutLegacyMetrics()`): `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info`.
 - **Required labels** `domain`, `service`, `environment` on every Tier 1 metric; `queue` / `topic` are names, never URLs or ARNs; `tenant_id`, `event_id` and other unbounded labels are prohibited.
 
-Registry, label vocabulary and ratification packets: [docs/observability/metrics-registry.md](docs/observability/metrics-registry.md) (generated). Model, wiring and migration: [docs/observability/README.md](docs/observability/README.md). Reference rules, SLO and alerts: [`monitoring/prometheus/`](monitoring/prometheus/), with [runbook](docs/observability/runbook.md). CI enforces all of it (`make metrics-lint`, `make rules-check`).
+Registry, label vocabulary and ratification packets: [docs/observability/metrics-registry.md](docs/observability/metrics-registry.md) (generated). Model, wiring and migration: [docs/observability/README.md](docs/observability/README.md). Reference rules, SLO and alerts: [`monitoring/prometheus/`](monitoring/prometheus/), with [runbook](docs/observability/runbook.md). Reference dashboard: [`monitoring/grafana/`](monitoring/grafana/). Reference autoscaling: [`monitoring/kubernetes/`](monitoring/kubernetes/). CI enforces all of it (`make metrics-lint`, `make rules-check`).
 
 ### Tracing and logs
 

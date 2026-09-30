@@ -11,9 +11,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
@@ -171,4 +174,57 @@ func TestConsumer_WithDLQForwarding_MalformedMessage(t *testing.T) {
 		})
 		return err == nil && attrs.Attributes["ApproximateNumberOfMessages"] == "0" && attrs.Attributes["ApproximateNumberOfMessagesNotVisible"] == "0"
 	}, 10*time.Second, 200*time.Millisecond)
+}
+
+// TestConsumer_QueueDepthMetrics verifies the depth sampler against a real SQS
+// API: the source queue's backlog and that of its RedrivePolicy DLQ (whose URL
+// is derived from the policy ARN) land in platform_queue_depth /
+// platform_dlq_depth.
+func TestConsumer_QueueDepthMetrics(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	ls := fixtures.StartLocalStack(ctx, t)
+	dlqURL := ls.CreateQueue(ctx, t, "depth-it-dlq")
+	sourceURL := ls.CreateQueue(ctx, t, "depth-it-source")
+	dlqAttrs, err := ls.SQSClient.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
+		QueueUrl:       aws.String(dlqURL),
+		AttributeNames: []sqstypes.QueueAttributeName{sqstypes.QueueAttributeNameQueueArn},
+	})
+	require.NoError(t, err)
+	_, err = ls.SQSClient.SetQueueAttributes(ctx, &sqs.SetQueueAttributesInput{
+		QueueUrl:   aws.String(sourceURL),
+		Attributes: map[string]string{"RedrivePolicy": `{"deadLetterTargetArn":"` + dlqAttrs.Attributes["QueueArn"] + `","maxReceiveCount":"5"}`},
+	})
+	require.NoError(t, err)
+	for range 2 {
+		_, err = ls.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: aws.String(dlqURL), MessageBody: aws.String("dead")})
+		require.NoError(t, err)
+	}
+
+	prev := metrics.CurrentPlatform()
+	t.Cleanup(func() { metrics.ReplacePlatform(prev) })
+	reg := prometheus.NewRegistry()
+	_, err = events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "it", Environment: "test"}, reg, events.WithoutLegacyMetrics())
+	require.NoError(t, err)
+
+	consumer, err := events.NewSQSConsumer(events.SQSConfig{QueueURL: sourceURL, Region: "us-east-1", EndpointURL: ls.EndpointURL, WaitSeconds: 1},
+		func(context.Context, events.Envelope[json.RawMessage]) error { return nil },
+		events.WithQueueDepthMetrics(10*time.Second), events.WithDrainTimeout(2*time.Second))
+	require.NoError(t, err)
+	consumerCtx, stopConsumer := context.WithCancel(ctx)
+	go func() { _ = consumer.Start(consumerCtx) }()
+	defer func() { stopConsumer(); _ = consumer.Stop() }()
+
+	p := metrics.CurrentPlatform()
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(p.DLQDepth.WithLabelValues("depth-it-source")) == 2
+	}, 30*time.Second, 200*time.Millisecond, "DLQ depth sampled under the source queue's name")
+	assert.Zero(t, testutil.ToFloat64(p.QueueDepth.WithLabelValues("depth-it-source")))
 }

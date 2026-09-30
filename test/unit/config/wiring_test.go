@@ -44,6 +44,22 @@ func TestSQSConsumerOptions_OmitsMaxReceiveWhenZero(t *testing.T) {
 	require.Len(t, opts, 2)
 }
 
+func TestSQSConsumerOptions_QueueDepthInterval(t *testing.T) {
+	env := config.SQSConfigEnv{Concurrency: 1, VisibilityTimeout: 30 * time.Second, QueueDepthInterval: time.Minute}
+	require.Len(t, config.SQSConsumerOptions(env), 3)
+}
+
+func TestLoadSQS_QueueDepthInterval(t *testing.T) {
+	t.Setenv("SQS_QUEUE_DEPTH_INTERVAL", "")
+	assert.Zero(t, config.LoadSQS().QueueDepthInterval, "off by default")
+	t.Setenv("SQS_QUEUE_DEPTH_INTERVAL", "45s")
+	assert.Equal(t, 45*time.Second, config.LoadSQS().QueueDepthInterval)
+	t.Setenv("SQS_QUEUE_DEPTH_INTERVAL", "often")
+	cfg := config.LoadSQS()
+	assert.Zero(t, cfg.QueueDepthInterval)
+	assert.NotEmpty(t, cfg.Warnings)
+}
+
 func TestSNSConfigFromEnv(t *testing.T) {
 	env := config.SNSConfigEnv{TopicARN: "arn:aws:sns:us-east-1:123:topic", Region: "eu-west-1"}
 	cfg := config.SNSConfigFromEnv(env, nil)

@@ -8,6 +8,8 @@ How platform-events implements the standard's three-tier metric taxonomy, how a 
 | [runbook.md](runbook.md) | One section per reference alert. |
 | [`monitoring/prometheus/platform-events.rules.yml`](../../monitoring/prometheus/platform-events.rules.yml) | Reference recording rules, SLIs, SLO burn-rate and operational alerts. |
 | [`monitoring/prometheus/platform-events.rules.test.yml`](../../monitoring/prometheus/platform-events.rules.test.yml) | promtool alert unit tests (`make rules-check`). |
+| [`monitoring/grafana/platform-events.json`](../../monitoring/grafana/platform-events.json) | Reference Grafana dashboard: Canonical panels, Proposed shadow panels, legacy panels where still authoritative. |
+| [`monitoring/kubernetes/keda-scaledobject.example.yaml`](../../monitoring/kubernetes/keda-scaledobject.example.yaml) | Reference autoscaling (KEDA): outbox backlog and queue backlog. |
 
 ---
 
@@ -21,11 +23,15 @@ platform-events is a **platform library**. Every service in every domain that pu
 | Status | Metrics | May be used in alerts / SLOs / HPA |
 |---|---|---|
 | **Canonical** (named by the standard) | `platform_messages_received_total`, `platform_messages_processed_total`, `platform_messages_failed_total`, `platform_retry_total`, `platform_dlq_messages_total` | Yes. `platform_retry_total` is the exception; see [Known conflicts](#known-conflicts) |
-| **Proposed** (registry-proposed examples) | `platform_duplicate_messages_total`, `platform_dependency_request_seconds`, `platform_event_propagation_seconds` | No, until ratified (rules 11/12) |
+| **Proposed** (registry-proposed examples) | `platform_duplicate_messages_total`, `platform_dependency_request_seconds`, `platform_event_propagation_seconds`, `platform_queue_depth`, `platform_dlq_depth` | No, until ratified (rules 11/12) |
 | **Proposed** (new names, ratification packets submitted) | `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_pending_events`, `platform_outbox_leased_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info` | No, until ratified |
 | **Deprecated** (pre-standard) | `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info` | Yes during the compatibility period; they are the authoritative source where the successor is still Proposed |
 
-`platform_queue_depth` and `platform_dlq_depth` are not emitted. SQS queue depth comes from CloudWatch (`ApproximateNumberOfMessagesVisible`), not from the consumer. The outbox backlog is a different quantity and has its own gauge, `platform_outbox_pending_events`.
+**Queue depth is opt-in.** `platform_queue_depth` and `platform_dlq_depth` are sampled only by consumers started with `events.WithQueueDepthMetrics(interval)` (or `SQS_QUEUE_DEPTH_INTERVAL` through `config.SQSConsumerOptions`).
+- **Why the library emits them:** services may not use the SQS SDK themselves (depguard), so without this option there is no way to get queue depth into Prometheus.
+- **Cost:** every replica calls `sqs:GetQueueAttributes` on the queue, and on its RedrivePolicy DLQ, once per interval. Grant that permission on both.
+- **Aggregation:** replicas report the same queue, so use `max`, not `sum`.
+- **Outbox backlog:** a different quantity, with its own gauge, `platform_outbox_pending_events`.
 
 ## Required labels and label governance
 
@@ -77,11 +83,11 @@ pgWarnings, err := pgmetrics.InitWithIdentity(pgmetrics.Identity(id), registry)
 | Step | Status in platform-events | Service action |
 |---|---|---|
 | 1. Emit old and new in parallel | **Done.** `InitMetrics` registers both by default | Call `InitMetrics` |
-| 2. Migrate dashboards | — | Switch panels to the Tier 1 names (Canonical now; Proposed ones as shadow panels) |
+| 2. Migrate dashboards | **Reference dashboard shipped** ([`monitoring/grafana/platform-events.json`](../../monitoring/grafana/platform-events.json)); CI requires Proposed panels to be titled "(Proposed)" and legacy ones "(legacy)" | Import it, or switch your panels to the Tier 1 names |
 | 3. Migrate alerts | Reference rules already alert on the Canonical consumer metrics | Load the reference rules or port your own |
 | 4. Migrate recording rules | Same | — |
 | 5. Migrate SLOs | Consumer SLO defined on Canonical metrics (`platform_events:messages_failure_ratio:*`) | Adopt, or keep your own SLO on the Canonical metrics |
-| 6. Migrate HPA references | — | HPA/KEDA on the outbox backlog must keep using `outbox_pending_total` until `platform_outbox_pending_events` is ratified; queue-depth scaling uses CloudWatch |
+| 6. Migrate HPA references | **Reference KEDA manifest shipped** ([`monitoring/kubernetes/keda-scaledobject.example.yaml`](../../monitoring/kubernetes/keda-scaledobject.example.yaml)); CI forbids scaling on a Proposed metric | Scale the outbox on `outbox_pending_total` and the queue with KEDA's `aws-sqs-queue` scaler until `platform_outbox_pending_events` / `platform_queue_depth` are ratified |
 | 7. Deprecate legacy | **Done.** Legacy metrics are marked Deprecated (help text, registry) | — |
 | 8. Remove after sunset | Not before 2027-04-01, set by governance | `events.WithoutLegacyMetrics()` once steps 2–6 are complete |
 
@@ -100,9 +106,20 @@ The mapping from each legacy metric to its successor is in [metrics-registry.md]
 - **label vocabulary:** only approved labels, no prohibited label, every value in its approved set, `queue` / `topic` never a URL or ARN, `dependency` / `operation` pairs valid;
 - **registry compliance:** every emitted metric is registered and every registered metric is emitted; ratification packets complete; `Supersedes` ↔ `SupersededBy` consistent;
 - **rule files:** only registered metrics, no Proposed metric as a query target (comments only), labels within the vocabulary, and every alert has a severity, a summary and an existing runbook anchor;
+- **dashboards:** every query and template variable uses registered metrics (or the reference recording rules) and only their labels; a panel querying a Proposed metric must be titled "(Proposed)", one querying a legacy metric "(legacy)";
+- **autoscaling manifests:** no HPA/KEDA query on a Proposed metric (comments only), and registered metrics and labels only;
 - **inventory drift:** `metrics-registry.md` must equal the rendered registry.
 
 `make rules-check` (also in CI) runs `promtool check rules` and the alert unit tests.
+
+## SLO definitions
+
+| SLO | SLI | Objective | Window | Alerting | Source |
+|---|---|---|---|---|---|
+| Consumer processing success | `1 − platform_messages_failed_total / platform_messages_received_total` per `domain`, `service`, `environment`, `queue` (Canonical) | 99.9% (error budget 0.1%) | 30 days | Fast burn: failure ratio > 14.4 × budget over both 1h and 5m, only on queues with ≥ 1 msg/min → `PlatformEventsConsumerErrorBudgetBurn` (critical) | recording rules `platform_events:messages_failure_ratio:rate{5m,1h}`, `platform_events:messages_received:rate1h` |
+
+- **Latency and propagation SLOs** (`platform_message_processing_duration_seconds`, `platform_event_propagation_seconds`) are deliberately not defined yet. Both metrics are Proposed, and the standard forbids SLOs on unratified metrics. The dashboard shows them as shadow panels meanwhile.
+- **Adjusting the objective:** change `0.001` in both burn-rate expressions and keep the multi-window structure. A service may define a stricter SLO on the same Canonical SLI.
 
 ## Known conflicts
 

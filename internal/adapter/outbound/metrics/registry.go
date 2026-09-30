@@ -313,6 +313,27 @@ func Registry() []RegistryEntry {
 			GovernanceNotes:    "Registry-proposed example in the standard. New signal (no legacy predecessor).",
 		}),
 
+		platformEntry(StatusProposed, RegistryEntry{
+			Name:               "platform_queue_depth",
+			Type:               TypeGauge,
+			SemanticDefinition: "Messages waiting on a consumer's queue to be received (SQS ApproximateNumberOfMessages — visible, not in flight or delayed), sampled by the consumer every WithQueueDepthMetrics interval. Approximate by SQS design.",
+			ApprovedLabels:     []string{"queue"},
+			LabelValueRules:    map[string]string{"queue": QueueLabelRule},
+			Cardinality:        "queue (≤5 per service).",
+			AggregationNotes:   "Every replica samples the same queue, so aggregate with max, not sum: max by (domain, service, queue) (platform_queue_depth). The natural HPA/KEDA scaling signal once ratified.",
+			GovernanceNotes:    "Registry-proposed example in the standard. Emitted by platform-events because consuming services may not use the SQS SDK themselves (depguard); opt-in (WithQueueDepthMetrics) since each replica polls sqs:GetQueueAttributes.",
+		}),
+		platformEntry(StatusProposed, RegistryEntry{
+			Name:               "platform_dlq_depth",
+			Type:               TypeGauge,
+			SemanticDefinition: "Messages sitting in the dead-letter queue attached to a consumer's queue by its RedrivePolicy (SQS ApproximateNumberOfMessages of the DLQ), sampled with platform_queue_depth. queue is the SOURCE queue's name, so the gauge joins with the consumer's other queue metrics.",
+			ApprovedLabels:     []string{"queue"},
+			LabelValueRules:    map[string]string{"queue": QueueLabelRule},
+			Cardinality:        "queue (≤5 per service).",
+			AggregationNotes:   "max by (domain, service, queue) (platform_dlq_depth) > 0 — messages awaiting investigation or replay. Complements platform_dlq_messages_total (inflow) with the backlog.",
+			GovernanceNotes:    "Registry-proposed example in the standard. Not emitted when the queue has no RedrivePolicy.",
+		}),
+
 		// ── Tier 1, Proposed (new names) ─────────────────────────────────
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_messages_published_total",

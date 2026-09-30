@@ -91,6 +91,8 @@ type Platform struct {
 	OutboxDLOperations *prometheus.CounterVec   // platform_outbox_dead_letter_operations_total
 	LabelOverflow      *prometheus.CounterVec   // platform_telemetry_label_overflow_total
 	LibraryInfo        *prometheus.GaugeVec     // platform_library_info
+	QueueDepth         *prometheus.GaugeVec     // platform_queue_depth
+	DLQDepth           *prometheus.GaugeVec     // platform_dlq_depth
 
 	identity Identity
 }
@@ -447,6 +449,8 @@ func registerPlatform(r *registrar, id Identity) (*Platform, []RegistrationWarni
 		OutboxDLOperations: counter("platform_outbox_dead_letter_operations_total", "operation"),
 		LabelOverflow:      counter("platform_telemetry_label_overflow_total", "label"),
 		LibraryInfo:        gauge("platform_library_info", "library", "library_version"),
+		QueueDepth:         gauge("platform_queue_depth", "queue"),
+		DLQDepth:           gauge("platform_dlq_depth", "queue"),
 	}
 
 	// Pre-create the label-static counters at 0: a series that first appears
@@ -557,6 +561,21 @@ func IncDLQ(operation, eventType, reason string) {
 func IncDuplicate(queueURL, eventType string) {
 	if p := platform.Load(); p != nil && p.DuplicateMessages != nil {
 		p.DuplicateMessages.WithLabelValues(QueueName(queueURL), SanitizeEventType(eventType)).Inc()
+	}
+}
+
+// SetQueueDepth records the sampled number of messages waiting on queueURL.
+func SetQueueDepth(queueURL string, n float64) {
+	if p := platform.Load(); p != nil && p.QueueDepth != nil {
+		p.QueueDepth.WithLabelValues(QueueName(queueURL)).Set(n)
+	}
+}
+
+// SetDLQDepth records the sampled number of messages in the DLQ attached to
+// sourceQueueURL (labelled with the source queue's name).
+func SetDLQDepth(sourceQueueURL string, n float64) {
+	if p := platform.Load(); p != nil && p.DLQDepth != nil {
+		p.DLQDepth.WithLabelValues(QueueName(sourceQueueURL)).Set(n)
 	}
 }
 

@@ -296,7 +296,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 - **Deprecated entry points.** `events.Init` / `InitWithRegisterer` register legacy metrics only (SA1019).
 - **Registry = source of truth.** `internal/adapter/outbound/metrics/registry.go` holds tier, status (Canonical / Proposed / Deprecated), semantic definition, approved labels + values, cardinality, aggregation, `Supersedes` ↔ `SupersededBy`, and sunset. Change a metric → update the registry → `make metrics-doc`.
 - **Canonical:** `platform_messages_received_total{queue}`, `platform_messages_processed_total{queue,event_type}`, `platform_messages_failed_total{queue,event_type,reason}`, `platform_retry_total{operation,event_type}`, `platform_dlq_messages_total{operation,event_type,reason}`.
-- **Proposed** (shadow-emitted, never in alerts/SLO/HPA until ratified): `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}`, `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
+- **Proposed** (shadow-emitted, never in alerts/SLO/HPA until ratified): `platform_queue_depth` / `platform_dlq_depth` (opt-in `WithQueueDepthMetrics` / `SQS_QUEUE_DEPTH_INTERVAL`; polls `sqs:GetQueueAttributes`, DLQ URL derived from the RedrivePolicy ARN; client capability checked by type assertion so `SQSClientAPI` is unchanged), `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}`, `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
 - **Deprecated legacy:** `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info`. Still authoritative where the successor is Proposed.
 - **Consumer semantics.**
   - Every delivery is received once and ends processed, failed (+ retry), or dead-lettered.
@@ -312,6 +312,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
   - `make metrics-lint` (in `Validate / Quality` and `make ci`) registers the real collectors and enforces tiers, naming (`_total` / `_seconds`), required labels, vocabulary and registry parity.
   - The same target also checks the rule files (no Proposed metric outside comments, labels in vocabulary, runbook anchors) and inventory drift.
   - `make rules-check` runs promtool on `monitoring/prometheus/platform-events.rules.yml` (+ `.test.yml`).
+  - The same lint covers `monitoring/grafana/*.json` (registered metrics and labels; Proposed panels titled "(Proposed)", legacy ones "(legacy)") and `monitoring/kubernetes/*.yaml` (no scaling on Proposed metrics).
 - **Adding a metric.** Add the registry entry (Proposed + full packet), register it in `registerPlatform`, and add a recording function that nil-checks `platform.Load()`. Exercise it in `test/unit/metrics/standard_test.go` `exerciseAll`, then run `make metrics-doc`.
 
 ### Key Configuration Defaults
@@ -325,6 +326,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 | `SQS_WAIT_SECONDS` | `20` | Long-poll duration |
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | Parsed as `time.Duration` |
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
+| `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | Enables `platform_queue_depth` / `platform_dlq_depth` sampling (min 10s) |
 | `OUTBOX_POLL_INTERVAL` | `5s` | Parsed as `time.Duration` |
 | `OUTBOX_BATCH_SIZE` | `50` | Records per poll cycle |
 | `OUTBOX_MAX_ATTEMPTS` | `5` | Before moving to dead-letter |

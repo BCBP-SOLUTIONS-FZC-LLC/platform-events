@@ -29,6 +29,9 @@ type SQSConfigEnv struct {
 	VisibilityTimeout time.Duration
 	Concurrency       int
 	MaxReceiveCount   int // 0 = unset; apply WithMaxReceiveCount when wiring the consumer
+	// QueueDepthInterval (SQS_QUEUE_DEPTH_INTERVAL, e.g. "60s") enables the
+	// platform_queue_depth / platform_dlq_depth sampler; 0 (default) = off.
+	QueueDepthInterval time.Duration
 	// Warnings is non-empty when one or more env vars were set to invalid values
 	// and defaults were applied. Log these at startup so operators can detect
 	// misconfiguration without relying on unstructured stderr output.
@@ -204,16 +207,21 @@ func LoadSQS() SQSConfigEnv {
 	if w != "" {
 		warnings = append(warnings, w)
 	}
+	depthInterval, w := envDurationOrDefault("SQS_QUEUE_DEPTH_INTERVAL", 0)
+	if w != "" {
+		warnings = append(warnings, w)
+	}
 	return SQSConfigEnv{
-		QueueURL:          os.Getenv("SQS_QUEUE_URL"),
-		Region:            envOrDefault("AWS_REGION", "us-east-1"),
-		EndpointURL:       os.Getenv("AWS_ENDPOINT_URL"),
-		MaxMessages:       int32(maxMsg),
-		WaitSeconds:       int32(waitSec),
-		VisibilityTimeout: visTm,
-		Concurrency:       conc,
-		MaxReceiveCount:   maxRecv,
-		Warnings:          warnings,
+		QueueURL:           os.Getenv("SQS_QUEUE_URL"),
+		Region:             envOrDefault("AWS_REGION", "us-east-1"),
+		EndpointURL:        os.Getenv("AWS_ENDPOINT_URL"),
+		MaxMessages:        int32(maxMsg),
+		WaitSeconds:        int32(waitSec),
+		VisibilityTimeout:  visTm,
+		Concurrency:        conc,
+		MaxReceiveCount:    maxRecv,
+		QueueDepthInterval: depthInterval,
+		Warnings:           warnings,
 	}
 }
 
