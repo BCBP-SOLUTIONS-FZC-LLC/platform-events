@@ -14,7 +14,23 @@ linters:
     - gosec
     - errorlint
     - exhaustive
+    - depguard
   settings:
+    depguard:
+      rules:
+        # Every database connection, configuration and operation goes
+        # through platform-pgcommon (Pool, RunInTx, ConfigFromEnv and its
+        # Tx/TxOptions/Conn/Rows/Row/ErrNoRows aliases). Tests may still use
+        # pgx directly, e.g. to fake the full pgx.Tx interface.
+        pgcommon-only:
+          files:
+            - "$all"
+            - "!$test"
+          deny:
+            - pkg: github.com/jackc/pgx
+              desc: use platform-pgcommon (pgcommon.Tx, pgcommon.RunInTx, pgcommon.Conn, pgcommon.ErrNoRows, …) instead of pgx directly
+            - pkg: database/sql
+              desc: use platform-pgcommon's Pool instead of database/sql
     errcheck:
       exclude-functions:
         - fmt.Fprintf

@@ -5,10 +5,10 @@ package integration_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -56,7 +56,7 @@ func TestOutboxRunner_EndToEnd(t *testing.T) {
 		events.WithTraceID("trace-e2e"),
 	)
 
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return outbox.Enqueue(ctx, tx, env)
 	})
 	require.NoError(t, err)
@@ -90,11 +90,11 @@ func TestOutboxEnqueue_TransactionRollback(t *testing.T) {
 	env := events.NewEnvelope("rollback.test", "svc", json.RawMessage(`{}`))
 
 	// Enqueue and rollback.
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		if err := outbox.Enqueue(ctx, tx, env); err != nil {
 			return err
 		}
-		return pgx.ErrTxCommitRollback // force rollback
+		return errors.New("force rollback")
 	})
 	// RunInTx may or may not return error on forced rollback — just check nothing published.
 	_ = err

@@ -140,7 +140,7 @@ External dependencies (private modules):
 - `Runner.ReprocessDeadLetters(ctx, limit int) (int, error)` — moves up to `limit` records from `outbox_dead_letters` back to `outbox_events` for retry; applies a 30 s internal DB timeout.
 - `Runner.ReprocessDeadLettersWith(ctx, filter DLQFilter, limit int) (int, error)` — same as `ReprocessDeadLetters` but filters by `DLQFilter`; use for targeted replay without touching unrelated failures.
 - `Runner.DiscardDeadLetters(ctx, filter DLQFilter, limit int) (int64, error)` — permanently deletes up to `limit` matching dead-letter records; always call `ListDeadLetters` first to confirm selection; applies a 30 s internal DB timeout.
-- `Enqueue(ctx, tx pgx.Tx, env Envelope[json.RawMessage]) error` — insert a serialised envelope into the `outbox_events` table within the caller's transaction. No publish happens at insert time — the runner delivers asynchronously. Callers should pass the `pgx.Tx` obtained from `pgcommon.RunInTx` so the enqueue and the business-logic write commit or roll back as a single unit.
+- `Enqueue(ctx, tx pgcommon.Tx, env Envelope[json.RawMessage]) error` — insert a serialised envelope into the `outbox_events` table within the caller's transaction. No publish happens at insert time — the runner delivers asynchronously. Callers should pass the `pgcommon.Tx` obtained from `pgcommon.RunInTx` so the enqueue and the business-logic write commit or roll back as a single unit.
 - `ApplySchema(ctx, runner *migrate.Runner) error` — convenience wrapper that calls `platform-pgcommon`'s `migrate.Runner` to apply the embedded `pkg/outbox/migrations/` SQL files (`001`–`008`). Call once at service startup before `Runner.Start`.
 - Schema: `outbox_events(id UUID PK, event_type TEXT, payload JSONB, tenant_id TEXT, trace_id TEXT, attempts INT DEFAULT 0, last_error TEXT, created_at TIMESTAMPTZ, scheduled_at TIMESTAMPTZ, published_at TIMESTAMPTZ)`
 
@@ -151,7 +151,7 @@ logger, _ := logger.NewLogger(os.Getenv("APP_ENV"))
 defer func() { _ = logger.Sync() }()
 
 // 1. Apply outbox schema via pgcommon migrate runner
-migrateRunner := &migrate.Runner{DSN: cfg.DatabaseURL, Logger: logger}
+migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv(), Logger: logger}
 outbox.ApplySchema(ctx, migrateRunner)
 
 // 2. Load config and log any warnings via the structured logger (preferred over LogWarnings).
@@ -160,7 +160,8 @@ config.LogWarningsTo(logger, outboxEnv.Warnings) // falls back to stderr when lo
 
 // 3. Construct outbox runner with pgcommon pool.
 // NewRunner returns an error for misconfigured ClaimLeaseDuration.
-pool, _ := pgcommon.NewPool(ctx, pgcommon.ConfigFromEnv())
+// DB config is owned by platform-pgcommon: outboxEnv.DB = pgcommon.ConfigFromEnv().
+pool, _ := pgcommon.NewPool(ctx, outboxEnv.DB)
 runner, err := outbox.NewRunner(outbox.Config{Pool: pool, Publisher: snsPublisher, Logger: logger})
 if err != nil {
     log.Fatal(err)
@@ -177,7 +178,7 @@ go func() { _ = runner.Start(ctx) }()
 _ = runner.Stop()
 
 // 5. Enqueue inside a business transaction (pgcommon.RunInTx)
-pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
     _ = repo.SaveUser(ctx, tx, user)           // business write
     return outbox.Enqueue(ctx, tx, envelope)   // event write — same transaction
 })
@@ -328,7 +329,8 @@ SNS_TOPIC_ARN
 SQS_QUEUE_URL
 SQS_MAX_MESSAGES, SQS_WAIT_SECONDS, SQS_VISIBILITY_TIMEOUT, SQS_CONCURRENCY
 OUTBOX_POLL_INTERVAL, OUTBOX_BATCH_SIZE, OUTBOX_MAX_ATTEMPTS
-DATABASE_URL                                           # for outbox runner (platform-pgcommon DSN)
+DATABASE_URL                                           # outbox runner DSN — read by platform-pgcommon's ConfigFromEnv (or PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/PG_DBNAME/PG_SSLMODE; plus PG_MAX_CONNS, PG_STATEMENT_TIMEOUT, PG_LOCK_TIMEOUT, PG_BOUNCER_MODE, …)
+MIGRATION_DATABASE_URL                                 # optional DDL-role DSN for ApplySchema (pgcommon.MigrationDSNFromEnv)
 OTEL_SERVICE_NAME, OTEL_EXPORTER_OTLP_ENDPOINT
 OTEL_EXPORTER_OTLP_INSECURE
 SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against real AWS
@@ -380,7 +382,9 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 **Outbox schema lifecycle is owned by `platform-pgcommon`'s migrate runner** — `outbox.ApplySchema` is a thin wrapper that passes the embedded `pkg/outbox/migrations/` FS to `platform-pgcommon`'s `migrate.Runner`. Services that already call `migrateRunner.Up(ctx)` for their own schema can run outbox migrations in the same step. The outbox schema is versioned separately so consuming services can upgrade `platform-events` without conflating it with their domain migrations.
 
-**Outbox transactions compose with `pgcommon.RunInTx`** — `outbox.Enqueue` accepts a raw `pgx.Tx` rather than a pool so callers control the transaction boundary. The idiomatic pattern is `pgcommon.RunInTx(ctx, pool, opts, fn)` where `fn` performs the business write and calls `outbox.Enqueue(ctx, tx, env)` — both commit or both roll back. This avoids a second `BEGIN` inside `Enqueue` and keeps the dual-write window at zero.
+**All database access goes through platform-pgcommon** — connections (`pgcommon.Pool`), configuration (`config.LoadOutbox().DB` is `pgcommon.ConfigFromEnv()`, `MigrationDatabaseURL` is `pgcommon.MigrationDSNFromEnv()`), transactions (`pgcommon.RunInTx` — never `conn.Begin`, so pgcommon's PgBouncer GUC injection and per-transaction `StatementTimeout`/`LockTimeout` always apply) and types (`pgcommon.Tx`/`TxOptions`/`Conn`/`Rows`/`Row`/`ErrNoRows` aliases). A depguard rule (`pgcommon-only` in `.golangci.yml`) rejects `github.com/jackc/pgx` and `database/sql` imports in non-test code; tests may import pgx only to fake the full `pgx.Tx` interface.
+
+**Outbox transactions compose with `pgcommon.RunInTx`** — `outbox.Enqueue` accepts a `pgcommon.Tx` (an alias of `pgx.Tx`) rather than a pool so callers control the transaction boundary. The idiomatic pattern is `pgcommon.RunInTx(ctx, pool, opts, fn)` where `fn` performs the business write and calls `outbox.Enqueue(ctx, tx, env)` — both commit or both roll back. This avoids a second `BEGIN` inside `Enqueue` and keeps the dual-write window at zero.
 
 **`Codec` is optional and pluggable, not implemented in this library** — mirrors `port.Logger`: the interface and a `NoopCodec` identity reference live here; a consuming service implements it against its own schema-registry client (e.g. AWS Glue) and injects it via `WithCodec`/`WithConsumerCodec`. Absent, behaviour is byte-for-byte identical to pre-`Codec` releases — the encode/decode hooks are gated on `codec != nil` and `SchemaID != ""` respectively, both unreachable no-ops for existing callers.
 

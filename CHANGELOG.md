@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **All database access goes through platform-pgcommon (now v1.4.0).** Library code no longer imports `github.com/jackc/pgx` or `database/sql`; a depguard rule (`pgcommon-only`) keeps it that way.
+  - `outbox.Enqueue` and `port.OutboxStore.Enqueue` take a `pgcommon.Tx`. It is a type alias of `pgx.Tx`, so existing callers passing a `pgx.Tx` compile unchanged.
+  - The outbox store's `ClaimBatch` and `MarkFailed` transactions now run through `pgcommon.RunInTx` instead of `WithConn` + `conn.Begin`, so pgcommon's PgBouncer-mode GUC injection and its new per-transaction `StatementTimeout` / `LockTimeout` apply to them. `ClaimBatch` no longer returns records alongside an error when the claim transaction fails to commit.
+- **`config.LoadOutbox` loads database configuration via `pgcommon.ConfigFromEnv`.** New fields: `DB pgcommon.Config` (pass to `pgcommon.NewPool`) and `MigrationDatabaseURL` (`pgcommon.MigrationDSNFromEnv`: `MIGRATION_DATABASE_URL`, else the app DSN). `DatabaseURL` is now `DB.DSN`, so the `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` form works as well as `DATABASE_URL`. pgcommon's config warnings (e.g. insecure `sslmode`, invalid `PG_*` values, no DSN) are appended to `Warnings` with a `platform-pgcommon:` prefix. `String()` also masks `MigrationDatabaseURL`.
+
+### Security
+
+- Inherited from platform-pgcommon v1.4.0: session-level RLS GUCs (`app.tenant_id`, …) no longer leak to the next caller of a pooled connection in direct-Postgres mode, and DSN passwords are removed from every `NewPool` / `migrate.Runner` error.
+
+### Dependencies
+
+- `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` v1.1.0 → **v1.4.0** (brings `github.com/jackc/pgx/v5` v5.10.0 → v5.11.0). Consuming services inherit both; see pgcommon's [1.4.0 upgrade notes](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/blob/main/CHANGELOG.md). The ones most likely to matter:
+  - custom `pgx.Rows` mocks need a `TypeMap()` method;
+  - pgx now parses connection URIs like libpq (`+` is literal; IPv6 hosts need brackets) and returns text-format `timestamptz` in `time.Local`;
+  - pgcommon metrics gain a `pool` label and its OTel span attributes follow the stable semantic conventions (`db.statement` → `db.operation.name` / `db.query.text`, `net.peer.*` → `server.*`) — update dashboards and trace queries that filter on the old names.
+
 ---
 
 ## [1.5.0] - 2026-09-30

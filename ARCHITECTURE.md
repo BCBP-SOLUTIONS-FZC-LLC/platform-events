@@ -205,7 +205,7 @@ graph LR
 | `Runner.ReprocessDeadLettersWith(ctx, filter, limit)` | Same as `ReprocessDeadLetters` but restricts to records matching `DLQFilter`; use for targeted replay after fixing a root cause without replaying unrelated failures |
 | `Runner.DiscardDeadLetters(ctx, filter, limit)` | Permanently deletes up to `limit` dead-letter records matching `DLQFilter`; use for poison-pill records that can never succeed; returns `(int64, error)` — always call `ListDeadLetters` first to confirm the selection |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Deletes published records older than `olderThan` from `outbox_events` (batched to `limit` rows). Call periodically (e.g. daily) to prevent unbounded table growth; choose `olderThan ≥` the longest consumer idempotency window (minimum 7 days is safe for most workloads) |
-| `Enqueue(ctx, tx pgx.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; validates non-empty `ID`/`Type`/`Source`, non-zero `Timestamp`, and absence of null bytes in string fields; rejects payloads > 240 KB |
+| `Enqueue(ctx, tx pgcommon.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; validates non-empty `ID`/`Type`/`Source`, non-zero `Timestamp`, and absence of null bytes in string fields; rejects payloads > 240 KB |
 | `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`008` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index, DLQ filter index) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
 | `MigrationsTable` | Exported constant (`"outbox_migrations"`) — the golang-migrate tracking table used by `ApplySchema`; isolated from the consuming service's `schema_migrations` to prevent version-number collisions |
 
@@ -1013,7 +1013,7 @@ The inbox therefore reduces duplicate work; it does not make side effects exactl
 |-----------|---------------|
 | Envelope ID uniqueness | UUID v7 generated at `NewEnvelope` time |
 | At-least-once delivery | Outbox runner retries until `MaxAttempts` |
-| No dual-write | `outbox.Enqueue` runs inside the caller's `pgx.Tx`; no SNS call on enqueue |
+| No dual-write | `outbox.Enqueue` runs inside the caller's `pgcommon.Tx`; no SNS call on enqueue |
 | Atomic enqueue | If the business transaction rolls back, the outbox row is never committed |
 | Tenant isolation (consumer) | `pgcommon.WithGUCSet` injected per message before handler is called |
 | Constant-time HMAC | `hmac.Equal` in `service.Verify` — string `==` is never used |
@@ -1086,7 +1086,7 @@ graph LR
         dlq_new["pkg/events.NewSQSDLQPublisher\nforwards to the queue's RedrivePolicy DLQ\nno SQS SDK import in the service"]
         outbox_new["pkg/outbox.NewRunner\nrequires *pgcommon.Pool\nreturns (*Runner, error)"]
         apply_schema["pkg/outbox.ApplySchema\nembedded SQL migrations\ntable: outbox_migrations"]
-        enqueue["pkg/outbox.Enqueue\nINSERT inside caller's pgx.Tx"]
+        enqueue["pkg/outbox.Enqueue\nINSERT inside caller's pgcommon.Tx"]
     end
 
     subgraph pgcommon_lib["platform-pgcommon"]
@@ -1116,7 +1116,7 @@ graph LR
     sns_new -->|"Publisher"| outbox_new
     main -->|"SIGTERM"| outbox_new
     req_ctx -->|"WithTenantID · WithTraceID"| enqueue
-    enqueue -->|"pgx.Tx"| run_in_tx
+    enqueue -->|"pgcommon.Tx"| run_in_tx
 ```
 
 ---

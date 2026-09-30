@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
 
 // SNSConfigEnv holds environment-derived SNS publisher configuration.
@@ -35,15 +37,25 @@ type SQSConfigEnv struct {
 
 // OutboxConfigEnv holds environment-derived outbox runner configuration.
 type OutboxConfigEnv struct {
-	PollInterval       time.Duration
-	BatchSize          int
-	MaxAttempts        int
-	DatabaseURL        string
-	ClaimLeaseDuration time.Duration
-	StartupJitter      time.Duration
-	PublishConcurrency int
-	PublishTimeout     time.Duration
-	DrainTimeout       time.Duration
+	PollInterval time.Duration
+	BatchSize    int
+	MaxAttempts  int
+	// DB is the Postgres pool configuration, loaded by platform-pgcommon's
+	// ConfigFromEnv (DATABASE_URL, or PG_HOST/PG_PORT/PG_USER/PG_PASSWORD/
+	// PG_DBNAME/PG_SSLMODE, plus PG_MAX_CONNS, PG_STATEMENT_TIMEOUT, …). Pass
+	// it to pgcommon.NewPool; set DB.Logger / DB.GUCProvider first if needed.
+	DB pgcommon.Config
+	// DatabaseURL is DB.DSN, kept for callers that only need the DSN.
+	DatabaseURL string
+	// MigrationDatabaseURL is the DSN for outbox.ApplySchema / inbox.ApplySchema:
+	// MIGRATION_DATABASE_URL (a DDL-privileged role connecting directly, not
+	// through PgBouncer), else DatabaseURL — per pgcommon.MigrationDSNFromEnv.
+	MigrationDatabaseURL string
+	ClaimLeaseDuration   time.Duration
+	StartupJitter        time.Duration
+	PublishConcurrency   int
+	PublishTimeout       time.Duration
+	DrainTimeout         time.Duration
 	// Warnings is non-empty when one or more env vars were set to invalid values
 	// and defaults were applied. Log these at startup so operators can detect
 	// misconfiguration without relying on unstructured stderr output.
@@ -54,12 +66,13 @@ type OutboxConfigEnv struct {
 // component of DatabaseURL so the struct can be logged without leaking credentials.
 func (c OutboxConfigEnv) String() string {
 	masked := maskDSN(c.DatabaseURL)
+	maskedMigration := maskDSN(c.MigrationDatabaseURL)
 	claimLease := c.ClaimLeaseDuration.String()
 	if c.ClaimLeaseDuration == 0 {
 		claimLease = "0 (runner default: 10m)"
 	}
-	return fmt.Sprintf("{PollInterval:%s BatchSize:%d MaxAttempts:%d DatabaseURL:%s ClaimLeaseDuration:%s StartupJitter:%s PublishConcurrency:%d PublishTimeout:%s DrainTimeout:%s}",
-		c.PollInterval, c.BatchSize, c.MaxAttempts, masked, claimLease, c.StartupJitter, c.PublishConcurrency, c.PublishTimeout, c.DrainTimeout)
+	return fmt.Sprintf("{PollInterval:%s BatchSize:%d MaxAttempts:%d DatabaseURL:%s MigrationDatabaseURL:%s ClaimLeaseDuration:%s StartupJitter:%s PublishConcurrency:%d PublishTimeout:%s DrainTimeout:%s}",
+		c.PollInterval, c.BatchSize, c.MaxAttempts, masked, maskedMigration, claimLease, c.StartupJitter, c.PublishConcurrency, c.PublishTimeout, c.DrainTimeout)
 }
 
 func maskDSN(dsn string) string {
@@ -148,7 +161,7 @@ func (c SQSConfigEnv) Validate() error {
 // Validate returns an error if required fields are missing.
 func (c OutboxConfigEnv) Validate() error {
 	if c.DatabaseURL == "" {
-		return fmt.Errorf("platform-events: DATABASE_URL is required but not set")
+		return fmt.Errorf("platform-events: DATABASE_URL (or PG_USER and PG_DBNAME) is required but not set")
 	}
 	return nil
 }
@@ -233,17 +246,25 @@ func LoadOutbox() OutboxConfigEnv {
 	if w != "" {
 		warnings = append(warnings, w)
 	}
+	// Database configuration is owned by platform-pgcommon: the same env vars,
+	// defaults and validation as every other service using pgcommon.NewPool.
+	db, dbWarnings := pgcommon.ConfigFromEnv()
+	for _, dw := range dbWarnings {
+		warnings = append(warnings, fmt.Sprintf("platform-pgcommon: %s: %s", dw.Key, dw.Reason))
+	}
 	return OutboxConfigEnv{
-		PollInterval:       pollInterval,
-		BatchSize:          batchSize,
-		MaxAttempts:        maxAttempts,
-		DatabaseURL:        os.Getenv("DATABASE_URL"),
-		ClaimLeaseDuration: claimLease,
-		StartupJitter:      startupJitter,
-		PublishConcurrency: publishConcurrency,
-		PublishTimeout:     publishTimeout,
-		DrainTimeout:       drainTimeout,
-		Warnings:           warnings,
+		PollInterval:         pollInterval,
+		BatchSize:            batchSize,
+		MaxAttempts:          maxAttempts,
+		DB:                   db,
+		DatabaseURL:          db.DSN,
+		MigrationDatabaseURL: pgcommon.MigrationDSNFromEnv(),
+		ClaimLeaseDuration:   claimLease,
+		StartupJitter:        startupJitter,
+		PublishConcurrency:   publishConcurrency,
+		PublishTimeout:       publishTimeout,
+		DrainTimeout:         drainTimeout,
+		Warnings:             warnings,
 	}
 }
 

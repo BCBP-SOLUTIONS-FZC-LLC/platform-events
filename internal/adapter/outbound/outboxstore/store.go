@@ -8,9 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
@@ -43,7 +40,7 @@ func New(pool *pgcommon.Pool, logger port.Logger, claimLeaseDuration time.Durati
 // and Postgres breaking the ClaimBatch scheduled_at <= NOW() predicate.
 // scheduled_at is expressed as an offset from NOW() so any ScheduledAt delay
 // set by the caller is honoured without trusting the Go clock for absolute times.
-func InsertRecord(ctx context.Context, tx pgx.Tx, record domain.OutboxRecord) error {
+func InsertRecord(ctx context.Context, tx pgcommon.Tx, record domain.OutboxRecord) error {
 	delaySecs := record.ScheduledAt.Sub(record.CreatedAt).Seconds()
 	if delaySecs < 0 {
 		delaySecs = 0
@@ -65,7 +62,7 @@ func InsertRecord(ctx context.Context, tx pgx.Tx, record domain.OutboxRecord) er
 }
 
 // Enqueue inserts an outbox record within the caller's transaction.
-func (s *Store) Enqueue(ctx context.Context, tx pgx.Tx, record domain.OutboxRecord) error {
+func (s *Store) Enqueue(ctx context.Context, tx pgcommon.Tx, record domain.OutboxRecord) error {
 	return InsertRecord(ctx, tx, record)
 }
 
@@ -85,18 +82,8 @@ func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxR
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
 	var records []domain.OutboxRecord
-	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
-		tx, err := conn.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		committed := false
-		defer func() {
-			if !committed {
-				_ = tx.Rollback(context.Background())
-			}
-		}()
-
+	err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+		records = nil
 		rows, err := tx.Query(ctx, `
 			SELECT id, event_type, payload, tenant_id, trace_id,
 			       attempts, last_error, created_at, scheduled_at, published_at
@@ -160,14 +147,14 @@ func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxR
 				return err
 			}
 		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-		committed = true
 		return nil
 	})
-	return records, err
+	if err != nil {
+		// The claim is only in effect once committed: never hand back records
+		// whose lease rolled back.
+		return nil, err
+	}
+	return records, nil
 }
 
 const defaultStoreQueryTimeout = 5 * time.Second
@@ -180,7 +167,7 @@ func (s *Store) PendingCount(ctx context.Context) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
 	var count int64
-	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, `
 			SELECT COUNT(*) FROM outbox_events
 			WHERE published_at IS NULL
@@ -195,7 +182,7 @@ func (s *Store) PendingCount(ctx context.Context) (int64, error) {
 func (s *Store) MarkPublished(ctx context.Context, id string) error {
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
-	return s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	return s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		// WHERE published_at IS NULL prevents a concurrent runner from overwriting
 		// an already-published timestamp and suppressing the RowsAffected==0 warning.
 		tag, err := conn.Exec(ctx,
@@ -224,18 +211,9 @@ func (s *Store) MarkPublished(ctx context.Context, id string) error {
 func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int) error {
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
-	return s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
-		tx, err := conn.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		committed := false
-		defer func() {
-			if !committed {
-				_ = tx.Rollback(context.Background())
-			}
-		}()
-
+	deadLettered := false
+	err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+		deadLettered = false
 		// Read only the current attempts count under FOR UPDATE to serialise against
 		// a concurrent runner that re-claimed this record after lease expiry. The
 		// payload and other fields come from the in-memory rec — they are identical
@@ -243,12 +221,12 @@ func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastErr
 		// SKIP LOCKED is intentionally NOT used: we want the second runner to block
 		// briefly and observe the committed attempts, not skip the row.
 		var attempts int
-		err = tx.QueryRow(ctx, `
+		err := tx.QueryRow(ctx, `
 			SELECT attempts FROM outbox_events WHERE id = $1 AND published_at IS NULL
 			FOR UPDATE
 		`, rec.ID).Scan(&attempts)
 		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
+			if errors.Is(err, pgcommon.ErrNoRows) {
 				// Record was already published or dead-lettered by a concurrent runner
 				// (race after lease expiry). This is expected — not an error.
 				if s.logger != nil {
@@ -262,7 +240,7 @@ func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastErr
 		}
 
 		newAttempts := attempts + 1
-		deadLettered := newAttempts >= maxAttempts
+		deadLettered = newAttempts >= maxAttempts
 
 		if newAttempts >= maxAttempts {
 			// Move to dead-letter table using in-memory record fields — avoids a
@@ -300,19 +278,17 @@ func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastErr
 				return err
 			}
 		}
-
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-		committed = true
-
-		// Increment the dead-letter counter only after a successful commit so the
-		// metric never overcounts on a rolled-back transaction.
-		if deadLettered {
-			metrics.RecordOutboxDeadLetter(rec.EventType)
-		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// Increment the dead-letter counter only after a successful commit so the
+	// metric never overcounts on a rolled-back transaction.
+	if deadLettered {
+		metrics.RecordOutboxDeadLetter(rec.EventType)
+	}
+	return nil
 }
 
 // LeasedCount returns the number of records currently claimed by a runner
@@ -322,7 +298,7 @@ func (s *Store) LeasedCount(ctx context.Context) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
 	var count int64
-	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, `
 			SELECT COUNT(*) FROM outbox_events
 			WHERE published_at IS NULL
@@ -353,7 +329,7 @@ func (s *Store) PrunePublished(ctx context.Context, olderThan time.Duration, lim
 	ctx, cancel := context.WithTimeout(ctx, defaultPruneTimeout)
 	defer cancel()
 	var deleted int64
-	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		tag, err := conn.Exec(ctx, `
 			DELETE FROM outbox_events
 			WHERE id IN (
@@ -419,7 +395,7 @@ func (s *Store) ListDeadLetters(ctx context.Context, filter domain.DLQFilter, li
 	`, where, len(args))
 
 	var records []domain.DeadLetterRecord
-	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		rows, err := conn.Query(ctx, query, args...)
 		if err != nil {
 			return err
@@ -470,7 +446,7 @@ func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQF
 	`, where, limitArg)
 
 	var moved int
-	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		tag, err := conn.Exec(ctx, query, filterArgs...)
 		if err != nil {
 			return err
@@ -508,7 +484,7 @@ func (s *Store) DiscardDeadLetters(ctx context.Context, filter domain.DLQFilter,
 	`, where, limitArg)
 
 	var deleted int64
-	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		tag, err := conn.Exec(ctx, query, filterArgs...)
 		if err != nil {
 			return err
@@ -534,7 +510,7 @@ func (s *Store) ReprocessDeadLetters(ctx context.Context, limit int) (int, error
 	ctx, cancel := context.WithTimeout(ctx, defaultPruneTimeout)
 	defer cancel()
 	var moved int
-	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		tag, err := conn.Exec(ctx, `
 			WITH moved AS (
 				DELETE FROM outbox_dead_letters

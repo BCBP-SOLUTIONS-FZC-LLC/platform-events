@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/outboxstore"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
@@ -21,11 +21,11 @@ import (
 // Use with pgcommon.RunInTx so the business write and the outbox insert share one
 // transaction boundary (commit-or-rollback together):
 //
-//	pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+//	pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 //	    _ = repo.Save(ctx, tx, record)
 //	    return outbox.Enqueue(ctx, tx, envelope)
 //	})
-func Enqueue(ctx context.Context, tx pgx.Tx, env events.Envelope[json.RawMessage]) error {
+func Enqueue(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMessage]) error {
 	if tx == nil {
 		return fmt.Errorf("outbox: transaction must not be nil — use pgcommon.RunInTx to obtain a transaction")
 	}

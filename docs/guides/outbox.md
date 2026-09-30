@@ -51,7 +51,8 @@ Outbox Runner (polls outbox_events)                                   🔁 retry
 
 ```go
 // 1. Apply outbox schema migration (once at startup).
-migrateRunner := &migrate.Runner{DSN: os.Getenv("DATABASE_URL")}
+// DSN from platform-pgcommon: MIGRATION_DATABASE_URL, else DATABASE_URL / PG_*.
+migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv()}
 if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
     log.Fatal(err)
 }
@@ -99,7 +100,7 @@ defer func() {
 ### Enqueueing inside a transaction
 
 ```go
-err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
     // Business write and event enqueue commit or roll back atomically.
     if err := repo.SaveUser(ctx, tx, user); err != nil {
         return err

@@ -6,7 +6,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -31,7 +30,7 @@ func closedPoolStore(t *testing.T) (*outboxstore.Store, context.Context) {
 func enqueueRecord(t *testing.T, store *outboxstore.Store, pool *pgcommon.Pool) domain.OutboxRecord {
 	t.Helper()
 	rec := makeRecord("closed.pool.event")
-	err := pgcommon.RunInTx(context.Background(), pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(context.Background(), pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)

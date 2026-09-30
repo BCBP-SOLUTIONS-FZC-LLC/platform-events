@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 )
@@ -12,7 +12,7 @@ import (
 // OutboxStore persists and retrieves outbox records from durable storage.
 type OutboxStore interface {
 	// Enqueue inserts a record into the outbox within the caller's transaction.
-	Enqueue(ctx context.Context, tx pgx.Tx, record domain.OutboxRecord) error
+	Enqueue(ctx context.Context, tx pgcommon.Tx, record domain.OutboxRecord) error
 
 	// ClaimBatch atomically claims up to batchSize unpublished records.
 	// Uses SELECT ... FOR UPDATE SKIP LOCKED to support multiple concurrent runners.

@@ -12,18 +12,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 )
 
-// stubTx implements pgx.Tx for testing — only Exec is meaningful.
+// stubTx implements pgcommon.Tx for testing — only Exec is meaningful.
 type stubTx struct {
 	execSQL  string
 	execArgs []interface{}
 	execErr  error
 }
 
-func (s *stubTx) Begin(_ context.Context) (pgx.Tx, error) {
+func (s *stubTx) Begin(_ context.Context) (pgcommon.Tx, error) {
 	return nil, errors.New("not implemented")
 }
 
@@ -57,11 +59,11 @@ func (s *stubTx) Exec(_ context.Context, sql string, arguments ...any) (pgconn.C
 	return pgconn.CommandTag{}, s.execErr
 }
 
-func (s *stubTx) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+func (s *stubTx) Query(_ context.Context, _ string, _ ...any) (pgcommon.Rows, error) {
 	return nil, errors.New("not implemented")
 }
 
-func (s *stubTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+func (s *stubTx) QueryRow(_ context.Context, _ string, _ ...any) pgcommon.Row {
 	return nil
 }
 
@@ -69,7 +71,7 @@ func (s *stubTx) Conn() *pgx.Conn {
 	return nil
 }
 
-var _ pgx.Tx = (*stubTx)(nil)
+var _ pgcommon.Tx = (*stubTx)(nil)
 
 // ----------------------------
 // Enqueue: success

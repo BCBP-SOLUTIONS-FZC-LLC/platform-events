@@ -11,7 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
@@ -85,7 +85,7 @@ func (s *OutboxService) SetOutboxMetrics(m port.OutboxMetrics) {
 
 // Enqueue inserts a serialized envelope into the outbox within the given transaction.
 // The caller controls the transaction boundary — this function only does the INSERT.
-func (s *OutboxService) Enqueue(ctx context.Context, tx pgx.Tx, env domain.Envelope[json.RawMessage]) error {
+func (s *OutboxService) Enqueue(ctx context.Context, tx pgcommon.Tx, env domain.Envelope[json.RawMessage]) error {
 	if tx == nil {
 		return fmt.Errorf("outbox: transaction must not be nil — use pgcommon.RunInTx to obtain a transaction")
 	}

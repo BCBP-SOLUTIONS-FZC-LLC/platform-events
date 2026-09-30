@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -89,7 +88,7 @@ func TestOutbox_EnqueueAndDeliver_EndToEnd(t *testing.T) {
 		events.WithTenantID("acme"),
 		events.WithTraceID("trace-outbox-e2e-001"),
 	)
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return outbox.Enqueue(ctx, tx, env)
 	})
 	require.NoError(t, err, "Enqueue should succeed within a transaction")
@@ -171,7 +170,7 @@ func TestOutbox_MultipleEvents(t *testing.T) {
 			json.RawMessage(`{"item":"widget"}`),
 			events.WithTenantID("tenant-a"),
 		)
-		err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 			return outbox.Enqueue(ctx, tx, env)
 		})
 		require.NoError(t, err)
@@ -251,7 +250,7 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 	// Enqueue inside a transaction that we force to roll back by returning an error.
 	rolledBackEnv := events.NewEnvelope("payment.failed", "billing-svc", json.RawMessage(`{}`),
 		events.WithTenantID("test-tenant"))
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		_ = outbox.Enqueue(ctx, tx, rolledBackEnv)
 		return errIntentionalRollback // non-nil error causes RunInTx to rollback
 	})
@@ -261,7 +260,7 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 	// has processed at least one poll cycle after the rollback.
 	sentinelEnv := events.NewEnvelope("heartbeat.ping", "billing-svc", json.RawMessage(`{}`),
 		events.WithTenantID("test-tenant"))
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return outbox.Enqueue(ctx, tx, sentinelEnv)
 	})
 	require.NoError(t, err)

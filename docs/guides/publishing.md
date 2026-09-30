@@ -53,7 +53,7 @@ Flag any call to `publisher.Publish` or `publisher.PublishBatch` that appears in
 
 ```go
 // ✅ Correct — both writes in one transaction
-pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
     if err := repo.SaveUser(ctx, tx, user); err != nil {
         return err
     }
@@ -61,7 +61,7 @@ pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx
 })
 
 // ❌ Wrong — SNS call outside the transaction; event lost on crash
-pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
     return repo.SaveUser(ctx, tx, user)
 })
 publisher.Publish(ctx, envelope) // ← data inconsistency risk

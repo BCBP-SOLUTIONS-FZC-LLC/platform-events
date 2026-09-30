@@ -14,9 +14,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
@@ -29,7 +30,9 @@ type stubStore struct {
 
 func newStubStore() *stubStore { return &stubStore{failed: make(map[string]string)} }
 
-func (s *stubStore) Enqueue(_ context.Context, _ pgx.Tx, _ domain.OutboxRecord) error { return nil }
+func (s *stubStore) Enqueue(_ context.Context, _ pgcommon.Tx, _ domain.OutboxRecord) error {
+	return nil
+}
 func (s *stubStore) ClaimBatch(_ context.Context, _ int) ([]domain.OutboxRecord, error) {
 	return nil, nil
 }

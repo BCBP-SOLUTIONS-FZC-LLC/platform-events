@@ -373,7 +373,7 @@ func handlePaymentSettled(ctx context.Context, env events.Envelope[json.RawMessa
         return nil // permanent failure — discard
     }
 
-    return pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+    return pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
         // ① DB write — guarded by processed_events (atomically)
         tag, err := tx.Exec(ctx,
             `INSERT INTO processed_events (event_id, processed_at) VALUES ($1, NOW()) ON CONFLICT DO NOTHING`,
@@ -434,7 +434,7 @@ Then guard every handler inside the same transaction as the side-effect write:
 
 ```go
 func handleUserCreated(ctx context.Context, env events.Envelope[json.RawMessage]) error {
-    return pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+    return pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
         // 1. Claim the event ID — ON CONFLICT DO NOTHING is atomic.
         tag, err := tx.Exec(ctx, `
             INSERT INTO processed_events (event_id)

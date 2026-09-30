@@ -158,7 +158,60 @@ func TestLoadOutbox_Defaults(t *testing.T) {
 	assert.Equal(t, 1, cfg.PublishConcurrency)
 	assert.Equal(t, 10*time.Second, cfg.PublishTimeout)
 	assert.Equal(t, 30*time.Second, cfg.DrainTimeout)
+	// No database env at all: pgcommon's ConfigFromEnv reports it.
+	require.Len(t, cfg.Warnings, 1)
+	assert.Contains(t, cfg.Warnings[0], "platform-pgcommon: PG_USER/PG_DBNAME")
+	assert.Empty(t, cfg.DatabaseURL)
+	require.Error(t, cfg.Validate())
+}
+
+func TestLoadOutbox_DatabaseConfigFromPgcommon(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("MIGRATION_DATABASE_URL", "")
+	t.Setenv("PG_HOST", "db.internal")
+	t.Setenv("PG_PORT", "6432")
+	t.Setenv("PG_USER", "events")
+	t.Setenv("PG_PASSWORD", "s3cret")
+	t.Setenv("PG_DBNAME", "platform")
+	t.Setenv("PG_SSLMODE", "verify-full")
+	t.Setenv("PG_MAX_CONNS", "25")
+	t.Setenv("PG_STATEMENT_TIMEOUT", "15s")
+	t.Setenv("PG_BOUNCER_MODE", "true")
+
+	cfg := config.LoadOutbox()
+	require.NotEmpty(t, cfg.DatabaseURL, "DSN built from PG_* parts by pgcommon")
+	assert.Equal(t, cfg.DB.DSN, cfg.DatabaseURL)
+	assert.Contains(t, cfg.DatabaseURL, "db.internal")
+	assert.Equal(t, int32(25), cfg.DB.MaxConns)
+	assert.Equal(t, 15*time.Second, cfg.DB.StatementTimeout)
+	assert.True(t, cfg.DB.PGBouncerMode)
+	assert.Equal(t, cfg.DatabaseURL, cfg.MigrationDatabaseURL, "falls back to the app DSN")
+	assert.NoError(t, cfg.Validate())
 	assert.Empty(t, cfg.Warnings)
+	assert.NotContains(t, cfg.String(), "s3cret")
+}
+
+func TestLoadOutbox_MigrationDatabaseURL(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://app:apppw@pgbouncer:6432/db?sslmode=require")
+	t.Setenv("MIGRATION_DATABASE_URL", "postgres://ddl:ddlpw@postgres:5432/db?sslmode=require")
+
+	cfg := config.LoadOutbox()
+	assert.Equal(t, "postgres://app:apppw@pgbouncer:6432/db?sslmode=require", cfg.DatabaseURL)
+	assert.Equal(t, "postgres://ddl:ddlpw@postgres:5432/db?sslmode=require", cfg.MigrationDatabaseURL)
+	s := cfg.String()
+	assert.NotContains(t, s, "apppw")
+	assert.NotContains(t, s, "ddlpw")
+	assert.Contains(t, s, "MigrationDatabaseURL:postgres://***@postgres:5432")
+}
+
+func TestLoadOutbox_PgcommonWarningsForwarded(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db?sslmode=disable")
+	t.Setenv("PG_MAX_CONNS", "lots")
+
+	cfg := config.LoadOutbox()
+	joined := strings.Join(cfg.Warnings, "\n")
+	assert.Contains(t, joined, "platform-pgcommon: DATABASE_URL: sslmode=disable")
+	assert.Contains(t, joined, "platform-pgcommon: PG_MAX_CONNS")
 }
 
 func TestLoadOutbox_CustomValues(t *testing.T) {

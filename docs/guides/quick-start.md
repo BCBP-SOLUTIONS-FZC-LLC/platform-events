@@ -21,32 +21,37 @@ func main() {
     // 1. Register Prometheus metrics once.
     events.Init(os.Getenv("APP_NAME"), os.Getenv("BUILD_VERSION"))
 
-    // 2. Open the connection pool for the outbox runner.
-    pool, err := pgcommon.NewPool(ctx, pgcommon.Config{
-        DSN:         os.Getenv("DATABASE_URL"),
-        GUCProvider: pgcommon.GUCSetFromContext,
-    })
+    // 2. Load config. Database settings come from platform-pgcommon's
+    //    ConfigFromEnv (DATABASE_URL or PG_*, PG_MAX_CONNS, PG_STATEMENT_TIMEOUT, …).
+    outboxEnv := config.LoadOutbox()
+    config.LogWarnings(outboxEnv.Warnings)
+    if err := outboxEnv.Validate(); err != nil {
+        log.Fatal(err)
+    }
+
+    // 3. Open the connection pool for the outbox runner.
+    dbCfg := outboxEnv.DB
+    dbCfg.GUCProvider = pgcommon.GUCSetFromContext
+    pool, err := pgcommon.NewPool(ctx, dbCfg)
     if err != nil {
         log.Fatal(err)
     }
     defer pool.Close()
 
-    // 3. Apply the outbox schema migration.
-    migrateRunner := &migrate.Runner{DSN: os.Getenv("DATABASE_URL")}
+    // 4. Apply the outbox schema migration (MIGRATION_DATABASE_URL when set).
+    migrateRunner := &migrate.Runner{DSN: outboxEnv.MigrationDatabaseURL}
     if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
         log.Fatal(err)
     }
 
-    // 4. Construct the SNS publisher.
+    // 5. Construct the SNS publisher.
     snsEnv := config.LoadSNS()
     publisher, err := events.NewSNSPublisher(config.SNSConfigFromEnv(snsEnv, logger))
     if err != nil {
         log.Fatal(err)
     }
 
-    // 5. Start the outbox runner (delivers events asynchronously).
-    outboxEnv := config.LoadOutbox()
-    config.LogWarnings(outboxEnv.Warnings)
+    // 6. Start the outbox runner (delivers events asynchronously).
     runner, err := outbox.NewRunner(config.RunnerConfigFromEnv(outboxEnv, pool, publisher, logger))
     if err != nil {
         log.Fatal(err)

@@ -15,19 +15,21 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/service"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
-// noopTx is a minimal pgx.Tx stub used to avoid nil-tx panics when testing
+// noopTx is a minimal pgcommon.Tx stub used to avoid nil-tx panics when testing
 // OutboxService.Enqueue with a store that returns an error immediately.
 type noopTx struct{}
 
-func (noopTx) Begin(_ context.Context) (pgx.Tx, error) { return nil, errors.New("noop") }
-func (noopTx) Commit(_ context.Context) error          { return nil }
-func (noopTx) Rollback(_ context.Context) error        { return nil }
+func (noopTx) Begin(_ context.Context) (pgcommon.Tx, error) { return nil, errors.New("noop") }
+func (noopTx) Commit(_ context.Context) error               { return nil }
+func (noopTx) Rollback(_ context.Context) error             { return nil }
 func (noopTx) CopyFrom(_ context.Context, _ pgx.Identifier, _ []string, _ pgx.CopyFromSource) (int64, error) {
 	return 0, errors.New("noop")
 }
@@ -39,13 +41,13 @@ func (noopTx) Prepare(_ context.Context, _, _ string) (*pgconn.StatementDescript
 func (noopTx) Exec(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, nil
 }
-func (noopTx) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+func (noopTx) Query(_ context.Context, _ string, _ ...any) (pgcommon.Rows, error) {
 	return nil, errors.New("noop")
 }
-func (noopTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row { return nil }
-func (noopTx) Conn() *pgx.Conn                                        { return nil }
+func (noopTx) QueryRow(_ context.Context, _ string, _ ...any) pgcommon.Row { return nil }
+func (noopTx) Conn() *pgx.Conn                                             { return nil }
 
-var _ pgx.Tx = noopTx{}
+var _ pgcommon.Tx = noopTx{}
 
 // mockStore is a thread-safe in-memory OutboxStore for testing.
 // The mutex protects published and failed maps which are written by parallel
@@ -65,7 +67,7 @@ func newMockStore() *mockStore {
 	}
 }
 
-func (s *mockStore) Enqueue(_ context.Context, _ pgx.Tx, rec domain.OutboxRecord) error {
+func (s *mockStore) Enqueue(_ context.Context, _ pgcommon.Tx, rec domain.OutboxRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = append(s.records, rec)

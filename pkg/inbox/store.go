@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
@@ -37,7 +36,7 @@ func (s *Store) Consumer() string { return s.consumer }
 // IsProcessed reports whether eventID was already recorded for this consumer.
 func (s *Store) IsProcessed(ctx context.Context, eventID uuid.UUID) (bool, error) {
 	var exists bool
-	err := pgcommon.RunInTx(ctx, s.pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return tx.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM processed_events WHERE event_id = $1 AND consumer = $2)`,
 			eventID.String(), s.consumer).Scan(&exists)
@@ -51,7 +50,7 @@ func (s *Store) IsProcessed(ctx context.Context, eventID uuid.UUID) (bool, error
 // MarkProcessed records eventID for this consumer. Recording an ID twice is
 // a no-op.
 func (s *Store) MarkProcessed(ctx context.Context, eventID uuid.UUID) error {
-	err := pgcommon.RunInTx(ctx, s.pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		_, execErr := tx.Exec(ctx,
 			`INSERT INTO processed_events (event_id, consumer) VALUES ($1, $2) ON CONFLICT (event_id, consumer) DO NOTHING`,
 			eventID.String(), s.consumer)
@@ -81,7 +80,7 @@ func (s *Store) Prune(ctx context.Context, retention time.Duration, batch int) (
 	var total int64
 	for {
 		var n int64
-		err := pgcommon.RunInTx(ctx, s.pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 			tag, execErr := tx.Exec(ctx, `
 				DELETE FROM processed_events
 				WHERE ctid IN (

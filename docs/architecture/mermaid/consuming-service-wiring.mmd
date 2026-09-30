@@ -10,7 +10,7 @@ graph LR
         dlq_new["pkg/events.NewSQSDLQPublisher\nforwards to the queue's RedrivePolicy DLQ\nno SQS SDK import in the service"]
         outbox_new["pkg/outbox.NewRunner\nrequires *pgcommon.Pool\nreturns (*Runner, error)"]
         apply_schema["pkg/outbox.ApplySchema\nembedded SQL migrations\ntable: outbox_migrations"]
-        enqueue["pkg/outbox.Enqueue\nINSERT inside caller's pgx.Tx"]
+        enqueue["pkg/outbox.Enqueue\nINSERT inside caller's pgcommon.Tx"]
     end
 
     subgraph pgcommon_lib["platform-pgcommon"]
@@ -40,4 +40,4 @@ graph LR
     sns_new -->|"Publisher"| outbox_new
     main -->|"SIGTERM"| outbox_new
     req_ctx -->|"WithTenantID · WithTraceID"| enqueue
-    enqueue -->|"pgx.Tx"| run_in_tx
+    enqueue -->|"pgcommon.Tx"| run_in_tx

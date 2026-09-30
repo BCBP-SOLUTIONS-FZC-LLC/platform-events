@@ -96,7 +96,7 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 
 | Symbol | Purpose |
 |---|---|
-| `Enqueue(ctx, tx, env)` | Insert inside the caller's `pgx.Tx` — no SNS call; rejects payloads > 240 KB |
+| `Enqueue(ctx, tx, env)` | Insert inside the caller's `pgcommon.Tx` — no SNS call; rejects payloads > 240 KB |
 | `NewRunner(Config)`, `Runner.Start` / `Stop` / `Ready` | Poll → claim (`SKIP LOCKED` + lease) → publish → mark |
 | `Runner.ListDeadLetters` / `ReprocessDeadLetters` / `ReprocessDeadLettersWith` / `DiscardDeadLetters` | Inspect / replay / discard `outbox_dead_letters` (`DLQFilter`, `DeadLetterRecord`) |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Batched delete of old published rows |
@@ -363,7 +363,7 @@ go test -short ./test/integration/...   # -short skips every test that needs Doc
 ### How the pipeline works
 
 ```
-service write ──(same pgx.Tx)──▶ outbox_events (Postgres)
+service write ──(same pgcommon.Tx)──▶ outbox_events (Postgres)
                                         │
                               outbox.Runner (PollInterval, default 5 s)
                                         │
@@ -466,7 +466,8 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox` / `LoadOTel`). The li
 | `OUTBOX_CLAIM_LEASE_DURATION` | `10m` (store default when unset) | How long a claimed record is hidden from other runners |
 | `OUTBOX_STARTUP_JITTER` | `0` | Use `5s`–`10s` with multiple replicas |
 | `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_DRAIN_TIMEOUT` | `1` / `10s` / `30s` | `1` uses SNS `PublishBatch`; per-record timeout; `Stop()` wait bound |
-| `DATABASE_URL` | — | Postgres DSN for the outbox runner |
+| `DATABASE_URL` | — | Postgres DSN for the outbox runner. Read by platform-pgcommon's `ConfigFromEnv` (exposed as `config.LoadOutbox().DB`); alternatively `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE`. Pool tuning (`PG_MAX_CONNS`, `PG_STATEMENT_TIMEOUT`, `PG_LOCK_TIMEOUT`, `PG_BOUNCER_MODE`, …) per platform-pgcommon |
+| `MIGRATION_DATABASE_URL` | `DATABASE_URL` | DDL-role DSN for `ApplySchema`, connecting directly (not via PgBouncer) — `config.LoadOutbox().MigrationDatabaseURL` |
 | `OTEL_SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_INSECURE` | — / `localhost:4317` / `false` | Insecure is forced `true` when `APP_ENV` is `dev` / `development` / `local` |
 | `APP_ENV` | — | Environment gate for OTel insecure mode |
 | `SMOKE_SNS_TOPIC_ARN` / `SMOKE_SQS_QUEUE_URL` | — | `make test-smoke` only |

@@ -8,10 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
@@ -45,7 +46,7 @@ func (s *mockOutboxStore) setClaimErr(err error) {
 	s.claimErr = err
 }
 
-func (s *mockOutboxStore) Enqueue(_ context.Context, _ pgx.Tx, rec domain.OutboxRecord) error {
+func (s *mockOutboxStore) Enqueue(_ context.Context, _ pgcommon.Tx, rec domain.OutboxRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = append(s.records, rec)
