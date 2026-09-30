@@ -7,12 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`events.WithDLQForwarding(dlq)`** consumer option — forwards poison messages to the source queue's `RedrivePolicy` DLQ with their **original raw body and attributes**, deleting the source message only after the forward succeeds (on failure it stays visible; SQS redrive remains the backstop). Forwarded: bodies that are not a valid envelope (`malformed message body: …` — previously deleted and only logged, i.e. lost), messages past the `WithMaxReceiveCount` threshold (after `WithDeadLetterHandler`, when set, succeeds), and messages past it whose codec decode fails. `WithMaxReceiveCount` defaults to 5 when only `WithDLQForwarding` is set. With forwarding enabled, `Start` resolves the DLQ first and returns an error wrapping `ErrDLQNotConfigured` / `ErrDLQInvalidRedrivePolicy` when the queue has no usable `RedrivePolicy` (transient failures are logged and the consumer starts), so poison messages can never be left redelivered until retention expires. Each forward is bounded by 30 s, capped at half of `WithVisibilityTimeout` (min 1 s), so a slow forward cannot let the message reappear and be forwarded twice.
+- **`events.SourceMessageFromContext(ctx)`** / `events.SourceMessage` — built lazily on first call, so handlers that never use it pay no copy — the raw SQS message (body before codec decoding, String/Number attributes, queue URL, message ID, receive count) on every `Handler` and `WithDeadLetterHandler` context. Forward this rather than `env.JSON()`, which drops attributes and, with `WithConsumerCodec`, re-serialises a decoded payload under a still-set `SchemaID` that fails to decode on redrive.
+- `DLQPublisher`: `sqs.dlq_forward` OTel span (`SpanKindProducer`) and `events_dlq_forward_duration_seconds{queue,event_type}` histogram.
+- `DLQConfig.CacheTTL` (default 15 min; negative disables expiry) — a retargeted `RedrivePolicy` is picked up without a restart. The cache entry is also evicted when `SendMessage` reports the DLQ no longer exists (`ErrDLQUnresolved`).
+- `DLQConfig.StrictAttributes` — opt back into rejecting messages with more than 10 attributes.
+
 ### Changed
 
 - **All database access goes through platform-pgcommon (now v1.4.0).** Library code no longer imports `github.com/jackc/pgx` or `database/sql`; a depguard rule (`pgcommon-only`) keeps it that way.
   - `outbox.Enqueue` and `port.OutboxStore.Enqueue` take a `pgcommon.Tx`. It is a type alias of `pgx.Tx`, so existing callers passing a `pgx.Tx` compile unchanged.
   - The outbox store's `ClaimBatch` and `MarkFailed` transactions now run through `pgcommon.RunInTx` instead of `WithConn` + `conn.Begin`, so pgcommon's PgBouncer-mode GUC injection and its new per-transaction `StatementTimeout` / `LockTimeout` apply to them. `ClaimBatch` no longer returns records alongside an error when the claim transaction fails to commit.
 - **`config.LoadOutbox` loads database configuration via `pgcommon.ConfigFromEnv`.** New fields: `DB pgcommon.Config` (pass to `pgcommon.NewPool`) and `MigrationDatabaseURL` (`pgcommon.MigrationDSNFromEnv`: `MIGRATION_DATABASE_URL`, else the app DSN). `DatabaseURL` is now `DB.DSN`, so the `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE` form works as well as `DATABASE_URL`. pgcommon's config warnings (e.g. insecure `sslmode`, invalid `PG_*` values, no DSN) are appended to `Warnings` with a `platform-pgcommon:` prefix. `String()` also masks `MigrationDatabaseURL`.
+- `DLQPublisher.SendToDLQ` no longer rejects a message whose attributes exceed the SQS limit of 10: the lowest-priority caller attributes are dropped (kept first: `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical) and logged at WARN, so a message is never kept out of the DLQ by its attribute count. Set `StrictAttributes` for the v1.5.0 behaviour.
+- `EventType` (and the FIFO identity) is taken from the body only when it is a full envelope (`id`, `type`, `source`, `time`), so arbitrary JSON with a `type` key — or an SNS notification wrapper — cannot mint `event_type` metric label values.
+- `SendToDLQ` trims excess attributes *before* validating, then validates everything SQS would reject before any AWS call — characters outside the SQS-allowed set in the body or attribute values, attribute names (`AWS.`/`Amazon.` prefixes, disallowed characters, periods, > 256 chars), and body + attributes over 1 MiB — returning `ErrDLQInvalidMessage`. `SendMessage` rejections of the message itself (`InvalidParameterValue`, `InvalidMessageContents`, `InvalidAttributeName`, `InvalidAttributeValue`) are now `ErrDLQInvalidMessage` instead of `ErrDLQSendFailed`. `DLQReason` characters SQS rejects are replaced with U+FFFD.
+- `mock.DLQPublisher.SendToDLQ` applies the same input validation as the SQS publisher, so a call that fails in production fails in tests.
+- `events.DLQPublisher` is now a type alias of the internal port interface (same method set — source compatible).
+
+### Fixed
+
+- FIFO DLQs: an envelope ID containing characters invalid for `MessageGroupId`/`MessageDeduplicationId` now falls back to the body's SHA-256 instead of failing `SendMessage`.
 
 ### Security
 

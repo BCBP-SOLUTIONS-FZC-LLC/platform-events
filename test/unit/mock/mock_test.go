@@ -152,3 +152,29 @@ func TestMockDLQPublisher_SetErrorAndReset(t *testing.T) {
 	require.NoError(t, m.SendToDLQ(context.Background(), "q", []byte("x"), nil, "r"))
 	assert.Len(t, m.Sent(), 1)
 }
+
+func TestMockDLQPublisher_ValidatesLikeSQSPublisher(t *testing.T) {
+	cases := map[string]struct {
+		source string
+		body   []byte
+		attrs  map[string]string
+		reason string
+	}{
+		"empty source":       {"", []byte("x"), nil, "r"},
+		"empty body":         {"q", nil, nil, "r"},
+		"empty reason":       {"q", []byte("x"), nil, " "},
+		"invalid utf8":       {"q", []byte{0xff}, nil, "r"},
+		"NUL in body":        {"q", []byte("a\x00"), nil, "r"},
+		"reserved attr name": {"q", []byte("x"), map[string]string{"AWS.x": "v"}, "r"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			m := &mock.DLQPublisher{}
+			err := m.SendToDLQ(context.Background(), tc.source, tc.body, tc.attrs, tc.reason)
+			require.ErrorIs(t, err, events.ErrDLQInvalidMessage)
+			var dlqErr *events.DLQError
+			require.ErrorAs(t, err, &dlqErr)
+			assert.Empty(t, m.Sent(), "rejected messages are not recorded")
+		})
+	}
+}

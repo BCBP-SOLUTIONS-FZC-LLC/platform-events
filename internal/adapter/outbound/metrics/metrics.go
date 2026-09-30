@@ -37,6 +37,8 @@ var (
 
 	// DLQForwardedTotal counts messages forwarded to a source queue's DLQ.
 	DLQForwardedTotal *prometheus.CounterVec
+	// DLQForwardDuration measures SendToDLQ latency (resolution + SendMessage).
+	DLQForwardDuration *prometheus.HistogramVec
 
 	// Outbox infrastructure error counters.
 	OutboxPollErrorsTotal          *prometheus.CounterVec
@@ -280,6 +282,13 @@ func initMetricsWithRegisterer(serviceName, buildVersion string, reg prometheus.
 		ConstLabels: prometheus.Labels{"service": serviceName},
 	}, []string{"queue", "event_type", "status"})
 
+	DLQForwardDuration = factory.NewHistogramVec(prometheus.HistogramOpts{
+		Name:        "events_dlq_forward_duration_seconds",
+		Help:        "Duration of DLQ publisher SendToDLQ calls in seconds, including DLQ resolution on a cache miss.",
+		ConstLabels: prometheus.Labels{"service": serviceName},
+		Buckets:     []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5},
+	}, []string{"queue", "event_type"})
+
 	OversizedEventTypeLabelTotal = factory.NewCounterVec(prometheus.CounterOpts{
 		Name:        "events_oversized_event_type_label_total",
 		Help:        "Total event_type values that exceeded the label length cap and were replaced with __oversized__. A non-zero rate indicates misconfigured or adversarial producers.",
@@ -447,14 +456,19 @@ func RecordInboxDuplicate(consumer string) {
 	}
 }
 
-// RecordDLQForward increments the DLQ forward counter for the source queue.
-// Safe to call before Init — no-ops when metrics are not initialised.
-func RecordDLQForward(queue, eventType, status string) {
+// RecordDLQForward increments the DLQ forward counter and observes the forward
+// duration for the source queue. Safe to call before Init — no-ops when
+// metrics are not initialised.
+func RecordDLQForward(queue, eventType, status string, durationSeconds float64) {
 	metricsMu.RLock()
-	c := DLQForwardedTotal
+	c, d := DLQForwardedTotal, DLQForwardDuration
 	metricsMu.RUnlock()
+	et := SanitizeEventType(eventType)
 	if c != nil {
-		c.WithLabelValues(queue, SanitizeEventType(eventType), status).Inc()
+		c.WithLabelValues(queue, et, status).Inc()
+	}
+	if d != nil {
+		d.WithLabelValues(queue, et).Observe(durationSeconds)
 	}
 }
 

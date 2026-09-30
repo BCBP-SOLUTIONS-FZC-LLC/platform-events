@@ -5,6 +5,7 @@ import (
 	"maps"
 	"sync"
 
+	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
@@ -18,6 +19,12 @@ type DLQMessage struct {
 
 // DLQPublisher is a thread-safe in-memory DLQPublisher for use in unit tests.
 // ResolveDLQ returns DLQURL (default "mock://dlq").
+//
+// SendToDLQ validates its input exactly as the SQS publisher does before any
+// AWS call — empty source queue URL, body or reason; characters SQS does not
+// allow; invalid attribute names; over 1 MiB of body plus attributes — and
+// returns the same *events.DLQError (ErrDLQInvalidMessage) without recording
+// the message, so a call that would fail in production fails in tests too.
 type DLQPublisher struct {
 	DLQURL string
 
@@ -32,6 +39,9 @@ func (m *DLQPublisher) SendToDLQ(_ context.Context, sourceQueueURL string, body 
 	defer m.mu.Unlock()
 	if m.err != nil {
 		return m.err
+	}
+	if err := internalsqs.ValidateDLQMessage(sourceQueueURL, body, attrs, reason); err != nil {
+		return err
 	}
 	m.sent = append(m.sent, DLQMessage{
 		SourceQueueURL: sourceQueueURL,

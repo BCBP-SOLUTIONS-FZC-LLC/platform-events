@@ -66,13 +66,36 @@ func WithDeadLetterHandler(fn Handler) ConsumerOption {
 	})
 }
 
+// WithDLQForwarding forwards poison messages — bodies that are not a valid
+// envelope, messages past the WithMaxReceiveCount threshold (after the
+// WithDeadLetterHandler callback, when set, succeeds), and messages past it
+// whose codec decode fails — to the source queue's RedrivePolicy DLQ via p.
+// The original raw body and attributes are forwarded, and the message is
+// deleted only once the forward succeeds; otherwise it stays visible and SQS's
+// own redrive remains the backstop. Without this option malformed messages
+// are deleted and only logged.
+//
+// Start resolves the queue's DLQ first and returns an error wrapping
+// ErrDLQNotConfigured / ErrDLQInvalidRedrivePolicy when the queue has no
+// usable RedrivePolicy (a transient resolution failure is logged and the
+// consumer starts). Each forward is bounded by 30s, capped at half the
+// WithVisibilityTimeout value (minimum 1s) so the message cannot reappear
+// mid-forward.
+//
+// WithMaxReceiveCount (default 5) must be strictly lower than the queue's
+// RedrivePolicy maxReceiveCount, or SQS moves the message first.
+func WithDLQForwarding(p DLQPublisher) ConsumerOption {
+	return internalsqs.WithDLQPublisher(p)
+}
+
 // WithDrainTimeout sets how long Stop() waits for in-flight handlers to finish.
 func WithDrainTimeout(d time.Duration) ConsumerOption {
 	return internalsqs.WithDrainTimeout(d)
 }
 
 // WithMaxReceiveCount sets the ApproximateReceiveCount threshold at which a message
-// is routed to the dead-letter handler. Requires WithDeadLetterHandler to be set.
+// is routed to the dead-letter handler and/or DLQ. Requires WithDeadLetterHandler
+// or WithDLQForwarding.
 func WithMaxReceiveCount(n int) ConsumerOption {
 	return internalsqs.WithMaxReceiveCount(n)
 }

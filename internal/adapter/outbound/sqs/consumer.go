@@ -4,10 +4,12 @@ package sqs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,9 +72,26 @@ func WithDeadLetterHandler(fn port.Handler) ConsumerOption {
 	return func(c *sqsConsumer) { c.deadLetterHandler = fn }
 }
 
+// WithDLQPublisher forwards poison messages to the source queue's configured
+// dead-letter queue via p, deleting the original only after the forward
+// succeeds (on failure it stays visible and SQS's own redrive remains the
+// backstop). Forwarded are, verbatim with their original attributes:
+//   - bodies that are not a valid envelope (instead of deleting them);
+//   - messages whose ApproximateReceiveCount exceeds the WithMaxReceiveCount
+//     threshold — after the dead-letter handler, when one is set, succeeds;
+//   - messages over that threshold whose codec decode fails.
+//
+// Start resolves the DLQ first and fails on a missing or malformed
+// RedrivePolicy (see checkDLQ). The threshold must be strictly lower than the
+// queue's RedrivePolicy maxReceiveCount, or SQS moves the message first.
+func WithDLQPublisher(p port.DLQPublisher) ConsumerOption {
+	return func(c *sqsConsumer) { c.dlq = p }
+}
+
 // WithMaxReceiveCount sets the ApproximateReceiveCount threshold at which a message
-// is routed to the dead-letter handler instead of the normal handler.
-// Requires WithDeadLetterHandler to be set; 0 disables dead-letter routing.
+// is routed to the dead-letter handler and/or DLQ publisher instead of the
+// normal handler. Requires WithDeadLetterHandler or WithDLQPublisher; 0
+// disables dead-letter routing.
 func WithMaxReceiveCount(n int) ConsumerOption {
 	return func(c *sqsConsumer) { c.maxReceiveCount = n }
 }
@@ -129,6 +148,7 @@ type sqsConsumer struct {
 	concurrency       int
 	visibilityTimeout time.Duration
 	deadLetterHandler port.Handler
+	dlq               port.DLQPublisher
 	drainTimeout      time.Duration
 	codec             port.Codec
 
@@ -222,10 +242,10 @@ func NewWithClient(cfg Config, client SQSClientAPI, handler port.Handler, opts .
 
 	// If a dead-letter handler is registered but no receive-count threshold was
 	// set, apply a safe default so the handler is actually invoked.
-	if c.deadLetterHandler != nil && c.maxReceiveCount == 0 {
+	if (c.deadLetterHandler != nil || c.dlq != nil) && c.maxReceiveCount == 0 {
 		c.maxReceiveCount = 5
 		if c.logger != nil {
-			c.logger.Warn("sqs: WithDeadLetterHandler set without WithMaxReceiveCount; defaulting maxReceiveCount to 5", nil)
+			c.logger.Warn("sqs: WithDeadLetterHandler/WithDLQPublisher set without WithMaxReceiveCount; defaulting maxReceiveCount to 5", nil)
 		}
 	}
 
@@ -246,6 +266,10 @@ func NewWithClient(cfg Config, client SQSClientAPI, handler port.Handler, opts .
 // timeout has been exceeded). Stop() blocks until Start returns.
 // The consumer is fully restartable: Start() may be called again after Stop().
 func (c *sqsConsumer) Start(ctx context.Context) error {
+	if err := c.checkDLQ(ctx); err != nil {
+		return err
+	}
+
 	// Create a fresh doneCh for this cycle before entering the loop.
 	// All fields written here are protected by c.mu; Stop() reads doneCh under
 	// the same lock, guaranteeing it sees the channel for the current cycle.
@@ -421,6 +445,42 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 	}
 }
 
+// dlqStartupCheckTimeout bounds the DLQ resolution Start performs when DLQ
+// forwarding is enabled.
+const dlqStartupCheckTimeout = 10 * time.Second
+
+// checkDLQ resolves the queue's DLQ when DLQ forwarding is enabled. Without a
+// usable RedrivePolicy every forward fails permanently, so poison messages
+// would never be deleted — and with no RedrivePolicy SQS never moves them
+// either — leaving them redelivered until the retention period expires. A
+// permanent configuration error is therefore returned; a transient failure is
+// logged and the consumer starts anyway (each forward re-resolves).
+func (c *sqsConsumer) checkDLQ(ctx context.Context) error {
+	if c.dlq == nil {
+		return nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, dlqStartupCheckTimeout)
+	defer cancel()
+	dlqURL, err := c.dlq.ResolveDLQ(checkCtx, c.queueURL)
+	switch {
+	case err == nil:
+		if c.logger != nil {
+			c.logger.Info("sqs: DLQ forwarding enabled", map[string]any{"queue": c.queueURL, "dlq_url": dlqURL})
+		}
+		return nil
+	case errors.Is(err, domain.ErrDLQNotConfigured), errors.Is(err, domain.ErrDLQInvalidRedrivePolicy):
+		return fmt.Errorf("sqs: DLQ forwarding is enabled but the queue has no usable RedrivePolicy: %w", err)
+	default:
+		if c.logger != nil {
+			c.logger.Warn("sqs: could not resolve DLQ at startup; forwards will retry resolution", map[string]any{
+				"queue": c.queueURL,
+				"error": err.Error(),
+			})
+		}
+		return nil
+	}
+}
+
 // Stop cancels the receive loop and waits for all in-flight handlers to finish
 // (up to DrainTimeout). Returns an error if the drain timeout is exceeded.
 // When DrainTimeout is exceeded, Stop returns the error and signals handler
@@ -476,9 +536,14 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 				"body":       logBody,
 			})
 		}
-		// Delete malformed messages to avoid infinite retry loops.
+		// A malformed message will never parse, so it must leave the queue:
+		// forward it to the DLQ when one is configured (deleting only once the
+		// forward succeeds), otherwise delete it to avoid infinite retry loops.
 		// Record a metric so operators can detect producer schema mismatches.
 		metrics.RecordConsume(c.queueURL, "unknown", "malformed", 0)
+		if c.dlq != nil && !c.forwardToDLQ(drainCtx, context.Background(), msg, "malformed message body: "+err.Error()) {
+			return
+		}
 		c.deleteMessage(msg)
 		return
 	}
@@ -493,6 +558,9 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	// with events.TraceIDFromContext — GUCSet does not carry TraceID.
 	handlerBase := pgcommon.WithGUCSet(context.WithoutCancel(loopCtx), pgdomain.GUCSet{TenantID: env.TenantID})
 	handlerBase = port.WithEnvelopeTraceID(handlerBase, env.TraceID)
+	handlerBase = port.WithSourceMessage(handlerBase, func() port.SourceMessage { return sourceMessage(c.queueURL, msg) })
+	receiveCount := approxReceiveCount(msg.Attributes)
+	overThreshold := c.maxReceiveCount > 0 && receiveCount > c.maxReceiveCount
 
 	// Codec decode — SchemaID is the signal: empty means Payload is already
 	// plain JSON (legacy producer, NoopCodec, or WithCodec never configured
@@ -516,6 +584,12 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 					"error":      decErr.Error(),
 				})
 			}
+			// Past the dead-letter threshold, stop retrying a payload that keeps
+			// failing to decode: forward the undecoded original to the DLQ.
+			if c.dlq != nil && overThreshold &&
+				c.forwardToDLQ(drainCtx, handlerBase, msg, "codec decode failed: "+decErr.Error()) {
+				c.deleteMessage(msg)
+			}
 			return
 		}
 		env.Payload = decoded
@@ -525,12 +599,13 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	// Route to dead-letter handler when ApproximateReceiveCount reaches the threshold.
 	// The message is deleted only if the dead-letter handler succeeds; on failure it
 	// is left visible for retry, matching the semantics of the normal handler.
-	if c.deadLetterHandler != nil && c.maxReceiveCount > 0 {
-		// Use > (strictly greater than) to match SQS DLQ semantics: SQS moves a
-		// message after the receive count *exceeds* MaxReceiveCount (i.e. on the
-		// N+1th delivery). Using >= would fire one delivery too early, consuming
-		// the last retry budget before SQS would have acted.
-		if approxReceiveCount(msg.Attributes) > c.maxReceiveCount {
+	if c.deadLetterHandler != nil || c.dlq != nil {
+		// overThreshold uses > (strictly greater than) to match SQS DLQ
+		// semantics: SQS moves a message after the receive count *exceeds*
+		// MaxReceiveCount (i.e. on the N+1th delivery). Using >= would fire one
+		// delivery too early, consuming the last retry budget before SQS would
+		// have acted.
+		if overThreshold {
 			// Tie DLH context to drainCtx so it respects the drain deadline.
 			dlhCtx, dlhCancel := context.WithCancel(handlerBase)
 			stopDrain := context.AfterFunc(drainCtx, dlhCancel)
@@ -538,13 +613,26 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			defer dlhCancel()
 
 			start := time.Now()
-			dlhErr := c.deadLetterHandler(dlhCtx, env)
+			var dlhErr error
+			if c.deadLetterHandler != nil {
+				dlhErr = c.deadLetterHandler(dlhCtx, env)
+			}
+			// The DLH runs first so a failing DLH leaves the message on the
+			// source queue un-forwarded; a DLH that succeeded runs again if the
+			// forward then fails, so it must be idempotent.
+			if dlhErr == nil && c.dlq != nil {
+				reason := fmt.Sprintf("receive count %d exceeded consumer max receive count %d", receiveCount, c.maxReceiveCount)
+				if !c.forwardToDLQ(drainCtx, handlerBase, msg, reason) {
+					dlhErr = errDLQForwardFailed
+				}
+			}
 			dur := time.Since(start)
 
 			dlhStatus := "success"
 			if dlhErr != nil {
 				dlhStatus = "error"
-				if c.logger != nil {
+				// A failed DLQ forward was already logged by forwardToDLQ.
+				if c.logger != nil && !errors.Is(dlhErr, errDLQForwardFailed) {
 					c.logger.Error("sqs: dead-letter handler failed — message left visible for retry", map[string]any{
 						"message_id": aws.ToString(msg.MessageId),
 						"event_type": env.Type,
@@ -559,7 +647,8 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 					"event_type":                env.Type,
 					"tenant_id":                 env.TenantID,
 					"event_id":                  env.ID,
-					"approximate_receive_count": approxReceiveCount(msg.Attributes),
+					"approximate_receive_count": receiveCount,
+					"forwarded_to_dlq":          c.dlq != nil,
 				})
 			}
 			// Emit the same consume metrics for DLH invocations so dashboards and
@@ -708,6 +797,71 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	}
 
 	metrics.RecordConsume(c.queueURL, env.Type, status, dur.Seconds())
+}
+
+// errDLQForwardFailed marks a dead-letter routing attempt whose DLQ forward
+// failed; forwardToDLQ has already logged the cause.
+var errDLQForwardFailed = errors.New("sqs: forward to DLQ failed")
+
+// maxDLQForwardTimeout bounds a single DLQ forward (resolution + SendMessage).
+const maxDLQForwardTimeout = 30 * time.Second
+
+// dlqForwardTimeout returns the forward deadline: maxDLQForwardTimeout, capped
+// at half the configured visibility timeout (minimum 1s). Forwards run before
+// visibility extension starts, so a forward outliving the visibility timeout
+// would let the message be redelivered — and forwarded twice — mid-flight.
+func (c *sqsConsumer) dlqForwardTimeout() time.Duration {
+	if c.visibilityTimeout > 0 {
+		return max(min(maxDLQForwardTimeout, c.visibilityTimeout/2), time.Second)
+	}
+	return maxDLQForwardTimeout
+}
+
+// forwardToDLQ forwards msg, as received, to the DLQ and reports success.
+// parent supplies context values (trace, baggage); its cancellation is ignored
+// so a forward in flight at Stop() completes, bounded by dlqForwardTimeout and
+// the drain deadline.
+func (c *sqsConsumer) forwardToDLQ(drainCtx, parent context.Context, msg sqstypes.Message, reason string) bool {
+	src := sourceMessage(c.queueURL, msg)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), c.dlqForwardTimeout())
+	defer cancel()
+	stopDrain := context.AfterFunc(drainCtx, cancel)
+	defer stopDrain()
+
+	if err := c.dlq.SendToDLQ(ctx, src.QueueURL, src.Body, src.Attributes, reason); err != nil {
+		if c.logger != nil {
+			c.logger.Error("sqs: DLQ forward failed — message left visible for retry", map[string]any{
+				"message_id": src.MessageID,
+				"queue":      c.queueURL,
+				"reason":     reason,
+				"error":      err.Error(),
+			})
+		}
+		return false
+	}
+	return true
+}
+
+// sourceMessage captures msg as received, for WithSourceMessage and DLQ
+// forwarding. Binary message attributes are omitted.
+func sourceMessage(queueURL string, msg sqstypes.Message) port.SourceMessage {
+	var attrs map[string]string
+	for k, v := range msg.MessageAttributes {
+		if v.StringValue == nil || strings.HasPrefix(aws.ToString(v.DataType), "Binary") {
+			continue
+		}
+		if attrs == nil {
+			attrs = make(map[string]string, len(msg.MessageAttributes))
+		}
+		attrs[k] = *v.StringValue
+	}
+	return port.SourceMessage{
+		QueueURL:     queueURL,
+		MessageID:    aws.ToString(msg.MessageId),
+		Body:         []byte(aws.ToString(msg.Body)),
+		Attributes:   attrs,
+		ReceiveCount: approxReceiveCount(msg.Attributes),
+	}
 }
 
 // decodeCodecPayload reverses the SNS publisher's codec-encode step. Returns
