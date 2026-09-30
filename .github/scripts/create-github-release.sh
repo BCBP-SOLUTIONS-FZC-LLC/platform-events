@@ -34,10 +34,17 @@ DIGEST_SHORT="${IMAGE_DIGEST#sha256:}"
 DIGEST_SHORT="${DIGEST_SHORT:0:12}"
 RELEASE_TITLE="${RELEASE_TAG} · sha256:${DIGEST_SHORT}"
 
+# Attach every cross-compiled binary (all listed in checksums.txt), not only
+# the linux/amd64 one named in release-asset.name.
+BINARIES=()
+for f in platform-events_*; do
+  case "$f" in *.sha256) ;; *) BINARIES+=("$f") ;; esac
+done
+
 gh release create "$RELEASE_TAG" \
   --title "$RELEASE_TITLE" \
   --notes-file release-notes.md \
-  "$ASSET_NAME" \
+  "${BINARIES[@]}" \
   checksums.txt \
   provenance.slsa.json \
   sbom.cyclonedx.json \
