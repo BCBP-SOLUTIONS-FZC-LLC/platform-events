@@ -986,7 +986,7 @@ The inbox therefore reduces duplicate work; it does not make side effects exactl
 **Failure invariants:**
 - **Transient AWS failures never exhaust retry budgets** — SNS throttling / service-unavailable / internal-failure / request-timeout and network timeouts are wrapped in `domain.RetryableError`; the outbox uses threshold `MaxAttempts+1` for them. The same classification is surfaced to DLQ callers as `events.ErrRetryable`.
 - **A stalled dependency degrades throughput, not correctness** — receive errors back off 1 s → 30 s with jitter; outbox poll errors back off 1 s → 30 s; per-call timeouts bound `ReceiveMessage` (`WaitSeconds + 5 s`), `DeleteMessage` (10 s) and each publish (`PublishTimeout`).
-- **Poison messages cannot wedge a queue** — malformed JSON is deleted and counted; semantically poisoned messages are routed by `WithDeadLetterHandler` (and optionally forwarded by `DLQPublisher`) or redriven by SQS after `maxReceiveCount`.
+- **Poison messages cannot wedge a queue** — malformed JSON is counted and deleted (after being forwarded to the SQS DLQ when `WithDLQForwarding` is set); semantically poisoned messages are routed by `WithDeadLetterHandler` (and optionally forwarded by `DLQPublisher`) or redriven by SQS after `maxReceiveCount`.
 
 **Dependency degradation matrix:**
 
@@ -1036,7 +1036,7 @@ The inbox therefore reduces duplicate work; it does not make side effects exactl
 | DLQ forward never loses the original | `SendToDLQ` returns an error on any failure; callers return it so the source message stays visible. Invalid input is rejected before any AWS call |
 | DLQ lookup cached, failures not | `RedrivePolicy` is resolved once per source queue per publisher; a failed lookup is retried on the next call |
 | Standard DLQ attributes are authoritative | `DLQReason`, `OriginalQueue`, `FailedAt`, `ConsumerName` override caller-supplied values; `EventType` comes from the envelope body when parseable; `DLQReason` truncated to 1 KiB on a rune boundary |
-| Malformed messages deleted and counted | SQS messages that cannot be unmarshalled to `Envelope` are deleted immediately and counted as `events_consumed_total{status=malformed}` — prevents poison-pill messages from blocking the queue |
+| Malformed messages deleted and counted | SQS messages that cannot be unmarshalled to `Envelope` are counted as `events_consumed_total{status=malformed}` and deleted — immediately, or after a successful forward to the SQS DLQ with `WithDLQForwarding` — preventing poison-pill messages from blocking the queue |
 | SKIP LOCKED for horizontal scale | Multiple outbox runner instances claim disjoint batches; no distributed lock required |
 | Dead letters are queryable & observable | `outbox_dead_letters` is a Postgres table (retryable from SQL); `outbox_dead_letters_total` counter enables alerting |
 | Batch split at 10 | `PublishBatch` splits silently; partial failures return `BatchError` per message |

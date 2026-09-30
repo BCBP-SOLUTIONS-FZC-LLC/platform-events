@@ -12,7 +12,7 @@ Core capabilities:
 - **Outbox runner** — transactional outbox pattern over a Postgres table; guarantees at-least-once delivery without 2PC
 - **Inbox** (`pkg/inbox`) — consumer-side dedup: `processed_events` ledger (`ApplySchema`, `Store`, `Handler` wrapper, `Prune`), metric `events_inbox_duplicates_total`
 - **`GlueDecodeCodec`** — decode-only codec stripping the Glue Schema Registry wire header
-- **`DLQPublisher`** — forwards failed messages to the source queue's `RedrivePolicy` DLQ (`SendToDLQ`, `ResolveDLQ`); the only sanctioned SQS path for consumer services (they must not import the SQS SDK). Typed `*DLQError` + `ErrRetryable`; `mock.DLQPublisher`; metric `events_dlq_forwarded_total`
+- **`DLQPublisher`** — forwards failed messages to the source queue's `RedrivePolicy` DLQ (`SendToDLQ`, `ResolveDLQ`); the only sanctioned SQS path for consumer services (they must not import the SQS SDK). Typed `*DLQError` + `ErrRetryable`; `mock.DLQPublisher` (validates input like the real one); metrics `events_dlq_forwarded_total` / `events_dlq_forward_duration_seconds`; span `sqs.dlq_forward`. Consumer option `WithDLQForwarding(dlq)` forwards malformed / over-`WithMaxReceiveCount` / decode-poison messages automatically (raw body + attributes); handlers get the raw message via `events.SourceMessageFromContext(ctx)` — never forward `env.JSON()`
 - **Event-envelope types** — versioned, typed `Envelope[T]` carrying metadata (event ID, type, source, tenant, trace ID, timestamp) plus JSON-serialised payload
 - **HMAC helpers** — SHA-256 HMAC signing and verification for webhook and cross-service event authentication
 

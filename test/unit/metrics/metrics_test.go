@@ -256,7 +256,8 @@ func TestRecordOutboxDeadLettersDiscarded_PositiveIncrements(t *testing.T) {
 func TestRecordDLQForward_AfterInit(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	internalmetics.InitWithRegisterer("record-dlq-test", "v0.0.6", reg)
-	internalmetics.RecordDLQForward("https://sqs.us-east-1.amazonaws.com/123/q", "order.placed", "success")
-	internalmetics.RecordDLQForward("https://sqs.us-east-1.amazonaws.com/123/q", "order.placed", "success")
+	internalmetics.RecordDLQForward("https://sqs.us-east-1.amazonaws.com/123/q", "order.placed", "success", 0.01)
+	internalmetics.RecordDLQForward("https://sqs.us-east-1.amazonaws.com/123/q", "order.placed", "success", 0.01)
 	assert.InDelta(t, 2, testutil.ToFloat64(internalmetics.DLQForwardedTotal.WithLabelValues("https://sqs.us-east-1.amazonaws.com/123/q", "order.placed", "success")), 0)
+	assert.Equal(t, 1, testutil.CollectAndCount(internalmetics.DLQForwardDuration, "events_dlq_forward_duration_seconds"))
 }

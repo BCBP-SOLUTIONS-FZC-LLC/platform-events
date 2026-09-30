@@ -153,7 +153,7 @@ if err := dlq.SendToDLQ(ctx, queueURL, body, nil, reason); err != nil {
 | `TopicARN` must be an SNS ARN | `NewSNSPublisher` rejects empty values and anything without an `arn:aws:sns:` / `arn:aws-cn:sns:` / `arn:aws-us-gov:sns:` prefix |
 | `VisibilityTimeout` ≤ 12 h | `NewSQSConsumer` rejects larger values (SQS hard limit) |
 | Outbox payload ≤ 240 KB | `outbox.Enqueue` rejects larger envelopes (the SNS limit is 256 KB) and null bytes in string fields |
-| Malformed message bodies are not retried | Deleted immediately, counted as `events_consumed_total{status="malformed"}` |
+| Malformed message bodies are not retried | Counted as `events_consumed_total{status="malformed"}`; forwarded verbatim to the queue's DLQ with `WithDLQForwarding`, otherwise deleted immediately |
 | `WithMaxReceiveCount(n)` must be **lower** than the queue's `RedrivePolicy` `maxReceiveCount` | Otherwise SQS moves the message before the dead-letter handler runs — see [Forwarding to the SQS DLQ](docs/guides/consuming.md#forwarding-to-the-sqs-dlq) |
 | DLQ forwards carry authoritative metadata | `DLQReason`, `OriginalQueue`, `FailedAt`, `ConsumerName` override caller values; `DLQReason` capped at 1 KiB |
 | `last_error` is bounded | Truncated to 512 chars in `outbox_events` / `outbox_dead_letters` |
@@ -495,7 +495,7 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox` / `LoadOTel`). The li
 Call `events.Init(serviceName, buildVersion)` once at startup (`InitWithRegisterer` in tests). Every metric carries a `service` label.
 
 - **Publish:** `events_published_total{topic,event_type,status}`, `events_publish_duration_seconds`, `events_codec_encode_total` / `events_codec_encode_duration_seconds`.
-- **Consume:** `events_consumed_total{queue,event_type,status}` (`success` / `error` / `malformed` / `dlq_success` / `dlq_error`), `events_consume_duration_seconds`, `events_codec_decode_total` / `events_codec_decode_duration_seconds`, `events_inbox_duplicates_total{consumer}`, `events_dlq_forwarded_total{queue,event_type,status}`.
+- **Consume:** `events_consumed_total{queue,event_type,status}` (`success` / `error` / `malformed` / `dlq_success` / `dlq_error`), `events_consume_duration_seconds`, `events_codec_decode_total` / `events_codec_decode_duration_seconds`, `events_inbox_duplicates_total{consumer}`, `events_dlq_forwarded_total{queue,event_type,status}`, `events_dlq_forward_duration_seconds{queue,event_type}`.
 - **Outbox:** `outbox_pending_total`, `outbox_leased_total`, `outbox_published_total`, `outbox_attempts_total`, `outbox_dead_letters_total`, `outbox_dead_letters_reprocessed_total`, `outbox_dead_letters_discarded_total`, `outbox_poll_errors_total`, `outbox_unmarshal_errors_total`, `outbox_mark_published_errors_total`.
 - **SQS infrastructure:** `sqs_receive_errors_total`, `sqs_delete_errors_total`, `sqs_visibility_extension_errors_total`.
 - **Hygiene:** `events_oversized_event_type_label_total` (event types > 128 bytes are replaced with `__oversized__`).
