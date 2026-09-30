@@ -47,7 +47,8 @@ See [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envel
 
 | Version | Status | Go module | Supported until |
 |---------|--------|-----------|-----------------|
-| `v1.0.x` | **Current** | `@v1.0.0` | Active; patch releases as needed |
+| `v1.5.x` | **Current** | `@v1.5.0` | Active; patch releases as needed |
+| `v1.0.x` – `v1.4.x` | Superseded | `@v1.4.0` … `@v1.0.0` | Upgrade to `v1.5.x` — MINOR releases are backward compatible |
 | `< v1.0.0` | — | — | No tagged releases before `v1.0.0` |
 
 When a new **MAJOR** line ships (e.g. `v2`), the previous major receives **security fixes only** for a period defined by the platform team (typically 6 months after `v2.0.0`).
@@ -98,8 +99,10 @@ The release workflow (`.github/workflows/release.yml`) automates validation and 
    ```
 
 5. **The release workflow** (triggered by the tag) will:
-   - Re-run vet, lint, and tests with the race detector at the exact tagged commit.
-   - Create a **GitHub Release** with the CHANGELOG section as release notes.
+   - Re-run both validation gates (`Validate / Test`, `Validate / Quality`) at the exact tagged commit.
+   - Verify the tag matches the checkout and that `CHANGELOG.md` has the `## [X.Y.Z]` section.
+   - Cross-compile the reference CLI for 5 platforms, push the reference-CLI image to GHCR (`vX.Y.Z`, `vX.Y`, `vX`, `latest`), Trivy-scan it (CRITICAL/HIGH fail the release), and attach an SBOM, SLSA provenance and a Cosign signature.
+   - Create a **GitHub Release** with the CHANGELOG section as release notes plus the binaries, checksums, SBOM and provenance.
 
 6. **Notify consumers** (Slack/ADR) with upgrade notes if MINOR or MAJOR.
 

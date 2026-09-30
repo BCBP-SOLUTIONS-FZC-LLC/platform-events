@@ -10,7 +10,7 @@ set -euo pipefail
 VERSION="${RELEASE_TAG#v}"
 awk "/^## \\[${VERSION}\\]/{found=1; next} /^## \\[/{if(found) exit} found{print}" CHANGELOG.md \
   | sed -e 's/^[[:space:]]*$//' \
-  | tee release-notes.md | true
+  > release-notes.md
 
 if [ ! -s release-notes.md ]; then
   echo "::error file=CHANGELOG.md::Missing entry for ${VERSION}"
@@ -23,5 +23,5 @@ fi
   echo "---"
   echo "**Docker image:** \`${IMAGE_NAME}:${IMAGE_VERSION}\`"
   echo "**Digest:** \`${IMAGE_DIGEST}\`"
-} | tee release-notes.md.tmp | true
+} > release-notes.md.tmp
 mv release-notes.md.tmp release-notes.md

@@ -233,7 +233,7 @@ This is a **private module**. Configure Go before fetching:
 ```bash
 go env -w GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*
 git config --global url."ssh://git@github.com/".insteadOf "https://github.com/"   # SSH key registered with the org
-go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@v1.4.0
+go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@v1.5.0
 ```
 
 **CI / Docker builds:** add a GitHub PAT (classic `repo` scope, or fine-grained Contents: Read on all `BCBP-SOLUTIONS-FZC-LLC/*` repos) as the repository secret `GO_PRIVATE_TOKEN`, and configure git credentials before `go mod download`:
