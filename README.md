@@ -521,7 +521,7 @@ git tag -a v1.5.0 -m "v1.5.0"
 git push origin v1.5.0     # triggers release.yml
 ```
 
-`release.yml` re-runs both validation gates at the tag, verifies the tag matches the checkout and that `CHANGELOG.md` has a `## [X.Y.Z]` section, cross-compiles the CLI for 5 platforms, pushes the image (`vX.Y.Z`, `vX.Y`, `vX`, `latest`) with a Trivy CRITICAL/HIGH gate, SBOM, SLSA provenance and a Cosign keyless signature, then publishes the GitHub Release from the matching `CHANGELOG.md` section. SemVer rules and supported versions: [VERSIONING.md](VERSIONING.md).
+`release.yml` is the **same pipeline as `ci.yml`**, run at the tag: a fast `Verify tag + CHANGELOG` job (tag = checkout, `## [X.Y.Z]` section present), then the identical `Validate / Test`, `Validate / Quality`, `Build image (cache)`, `Trivy CVE scan` (CRITICAL / HIGH / UNKNOWN), `Smoke tests` and `Cross-language compatibility` gates, plus 5-platform CLI binaries. Only after **all** of them pass does `Push image → GHCR` publish the image (`vX.Y.Z`, `vX.Y`, `vX`, `latest`) — a cache hit of the exact image that was scanned and smoke-tested — with SBOM, SLSA provenance and a Cosign keyless signature, and `GitHub Release` publishes the notes from the matching `CHANGELOG.md` section with binaries, checksums, SBOM and provenance attached. SemVer rules and supported versions: [VERSIONING.md](VERSIONING.md).
 
 ---
 
@@ -533,7 +533,7 @@ Five workflow files, mirroring `iam-org-membership` — the org's reference pipe
 - **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 95%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
 - **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make vuln-check` → Dockerfile digest-pinning check.
 - **`changelog-check.yml`** — fails a PR touching `internal/`, `pkg/` or `cmd/` without a `CHANGELOG.md` update.
-- **`release.yml`** — on `v*.*.*` tags, see [Releasing](#releasing).
+- **`release.yml`** — on `v*.*.*` tags: the same job graph as `ci.yml` plus verify / binaries / publish — see [Releasing](#releasing).
 
 | Required check (org ruleset) | Job |
 |---|---|

@@ -4,11 +4,13 @@
 #
 # Parallel flow:
 #
-#   validate-test ──────┐──► interop (cross-language wire format)
-#   build-image ────────┤──► trivy ──────┐
-#                       │   smoke ───────┤──► pr-summary (PR events only)
-#                       └────────────────┤──► push       (push events only, needs quality too)
-#   validate-quality ───────────────────┘
+#   validate-test ──────┬──► interop (cross-language wire format) ──┐
+#   build-image ────────┼──► trivy ─────────────────────────────────┤──► pr-summary (PR events only)
+#                       └──► smoke ─────────────────────────────────┤──► push       (push events only)
+#   validate-quality ───────────────────────────────────────────────┘
+#
+# release.yml runs this same graph at the tag (plus verify / binaries /
+# publish) — keep the two in step when changing a gate.
 #
 # platform-events is a library; the image is the reference CLI
 # (cmd/platform-events). Building, CVE-scanning and smoke-testing it checks
@@ -76,6 +78,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      # Reused by trivy/smoke so their "load from cache" build uses the same
+      # build args and is a true cache hit of this image.
+      source_date_epoch: ${{ steps.cache.outputs.SOURCE_DATE_EPOCH }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7.0.0
@@ -160,7 +166,9 @@ jobs:
           load: true
           tags: platform-events-ci-test
           cache-from: type=gha
-          build-args: BUILD_VERSION=${{ github.sha }}
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ needs.build-image.outputs.source_date_epoch }}
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
 
@@ -244,7 +252,9 @@ jobs:
           load: true
           tags: platform-events-ci-test
           cache-from: type=gha
-          build-args: BUILD_VERSION=${{ github.sha }}
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ needs.build-image.outputs.source_date_epoch }}
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
 
@@ -296,7 +306,9 @@ jobs:
   push:
     name: Push image → GHCR
     runs-on: ubuntu-latest
-    needs: [validate-test, trivy, smoke, validate-quality]
+    # Same gate set as release.yml's push: nothing is published unless the
+    # tests, quality, image scan, smoke tests and Go↔Python interop all passed.
+    needs: [validate-test, validate-quality, trivy, smoke, interop]
     if: github.event_name == 'push'
     timeout-minutes: 25
     permissions:

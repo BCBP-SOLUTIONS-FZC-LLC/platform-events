@@ -1061,7 +1061,7 @@ The CLI is also built into a digest-pinned distroless image (`Dockerfile`, ~6 MB
 | `Build image (cache)` → `Trivy CVE scan` / `Smoke tests` | `ci.yml` | Hadolint; no fixable CRITICAL/HIGH/UNKNOWN CVE in the image; the binary starts, validates config, stamps its version |
 | `Cross-language compatibility` | `ci.yml` → `platform-interop-tests` | Go ↔ Python envelope JSON and HMAC byte-for-byte |
 | `Push image → GHCR` | `ci.yml`, push to `main` | Signed (Cosign keyless), SBOM + provenance attested |
-| Release | `release.yml`, `v*.*.*` tag | Tag = checkout; `CHANGELOG.md` has the version; 5-platform CLI build; image `vX.Y.Z` scanned (CRITICAL/HIGH), signed, provenance exported; GitHub Release with binaries, checksums, SBOM, provenance |
+| Release | `release.yml`, `v*.*.*` tag | **Same job graph as `ci.yml`** at the tag: tag = checkout and `CHANGELOG.md` has the version (fail fast), then every CI gate above; the image is pushed only after all gates pass, as a cache hit of the scanned image, then signed with provenance; GitHub Release with binaries, checksums, SBOM, provenance |
 
 SemVer rules: [VERSIONING.md](VERSIONING.md).
 

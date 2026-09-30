@@ -391,7 +391,7 @@ GitHub Actions mirrors `iam-org-membership`'s pipeline — the org ruleset on `m
 - **`validate-quality.yml`** (reusable) — `go mod verify`, HTML-entity check, RLS-6 grep, `gofmt`, tidy drift, `make vet` / `make lint` (each also with `-tags=integration,e2e`), `make vuln-check`, Dockerfile digest-pinning check. `golangci-lint` runs via `go tool` (the `tool` directive in `go.mod` is not propagated to consumers).
 - **`ci.yml`** (push/PR to main) — the two gates + `Build image (cache)` in parallel → `Trivy CVE scan` / `Smoke tests` → `Cross-language compatibility` → `PR summary`; on push, `Push image → GHCR` (Cosign-signed).
 - **`changelog-check.yml`** — PRs touching `internal/`, `pkg/`, `cmd/` must update `CHANGELOG.md`.
-- **`release.yml`** (`v*` tags) — both gates → tag + CHANGELOG verification → 5-platform CLI build → image push/scan/sign/provenance → GitHub Release. The Git tag is the **Go module release** consuming services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z`.
+- **`release.yml`** (`v*` tags) — **the same job graph as `ci.yml`** at the tag, behind a fail-fast tag + CHANGELOG `verify` job, plus 5-platform CLI binaries; the image is pushed (semver tags, signed, provenance) only after every gate passes, then the GitHub Release is published. Change a gate in `ci.yml` → change it in `release.yml` too. The Git tag is the **Go module release** consuming services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z`.
 
 Standard-library `govulncheck` findings are fixed by bumping the `go` directive in `go.mod` (CI reads the toolchain from it via `go-version-file`). Base images are re-pinned with `make pin-base-images`.
 
