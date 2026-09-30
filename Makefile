@@ -8,6 +8,20 @@ APP_ENV       ?= dev
 GO            ?= go
 BUILD_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
+# Private modules — resolved via SSH (git@github.com:) using the global URL
+# rewrite. No tokens needed for local dev; an SSH key registered with the
+# BCBP-SOLUTIONS-FZC-LLC org is required.
+export GOPRIVATE  ?= github.com/BCBP-SOLUTIONS-FZC-LLC/*
+export GONOSUMDB  ?= github.com/BCBP-SOLUTIONS-FZC-LLC/*
+
+# Docker socket for testcontainers-go (Mac Docker Desktop uses a user socket).
+# Only exported when a socket actually exists, so a Docker context set up by
+# another runtime (e.g. colima) is not overridden with a dead path.
+DOCKER_SOCKET := $(shell if [ -S /Users/$(USER)/.docker/run/docker.sock ]; then echo unix:///Users/$(USER)/.docker/run/docker.sock; elif [ -S /var/run/docker.sock ]; then echo unix:///var/run/docker.sock; fi)
+ifneq ($(DOCKER_SOCKET),)
+export DOCKER_HOST ?= $(DOCKER_SOCKET)
+endif
+
 export APP_NAME APP_ENV BUILD_VERSION
 
 # Test package groups (explicit to handle per-group build tags cleanly).
@@ -17,9 +31,20 @@ TEST_UNIT_PKGS := ./test/unit/... ./internal/core/service/...
 TEST_INT_PKGS  := ./test/integration/...
 TEST_E2E_PKGS  := ./test/e2e/...
 
+# Every build tag the test/ tree declares (integration: test/integration,
+# e2e: test/e2e). vet and lint run a second pass with all of them — CI's
+# quality gate calls `make vet`/`make lint`, so without it the tagged test
+# files were never vetted or linted. smoke is excluded: test/smoke needs live
+# AWS resources and is excluded from golangci-lint in .golangci.yml.
+ALL_TEST_TAGS := integration,e2e
+
 # Source packages measured for coverage (excludes test helpers and cmd).
 # Uses tr+sed instead of paste -sd, because macOS BSD paste rejects combined flags.
-COVER_PKG_LIST := $(shell $(GO) list ./internal/... ./pkg/... | tr '\n' ',' | sed 's/,$$//')
+COVER_PKG_LIST := $(shell $(GO) list ./internal/... ./pkg/... 2>/dev/null | tr '\n' ',' | sed 's/,$$//')
+
+# Pinned to prevent unintended breakage from new advisories landing mid-CI.
+# To upgrade: go run golang.org/x/vuln/cmd/govulncheck@latest --version, then update below.
+GOVULNCHECK_VERSION ?= v1.1.4
 
 # -----------------------------
 # SETUP
@@ -30,32 +55,39 @@ setup:
 	@test -f .env || cp .env-example .env
 	@echo "Environment ready (.env)"
 
+# godoc: serve package documentation locally using pkgsite.
+# Opens http://localhost:8080 — browse to the module path in the UI.
+.PHONY: godoc
+godoc:
+	@echo "Starting pkgsite at http://localhost:8080 — press Ctrl-C to stop"
+	$(GO) run golang.org/x/pkgsite/cmd/pkgsite@latest -open .
+
 .PHONY: help
 help:
 	@echo "Available commands:"
-	@echo "  make setup           - copy .env-example to .env if missing"
-	@echo "  make tidy            - go mod tidy"
-	@echo "  make fmt             - go fmt ./..."
-	@echo "  make vet             - go vet all packages"
-	@echo "  make lint            - run golangci-lint"
-	@echo "  make test            - unit + integration tests (requires Docker)"
-	@echo "  make test-ci         - unit + integration + e2e with race detector (used in CI)"
-	@echo "  make test-unit       - unit tests only"
-	@echo "  make test-int        - integration tests (requires Docker / LocalStack)"
-	@echo "  make test-smoke      - smoke tests (requires live AWS resources)"
-	@echo "  make test-e2e        - e2e tests (requires Docker / LocalStack)"
-	@echo "  make build           - compile reference CLI to bin/"
-	@echo "  make docker-up       - start LocalStack (SNS + SQS + Postgres)"
-	@echo "  make docker-down     - stop LocalStack"
-	@echo "  make cover           - coverage profile + open HTML report"
-	@echo "  make cover-func      - coverage summary by function"
-	@echo "  make ci              - tidy + vet + lint + test-ci + build"
-	@echo "  make godoc           - serve docs locally via pkgsite (http://localhost:8080)"
-	@echo "  make fmt-check       - verify gofmt formatting (no changes applied)"
-	@echo "  make mod-verify      - go mod verify (check module download integrity)"
-	@echo "  make vuln-check      - govulncheck on library packages"
-	@echo "  make race            - unit + integration + e2e with -race flag"
-	@echo "  make clean           - remove build artefacts"
+	@echo "  make setup            - copy .env-example to .env if missing"
+	@echo "  make tidy             - go mod tidy"
+	@echo "  make fmt              - gofmt -w the whole module"
+	@echo "  make fmt-check        - verify gofmt formatting (mirrors CI)"
+	@echo "  make vet              - go vet (default build + every test build tag)"
+	@echo "  make lint             - run golangci-lint (default build + every test build tag)"
+	@echo "  make test             - unit + integration tests in parallel (requires Docker)"
+	@echo "  make test-ci          - unit + integration + e2e with race detector + merged coverage (used in CI)"
+	@echo "  make test-unit        - unit tests only (no Docker required)"
+	@echo "  make test-integration - integration tests (requires Docker / LocalStack); alias: test-int"
+	@echo "  make test-e2e         - e2e tests (requires Docker / LocalStack)"
+	@echo "  make test-smoke       - smoke tests (requires live AWS resources)"
+	@echo "  make race             - unit + integration + e2e with -race flag"
+	@echo "  make build            - compile reference CLI to bin/"
+	@echo "  make cover            - coverage HTML report (runs test-ci)"
+	@echo "  make cover-func       - coverage summary by function (runs test-ci)"
+	@echo "  make ci               - tidy + fmt-check + vet + lint + test-ci + build"
+	@echo "  make docker-up        - start LocalStack (SNS + SQS + Postgres)"
+	@echo "  make docker-down      - stop LocalStack"
+	@echo "  make mod-verify       - go mod verify (check module download integrity)"
+	@echo "  make vuln-check       - govulncheck on internal + pkg"
+	@echo "  make godoc            - serve local godoc/pkgsite at http://localhost:8080"
+	@echo "  make clean            - remove build artefacts"
 
 # -----------------------------
 # GO BASICS
@@ -67,11 +99,30 @@ tidy:
 
 .PHONY: fmt
 fmt:
-	$(GO) fmt ./...
+	@gofmt -l -w .
 
 .PHONY: vet
 vet:
 	$(GO) vet ./...
+	$(GO) vet -tags=$(ALL_TEST_TAGS) ./...
+
+.PHONY: fmt-check
+fmt-check:
+	@unformatted=$$(gofmt -l . 2>/dev/null); \
+	if [ -n "$$unformatted" ]; then \
+		echo "FAIL: unformatted files:"; \
+		echo "$$unformatted"; \
+		exit 1; \
+	fi
+	@echo "gofmt: all files formatted"
+
+.PHONY: mod-verify
+mod-verify:
+	$(GO) mod verify
+
+.PHONY: vuln-check
+vuln-check:
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./internal/... ./pkg/...
 
 # -----------------------------
 # LINT
@@ -80,40 +131,93 @@ vet:
 .PHONY: lint
 lint:
 	@echo "Running linter..."
-	$(GO) tool golangci-lint run
+	$(GO) tool golangci-lint run ./...
+	$(GO) tool golangci-lint run --build-tags=$(ALL_TEST_TAGS) ./...
 
 # -----------------------------
 # TESTS
 # -----------------------------
 
+# run_suite runs one coverage-instrumented suite into .coverage/<name>.out.
+# Suites run in parallel (make -j3), so their logs interleave — on failure the
+# `--- FAIL:` lines are re-printed in a summary block at the end.
+#   $(1) = suite name   $(2) = go test packages + flags
+define run_suite
+	{ $(GO) test $(2) \
+	  -coverpkg=$(COVER_PKG_LIST) \
+	  -coverprofile=.coverage/$(1).out \
+	  2>&1; echo $$? >.coverage/$(1).exitcode; } | tee .coverage/$(1).raw; \
+	_exit=$$(cat .coverage/$(1).exitcode 2>/dev/null || echo 1); \
+	[ "$$_exit" = "0" ] || { \
+	  printf '\n\n=== FAILING $(1) TESTS (see full log above for details) ===\n'; \
+	  grep '^--- FAIL:' .coverage/$(1).raw || printf '(no --- FAIL lines — check for DATA RACE or panic above)\n'; \
+	  printf '=============================================================\n\n'; \
+	}; \
+	exit "$$_exit"
+endef
+
+.PHONY: _test-unit
+_test-unit: | .coverage
+	$(call run_suite,unit,$(TEST_UNIT_PKGS) -race -count=1 -timeout 120s)
+
+.PHONY: _test-integration
+_test-integration: | .coverage
+	$(call run_suite,integration,$(TEST_INT_PKGS) -tags=integration -race -count=1 -timeout 300s)
+
+.PHONY: _test-e2e
+_test-e2e: | .coverage
+	$(call run_suite,e2e,$(TEST_E2E_PKGS) -tags=e2e -race -count=1 -timeout 300s)
+
 .PHONY: test
 test:
-	$(GO) test $(TEST_UNIT_PKGS) -count=1 -timeout 120s -v
-	$(GO) test $(TEST_INT_PKGS)  -tags=integration -count=1 -timeout 300s -v
+	$(MAKE) -j2 _test-unit-plain _test-integration-plain
 
-# test-ci: used by CI and release workflows; enables the race detector.
-# Includes e2e tests (requires Docker on the runner, same as cover-func).
+.PHONY: _test-unit-plain _test-integration-plain
+_test-unit-plain:
+	$(GO) test $(TEST_UNIT_PKGS) -count=1 -timeout 120s -v
+_test-integration-plain:
+	$(GO) test $(TEST_INT_PKGS) -tags=integration -count=1 -timeout 300s -v
+
+# Merge the per-suite profiles into a single coverage.out (max-count
+# strategy — any suite covering a block wins). Mirrors iam-org-membership.
+.PHONY: _merge-coverage
+_merge-coverage:
+	@python3 scripts/merge_coverage.py \
+	  .coverage/unit.out .coverage/integration.out .coverage/e2e.out \
+	  > coverage.out
+	@echo "==> coverage.out merged from all suites (max-count strategy)"
+
+# test-ci: used by CI and release workflows; enables the race detector and
+# writes the merged coverage.out that ci.yml / release.yml read.
+# Includes e2e tests (requires Docker on the runner).
 .PHONY: test-ci
-test-ci:
-	$(GO) test $(TEST_UNIT_PKGS) -race -count=1 -timeout 120s
-	$(GO) test $(TEST_INT_PKGS)  -tags=integration -race -count=1 -timeout 300s
-	$(GO) test $(TEST_E2E_PKGS)  -tags=e2e -race -count=1 -timeout 300s
+test-ci: | .coverage
+	$(MAKE) -j3 _test-unit _test-integration _test-e2e
+	$(MAKE) _merge-coverage
 
 .PHONY: test-unit
 test-unit:
 	$(GO) test $(TEST_UNIT_PKGS) -count=1 -timeout 60s -v
 
+.PHONY: test-integration
+test-integration:
+	$(GO) test $(TEST_INT_PKGS) -tags=integration -count=1 -timeout 300s -v
+
+# test-int: kept as an alias — referenced by README / CLAUDE.md / CONTRIBUTING.
 .PHONY: test-int
-test-int:
-	$(GO) test $(TEST_INT_PKGS) -tags=integration -count=1 -timeout 120s -v
+test-int: test-integration
+
+.PHONY: test-e2e
+test-e2e:
+	$(GO) test $(TEST_E2E_PKGS) -tags=e2e -count=1 -timeout 300s -v
 
 .PHONY: test-smoke
 test-smoke:
 	$(GO) test ./test/smoke/... -tags=smoke -count=1 -timeout 60s -v
 
-.PHONY: test-e2e
-test-e2e:
-	$(GO) test $(TEST_E2E_PKGS) -tags=e2e -count=1 -timeout 300s -v
+.PHONY: race
+race:
+	$(MAKE) -j3 _test-unit _test-integration _test-e2e
 
 # -----------------------------
 # BUILD
@@ -146,87 +250,28 @@ docker-down:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy vet lint test-ci build
+ci: tidy fmt-check vet lint test-ci build
 
 # -----------------------------
 # COVERAGE
 # -----------------------------
 
 .PHONY: cover
-cover:
-	$(GO) test \
-	  $(TEST_UNIT_PKGS) $(TEST_INT_PKGS) $(TEST_E2E_PKGS) \
-	  -tags=integration,e2e \
-	  -race -count=1 -timeout 300s \
-	  -coverpkg=$(COVER_PKG_LIST) \
-	  -coverprofile=coverage.out
+cover: test-ci
 	$(GO) tool cover -html=coverage.out
 
 .PHONY: cover-func
-cover-func:
-	$(GO) test \
-	  $(TEST_UNIT_PKGS) $(TEST_INT_PKGS) $(TEST_E2E_PKGS) \
-	  -tags=integration,e2e \
-	  -race -count=1 -timeout 300s \
-	  -coverpkg=$(COVER_PKG_LIST) \
-	  -coverprofile=coverage.out
+cover-func: test-ci
 	$(GO) tool cover -func=coverage.out
-
-# -----------------------------
-# DEBUG HELPERS
-# -----------------------------
-
-.PHONY: race
-race:
-	$(GO) test \
-	  $(TEST_UNIT_PKGS) $(TEST_INT_PKGS) $(TEST_E2E_PKGS) \
-	  -tags=integration,e2e \
-	  -race -count=1 -timeout 300s
-
-# -----------------------------
-# GODOC
-# -----------------------------
-
-# godoc: serve package documentation locally using pkgsite.
-# Opens http://localhost:8080 — browse to the module path in the UI.
-.PHONY: godoc
-godoc:
-	@echo "Starting pkgsite at http://localhost:8080 — press Ctrl-C to stop"
-	$(GO) run golang.org/x/pkgsite/cmd/pkgsite@latest -open .
-
-# -----------------------------
-# CHECKS (mirror what CI runs; safe to call locally before pushing)
-# -----------------------------
-
-# fmt-check: verify formatting without modifying files (mirrors CI gofmt step).
-.PHONY: fmt-check
-fmt-check:
-	@unformatted=$$(gofmt -l cmd/ internal/ pkg/ test/); \
-	if [ -n "$$unformatted" ]; then \
-		echo "FAIL: unformatted files:"; \
-		echo "$$unformatted"; \
-		exit 1; \
-	fi
-	@echo "gofmt: all files formatted"
-
-# mod-verify: check that downloaded module zips match go.sum hashes.
-.PHONY: mod-verify
-mod-verify:
-	$(GO) mod verify
-
-# vuln-check: scan library packages for known vulnerabilities (excludes cmd/).
-# Version is pinned to prevent unintended breakage from new advisories landing mid-CI.
-# To upgrade: go run golang.org/x/vuln/cmd/govulncheck@latest --version, then update below.
-GOVULNCHECK_VERSION ?= v1.1.4
-.PHONY: vuln-check
-vuln-check:
-	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./internal/... ./pkg/...
 
 # -----------------------------
 # CLEAN
 # -----------------------------
 
+.coverage:
+	@mkdir -p .coverage
+
 .PHONY: clean
 clean:
-	rm -rf bin
+	rm -rf bin .coverage
 	rm -f coverage.out coverage.html coverage_*.out *.coverprofile profile.cov

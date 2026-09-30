@@ -41,3 +41,5 @@ go.work.sum
 
 # Claude Code temporary worktrees
 .claude/worktrees/
+# Per-suite coverage profiles written by make test-ci
+.coverage/

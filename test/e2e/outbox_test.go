@@ -273,9 +273,10 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 
 	var sentinelCount atomic.Int32
 	sentinelHandler := func(_ context.Context, env events.Envelope[json.RawMessage]) error {
-		if env.ID == sentinelEnv.ID {
+		switch env.ID {
+		case sentinelEnv.ID:
 			sentinelReceived <- struct{}{}
-		} else if env.ID == rolledBackEnv.ID {
+		case rolledBackEnv.ID:
 			sentinelCount.Add(1) // should never happen
 		}
 		return nil
