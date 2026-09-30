@@ -83,11 +83,41 @@ help:
 	@echo "  make cover-func       - coverage summary by function (runs test-ci)"
 	@echo "  make ci               - tidy + fmt-check + vet + lint + test-ci + build"
 	@echo "  make docker-up        - start LocalStack (SNS + SQS + Postgres)"
+	@echo "  make docker-build     - build the reference-CLI image as CI does (needs GO_PRIVATE_TOKEN)"
+	@echo "  make pin-base-images  - fetch + pin SHA digests for Dockerfile base images"
 	@echo "  make docker-down      - stop LocalStack"
 	@echo "  make mod-verify       - go mod verify (check module download integrity)"
 	@echo "  make vuln-check       - govulncheck on internal + pkg"
 	@echo "  make godoc            - serve local godoc/pkgsite at http://localhost:8080"
 	@echo "  make clean            - remove build artefacts"
+
+# pin-base-images: fetch and pin the current SHA digests for Dockerfile base
+# images. Writes the digests both to the Dockerfile FROM lines and to
+# .docker-digests (a checked-in provenance record). CI's quality gate rejects
+# any FROM line without a digest.
+.PHONY: pin-base-images
+pin-base-images:
+	@echo "Fetching SHA digests for Dockerfile base images..."
+	@GOLANG_DIGEST=$$(docker buildx imagetools inspect golang:1.26.6-alpine --format '{{.Manifest.Digest}}') && \
+	 DISTROLESS_DIGEST=$$(docker buildx imagetools inspect gcr.io/distroless/static-debian13:nonroot --format '{{.Manifest.Digest}}') && \
+	 sed -i.bak -E \
+	   -e "s|FROM golang:1.26.6-alpine(@sha256:[a-f0-9]+)?|FROM golang:1.26.6-alpine@$$GOLANG_DIGEST|" \
+	   -e "s|FROM gcr.io/distroless/static-debian13:nonroot(@sha256:[a-f0-9]+)?|FROM gcr.io/distroless/static-debian13:nonroot@$$DISTROLESS_DIGEST|" \
+	   Dockerfile && rm -f Dockerfile.bak && \
+	 echo "golang:1.26.6-alpine $$GOLANG_DIGEST" > .docker-digests && \
+	 echo "gcr.io/distroless/static-debian13:nonroot $$DISTROLESS_DIGEST" >> .docker-digests && \
+	 echo "Digests written to .docker-digests — commit both Dockerfile and .docker-digests"
+
+# docker-build: build the reference-CLI image the way CI does. Needs a GitHub
+# token with read access to the private BCBP modules in GO_PRIVATE_TOKEN
+# (e.g. GO_PRIVATE_TOKEN=$$(gh auth token) make docker-build).
+.PHONY: docker-build
+docker-build:
+	@test -n "$$GO_PRIVATE_TOKEN" || { echo "GO_PRIVATE_TOKEN is not set"; exit 1; }
+	docker build --platform linux/amd64 \
+	  --secret id=go_private_token,env=GO_PRIVATE_TOKEN \
+	  --build-arg BUILD_VERSION=$(BUILD_VERSION) \
+	  -t $(APP_NAME)-ci-test .
 
 # -----------------------------
 # GO BASICS

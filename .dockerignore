@@ -1,0 +1,42 @@
+# Version control
+.git
+.gitignore
+
+# Environment files — never bake secrets into the image
+.env
+.env.*
+*.env
+.go_private_token
+
+# Development tooling and docs
+.claude/
+.github/
+docs/
+scripts/
+*.md
+
+# Local compose (host-only)
+docker-compose.yml
+docker-compose.yaml
+
+# Test artefacts
+test/
+coverage.out
+coverage*.out
+coverage.html
+*.coverprofile
+**/*_test.go
+
+# Build artefacts already compiled outside Docker
+bin/
+.coverage/
+
+# IDE and OS noise
+.idea/
+.vscode/
+*.DS_Store
+*.swp
+*.swo
+
+# Go tool cache (not needed in image)
+vendor/

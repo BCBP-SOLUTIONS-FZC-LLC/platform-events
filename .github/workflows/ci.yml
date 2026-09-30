@@ -1,175 +1,381 @@
 # CI for https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events
+# Pipeline mirrors iam-org-membership (the org's reference pipeline, whose job
+# names are the required status checks on main).
+#
+# Parallel flow:
+#
+#   validate-test ──────┐──► interop (cross-language wire format)
+#   build-image ────────┤──► trivy ──────┐
+#                       │   smoke ───────┤──► pr-summary (PR events only)
+#                       └────────────────┤──► push       (push events only, needs quality too)
+#   validate-quality ───────────────────┘
+#
+# platform-events is a library; the image is the reference CLI
+# (cmd/platform-events). Building, CVE-scanning and smoke-testing it checks
+# the compiled binary — every dependency and the Go standard library linked
+# into it — the way consuming services will ship them.
+#
+# build-image lints the Dockerfile (Hadolint + .dockerignore check) as its
+# first steps, before the expensive build — a lint failure never starts the
+# build. validate-test runs the race+coverage gate and gates trivy/smoke
+# (correctness). validate-quality gates push only (style + lint).
+#
+# Required status checks (org ruleset) produced by this file: "Validate / Test
+# / test", "Validate / Quality / quality", "Build image (cache)", "Trivy CVE
+# scan", "Smoke tests", "PR summary". Renaming a job breaks merging.
+#
+# paths-ignore skips this entire (expensive) pipeline for commits that only
+# touch Markdown docs or the mermaid diagrams — those can't affect test/build
+# outcomes. A commit that touches both docs and code still runs normally
+# (paths-ignore only skips when EVERY changed file matches).
+#
 name: CI
 
 "on":
   push:
-    branches: [main]
+    branches: [main, master]
+    paths-ignore: ['**.md', 'docs/architecture/**', 'docs/guides/**']
   pull_request:
-    branches: [main]
+    branches: [main, master]
+    paths-ignore: ['**.md', 'docs/architecture/**', 'docs/guides/**']
   workflow_dispatch:
 
 permissions:
   contents: read
+  packages: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-  GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+  IMAGE_NAME: ghcr.io/bcbp-solutions-fzc-llc/platform-events
+  BUILDKIT_PROGRESS: plain
 
 jobs:
-  validate:
-    name: Validate
-    uses: ./.github/workflows/validate.yml
+  # ── runs in parallel with validate-quality + build-image ─────────────────
+  validate-test:
+    name: Validate / Test
+    uses: ./.github/workflows/validate-test.yml
     secrets: inherit
 
-  coverage:
-    name: Coverage
+  # ── runs in parallel with validate-test + build-image ────────────────────
+  validate-quality:
+    name: Validate / Quality
+    uses: ./.github/workflows/validate-quality.yml
+    secrets: inherit
+
+  # ── runs in parallel with validate-test + validate-quality ───────────────
+  # Lints the Dockerfile as its first steps — a hadolint failure exits before
+  # the expensive build ever starts, no separate job/job-minute needed.
+  build-image:
+    name: Build image (cache)
     runs-on: ubuntu-latest
-    needs: validate
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.0
         with:
-          persist-credentials: false
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - name: Hadolint
+        uses: hadolint/hadolint-action@v3.3.0
         with:
-          go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            go.mod
+          dockerfile: Dockerfile
+          ignore: DL3008
 
-      - name: Configure private module access
-        run: |
-          git config --global credential.helper store
-          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
-          chmod 600 ~/.git-credentials
+      - name: Check .dockerignore exists
+        run: test -f .dockerignore
 
-      - name: Download modules
-        run: go mod download
+      # SOURCE_DATE_EPOCH + cache targets (grouped in docker-build-prep.sh).
+      - name: Prepare Docker build
+        id: cache
+        env:
+          REGISTRY_REF: ${{ env.IMAGE_NAME }}:buildcache
+          CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        run: bash .github/scripts/docker-build-prep.sh
 
-      - name: Coverage (≥95% required)
-        run: |
-          make cover-func
-          pct=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
-          echo "Total coverage: ${pct}%"
-          awk -v p="$pct" 'BEGIN { if (p+0 < 95) { print "FAIL: " p "% is below the 95% threshold"; exit 1 } }'
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v7
-        if: always()
+      # Log in so registry cache reads (and writes on non-fork runs) are authenticated.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.4.0
         with:
-          name: coverage-report
-          path: coverage.out
-          if-no-files-found: ignore
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-  build:
-    name: Build
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      # Build and write all layers to GHA + registry cache (no local load needed here).
+      - name: Build image → cache
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          # This cache job only feeds downstream trivy/smoke, which load amd64 images.
+          platforms: linux/amd64
+          push: false
+          load: false
+          # Pull fresh base image on push/manual runs; skip on PRs for speed.
+          pull: ${{ github.event_name != 'pull_request' }}
+          cache-from: ${{ steps.cache.outputs.from }}
+          cache-to: ${{ steps.cache.outputs.to }}
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ steps.cache.outputs.SOURCE_DATE_EPOCH }}
+          secrets: |
+            go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
+
+  # ── gates on build-image, runs in parallel with smoke ─────────────────────
+  trivy:
+    name: Trivy CVE scan
     runs-on: ubuntu-latest
-    needs: coverage
+    needs: [validate-test, build-image]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.0
         with:
-          persist-credentials: false
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      # Restore from GHA cache (all layers cached → near-instant rebuild).
+      - name: Load image from cache
+        uses: docker/build-push-action@v7.3.0
         with:
-          go-version-file: go.mod
-          cache-dependency-path: |
-            go.sum
-            go.mod
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: platform-events-ci-test
+          cache-from: type=gha
+          build-args: BUILD_VERSION=${{ github.sha }}
+          secrets: |
+            go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
 
-      - name: Configure private module access
-        run: |
-          git config --global credential.helper store
-          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
-          chmod 600 ~/.git-credentials
-
-      - name: Download modules
-        run: go mod download
-
-      - name: Build binary
-        run: make build
-
-      - name: Verify binary
-        run: test -x bin/platform-events
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v7
+      - name: Cache Trivy DB
+        uses: actions/cache@v6.0.0
         with:
-          name: platform-events-linux-amd64
-          path: bin/platform-events
-          if-no-files-found: error
+          path: /tmp/trivy-cache
+          key: trivy-db-${{ runner.os }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-
 
+      # Table format: human-readable in CI logs; fails on CRITICAL/HIGH/UNKNOWN.
+      # Scans both the OS layer and the Go binary's module + stdlib versions.
+      - name: Trivy scan — CRITICAL / HIGH / UNKNOWN
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: platform-events-ci-test
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH,UNKNOWN
+          ignore-unfixed: true
+          cache-dir: /tmp/trivy-cache
+
+      # SARIF format: uploads to GitHub Security tab.
+      - name: Trivy scan — SARIF upload
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: platform-events-ci-test
+          format: sarif
+          output: trivy-results.sarif
+          exit-code: '0'
+          ignore-unfixed: true
+          cache-dir: /tmp/trivy-cache
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4.37.0
+        continue-on-error: true
+        with:
+          sarif_file: trivy-results.sarif
+
+      # CycloneDX SBOM — full component inventory for compliance / audit.
+      - name: Trivy SBOM — CycloneDX
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: platform-events-ci-test
+          format: cyclonedx
+          output: sbom.cyclonedx.json
+          exit-code: '0'
+          cache-dir: /tmp/trivy-cache
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cyclonedx.json
+          retention-days: 90
+
+  # ── gates on validate-test + build-image, runs in parallel with trivy ─────
+  smoke:
+    name: Smoke tests
+    runs-on: ubuntu-latest
+    needs: [validate-test, build-image]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      # Restore from GHA cache (all layers cached → near-instant rebuild).
+      - name: Load image from cache
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: platform-events-ci-test
+          cache-from: type=gha
+          build-args: BUILD_VERSION=${{ github.sha }}
+          secrets: |
+            go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
+
+      - name: Smoke tests
+        run: bash .github/scripts/smoke-tests.sh
+
+  # ── cross-language wire-format compatibility (Go ↔ Python) ────────────────
   interop:
     name: Cross-language compatibility
-    needs: build
+    needs: validate-test
     uses: BCBP-SOLUTIONS-FZC-LLC/platform-interop-tests/.github/workflows/interop.yml@main
     with:
-      # This repo's own PR/branch ref; the other five default to their main branch (see
-      # platform-interop-tests/README.md for why — this job exists to catch *this* repo's
-      # changes breaking a cross-language contract, not to re-test the other five on every PR).
+      # This repo's own PR/branch ref; the other libraries default to their main
+      # branch (see platform-interop-tests/README.md) — this job exists to catch
+      # *this* repo's changes breaking a cross-language contract.
       platform_events_ref: ${{ github.head_ref || github.ref_name }}
     secrets:
-      # GO_PRIVATE_TOKEN fallback: this repo doesn't define GH_PRIVATE_TOKEN today (only the
-      # three Python repos do) — see interop.yml's `secrets.gh_private_token` description for
-      # why either works for a plain repo-read checkout. Add GH_PRIVATE_TOKEN as a secret here
-      # (or org-wide) to drop the fallback once confirmed.
       gh_private_token: ${{ secrets.GH_PRIVATE_TOKEN || secrets.GO_PRIVATE_TOKEN }}
 
+  # ── posts or updates a single comment on every PR push ───────────────────
   pr-summary:
     name: PR summary
     runs-on: ubuntu-latest
-    needs: [validate, coverage, build, interop]
-    if: always() && github.event_name == 'pull_request'
+    needs: [validate-test, validate-quality, build-image, trivy, smoke, interop]
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
     permissions:
+      contents: read
       pull-requests: write
     steps:
-      - name: Post summary comment
-        uses: actions/github-script@v9
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
+
+      - name: Post or update summary comment
+        uses: actions/github-script@v7.1.0
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         with:
           script: |
-            const results = {
-              'Validate (Quality + Test)': '${{ needs.validate.result }}',
-              'Coverage': '${{ needs.coverage.result }}',
-              'Build': '${{ needs.build.result }}',
-              'Cross-language compatibility': '${{ needs.interop.result }}',
-            };
-            const icon = (r) => (r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌');
-            const rows = Object.entries(results)
-              .map(([name, result]) => `| ${name} | ${icon(result)} ${result} |`)
-              .join('\n');
-            const body = [
-              '### CI summary',
-              '',
-              '| Check | Result |',
-              '|---|---|',
-              rows,
-            ].join('\n');
+            const fs = require('fs')
+            const code = fs.readFileSync('.github/scripts/pr-summary.js', 'utf8')
+            const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
+            const run = new AsyncFunction('github', 'context', 'core', 'require', 'process', code)
+            await run(github, context, core, require, process)
 
-            const marker = '<!-- pr-summary-bot -->';
-            const fullBody = `${marker}\n${body}`;
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const existing = comments.find((c) => c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body: fullBody,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: fullBody,
-              });
-            }
+  # ── push the reference-CLI image to GHCR on merge to main ─────────────────
+  push:
+    name: Push image → GHCR
+    runs-on: ubuntu-latest
+    needs: [validate-test, trivy, smoke, validate-quality]
+    if: github.event_name == 'push'
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
+
+      - name: Set SOURCE_DATE_EPOCH
+        id: sde
+        run: bash .github/scripts/set-source-date-epoch.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6.1.0
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Build and push
+        id: pushed
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          pull: true
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUILD_VERSION=${{ github.sha }}
+            SOURCE_DATE_EPOCH=${{ steps.sde.outputs.SOURCE_DATE_EPOCH }}
+          secrets: |
+            go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: |
+            type=gha,mode=max
+            type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      # Keyless signing via Sigstore OIDC — no long-lived key to rotate or leak.
+      - name: Sign image with Cosign
+        run: |
+          cosign sign --yes \
+            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github\.com/${{ github.repository }}/.github/workflows/.*@refs/heads/(main|master)$" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "${{ env.IMAGE_NAME }}@${{ steps.pushed.outputs.digest }}"
+
+      - name: Log image digest
+        env:
+          IMAGE_DIGEST: ${{ steps.pushed.outputs.digest }}
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+        run: bash .github/scripts/log-image-digest.sh

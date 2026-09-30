@@ -1,6 +1,6 @@
 module github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon v1.1.0

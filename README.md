@@ -3,7 +3,7 @@
 The platform's shared **event-driven messaging library** — the single sanctioned path for every service that publishes or consumes domain events. It owns the canonical event envelope, the SNS publisher, the SQS consumer loop, the transactional outbox, consumer-side deduplication (inbox), dead-letter forwarding, HMAC signing, and the messaging-layer observability every service would otherwise re-implement. It is consumed as a private Go module and is **never deployed on its own**.
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`
-**Module:** Go 1.26.5 · private module · library only (`cmd/platform-events` is a reference CLI that prints version info, not a server)
+**Module:** Go 1.26.6 · private module · library only (`cmd/platform-events` is a reference CLI that validates config and prints version info, not a server — CI builds, scans and smoke-tests it as a container image)
 **Design:** Clean Architecture — public API in `pkg/`, AWS/Postgres adapters in `internal/adapter/`, SDK-free core in `internal/core/`. Design narrative, sequence diagrams and invariants: [ARCHITECTURE.md](ARCHITECTURE.md). The wire format is byte-compatible with the Python sibling [`platform-eventcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-eventcommon); the `interop` CI job enforces it.
 
 ---
@@ -188,6 +188,8 @@ platform-events/
 │   ├── architecture/mermaid/          # 13 × .mmd diagram sources (embedded in ARCHITECTURE.md)
 │   └── guides/                        # Detailed how-to guides (linked throughout this README)
 ├── scripts/merge_coverage.py          # Merges per-suite coverage profiles (max-count)
+├── .github/workflows/ + scripts/      # CI: ci, validate-test, validate-quality, changelog-check, release
+├── Dockerfile · .docker-digests       # Reference-CLI image (digest-pinned) for CI build / Trivy / smoke
 └── test/                              # unit/ (no Docker), integration/ + e2e/ (testcontainers), smoke/ (live AWS), fixtures/
 ```
 
@@ -297,7 +299,7 @@ Production defaults, backpressure tuning and the service adoption checklist: [Op
 
 ### Prerequisites
 
-- Go 1.26.5+
+- Go 1.26.6+
 - Docker — testcontainers-go starts LocalStack + Postgres for the integration and e2e suites; `make docker-up` for manual runs
 - `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (`GONOSUMDB` too) and an SSH key registered with the BCBP org — the Makefile exports both
 
@@ -333,6 +335,8 @@ make docker-up   # optional: LocalStack (SNS + SQS) on :4566 + Postgres on :5432
 | `make cover` / `make cover-func` | Coverage HTML report / per-function summary (runs `test-ci`) |
 | `make ci` | `tidy` + `fmt-check` + `vet` + `lint` + `test-ci` + `build` |
 | `make docker-up` / `make docker-down` | Start/stop LocalStack + Postgres |
+| `make docker-build` | Build the reference-CLI image the way CI does (needs `GO_PRIVATE_TOKEN`) |
+| `make pin-base-images` | Re-pin the Dockerfile base-image digests (updates `Dockerfile` + `.docker-digests`) |
 | `make godoc` | Serve package docs via pkgsite at http://localhost:8080 |
 | `make clean` | Remove `bin/`, `.coverage/` and coverage files |
 
@@ -438,7 +442,7 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 
 ### Coverage
 
-CI (`ci.yml` → `make cover-func`) fails below **95%** total, measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live under `test/`, a separate package tree, so every run uses `-coverpkg`; `make test-ci` merges the unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.1%** (verified 2026-09-30).
+CI (`ci.yml` → `make cover-func`) fails below **95%** total, measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live under `test/`, a separate package tree, so every run uses `-coverpkg`; `make test-ci` merges the unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.0%** (verified 2026-09-30).
 
 ---
 
@@ -504,7 +508,7 @@ The publisher starts an `sns.publish` span and injects the OTel propagation head
 
 ## Releasing
 
-This is a library — it is never containerised or deployed; consuming services pin a tag.
+This is a library — it is never deployed; consuming services pin a Git tag. The release also publishes cross-compiled reference-CLI binaries and a signed CLI image to GHCR, so the exact build that passed the CVE scan is traceable.
 
 | Version bump | When |
 |---|---|
@@ -517,24 +521,32 @@ git tag -a v1.5.0 -m "v1.5.0"
 git push origin v1.5.0     # triggers release.yml
 ```
 
-`release.yml` re-runs validation and the coverage gate, builds at the tag, and publishes a GitHub Release from the matching `CHANGELOG.md` section. SemVer rules and supported versions: [VERSIONING.md](VERSIONING.md).
+`release.yml` re-runs both validation gates at the tag, verifies the tag matches the checkout and that `CHANGELOG.md` has a `## [X.Y.Z]` section, cross-compiles the CLI for 5 platforms, pushes the image (`vX.Y.Z`, `vX.Y`, `vX`, `latest`) with a Trivy CRITICAL/HIGH gate, SBOM, SLSA provenance and a Cosign keyless signature, then publishes the GitHub Release from the matching `CHANGELOG.md` section. SemVer rules and supported versions: [VERSIONING.md](VERSIONING.md).
 
 ---
 
 ## CI
 
-Five workflow files:
+Five workflow files, mirroring `iam-org-membership` — the org's reference pipeline, whose job names are the required status checks on `main`:
 
-- **`ci.yml`** — orchestrator on push / PR to `main`: `validate` → `coverage` (`make cover-func`, fails below **95%**, uploads `coverage.out`) → `build` (`make build`, asserts `bin/platform-events`) → `interop` (`platform-interop-tests` cross-language compatibility) → `pr-summary`.
-- **`validate.yml`** (reusable) — fans out into the two required checks `Validate / Quality / quality` and `Validate / Test / test`.
-- **`quality.yml`** (reusable) — `go mod verify` → `make fmt-check` → `go mod tidy` drift → `make vet` → `make lint` → `make vuln-check`. `vet` and `lint` include the `integration,e2e` build tags.
-- **`test.yml`** (reusable) — `make test-ci` (unit + integration + e2e, `-race`; Docker on the runner for testcontainers).
-- **`release.yml`** — on `v*.*.*` tags: validate → coverage → build → publish GitHub Release.
+- **`ci.yml`** — orchestrator on push / PR to `main`. `Validate / Test`, `Validate / Quality` and `Build image (cache)` run in parallel; `Trivy CVE scan` and `Smoke tests` gate on the test job and the image; `Cross-language compatibility` (`platform-interop-tests`) gates on the test job; `PR summary` posts one status comment per PR; on push to `main`, `Push image → GHCR` publishes and Cosign-signs the reference-CLI image. Docs-only commits (`**.md`, `docs/architecture/**`, `docs/guides/**`) skip the pipeline.
+- **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 95%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
+- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make vuln-check` → Dockerfile digest-pinning check.
+- **`changelog-check.yml`** — fails a PR touching `internal/`, `pkg/` or `cmd/` without a `CHANGELOG.md` update.
+- **`release.yml`** — on `v*.*.*` tags, see [Releasing](#releasing).
+
+| Required check (org ruleset) | Job |
+|---|---|
+| `Validate / Test / test` | `validate-test.yml` via `ci.yml` |
+| `Validate / Quality / quality` | `validate-quality.yml` via `ci.yml` |
+| `Build image (cache)` | Hadolint → `.dockerignore` check → Buildx build into GHA/registry cache |
+| `Trivy CVE scan` | Fails on fixable CRITICAL / HIGH / UNKNOWN in the image (OS layer **and** the Go binary's modules + stdlib); uploads SARIF + CycloneDX SBOM |
+| `Smoke tests` | Image ≤ 50 MB; the CLI exits non-zero with no configuration (`-strict`); prints `platform-events <version>` |
+| `PR summary` | Posts / updates the PR status comment |
 
 `make test-smoke` (live AWS) is intentionally excluded — run it manually before the first deploy to a new AWS account.
 
-**Required GitHub Actions repository secret: `GO_PRIVATE_TOKEN`** — needed to fetch `platform-pgcommon`; every checkout uses `persist-credentials: false`.
-
+**Required GitHub Actions secret: `GO_PRIVATE_TOKEN`** — fetches `platform-pgcommon` in every Go job and is passed to `docker build` as the `go_private_token` build secret (never written to an image layer). Optional: `CI_REPO_READ_TOKEN` (checkout; falls back to `GITHUB_TOKEN`) and `GH_PRIVATE_TOKEN` (interop; falls back to `GO_PRIVATE_TOKEN`).
 ---
 
 ## Docker
@@ -547,6 +559,15 @@ Five workflow files:
 | `postgres` | `postgres:16-alpine` | `5432` | Outbox / inbox store (`postgres` / `postgres`, DB `platform_events_dev`) |
 
 `make docker-up` / `make docker-down` start and stop both. The integration and e2e suites do **not** need them — testcontainers-go starts its own isolated containers per run (the Makefile exports `DOCKER_HOST` for Docker Desktop's user socket).
+
+### The reference-CLI image
+
+`Dockerfile` builds `cmd/platform-events` into a ~6 MB `gcr.io/distroless/static-debian13:nonroot` image (non-root, no shell). It exists so CI can CVE-scan and smoke-test the compiled binary — the library itself is consumed as a Go module, never as an image. Both base images are pinned by digest (recorded in `.docker-digests`; refresh with `make pin-base-images`), and the private-module token is a BuildKit secret, never a layer.
+
+```bash
+GO_PRIVATE_TOKEN=$(gh auth token) make docker-build   # → platform-events-ci-test
+docker run --rm platform-events-ci-test               # -strict: exits 1 without SNS/SQS/DB config
+```
 
 ---
 

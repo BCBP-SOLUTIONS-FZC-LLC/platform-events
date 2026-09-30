@@ -2,7 +2,7 @@
 
 This document describes the internal structure, dependency rules, and runtime data flows of `platform-events`.
 
-`platform-events` is a **private Go shared library** (`github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26.5) — never deployed on its own. It is linked into every platform service that publishes or consumes domain events and owns the **messaging boundary** of the platform: the canonical `Envelope[T]` wire format, the SNS publisher, the SQS consumer loop, the transactional outbox (`outbox_events` / `outbox_dead_letters`), consumer-side deduplication (`processed_events`), explicit dead-letter forwarding to a queue's SQS DLQ, HMAC helpers, and the `events_*` / `outbox_*` / `sqs_*` metrics and OTel spans around all of it. Consuming services never import the SNS/SQS SDK directly — depguard rules in service repositories forbid it — so every transport concern a service needs is an API here.
+`platform-events` is a **private Go shared library** (`github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26.6) — never deployed on its own. It is linked into every platform service that publishes or consumes domain events and owns the **messaging boundary** of the platform: the canonical `Envelope[T]` wire format, the SNS publisher, the SQS consumer loop, the transactional outbox (`outbox_events` / `outbox_dead_letters`), consumer-side deduplication (`processed_events`), explicit dead-letter forwarding to a queue's SQS DLQ, HMAC helpers, and the `events_*` / `outbox_*` / `sqs_*` metrics and OTel spans around all of it. Consuming services never import the SNS/SQS SDK directly — depguard rules in service repositories forbid it — so every transport concern a service needs is an API here.
 
 > **Design intent:** this library centralises event publishing, consumption, and guaranteed delivery at the messaging boundary — ensuring uniform envelope format, tenant propagation, and observability across all consuming services without requiring each service to reimplement these concerns.
 
@@ -1050,7 +1050,20 @@ The inbox therefore reduces duplicate work; it does not make side effects exactl
 
 ## Distribution and service wiring
 
-`platform-events` ships no container image, Helm chart or binary for production — it is a Go module that consuming services pin by tag (`go get …@vX.Y.Z`). `cmd/platform-events` is a reference CLI that prints version information and exists to prove the module builds as an executable (`make build`, asserted in CI). Releases are cut by pushing a `v*.*.*` tag: `release.yml` re-validates, re-runs the 95% coverage gate, builds at the tag, and publishes a GitHub Release from the matching `CHANGELOG.md` section. SemVer rules: [VERSIONING.md](VERSIONING.md).
+`platform-events` has no production deployment, Helm chart or service image — it is a Go module that consuming services pin by tag (`go get …@vX.Y.Z`). `cmd/platform-events` is a reference CLI that loads and validates configuration (`-strict` exits non-zero when it is incomplete) and prints version information.
+
+The CLI is also built into a digest-pinned distroless image (`Dockerfile`, ~6 MB). The image is a **CI artefact, not a runtime**: it lets the org's reference pipeline (mirrored from `iam-org-membership`) Trivy-scan the compiled binary — every linked module and the Go standard library — and smoke-test it, the same way consuming services ship the library inside their own binaries.
+
+| Stage | Where | What it proves |
+|---|---|---|
+| `Validate / Test` | `validate-test.yml` | unit + integration + e2e with `-race`; merged coverage ≥ 95% |
+| `Validate / Quality` | `validate-quality.yml` | fmt, tidy, vet + lint (incl. tagged tests), govulncheck, RLS-6 grep, Dockerfile digest pinning |
+| `Build image (cache)` → `Trivy CVE scan` / `Smoke tests` | `ci.yml` | Hadolint; no fixable CRITICAL/HIGH/UNKNOWN CVE in the image; the binary starts, validates config, stamps its version |
+| `Cross-language compatibility` | `ci.yml` → `platform-interop-tests` | Go ↔ Python envelope JSON and HMAC byte-for-byte |
+| `Push image → GHCR` | `ci.yml`, push to `main` | Signed (Cosign keyless), SBOM + provenance attested |
+| Release | `release.yml`, `v*.*.*` tag | Tag = checkout; `CHANGELOG.md` has the version; 5-platform CLI build; image `vX.Y.Z` scanned (CRITICAL/HIGH), signed, provenance exported; GitHub Release with binaries, checksums, SBOM, provenance |
+
+SemVer rules: [VERSIONING.md](VERSIONING.md).
 
 **Migrations ride with the service.** Each service applies `outbox.ApplySchema` / `inbox.ApplySchema` from its own startup or migration job, with a direct (non-PgBouncer) connection — the migration runner's advisory lock is session-scoped. New migrations are additive and `IF NOT EXISTS`; see [Migration 003 — production upgrade runbook](#migration-003--production-upgrade-runbook) for the one index rebuild that needs care on large tables.
 
@@ -1116,7 +1129,7 @@ graph LR
 - **Smoke** (`test/smoke/`, `-tags=smoke`, live AWS) — manual only, before the first deploy to a new AWS account; excluded from CI and from lint.
 - **Interop** — `platform-interop-tests` (CI job `interop`) runs Go and Python probes against shared fixtures and compares envelope JSON and HMAC output byte-for-byte.
 
-`make test-ci` runs unit, integration and e2e in parallel with `-race`, each writing its own profile to `.coverage/`, merged by `scripts/merge_coverage.py` (max-count) into `coverage.out`. Coverage is measured over `./internal/...` + `./pkg/...` with `-coverpkg` (tests live in a separate package tree). CI fails below **95%**; the merged total is **97.1%** (verified 2026-09-30). `make vet` and `make lint` run a second pass with `-tags=integration,e2e`, so tagged test files are vetted and linted too.
+`make test-ci` runs unit, integration and e2e in parallel with `-race`, each writing its own profile to `.coverage/`, merged by `scripts/merge_coverage.py` (max-count) into `coverage.out`. Coverage is measured over `./internal/...` + `./pkg/...` with `-coverpkg` (tests live in a separate package tree). CI fails below **95%**; the merged total is **97.0%** (verified 2026-09-30). `make vet` and `make lint` run a second pass with `-tags=integration,e2e`, so tagged test files are vetted and linted too.
 
 ---
 

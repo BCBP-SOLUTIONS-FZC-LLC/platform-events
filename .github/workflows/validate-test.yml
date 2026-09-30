@@ -1,0 +1,97 @@
+# Reusable workflow — test gate.
+# Race detector (unit · integration · e2e, in parallel) + merged coverage gate.
+# Called by ci.yml and release.yml. Gates trivy and smoke.
+#
+# The job id ("test") and name ("test") combine with the caller's job name
+# ("Validate / Test") to produce the required status check
+# "Validate / Test / test" (org ruleset). Do not rename either.
+name: Validate / Test
+
+"on":
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to check out (leave empty to use the caller ref)'
+        type: string
+        required: false
+        default: ''
+    outputs:
+      pct:
+        description: 'Total statement coverage percentage'
+        value: ${{ jobs.test.outputs.pct }}
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    # make test-ci runs unit/integration/e2e in parallel; integration and e2e
+    # each start their own LocalStack + Postgres containers (testcontainers-go).
+    # A full local run takes ~3 min; 30 min leaves headroom for cold image pulls.
+    timeout-minutes: 30
+    outputs:
+      pct: ${{ steps.gate.outputs.pct }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            go.mod
+
+      # Store credentials so go mod download can fetch private BCBP modules
+      # (platform-pgcommon).
+      - name: Configure private module access
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      - name: Download modules
+        env:
+          GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+          GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      # Mandatory blocking gate: the full suite with -race and coverage. Any
+      # data race detected here blocks all downstream jobs (trivy, smoke,
+      # push, release). Do NOT remove or skip. e2e runs inside this step
+      # (unlike iam-org-membership) because its outbox pipeline tests carry
+      # real coverage of the runner and adapters.
+      - name: Tests — unit · integration · e2e (race + coverage)
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: 'true'
+        run: make test-ci
+
+      # make test-ci merges all three coverage profiles into coverage.out via
+      # _merge-coverage. Assert the combined statement coverage meets 95%.
+      # Do not lower this threshold.
+      - name: Coverage threshold gate (≥ 95%)
+        id: gate
+        run: bash .github/scripts/coverage-gate.sh
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: coverage-report-${{ github.sha }}
+          path: coverage.out
+          if-no-files-found: ignore
+          retention-days: 30

@@ -1,0 +1,130 @@
+# Reusable workflow — quality gate.
+# fmt · tidy · vet · lint (golangci-lint) · vuln-check · Dockerfile pinning.
+# Called by ci.yml and release.yml. Must pass before push/release; does NOT
+# gate coverage, trivy, or smoke (those only need validate-test.yml).
+#
+# The job id ("quality") and name ("quality") combine with the caller's job
+# name ("Validate / Quality") to produce the required status check
+# "Validate / Quality / quality" (org ruleset). Do not rename either.
+name: Validate / Quality
+
+"on":
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Git ref to check out (leave empty to use the caller ref)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  quality:
+    name: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6.5.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            go.mod
+
+      - name: Configure private module access
+        run: |
+          git config --global credential.helper store
+          echo "https://x-access-token:${{ secrets.GO_PRIVATE_TOKEN }}@github.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      - name: Download modules
+        env:
+          GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+          GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      # Workflow files must use literal operators, not HTML entity encodings.
+      - name: Reject HTML-escaped operators in workflow files
+        run: |
+          if grep -REn '&(gt|lt|amp)' .github/workflows/ .github/scripts/; then
+            echo "::error::Workflow or script files contain HTML entities. Use literal operators instead."
+            exit 1
+          fi
+
+      # RLS-6: the library must never bind app.tenant_id session-wide. The only
+      # legitimate way is pgcommon.WithGUCSet (what the SQS consumer injects per
+      # message), which emits SET LOCAL inside a transaction. A session-scoped
+      # SET would persist across pooled backends and leak across tenants under
+      # PgBouncer in every consuming service at once.
+      - name: Reject non-LOCAL SET app.tenant_id (RLS-6)
+        run: |
+          hits=$(grep -REn '\bSET[[:space:]]+("?app\.tenant_id"?)[[:space:]]*=' \
+                   --include='*.go' --include='*.sql' \
+                   cmd/ internal/ pkg/ | grep -v 'SET LOCAL' | grep -v 'set_config' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Non-LOCAL SET app.tenant_id detected (RLS-6). Use pgcommon.WithGUCSet + RunInTx which emits SET LOCAL inside a tx."
+            echo "$hits"
+            exit 1
+          fi
+          echo "RLS-6 non-LOCAL SET check passed."
+
+      - name: Format check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "${unformatted}" ]; then
+            echo "${unformatted}" | while IFS= read -r f; do
+              echo "::error file=${f},title=Format check::Not formatted — run 'make fmt'"
+            done
+            exit 1
+          fi
+
+      - name: Tidy check
+        run: |
+          make tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error file=go.mod,title=Module drift::go.mod or go.sum is stale — run 'go mod tidy' and commit the result."
+            exit 1
+          fi
+
+      # make vet / make lint each run a second pass with -tags=integration,e2e
+      # so tagged test files are checked too.
+      - name: Vet
+        run: make vet
+
+      - name: Lint
+        run: make lint
+
+      - name: Vulnerability check
+        run: |
+          if ! make vuln-check; then
+            echo "::error file=go.mod,title=Vulnerability found::govulncheck detected vulnerabilities — run 'make vuln-check' locally to view details. Standard-library findings are fixed by bumping the go directive in go.mod."
+            exit 1
+          fi
+
+      # Enforce digest-pinned FROM lines in the Dockerfile. Floating tags (e.g.
+      # golang:1.26.6-alpine without @sha256:...) can be silently overwritten by
+      # upstream maintainers, breaking supply-chain guarantees. Run
+      # `make pin-base-images` (requires docker) to update the pinned digests.
+      - name: Dockerfile base image digest check
+        run: |
+          if grep -E '^FROM [^ @]+:[^ @]+( AS .+)?$' Dockerfile; then
+            echo "::error file=Dockerfile,title=Unpinned base image::Dockerfile FROM lines must use digest-pinned references (e.g. golang:1.26.6-alpine@sha256:...). Run 'make pin-base-images' to update."
+            exit 1
+          fi
+          echo "Dockerfile base images are digest-pinned."

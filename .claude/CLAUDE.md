@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Repo Is
 
-`platform-events` is a **private Go shared library** (module: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26.4) that provides reusable SNS publisher and SQS consumer primitives for platform services. It lives in a **private GitHub repository** and is consumed as a Go module dependency by internal platform services — it is never deployed as a standalone server.
+`platform-events` is a **private Go shared library** (module: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26.6) that provides reusable SNS publisher and SQS consumer primitives for platform services. It lives in a **private GitHub repository** and is consumed as a Go module dependency by internal platform services — it is never deployed as a standalone server.
 
 Core capabilities:
 - `Publisher` interface + AWS SNS implementation
@@ -385,26 +385,15 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 ## CI/CD
 
-GitHub Actions runs three workflows. This is a **private module** — there is no production server deployment; CI validates library quality and publishes Go module versions via git tags.
+GitHub Actions mirrors `iam-org-membership`'s pipeline — the org ruleset on `main` requires its job names (`Validate / Test / test`, `Validate / Quality / quality`, `Build image (cache)`, `Trivy CVE scan`, `Smoke tests`, `PR summary`), so **do not rename those jobs**. This is a **private module** with no production deployment; the Docker image is the reference CLI (`cmd/platform-events`), built only so CI can Trivy-scan and smoke-test the compiled binary.
 
-**`.github/workflows/validate.yml`** (reusable, called by both ci.yml and release.yml):
-1. `go mod download` + `go mod verify` — module integrity
-2. `gofmt -l` — format check
-3. `go mod tidy` drift check
-4. `go vet`
-5. `golangci-lint` — invoked via `go tool golangci-lint` (declared in the `tool` directive in `go.mod`). The Go 1.24+ `tool` directive is NOT propagated to downstream consumers' `go.sum` — only the `require` block is. Consuming services that `go get platform-events` do not pull in golangci-lint or its transitive dependencies.
-6. `govulncheck ./internal/... ./pkg/...`
-7. `make test-ci` — unit + integration (LocalStack + Postgres via testcontainers) with race detector
+- **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → `.github/scripts/coverage-gate.sh` (≥ 95%).
+- **`validate-quality.yml`** (reusable) — `go mod verify`, HTML-entity check, RLS-6 grep, `gofmt`, tidy drift, `make vet` / `make lint` (each also with `-tags=integration,e2e`), `make vuln-check`, Dockerfile digest-pinning check. `golangci-lint` runs via `go tool` (the `tool` directive in `go.mod` is not propagated to consumers).
+- **`ci.yml`** (push/PR to main) — the two gates + `Build image (cache)` in parallel → `Trivy CVE scan` / `Smoke tests` → `Cross-language compatibility` → `PR summary`; on push, `Push image → GHCR` (Cosign-signed).
+- **`changelog-check.yml`** — PRs touching `internal/`, `pkg/`, `cmd/` must update `CHANGELOG.md`.
+- **`release.yml`** (`v*` tags) — both gates → tag + CHANGELOG verification → 5-platform CLI build → image push/scan/sign/provenance → GitHub Release. The Git tag is the **Go module release** consuming services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z`.
 
-**`.github/workflows/ci.yml`** (push/PR to main):
-1. **validate** — calls validate.yml
-2. **coverage** — all tests with `-coverpkg` + ≥ 95% gate; uploads `coverage.out` artefact
-3. **build** — `make build`; verifies binary is executable
-
-**`.github/workflows/release.yml`** (push of `v*` tags):
-1. **validate** — calls validate.yml at the tag ref
-2. **build** — compile reference binary
-3. **publish** — create GitHub Release with notes from `CHANGELOG.md`; this is the **Go module release** consuming services pin to with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z`
+Standard-library `govulncheck` findings are fixed by bumping the `go` directive in `go.mod` (CI reads the toolchain from it via `go-version-file`). Base images are re-pinned with `make pin-base-images`.
 
 ## Extending the Library
 
