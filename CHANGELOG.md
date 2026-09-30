@@ -9,13 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Enterprise Platform Observability Standard metrics.** All platform-events metrics are now Tier 1 `platform_*`, the same model as platform-pgcommon's `platform_db_*`. See [docs/observability](docs/observability/README.md).
+  - `events.InitMetrics(MetricsIdentity{Domain, Service, Environment, Version}, registerer, ...MetricsOption)` injects the required `domain` / `service` / `environment` labels centrally as const labels. An empty Environment falls back to `APP_ENV` → `ENVIRONMENT` → `dev`.
+  - The legacy metrics are registered in parallel for the compatibility period unless `WithoutLegacyMetrics()` is given.
+  - Fail-soft: a `platform_*` metric the registry already holds with another shape is disabled and returned as a `RegistrationWarning`. IAM services register `platform_retry_total` / `platform_dependency_request_seconds` with conflicting label sets. Registerer wrappers that already inject identity labels are handled, with each label applied once and the wrapper's value winning.
+  - Helpers: `MetricsIdentityFromEnv`, `MetricsIdentityFromLabels` (platform-gincommon interop), `MetricsEnvironmentFromEnv`, `MetricsRegistry()`.
+  - **Canonical:** `platform_messages_received_total{queue}`, `platform_messages_processed_total{queue,event_type}`, `platform_messages_failed_total{queue,event_type,reason}`, `platform_retry_total{operation,event_type}`, `platform_dlq_messages_total{operation,event_type,reason}`. Each delivery is received once and ends processed, failed (and retried) or dead-lettered. A dead-lettered message is counted once, whether it was forwarded by `WithDLQForwarding`, the dead-letter handler, or a handler calling `SendToDLQ`.
+  - **Proposed** (shadow-emitted; ratification packets in `docs/observability/metrics-registry.md`): `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}` (SNS, SQS, codec), `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_pending_events`, `platform_outbox_leased_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
+  - Label rules: `queue` / `topic` values are names, never URLs or ARNs. High-cardinality labels (`tenant_id`, `event_id`, …) are prohibited. Label-static counters are pre-created at 0 so the first error after a restart is visible to `increase()`.
+- **Metrics registry**: `internal/adapter/outbound/metrics/registry.go` is platform-events' entry in the Platform Observability Registry. It records tier, status, semantic definition, approved labels and values, cardinality, aggregation expectations, successor and sunset. `docs/observability/metrics-registry.md` is generated from it (`make metrics-doc`).
+- **CI enforcement**: `make metrics-lint` runs in `Validate / Quality` and `make ci`.
+  - It registers the real collectors and checks namespace classification, naming (`_total` / `_seconds`), required labels, label vocabulary, prohibited labels and registry ↔ instrumentation parity.
+  - It also checks the rule files (registered metrics only, no Proposed metric outside comments, labels in vocabulary, runbook anchors exist) and inventory drift.
+  - `make rules-check` runs `promtool check rules` and the alert unit tests.
+- **Reference monitoring bundle**: `monitoring/prometheus/platform-events.rules.yml` contains recording rules, a consumer SLO (99.9%, multi-window burn rate) and 11 operational alerts. Each alert has a `docs/observability/runbook.md` section, and all of them are covered by promtool tests.
+
 - **`events.WithDLQForwarding(dlq)`** consumer option — forwards poison messages to the source queue's `RedrivePolicy` DLQ with their **original raw body and attributes**, deleting the source message only after the forward succeeds (on failure it stays visible; SQS redrive remains the backstop). Forwarded: bodies that are not a valid envelope (`malformed message body: …` — previously deleted and only logged, i.e. lost), messages past the `WithMaxReceiveCount` threshold (after `WithDeadLetterHandler`, when set, succeeds), and messages past it whose codec decode fails. `WithMaxReceiveCount` defaults to 5 when only `WithDLQForwarding` is set. With forwarding enabled, `Start` resolves the DLQ first and returns an error wrapping `ErrDLQNotConfigured` / `ErrDLQInvalidRedrivePolicy` when the queue has no usable `RedrivePolicy` (transient failures are logged and the consumer starts), so poison messages can never be left redelivered until retention expires. Each forward is bounded by 30 s, capped at half of `WithVisibilityTimeout` (min 1 s), so a slow forward cannot let the message reappear and be forwarded twice.
 - **`events.SourceMessageFromContext(ctx)`** / `events.SourceMessage` — built lazily on first call, so handlers that never use it pay no copy — the raw SQS message (body before codec decoding, String/Number attributes, queue URL, message ID, receive count) on every `Handler` and `WithDeadLetterHandler` context. Forward this rather than `env.JSON()`, which drops attributes and, with `WithConsumerCodec`, re-serialises a decoded payload under a still-set `SchemaID` that fails to decode on redrive.
-- `DLQPublisher`: `sqs.dlq_forward` OTel span (`SpanKindProducer`) and `events_dlq_forward_duration_seconds{queue,event_type}` histogram.
+- `DLQPublisher`: `sqs.dlq_forward` OTel span (`SpanKindProducer`); its SQS calls are timed in `platform_dependency_request_seconds`.
 - `DLQConfig.CacheTTL` (default 15 min; negative disables expiry) — a retargeted `RedrivePolicy` is picked up without a restart. The cache entry is also evicted when `SendMessage` reports the DLQ no longer exists (`ErrDLQUnresolved`).
 - `DLQConfig.StrictAttributes` — opt back into rejecting messages with more than 10 attributes.
 
 ### Changed
+
+- **Metrics: legacy metrics are Deprecated.** `events_*`, `outbox_*`, `sqs_*` and `platform_events_build_info` are unchanged and still emitted, but are marked Deprecated in their help text and the registry, each with a Tier 1 successor. Sunset is not before 2027-04-01. `events.Init` / `events.InitWithRegisterer` are deprecated (legacy metrics only) in favour of `events.InitMetrics`.
+- The reference CLI initialises metrics with `InitMetrics` (`domain="platform"`).
+- CI no longer skips the pipeline for changes under `docs/observability/`: those files are checked by `make metrics-lint`.
 
 - **All database access goes through platform-pgcommon (now v1.4.0).** Library code no longer imports `github.com/jackc/pgx` or `database/sql`; a depguard rule (`pgcommon-only`) keeps it that way.
   - `outbox.Enqueue` and `port.OutboxStore.Enqueue` take a `pgcommon.Tx`. It is a type alias of `pgx.Tx`, so existing callers passing a `pgx.Tx` compile unchanged.
@@ -28,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `events.DLQPublisher` is now a type alias of the internal port interface (same method set — source compatible).
 
 ### Fixed
+
+- `platform_events_build_info` failed to register on a registerer that injects a `service` label (e.g. a `WrapRegistererWith` wrapper): `service` was a variable label colliding with the injected one. It is now a const label like on every other metric; the exposed series is unchanged.
 
 - FIFO DLQs: an envelope ID containing characters invalid for `MessageGroupId`/`MessageDeduplicationId` now falls back to the body's SHA-256 instead of failing `SendMessage`.
 

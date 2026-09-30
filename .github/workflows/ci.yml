@@ -28,7 +28,8 @@
 #
 # paths-ignore skips this entire (expensive) pipeline for commits that only
 # touch Markdown docs or the mermaid diagrams — those can't affect test/build
-# outcomes. A commit that touches both docs and code still runs normally
+# outcomes. docs/observability/** is deliberately NOT ignored: the runbook
+# anchors and the generated metrics inventory are checked by make metrics-lint. A commit that touches both docs and code still runs normally
 # (paths-ignore only skips when EVERY changed file matches).
 #
 name: CI
@@ -36,10 +37,10 @@ name: CI
 "on":
   push:
     branches: [main, master]
-    paths-ignore: ['**.md', 'docs/architecture/**', 'docs/guides/**']
+    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**']
   pull_request:
     branches: [main, master]
-    paths-ignore: ['**.md', 'docs/architecture/**', 'docs/guides/**']
+    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**']
   workflow_dispatch:
 
 permissions:

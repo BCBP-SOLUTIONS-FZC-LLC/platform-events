@@ -19,9 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/aws/smithy-go"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -33,6 +31,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
@@ -753,16 +752,27 @@ func TestSendToDLQ_CreatesSpan(t *testing.T) {
 	assert.NotEmpty(t, bad.Events(), "error must be recorded on the span")
 }
 
-func TestSendToDLQ_RecordsDuration(t *testing.T) {
-	queue := dlqSourceURL + "-duration"
-	count := func() uint64 {
-		m := &dto.Metric{}
-		require.NoError(t, metrics.DLQForwardDuration.WithLabelValues(queue, "order.created").(prometheus.Histogram).Write(m))
-		return m.GetHistogram().GetSampleCount()
-	}
-	before := count()
-	require.NoError(t, newTestDLQPublisher(t, &mockDLQClient{}, "").SendToDLQ(context.Background(), queue, envelopeBody(t), nil, "r"))
-	assert.Equal(t, before+1, count())
+func TestSendToDLQ_PlatformMetrics(t *testing.T) {
+	reg := initPlatformMetrics(t)
+	ctx, attribution := port.WithDLQAttribution(context.Background(), "malformed")
+
+	p := newTestDLQPublisher(t, &mockDLQClient{}, "")
+	require.NoError(t, p.SendToDLQ(ctx, dlqSourceURL, envelopeBody(t), nil, "r"))
+	assert.True(t, attribution.Recorded(), "the publisher marks the message counted")
+	require.NoError(t, p.SendToDLQ(context.Background(), dlqSourceURL, envelopeBody(t), nil, "r"))
+
+	failing := &mockDLQClient{sendMessageFn: func(context.Context, *sqs.SendMessageInput) (*sqs.SendMessageOutput, error) {
+		return nil, errors.New("boom")
+	}}
+	failCtx, failAttribution := port.WithDLQAttribution(context.Background(), "malformed")
+	require.Error(t, newTestDLQPublisher(t, failing, "").SendToDLQ(failCtx, dlqSourceURL, envelopeBody(t), nil, "r"))
+	assert.False(t, failAttribution.Recorded(), "a failed forward is not counted")
+
+	assert.InDelta(t, 1, counterValue(t, reg, "platform_dlq_messages_total", map[string]string{"operation": "consume", "event_type": "order.created", "reason": "malformed"}), 0)
+	assert.InDelta(t, 1, counterValue(t, reg, "platform_dlq_messages_total", map[string]string{"operation": "consume", "event_type": "order.created", "reason": "explicit"}), 0)
+	assert.Equal(t, uint64(2), histogramCount(t, reg, "platform_dependency_request_seconds", map[string]string{"dependency": "sqs", "operation": "get_queue_attributes", "outcome": "success"}))
+	assert.Equal(t, uint64(2), histogramCount(t, reg, "platform_dependency_request_seconds", map[string]string{"dependency": "sqs", "operation": "send_message", "outcome": "success"}))
+	assert.Equal(t, uint64(1), histogramCount(t, reg, "platform_dependency_request_seconds", map[string]string{"dependency": "sqs", "operation": "send_message", "outcome": "error"}))
 }
 
 func TestSendToDLQ_TrimmedAttributesAreNotValidated(t *testing.T) {

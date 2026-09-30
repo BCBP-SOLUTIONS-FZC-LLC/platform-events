@@ -313,6 +313,7 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 		n, leasedErr := r.svc.LeasedCount(lcCtx)
 		lcCancel()
 		if leasedErr != nil {
+			metrics.RecordOutboxLeasedCountError()
 			if r.cfg.Logger != nil {
 				r.cfg.Logger.Warn("outbox: failed to query leased count", map[string]any{
 					"error": leasedErr.Error(),

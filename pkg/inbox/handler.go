@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
@@ -23,7 +24,8 @@ type Ledger interface {
 //
 //   - the envelope ID must parse as a UUID, else an error (→ retry / DLQ);
 //   - an ID already recorded is acknowledged without calling next, and
-//     counted in events_inbox_duplicates_total{consumer};
+//     counted in platform_duplicate_messages_total{queue,event_type} (and the
+//     legacy events_inbox_duplicates_total{consumer});
 //   - otherwise next runs, and the ID is recorded only when next returns nil.
 //
 // A ledger read or write error is returned, so SQS redelivers.
@@ -39,6 +41,11 @@ func Handler(ledger Ledger, next events.Handler) events.Handler {
 		}
 		if seen {
 			metrics.RecordInboxDuplicate(ledger.Consumer())
+			queueURL := ""
+			if src, ok := port.SourceMessageFromContext(ctx); ok {
+				queueURL = src.QueueURL
+			}
+			metrics.IncDuplicate(queueURL, env.Type)
 			return nil
 		}
 		if err := next(ctx, env); err != nil {

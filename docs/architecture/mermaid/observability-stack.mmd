@@ -9,7 +9,7 @@ flowchart LR
     end
 
     subgraph svc["Consuming service wiring"]
-        init["events.Init(service, version)\nonce at startup"]
+        init["events.InitMetrics(identity, registerer)\nonce at startup"]
         otel["OTel TracerProvider + propagator\n(e.g. gincommon.InitTracingFromEnv)\nnone registered → spans are no-ops"]
         reg["Prometheus registerer\n/metrics endpoint"]
     end
@@ -35,8 +35,8 @@ flowchart LR
     lg --> logs
 
     subgraph alerts["Alert on (day one)"]
-        a1["outbox_dead_letters_total rate > 0 — publish-side primary alert"]
-        a2["events_consumed_total{status=error} rising · status=malformed > 0"]
+        a1["platform_dlq_messages_total{operation=outbox_publish} rate > 0 — publish-side primary alert"]
+        a2["platform_messages_failed_total rising · reason=malformed > 0"]
         a3["events_dlq_forwarded_total{status=error} > 0 — poison messages cycling"]
         a4["sqs_delete_errors_total > 0 — duplicate delivery in progress"]
         a5["outbox_pending_total sustained growth — runner stalled or SNS throttled"]

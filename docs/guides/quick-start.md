@@ -13,13 +13,23 @@ import (
     "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
     "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
     "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+    "github.com/prometheus/client_golang/prometheus"
 )
 
 func main() {
     ctx := context.Background()
 
-    // 1. Register Prometheus metrics once.
-    events.Init(os.Getenv("APP_NAME"), os.Getenv("BUILD_VERSION"))
+    // 1. Register the Tier 1 platform_* metrics (Enterprise Platform Observability
+    //    Standard) once — same registerer and identity as pgmetrics.InitWithIdentity.
+    //    Environment defaults to APP_ENV / ENVIRONMENT / "dev"; service to APP_NAME.
+    id := events.MetricsIdentityFromEnv("iam", "", os.Getenv("BUILD_VERSION"))
+    metricWarnings, err := events.InitMetrics(id, prometheus.DefaultRegisterer)
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, w := range metricWarnings {
+        log.Println(w) // a platform_* metric the registry refused — disabled, not fatal
+    }
 
     // 2. Load config. Database settings come from platform-pgcommon's
     //    ConfigFromEnv (DATABASE_URL or PG_*, PG_MAX_CONNS, PG_STATEMENT_TIMEOUT, …).

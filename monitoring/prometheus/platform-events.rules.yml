@@ -1,0 +1,201 @@
+# platform-events — reference Prometheus rules for services using the
+# library (load alongside the service's own rules).
+#
+# Enterprise Platform Observability Standard, compatibility period:
+#   - Consumer-side rules use the Canonical Tier 1 metrics
+#     (platform_messages_received/processed/failed_total,
+#     platform_dlq_messages_total) — the migration target, safe to alert on.
+#   - Producer / outbox / SQS-client rules still use the LEGACY metrics
+#     (events_published_total, outbox_*, sqs_*), which stay authoritative
+#     until their Tier 1 successors are ratified. The successors (Status:
+#     Proposed — see docs/observability/metrics-registry.md) are shadow-emitted
+#     in parallel and MUST NOT be used in alerts, recording rules, SLOs or HPA
+#     until the registry marks them Canonical (rules 11/12). Each such rule
+#     names its successor in an "# after ratification:" comment.
+#   CI enforces all of this (test/unit/metrics/rules_test.go); promtool
+#   validates syntax and the alert unit tests (make rules-check).
+#
+# platform_retry_total is Canonical but deliberately not alerted on: IAM
+# services register it with conflicting label sets, so in those services it
+# is disabled (RegistrationWarning) and an alert on it would never fire.
+#
+# Label note: Tier 1 metrics carry {domain, service, environment} plus their
+# approved labels; queue is the queue NAME. Legacy metrics carry {service}
+# plus the full queue URL / topic ARN. Aggregations below keep `service`
+# (and `queue` / `topic` where meaningful) so dashboards join cleanly.
+#
+# Counter note: platform-events pre-creates label-static counters at 0 (per
+# queue when a consumer starts, outbox error/operation counters at init), so
+# increase()-based alerts see the first event after a restart.
+
+groups:
+  - name: platform_events.recording
+    interval: 30s
+    rules:
+      # ── Consumer SLIs (Canonical Tier 1) ──────────────────────────────
+      - record: platform_events:messages_received:rate5m
+        expr: sum by (domain, service, environment, queue) (rate(platform_messages_received_total[5m]))
+
+      - record: platform_events:messages_failure_ratio:rate5m
+        expr: |
+          sum by (domain, service, environment, queue) (rate(platform_messages_failed_total[5m]))
+            /
+          sum by (domain, service, environment, queue) (rate(platform_messages_received_total[5m]))
+
+      - record: platform_events:messages_failure_ratio:rate1h
+        expr: |
+          sum by (domain, service, environment, queue) (rate(platform_messages_failed_total[1h]))
+            /
+          sum by (domain, service, environment, queue) (rate(platform_messages_received_total[1h]))
+
+      - record: platform_events:messages_success_ratio:rate5m
+        expr: |
+          sum by (domain, service, environment, queue) (rate(platform_messages_processed_total[5m]))
+            /
+          sum by (domain, service, environment, queue) (rate(platform_messages_received_total[5m]))
+
+      - record: platform_events:dlq_messages:increase15m
+        expr: sum by (domain, service, environment, operation, reason) (increase(platform_dlq_messages_total[15m]))
+
+      # ── Producer / outbox (legacy, authoritative until ratification) ──
+      # after ratification: platform_messages_published_total{outcome="error"} / platform_messages_published_total
+      - record: platform_events:publish_error_ratio:rate5m
+        expr: |
+          sum by (service, topic) (rate(events_published_total{status="error"}[5m]))
+            /
+          sum by (service, topic) (rate(events_published_total[5m]))
+
+      # after ratification: max by (domain, service) (platform_outbox_pending_events)
+      - record: platform_events:outbox_pending:max
+        expr: max by (service) (outbox_pending_total)
+
+      # after ratification: platform_outbox_publish_attempts_total{outcome="error"} / platform_outbox_publish_attempts_total
+      - record: platform_events:outbox_publish_error_ratio:rate5m
+        expr: |
+          sum by (service) (rate(outbox_published_total{status="error"}[5m]))
+            /
+          sum by (service) (rate(outbox_published_total[5m]))
+
+  - name: platform_events.alerts
+    rules:
+      # SLO: 99.9% of received messages are processed without failure
+      # (error budget 0.1%). Fast burn: 14.4× budget over 1h and 5m
+      # (2% of a 30-day budget in 1 hour) — Google SRE multi-window pattern.
+      - alert: PlatformEventsConsumerErrorBudgetBurn
+        expr: |
+          platform_events:messages_failure_ratio:rate1h > (14.4 * 0.001)
+            and
+          platform_events:messages_failure_ratio:rate5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }} is failing messages on {{ $labels.queue }} fast enough to exhaust its monthly error budget"
+          description: "Over 1.44% of messages received on {{ $labels.queue }} failed in both the last hour and the last 5 minutes."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumererrorbudgetburn"
+
+      - alert: PlatformEventsConsumerStalled
+        expr: |
+          sum by (domain, service, environment, queue) (rate(platform_messages_received_total[10m])) > 0
+            unless
+          sum by (domain, service, environment, queue) (rate(platform_messages_processed_total[10m])) > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }} receives messages on {{ $labels.queue }} but processes none"
+          description: "Messages have been delivered for 15 minutes without a single successful handler completion."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumerstalled"
+
+      - alert: PlatformEventsMalformedMessages
+        expr: sum by (domain, service, environment, queue) (increase(platform_messages_failed_total{reason="malformed"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} received malformed messages on {{ $labels.queue }}"
+          description: "Messages that are not valid event envelopes arrived in the last 15 minutes — a producer or subscription is misconfigured."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsmalformedmessages"
+
+      - alert: PlatformEventsMessagesDeadLettered
+        expr: platform_events:dlq_messages:increase15m > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} dead-lettered messages ({{ $labels.operation }}, {{ $labels.reason }})"
+          description: "Messages were moved to dead-letter storage in the last 15 minutes and need investigation or replay."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsmessagesdeadlettered"
+
+      # after ratification: platform_messages_published_total
+      - alert: PlatformEventsPublishErrors
+        expr: platform_events:publish_error_ratio:rate5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} fails over 5% of publishes"
+          description: "More than 5% of publishes have failed for 10 minutes."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventspublisherrors"
+
+      # after ratification: max by (domain, service) (platform_outbox_pending_events) > 1000
+      - alert: PlatformEventsOutboxBacklog
+        expr: platform_events:outbox_pending:max > 1000
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} has over 1000 unpublished outbox events"
+          description: "The transactional outbox backlog has stayed above 1000 events for 15 minutes; event delivery is lagging."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxbacklog"
+
+      # after ratification: platform_outbox_errors_total{operation="pending_count"}
+      - alert: PlatformEventsOutboxPendingUnknown
+        expr: platform_events:outbox_pending:max < 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} cannot read its outbox backlog"
+          description: "The outbox pending-count query has failed for 10 minutes, so the backlog alert is blind."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxpendingunknown"
+
+      # after ratification: platform_outbox_errors_total{operation="poll"}
+      - alert: PlatformEventsOutboxPollFailing
+        expr: sum by (service) (rate(outbox_poll_errors_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.service }}'s outbox runner cannot claim events"
+          description: "Every outbox poll cycle has been failing for 10 minutes; no outbox events are being delivered."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxpollfailing"
+
+      # after ratification: platform_outbox_errors_total{operation="mark_published"}
+      - alert: PlatformEventsOutboxDuplicateDeliveryRisk
+        expr: sum by (service) (increase(outbox_mark_published_errors_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} published outbox events it could not mark as published"
+          description: "Those events will be delivered again; consumers must be idempotent (inbox dedup)."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxduplicatedeliveryrisk"
+
+      # after ratification: platform_dependency_request_seconds_count{dependency="sqs",operation="receive_message",outcome="error"}
+      - alert: PlatformEventsSQSReceiveFailing
+        expr: sum by (service, queue) (rate(sqs_receive_errors_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.service }} cannot receive from SQS"
+          description: "ReceiveMessage has been failing for 10 minutes (credentials, IAM, network or a deleted queue)."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventssqsreceivefailing"
+
+      # after ratification: platform_telemetry_label_overflow_total
+      - alert: PlatformEventsOversizedEventType
+        expr: sum by (service) (increase(events_oversized_event_type_label_total[1h])) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.service }} saw event_type values over 128 bytes"
+          description: "A producer is sending event types outside the registry's naming convention; they are counted as __oversized__."
+          runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoversizedeventtype"

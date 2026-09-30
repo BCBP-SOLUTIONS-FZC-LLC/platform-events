@@ -86,7 +86,7 @@ func TestConsumer_DeletesOnSuccess(t *testing.T) {
 | `nil` | SQS message deleted from queue |
 | `non-nil error` | SQS message left visible; retried after visibility timeout |
 | Panic | Recovered; stack trace logged; SQS message left visible for retry |
-| Unmarshal failure | Counted as `events_consumed_total{status=malformed}`; forwarded to the DLQ then deleted with `WithDLQForwarding` (left visible if the forward fails), otherwise deleted immediately |
+| Unmarshal failure | Counted as `platform_messages_failed_total{reason="malformed"}`; forwarded to the DLQ then deleted with `WithDLQForwarding` (left visible if the forward fails), otherwise deleted immediately |
 
 **VisibilityTimeout limit:** SQS enforces a hard maximum of 12 hours. `NewSQSConsumer` returns an error if `VisibilityTimeout > 12h`.
 
@@ -226,7 +226,7 @@ The lookup is cached per source queue for `DLQConfig.CacheTTL` (default 15 min; 
 
 Standard attributes override caller values of the same name. SQS allows 10 attributes per message, so callers get at most 6 (5 when `ConsumerName` is set). Excess caller attributes are **dropped** before validation (so a dropped attribute cannot fail the send), lowest priority first (kept first: `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical order) and logged at WARN; set `DLQConfig.StrictAttributes` to reject with `ErrDLQInvalidMessage` instead. A FIFO DLQ (`.fifo`) gets `MessageGroupId` and `MessageDeduplicationId` set to the envelope ID (a SHA-256 of the body when it is not an envelope or the ID is not a valid FIFO identifier).
 
-Each forward emits an `sqs.dlq_forward` span (`SpanKindProducer`) and the `events_dlq_forwarded_total` / `events_dlq_forward_duration_seconds` metrics.
+Each forward emits an `sqs.dlq_forward` span (`SpanKindProducer`), counts the message once in `platform_dlq_messages_total{operation="consume",reason}` (legacy `events_dlq_forwarded_total`), and times its SQS calls in `platform_dependency_request_seconds`.
 
 **Wiring:**
 

@@ -371,7 +371,7 @@ flowchart TD
     RI --> D
     G -- permanent error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\noutbox_published_total{error}++"]
     I --> J{attempts ≥ MaxAttempts?}
-    J -- yes --> K["INSERT outbox_dead_letters\nDELETE outbox_events\noutbox_dead_letters_total++"]
+    J -- yes --> K["INSERT outbox_dead_letters\nDELETE outbox_events\nplatform_dlq_messages_total{operation=outbox_publish}++"]
     J -- no  --> D
     K --> D
     D -- done --> B
@@ -395,7 +395,7 @@ The SQS consumer long-polls, dispatches each message to a bounded pool of handle
 3. **Context enriched** — `pgcommon.WithGUCSet(ctx, GUCSet{TenantID: env.TenantID})` injected so all downstream pool calls enforce the event's tenant via RLS.
 4. **OTel span started** (`sqs.receive`) linked to the publisher's trace via `Envelope.TraceID`.
 5. **Handler called** with the enriched context. If it returns `nil`, the message is deleted. If it returns an error, the message stays visible for retry.
-6. **Metrics recorded** — `events_consumed_total`, `events_consume_duration_seconds`.
+6. **Metrics recorded** — `platform_messages_received_total`, then `platform_messages_processed_total` / `platform_messages_failed_total{reason}` / `platform_dlq_messages_total`, `platform_message_processing_duration_seconds`, `platform_event_propagation_seconds` (legacy `events_consumed_total` / `events_consume_duration_seconds` in parallel).
 
 > **Idempotency requirement:** handlers must be idempotent. SQS delivers messages at least once — a handler may be called more than once for the same `Envelope.ID` due to network retries, visibility timeout expiry, or consumer restarts. Use `Envelope.ID` (UUID v7) as the idempotency key. The recommended implementation is a `processed_events` Postgres table with `ON CONFLICT DO NOTHING` inside the same transaction as the side-effect write — see [Consuming guide § Implementing idempotency](docs/guides/consuming.md#implementing-idempotency) for full patterns and the common-mistakes table.
 
@@ -559,7 +559,7 @@ The platform has **two independent retry systems** — one for publish failures 
 | **Recovery action** | `runner.ReprocessDeadLetters(ctx, n)` or SQL `UPDATE` | SQS redrive policy or manual `ChangeMessageVisibility` |
 | **Explicit dead-lettering** | n/a — the runner dead-letters automatically after `MaxAttempts` | `events.DLQPublisher.SendToDLQ` — forward a poison message to the queue's configured DLQ immediately, without waiting for `MaxReceiveCount` |
 | **Who owns recovery** | Platform team (SQL access) | Service team (SQS console / redrive) |
-| **Observable signal** | `outbox_dead_letters_total` counter · `outbox_published_total{status=error}` | `ApproximateNumberOfMessagesNotVisible` CloudWatch · consumer `events_consumed_total{status=error}` · `events_dlq_forwarded_total` |
+| **Observable signal** | `platform_dlq_messages_total{operation="outbox_publish"}` counter · `outbox_published_total{status=error}` | `ApproximateNumberOfMessagesNotVisible` CloudWatch · consumer `events_consumed_total{status=error}` · `events_dlq_forwarded_total` |
 
 ### Producer-side failure timeline
 
@@ -584,7 +584,7 @@ t=30s attempts reaches MaxAttempts (default 5):
       → INSERT outbox_dead_letters (id, event_type, payload, tenant_id,
                                     trace_id, attempts, last_error, failed_at)
       → DELETE outbox_events
-      → outbox_dead_letters_total.Inc()
+      → platform_dlq_messages_total{operation=outbox_publish}.Inc()
 
       ── Recovery ─────────────────────────────────────────────────────────
       Step 1 — Inspect:
@@ -637,7 +637,7 @@ t=0   SQS delivers message. VisibilityTimeout = 30s.
 
       ── Malformed envelope (json.Unmarshal fails) ──────────────────────────
       Library calls DeleteMessage immediately.
-      events_consumed_total{status=malformed}.Inc()
+      platform_messages_failed_total{reason=malformed}.Inc()
       No retry — a malformed message will never unmarshal correctly.
 
 t=30s SQS makes message visible. Consumer receives it again.
@@ -679,7 +679,7 @@ Both systems use the term "dead letter" but they refer to entirely different sto
 | **Outbox dead letters** | Postgres rows in `outbox_dead_letters` — publish failures that exhausted `MaxAttempts` | `runner.ListDeadLetters(ctx, filter, n)` or `SELECT * FROM outbox_dead_letters WHERE tenant_id = 'acme'` | `runner.ReprocessDeadLettersWith(ctx, filter, n)` · `runner.ReprocessDeadLetters(ctx, n)` · `runner.DiscardDeadLetters(ctx, filter, n)` |
 | **SQS DLQ** | A separate SQS queue — consumer failures that exhausted `MaxReceiveCount`, **plus** messages a consumer forwarded explicitly with `DLQPublisher.SendToDLQ` (identifiable by the `DLQReason`, `OriginalQueue`, `FailedAt` and `ConsumerName` message attributes) | SQS console or `aws sqs receive-message --queue-url $DLQ_URL --message-attribute-names All` | SQS redrive policy (SQS console → Start DLQ redrive) |
 
-When an on-call alert fires on `outbox_dead_letters_total`, the fix is on the **publisher side** (SNS connectivity, payload validity, queue subscription). When the alert is on a high `ApproximateNumberOfMessagesNotVisible` or a growing SQS DLQ depth, the fix is on the **consumer handler side** (logic bug, downstream dependency failure, missing idempotency).
+When an on-call alert fires on `platform_dlq_messages_total{operation="outbox_publish"}`, the fix is on the **publisher side** (SNS connectivity, payload validity, queue subscription). When the alert is on a high `ApproximateNumberOfMessagesNotVisible` or a growing SQS DLQ depth, the fix is on the **consumer handler side** (logic bug, downstream dependency failure, missing idempotency).
 
 `DLQPublisher` writes to the **SQS DLQ**, never to `outbox_dead_letters` — the `outbox.Runner` DLQ API (`ListDeadLetters`, `ReprocessDeadLetters*`, `DiscardDeadLetters`) does not see messages it forwards.
 
@@ -797,14 +797,14 @@ flowchart TD
 
 | Symptom | Likely cause | Where to look | Fix |
 |---------|-------------|---------------|-----|
-| `outbox_dead_letters_total` rate > 0 | SNS publish failure or invalid payload | `outbox_dead_letters.last_error` | Fix root cause; call `ListDeadLetters` to inspect, then `ReprocessDeadLettersWith` (selective) or `ReprocessDeadLetters` (all); call `DiscardDeadLetters` for poison pills |
+| `platform_dlq_messages_total{operation="outbox_publish"}` rate > 0 | SNS publish failure or invalid payload | `outbox_dead_letters.last_error` | Fix root cause; call `ListDeadLetters` to inspect, then `ReprocessDeadLettersWith` (selective) or `ReprocessDeadLetters` (all); call `DiscardDeadLetters` for poison pills |
 | `outbox_mark_published_errors_total` > 0 | DB write failed after SNS delivery succeeded — record will be re-published on next poll | `outbox_events.last_error`; DB connectivity | Investigate DB health; note: consumer **must be idempotent** — duplicate delivery is actively occurring |
 | `outbox_pending_total` growing, `outbox_published_total` flat | SNS throttling or outbox runner stopped | `outbox_events.last_error`; outbox runner logs | Check SNS quotas; ensure runner is running; retryable errors auto-recover |
-| `events_consumed_total{status=error}` growing | Handler returning errors repeatedly | Handler logs; downstream service health | Fix handler bug; SQS redrive once fixed |
-| `events_consumed_total{status=malformed}` > 0 | Producer publishing invalid JSON or wrong topic/queue pair | Dead-lettered messages in SQS DLQ | Check producer serialisation; verify SQS filter policies |
+| `platform_messages_failed_total{reason="handler_error"}` growing | Handler returning errors repeatedly | Handler logs; downstream service health | Fix handler bug; SQS redrive once fixed |
+| `platform_messages_failed_total{reason="malformed"}` > 0 | Producer publishing invalid JSON or wrong topic/queue pair | Dead-lettered messages in SQS DLQ | Check producer serialisation; verify SQS filter policies |
 | SQS DLQ depth growing | Handler consistently failing after `MaxReceiveCount` retries | SQS DLQ message bodies; handler logs | Fix handler; redrive DLQ |
 | `events_dlq_forwarded_total{status="success"}` rising | Consumers explicitly dead-lettering poison messages | `DLQReason` / `ConsumerName` attributes on DLQ messages; `sqs: message forwarded to DLQ` WARN logs | Fix the producer or handler; redrive once fixed |
-| `events_dlq_forwarded_total{status="error"}` > 0 | DLQ forward failed — the original stays on the source queue and is retried | `sqs: failed to forward message to DLQ` ERROR logs; `errors.Is(err, events.ErrDLQNotConfigured)` etc. | Add or fix the source queue's `RedrivePolicy`; grant `sqs:GetQueueAttributes` / `sqs:GetQueueUrl` / `sqs:SendMessage`; transient errors self-heal |
+| `platform_messages_failed_total{reason="dead_letter_error"}` > 0 | DLQ forward failed — the original stays on the source queue and is retried | `sqs: failed to forward message to DLQ` ERROR logs; `errors.Is(err, events.ErrDLQNotConfigured)` etc. | Add or fix the source queue's `RedrivePolicy`; grant `sqs:GetQueueAttributes` / `sqs:GetQueueUrl` / `sqs:SendMessage`; transient errors self-heal |
 
 ### `outbox_events` table pruning
 
@@ -849,13 +849,22 @@ requeued, err := runner.ReprocessDeadLetters(ctx, 100)
 ```
 After fixing the root cause (SNS error, payload bug), call `ReprocessDeadLetters` to drain the table back into `outbox_events` for redelivery, then purge any remaining un-recoverable records with the SQL above.
 
-**Alert threshold:** set a Prometheus alert on `outbox_dead_letters_total` rate > 0 for more than 15 minutes — persistent dead-lettering signals a publish failure that requires operator action, not just transient SNS throttling.
+**Alert threshold:** set a Prometheus alert on `platform_dlq_messages_total{operation="outbox_publish"}` rate > 0 for more than 15 minutes — persistent dead-lettering signals a publish failure that requires operator action, not just transient SNS throttling.
 
 ---
 
 ## Observability stack
 
-The library emits three signal types and initialises none of the backends: Prometheus metrics (registered by `events.Init` on the default or a supplied registerer), OpenTelemetry spans (through the global `otel` tracer and propagator — no-ops until the service registers a provider), and structured logs through `port.Logger`. Every metric carries a `service` const label, and `event_type` label values are capped at 128 bytes (`__oversized__` otherwise, counted in `events_oversized_event_type_label_total`) so a misbehaving producer cannot explode label cardinality.
+The library emits three signal types and initialises none of the backends: Prometheus metrics (registered by `events.InitMetrics` on the default or a supplied registerer), OpenTelemetry spans (through the global `otel` tracer and propagator — no-ops until the service registers a provider), and structured logs through `port.Logger`.
+
+Metrics follow the **Enterprise Platform Observability Standard** ([docs/observability](docs/observability/README.md)):
+- **Tier 1 only.** platform-events is a cross-domain platform library, so every metric is Tier 1 `platform_*`. Tier 2 and Tier 3 metrics belong to the services.
+- **Required labels.** `domain`, `service` and `environment` are injected centrally as const labels from one `MetricsIdentity`.
+- **Registry.** Each metric has a registry entry (`internal/adapter/outbound/metrics/registry.go`) with status Canonical, Proposed (shadow-emitted until ratified) or Deprecated. The inventory is generated into [metrics-registry.md](docs/observability/metrics-registry.md).
+- **Compatibility period.** The pre-standard `events_*` / `outbox_*` / `sqs_*` metrics are emitted in parallel until `WithoutLegacyMetrics()`.
+- **Fail-soft registration.** A Tier 1 metric whose name another component already registered with a different shape is disabled and reported as a `RegistrationWarning`.
+- **Bounded label values.** `queue` / `topic` label values are names, never URLs or ARNs. `event_type` values are capped at 128 bytes (`__oversized__` otherwise, counted in `platform_telemetry_label_overflow_total`), so a misbehaving producer cannot explode label cardinality.
+- **CI enforcement.** `make metrics-lint` checks tiers, naming, required labels, label vocabulary, registry parity and the reference rule files. `make rules-check` runs promtool on the rules.
 
 > Source: [`docs/architecture/mermaid/observability-stack.mmd`](docs/architecture/mermaid/observability-stack.mmd)
 
@@ -871,7 +880,7 @@ flowchart LR
     end
 
     subgraph svc["Consuming service wiring"]
-        init["events.Init(service, version)\nonce at startup"]
+        init["events.InitMetrics(identity, registerer)\nonce at startup"]
         otel["OTel TracerProvider + propagator\n(e.g. gincommon.InitTracingFromEnv)\nnone registered → spans are no-ops"]
         reg["Prometheus registerer\n/metrics endpoint"]
     end
@@ -897,8 +906,8 @@ flowchart LR
     lg --> logs
 
     subgraph alerts["Alert on (day one)"]
-        a1["outbox_dead_letters_total rate > 0 — publish-side primary alert"]
-        a2["events_consumed_total{status=error} rising · status=malformed > 0"]
+        a1["platform_dlq_messages_total{operation=outbox_publish} rate > 0 — publish-side primary alert"]
+        a2["platform_messages_failed_total rising · reason=malformed > 0"]
         a3["events_dlq_forwarded_total{status=error} > 0 — poison messages cycling"]
         a4["sqs_delete_errors_total > 0 — duplicate delivery in progress"]
         a5["outbox_pending_total sustained growth — runner stalled or SNS throttled"]
@@ -950,12 +959,12 @@ When goroutine 1 finishes:
 | Signal | Metric | Meaning |
 |---|---|---|
 | Slow handlers | `events_consume_duration_seconds` p99 rising | Reduce concurrency or investigate handler latency |
-| Handler errors | `events_consumed_total{status=error}` growing | Messages being retried; check handler logic |
+| Handler errors | `platform_messages_failed_total{reason="handler_error"}` growing | Messages being retried; check handler logic |
 | Outbox backlog | `outbox_pending_total` growing | Publisher slow or SNS throttling; raise `PublishConcurrency` or check `outbox_published_total` |
 | Leased records | `outbox_leased_total` high | Many records in-flight; if combined with stalled `outbox_pending_total`, a runner may have crashed mid-batch — wait for `ClaimLeaseDuration` expiry or restart the runner |
 | Publish failures | `outbox_published_total{status=error}` | Check SNS connectivity and the `outbox_dead_letters` table |
 | DLQ forwards | `events_dlq_forwarded_total{status}` | `success` — consumers are dead-lettering poison messages · `error` — forward failed, original left on the source queue |
-| Dead letters | `outbox_dead_letters_total` rate > 0 | Records exhausted `MaxAttempts` — inspect `outbox_dead_letters` and replay via `Runner.ReprocessDeadLetters`; **primary publish-side alert** |
+| Dead letters | `platform_dlq_messages_total{operation="outbox_publish"}` rate > 0 | Records exhausted `MaxAttempts` — inspect `outbox_dead_letters` and replay via `Runner.ReprocessDeadLetters`; **primary publish-side alert** |
 
 **Logging correlation:** metrics and spans identify *that* something failed; structured log fields identify *which* message delivery and *which* tenant. Always include `event_id`, `event_type`, `trace_id`, and `tenant_id` on every log line inside a handler or publisher. See [Observability guide § Logging correlation](docs/guides/observability.md#logging-correlation) for patterns and Loki query examples.
 
@@ -995,15 +1004,15 @@ The inbox therefore reduces duplicate work; it does not make side effects exactl
 | Postgres unavailable during `Enqueue` | Caller transaction | Caller's `RunInTx` fails — no business write, no event | Caller's own error handling |
 | Postgres unavailable during poll | `outbox.Runner` | Poll backs off 1 s → 30 s; nothing is published until it recovers; nothing is lost | `outbox_poll_errors_total` |
 | SNS throttled / unavailable | `outbox.Runner` | Retryable — record retried every poll without consuming `MaxAttempts` | `outbox_published_total{status="error"}`, `outbox_pending_total` growth |
-| SNS permanent error (bad ARN, access denied) | `outbox.Runner` | `attempts++`; dead-lettered at `MaxAttempts` | `outbox_dead_letters_total` |
-| Schema registry down (`Codec.Encode` fails) | `outbox.Runner` | Treated as a **permanent** publish failure — counts toward `MaxAttempts`; an outage longer than `MaxAttempts × PollInterval` dead-letters records (replayable with `ReprocessDeadLettersWith`) | `events_codec_encode_total{status="error"}`, `outbox_dead_letters_total` |
+| SNS permanent error (bad ARN, access denied) | `outbox.Runner` | `attempts++`; dead-lettered at `MaxAttempts` | `platform_dlq_messages_total{operation="outbox_publish"}` |
+| Schema registry down (`Codec.Encode` fails) | `outbox.Runner` | Treated as a **permanent** publish failure — counts toward `MaxAttempts`; an outage longer than `MaxAttempts × PollInterval` dead-letters records (replayable with `ReprocessDeadLettersWith`) | `events_codec_encode_total{status="error"}`, `platform_dlq_messages_total{operation="outbox_publish"}` |
 | Schema registry down (`Codec.Decode` fails) | SQS consumer | Message left visible — retried, then redriven by SQS; **not** deleted like malformed JSON | `events_codec_decode_total{status="error"}` |
-| SQS `ReceiveMessage` fails | SQS consumer | Backoff 1 s → 30 s with jitter | `sqs_receive_errors_total` |
+| SQS `ReceiveMessage` fails | SQS consumer | Backoff 1 s → 30 s with jitter | `sqs_receive_errors_total` (Tier 1: `platform_dependency_request_seconds{dependency="sqs",operation="receive_message",outcome="error"}`, Proposed) |
 | SQS `DeleteMessage` fails | SQS consumer | Logged; the message is redelivered — **duplicate processing** | `sqs_delete_errors_total` |
 | SQS `ChangeMessageVisibility` fails | SQS consumer | Logged; a long handler may see its message redelivered concurrently | `sqs_visibility_extension_errors_total` |
 | Inbox ledger read/write fails | `inbox.Handler` | Error returned → message redelivered | Handler error metrics |
-| DLQ forward fails | `DLQPublisher` caller | Error returned (typed; `ErrRetryable` if transient) → caller keeps the original on the source queue | `events_dlq_forwarded_total{status="error"}` |
-| Handler panics | SQS consumer | Recovered, stack logged, span marked error, message left visible | `events_consumed_total{status="error"}` |
+| DLQ forward fails | `DLQPublisher` caller | Error returned (typed; `ErrRetryable` if transient) → caller keeps the original on the source queue | `platform_messages_failed_total{reason="dead_letter_error"}` |
+| Handler panics | SQS consumer | Recovered, stack logged, span marked error, message left visible | `platform_messages_failed_total{reason="handler_error"}` |
 
 ---
 
@@ -1036,9 +1045,9 @@ The inbox therefore reduces duplicate work; it does not make side effects exactl
 | DLQ forward never loses the original | `SendToDLQ` returns an error on any failure; callers return it so the source message stays visible. Invalid input is rejected before any AWS call |
 | DLQ lookup cached, failures not | `RedrivePolicy` is resolved once per source queue per publisher; a failed lookup is retried on the next call |
 | Standard DLQ attributes are authoritative | `DLQReason`, `OriginalQueue`, `FailedAt`, `ConsumerName` override caller-supplied values; `EventType` comes from the envelope body when parseable; `DLQReason` truncated to 1 KiB on a rune boundary |
-| Malformed messages deleted and counted | SQS messages that cannot be unmarshalled to `Envelope` are counted as `events_consumed_total{status=malformed}` and deleted — immediately, or after a successful forward to the SQS DLQ with `WithDLQForwarding` — preventing poison-pill messages from blocking the queue |
+| Malformed messages deleted and counted | SQS messages that cannot be unmarshalled to `Envelope` are counted as `platform_messages_failed_total{reason="malformed"}` and deleted — immediately, or after a successful forward to the SQS DLQ with `WithDLQForwarding` — preventing poison-pill messages from blocking the queue |
 | SKIP LOCKED for horizontal scale | Multiple outbox runner instances claim disjoint batches; no distributed lock required |
-| Dead letters are queryable & observable | `outbox_dead_letters` is a Postgres table (retryable from SQL); `outbox_dead_letters_total` counter enables alerting |
+| Dead letters are queryable & observable | `outbox_dead_letters` is a Postgres table (retryable from SQL); `platform_dlq_messages_total{operation="outbox_publish"}` counter enables alerting |
 | Batch split at 10 | `PublishBatch` splits silently; partial failures return `BatchError` per message |
 | Sequential batch transport errors | When `PublishConcurrency=1`, a non-`BatchError` from SNS marks all records in the claimed batch failed — safe at-least-once, may over-count attempts if SNS partially succeeded |
 | Handlers must be idempotent | SQS delivers at least once; use `Envelope.ID` as the idempotency key. Recommended: `INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING` inside the same transaction — see [Consuming guide § Implementing idempotency](docs/guides/consuming.md#implementing-idempotency) |
@@ -1080,7 +1089,7 @@ graph LR
     end
 
     subgraph events_lib["platform-events"]
-        metrics_init["pkg/events.Init\nregisters Prometheus metrics"]
+        metrics_init["pkg/events.InitMetrics\nregisters platform_* metrics"]
         sns_new["pkg/events.NewSNSPublisher\nreturns error on empty or invalid TopicARN"]
         sqs_new["pkg/events.NewSQSConsumer\ninjects GUCSet · links OTel trace"]
         dlq_new["pkg/events.NewSQSDLQPublisher\nforwards to the queue's RedrivePolicy DLQ\nno SQS SDK import in the service"]
@@ -1156,7 +1165,7 @@ Before a service (Go via this library, or Python via `platform-eventcommon`) con
 - [ ] No handler assumes delivery order; projections are upsert-style.
 
 **Observability**
-- [ ] Alert on `events_consumed_total{status="error"}` / `{status="malformed"}`, `events_dlq_forwarded_total{status="error"}`, and SQS DLQ depth (CloudWatch).
+- [ ] Alert on `platform_messages_failed_total` (by `reason`), `platform_messages_failed_total{reason="dead_letter_error"}`, and SQS DLQ depth (CloudWatch).
 - [ ] Every handler log line binds `event_id`, `event_type`, `trace_id`, `tenant_id`.
 
 ---

@@ -269,6 +269,7 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 	if err := c.checkDLQ(ctx); err != nil {
 		return err
 	}
+	metrics.InitQueue(c.queueURL)
 
 	// Create a fresh doneCh for this cycle before entering the loop.
 	// All fields written here are protected by c.mu; Stop() reads doneCh under
@@ -379,7 +380,9 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		// We pass loopCtx as the parent so cancellation still propagates immediately
 		// on Stop(), even before the per-call deadline fires.
 		rcvCtx, rcvCancel := context.WithTimeout(loopCtx, time.Duration(int(c.waitSeconds)+5)*time.Second)
+		rcvStart := time.Now()
 		out, err := c.client.ReceiveMessage(rcvCtx, receiveInput)
+		rcvDur := time.Since(rcvStart)
 		rcvCancel()
 		if err != nil {
 			select {
@@ -390,6 +393,7 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 				return nil
 			default:
 			}
+			metrics.ObserveDependency("sqs", "receive_message", err, rcvDur)
 			metrics.RecordSQSReceiveError(c.queueURL)
 			if c.logger != nil {
 				c.logger.Error("sqs: receive message failed", map[string]any{"error": err.Error()})
@@ -413,6 +417,7 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 			continue
 		}
 		receiveBackoff = receiveBackoffInit // reset on success
+		metrics.ObserveDependency("sqs", "receive_message", nil, rcvDur)
 
 		for _, msg := range out.Messages {
 			// Interruptible semaphore acquire: if loopCtx is cancelled while all
@@ -517,6 +522,8 @@ func (c *sqsConsumer) Stop() error {
 //     visibility-timeout extension (which must stop when the loop stops).
 func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.Message) {
 	tracer := otel.Tracer("platform-events")
+	receivedAt := time.Now()
+	metrics.ObserveReceived(c.queueURL)
 
 	var env domain.Envelope[json.RawMessage]
 	body := aws.ToString(msg.Body)
@@ -541,7 +548,9 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		// forward succeeds), otherwise delete it to avoid infinite retry loops.
 		// Record a metric so operators can detect producer schema mismatches.
 		metrics.RecordConsume(c.queueURL, "unknown", "malformed", 0)
-		if c.dlq != nil && !c.forwardToDLQ(drainCtx, context.Background(), msg, "malformed message body: "+err.Error()) {
+		metrics.IncFailed(c.queueURL, "unknown", "malformed")
+		if c.dlq != nil && !c.forwardToDLQ(drainCtx, context.Background(), msg, "unknown", "malformed", "malformed message body: "+err.Error()) {
+			metrics.IncRetry("consume", "unknown")
 			return
 		}
 		c.deleteMessage(msg)
@@ -561,6 +570,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	handlerBase = port.WithSourceMessage(handlerBase, func() port.SourceMessage { return sourceMessage(c.queueURL, msg) })
 	receiveCount := approxReceiveCount(msg.Attributes)
 	overThreshold := c.maxReceiveCount > 0 && receiveCount > c.maxReceiveCount
+	metrics.ObservePropagation(c.queueURL, env.Type, env.Timestamp, receivedAt)
 
 	// Codec decode — SchemaID is the signal: empty means Payload is already
 	// plain JSON (legacy producer, NoopCodec, or WithCodec never configured
@@ -573,8 +583,12 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		decodeStart := time.Now()
 		decoded, decErr := decodeCodecPayload(loopCtx, c.codec, env.SchemaID, env.Payload)
 		dur := time.Since(decodeStart)
+		if c.codec != nil {
+			metrics.ObserveDependency("codec", "decode", decErr, dur)
+		}
 		if decErr != nil {
 			metrics.RecordCodecDecode(c.queueURL, env.Type, "error", dur.Seconds())
+			metrics.IncFailed(c.queueURL, env.Type, "decode_error")
 			if c.logger != nil {
 				c.logger.Error("sqs: codec decode failed — message left visible for retry", map[string]any{
 					"message_id": aws.ToString(msg.MessageId),
@@ -587,9 +601,11 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			// Past the dead-letter threshold, stop retrying a payload that keeps
 			// failing to decode: forward the undecoded original to the DLQ.
 			if c.dlq != nil && overThreshold &&
-				c.forwardToDLQ(drainCtx, handlerBase, msg, "codec decode failed: "+decErr.Error()) {
+				c.forwardToDLQ(drainCtx, handlerBase, msg, env.Type, "decode_error", "codec decode failed: "+decErr.Error()) {
 				c.deleteMessage(msg)
+				return
 			}
+			metrics.IncRetry("consume", env.Type)
 			return
 		}
 		env.Payload = decoded
@@ -608,6 +624,9 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		if overThreshold {
 			// Tie DLH context to drainCtx so it respects the drain deadline.
 			dlhCtx, dlhCancel := context.WithCancel(handlerBase)
+			// A SendToDLQ from the dead-letter handler is attributed to
+			// max_receive_count and counted once, by the DLQ publisher.
+			dlhCtx, dlhAttribution := port.WithDLQAttribution(dlhCtx, "max_receive_count")
 			stopDrain := context.AfterFunc(drainCtx, dlhCancel)
 			defer stopDrain()
 			defer dlhCancel()
@@ -622,7 +641,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			// forward then fails, so it must be idempotent.
 			if dlhErr == nil && c.dlq != nil {
 				reason := fmt.Sprintf("receive count %d exceeded consumer max receive count %d", receiveCount, c.maxReceiveCount)
-				if !c.forwardToDLQ(drainCtx, handlerBase, msg, reason) {
+				if !c.forwardToDLQ(drainCtx, handlerBase, msg, env.Type, "max_receive_count", reason) {
 					dlhErr = errDLQForwardFailed
 				}
 			}
@@ -654,9 +673,20 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			// Emit the same consume metrics for DLH invocations so dashboards and
 			// alerts can distinguish DLH activity from normal handler activity.
 			metrics.RecordConsume(c.queueURL, env.Type, "dlq_"+dlhStatus, dur.Seconds())
+			if c.deadLetterHandler != nil {
+				metrics.ObserveProcessingDuration(c.queueURL, env.Type, dur)
+			}
 
 			if dlhErr != nil {
+				metrics.IncFailed(c.queueURL, env.Type, "dead_letter_error")
+				metrics.IncRetry("consume", env.Type)
 				return // do NOT delete — leave visible for retry
+			}
+			// Dead-lettered by the dead-letter handler alone (no forwarding,
+			// no SendToDLQ of its own): count it here. Forwards were counted
+			// in forwardToDLQ / by the DLQ publisher.
+			if c.dlq == nil && !dlhAttribution.Recorded() {
+				metrics.IncDLQ("consume", env.Type, "max_receive_count")
 			}
 			c.deleteMessage(msg)
 			return
@@ -696,6 +726,9 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	stopDrain := context.AfterFunc(drainCtx, handlerCancel)
 	defer stopDrain()
 	defer handlerCancel()
+	// A handler that dead-letters its message explicitly (SendToDLQ, then
+	// return nil) is counted as dead-lettered, not processed.
+	handlerCtx, handlerAttribution := port.WithDLQAttribution(handlerCtx, "explicit")
 
 	handlerCtx, span := tracer.Start(handlerCtx, "sqs.receive", spanOpts...)
 	defer span.End()
@@ -731,11 +764,16 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 					if msg.ReceiptHandle == nil {
 						return
 					}
-					if _, err := c.client.ChangeMessageVisibility(extCtx, &sqs.ChangeMessageVisibilityInput{
+					visStart := time.Now()
+					_, err := c.client.ChangeMessageVisibility(extCtx, &sqs.ChangeMessageVisibilityInput{
 						QueueUrl:          aws.String(c.queueURL),
 						ReceiptHandle:     msg.ReceiptHandle,
 						VisibilityTimeout: secs,
-					}); err != nil {
+					})
+					if extCtx.Err() == nil { // not cancelled because the handler returned
+						metrics.ObserveDependency("sqs", "change_message_visibility", err, time.Since(visStart))
+					}
+					if err != nil {
 						metrics.RecordSQSVisibilityError(c.queueURL)
 						if c.logger != nil {
 							// A failed extension means the message may become visible again
@@ -773,6 +811,9 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		span.RecordError(panicErr)
 		span.SetStatus(codes.Error, panicErr.Error())
 		metrics.RecordConsume(c.queueURL, env.Type, "error", dur.Seconds())
+		metrics.ObserveProcessingDuration(c.queueURL, env.Type, dur)
+		metrics.IncFailed(c.queueURL, env.Type, "handler_panic")
+		metrics.IncRetry("consume", env.Type)
 		panic(handlerPanic) // propagate to goroutine-level recovery for stack logging
 	}
 
@@ -791,10 +832,16 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			})
 		}
 		// Do not delete — leave visible for retry.
+		metrics.IncFailed(c.queueURL, env.Type, "handler_error")
+		metrics.IncRetry("consume", env.Type)
 	} else {
 		span.SetStatus(codes.Ok, "")
 		c.deleteMessage(msg)
+		if !handlerAttribution.Recorded() {
+			metrics.IncProcessed(c.queueURL, env.Type)
+		}
 	}
+	metrics.ObserveProcessingDuration(c.queueURL, env.Type, dur)
 
 	metrics.RecordConsume(c.queueURL, env.Type, status, dur.Seconds())
 }
@@ -820,9 +867,11 @@ func (c *sqsConsumer) dlqForwardTimeout() time.Duration {
 // forwardToDLQ forwards msg, as received, to the DLQ and reports success.
 // parent supplies context values (trace, baggage); its cancellation is ignored
 // so a forward in flight at Stop() completes, bounded by dlqForwardTimeout and
-// the drain deadline.
-func (c *sqsConsumer) forwardToDLQ(drainCtx, parent context.Context, msg sqstypes.Message, reason string) bool {
+// the drain deadline. reasonCode (a DLQReasonValues entry) attributes the
+// forward in platform_dlq_messages_total; reason is the DLQReason text.
+func (c *sqsConsumer) forwardToDLQ(drainCtx, parent context.Context, msg sqstypes.Message, eventType, reasonCode, reason string) bool {
 	src := sourceMessage(c.queueURL, msg)
+	parent, attribution := port.WithDLQAttribution(parent, reasonCode)
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), c.dlqForwardTimeout())
 	defer cancel()
 	stopDrain := context.AfterFunc(drainCtx, cancel)
@@ -838,6 +887,10 @@ func (c *sqsConsumer) forwardToDLQ(drainCtx, parent context.Context, msg sqstype
 			})
 		}
 		return false
+	}
+	// A DLQPublisher other than the SQS one does not count the message itself.
+	if !attribution.Recorded() {
+		metrics.IncDLQ("consume", eventType, reasonCode)
 	}
 	return true
 }
@@ -907,10 +960,12 @@ func (c *sqsConsumer) deleteMessage(msg sqstypes.Message) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), deleteMessageTimeout)
 	defer cancel()
+	start := time.Now()
 	_, err := c.client.DeleteMessage(ctx, &sqs.DeleteMessageInput{
 		QueueUrl:      aws.String(c.queueURL),
 		ReceiptHandle: msg.ReceiptHandle,
 	})
+	metrics.ObserveDependency("sqs", "delete_message", err, time.Since(start))
 	if err != nil {
 		metrics.RecordSQSDeleteError(c.queueURL)
 		if c.logger != nil {

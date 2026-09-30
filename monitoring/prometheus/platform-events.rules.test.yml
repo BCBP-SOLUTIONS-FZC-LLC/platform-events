@@ -1,0 +1,147 @@
+# promtool unit tests for platform-events.rules.yml (make rules-check).
+rule_files:
+  - platform-events.rules.yml
+
+evaluation_interval: 30s
+
+tests:
+  # 5% failures on one queue burn the budget; a healthy queue does not alert.
+  - interval: 1m
+    input_series:
+      - series: 'platform_messages_received_total{domain="iam",service="event-consumer",environment="prod",queue="orders"}'
+        values: '0+100x90'
+      - series: 'platform_messages_failed_total{domain="iam",service="event-consumer",environment="prod",queue="orders",event_type="iam.user.created",reason="handler_error"}'
+        values: '0+5x90'
+      - series: 'platform_messages_processed_total{domain="iam",service="event-consumer",environment="prod",queue="orders",event_type="iam.user.created"}'
+        values: '0+95x90'
+      - series: 'platform_messages_received_total{domain="iam",service="event-consumer",environment="prod",queue="users"}'
+        values: '0+100x90'
+      - series: 'platform_messages_processed_total{domain="iam",service="event-consumer",environment="prod",queue="users",event_type="iam.user.updated"}'
+        values: '0+100x90'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: PlatformEventsConsumerErrorBudgetBurn
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              domain: iam
+              service: event-consumer
+              environment: prod
+              queue: orders
+            exp_annotations:
+              summary: "event-consumer is failing messages on orders fast enough to exhaust its monthly error budget"
+              description: "Over 1.44% of messages received on orders failed in both the last hour and the last 5 minutes."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumererrorbudgetburn"
+      - eval_time: 70m
+        alertname: PlatformEventsConsumerStalled
+        exp_alerts: []
+
+  # Deliveries with no successful processing for 15 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'platform_messages_received_total{domain="iam",service="event-consumer",environment="prod",queue="orders"}'
+        values: '0+10x40'
+      - series: 'platform_messages_processed_total{domain="iam",service="event-consumer",environment="prod",queue="orders",event_type="iam.user.created"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PlatformEventsConsumerStalled
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: PlatformEventsConsumerStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              domain: iam
+              service: event-consumer
+              environment: prod
+              queue: orders
+            exp_annotations:
+              summary: "event-consumer receives messages on orders but processes none"
+              description: "Messages have been delivered for 15 minutes without a single successful handler completion."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumerstalled"
+
+  # The first malformed message after a restart alerts (series pre-created at 0).
+  - interval: 1m
+    input_series:
+      - series: 'platform_messages_failed_total{domain="iam",service="event-consumer",environment="prod",queue="orders",event_type="unknown",reason="malformed"}'
+        values: '0 0 0 1 1 1'
+      - series: 'platform_dlq_messages_total{domain="iam",service="event-consumer",environment="prod",operation="consume",event_type="unknown",reason="malformed"}'
+        values: '0 0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PlatformEventsMalformedMessages
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              domain: iam
+              service: event-consumer
+              environment: prod
+              queue: orders
+            exp_annotations:
+              summary: "event-consumer received malformed messages on orders"
+              description: "Messages that are not valid event envelopes arrived in the last 15 minutes — a producer or subscription is misconfigured."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsmalformedmessages"
+      - eval_time: 5m
+        alertname: PlatformEventsMessagesDeadLettered
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              domain: iam
+              service: event-consumer
+              environment: prod
+              operation: consume
+              reason: malformed
+            exp_annotations:
+              summary: "event-consumer dead-lettered messages (consume, malformed)"
+              description: "Messages were moved to dead-letter storage in the last 15 minutes and need investigation or replay."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsmessagesdeadlettered"
+
+  # Outbox backlog above 1000 for 15 minutes; a stale (-1) reading alerts separately.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_pending_total{service="orders"}'
+        values: '1500x30'
+      - series: 'outbox_pending_total{service="billing"}'
+        values: '-1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PlatformEventsOutboxBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: orders
+            exp_annotations:
+              summary: "orders has over 1000 unpublished outbox events"
+              description: "The transactional outbox backlog has stayed above 1000 events for 15 minutes; event delivery is lagging."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxbacklog"
+      - eval_time: 20m
+        alertname: PlatformEventsOutboxPendingUnknown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: billing
+            exp_annotations:
+              summary: "billing cannot read its outbox backlog"
+              description: "The outbox pending-count query has failed for 10 minutes, so the backlog alert is blind."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxpendingunknown"
+
+  # 10% publish errors for 10 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'events_published_total{service="orders",topic="arn:aws:sns:us-east-1:123:orders",event_type="orders.order.placed",status="success"}'
+        values: '0+90x30'
+      - series: 'events_published_total{service="orders",topic="arn:aws:sns:us-east-1:123:orders",event_type="orders.order.placed",status="error"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: PlatformEventsPublishErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: orders
+              topic: "arn:aws:sns:us-east-1:123:orders"
+            exp_annotations:
+              summary: "orders fails over 5% of publishes"
+              description: "More than 5% of publishes have failed for 10 minutes."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventspublisherrors"

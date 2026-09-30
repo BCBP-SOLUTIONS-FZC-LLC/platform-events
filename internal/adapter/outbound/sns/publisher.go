@@ -278,6 +278,7 @@ func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.Raw
 	start := time.Now()
 	out, err := p.client.Publish(ctx, input)
 	dur := time.Since(start)
+	metrics.ObserveDependency("sns", "publish", err, dur)
 
 	status := "success"
 	if err != nil {
@@ -475,6 +476,7 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 		PublishBatchRequestEntries: entries,
 	})
 	dur := time.Since(start)
+	metrics.ObserveDependency("sns", "publish_batch", err, dur)
 
 	if err != nil {
 		span.RecordError(err)
@@ -606,6 +608,7 @@ func (p *snsPublisher) encodeEnvelopePayload(ctx context.Context, env domain.Env
 	start := time.Now()
 	encoded, schemaID, err := p.codec.Encode(ctx, env.Type, env.Payload)
 	dur := time.Since(start)
+	metrics.ObserveDependency("codec", "encode", err, dur)
 	if err != nil {
 		metrics.RecordCodecEncode(p.topicARN, env.Type, "error", dur.Seconds())
 		return env, fmt.Errorf("sns: codec encode failed: %w", err)

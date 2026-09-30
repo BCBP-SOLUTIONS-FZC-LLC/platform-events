@@ -18,7 +18,7 @@ flowchart TD
     RI --> D
     G -- permanent error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\noutbox_published_total{error}++"]
     I --> J{attempts ≥ MaxAttempts?}
-    J -- yes --> K["INSERT outbox_dead_letters\nDELETE outbox_events\noutbox_dead_letters_total++"]
+    J -- yes --> K["INSERT outbox_dead_letters\nDELETE outbox_events\nplatform_dlq_messages_total{operation=outbox_publish}++"]
     J -- no  --> D
     K --> D
     D -- done --> B

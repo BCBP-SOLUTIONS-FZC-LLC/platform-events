@@ -4,7 +4,7 @@ graph LR
     end
 
     subgraph events_lib["platform-events"]
-        metrics_init["pkg/events.Init\nregisters Prometheus metrics"]
+        metrics_init["pkg/events.InitMetrics\nregisters platform_* metrics"]
         sns_new["pkg/events.NewSNSPublisher\nreturns error on empty or invalid TopicARN"]
         sqs_new["pkg/events.NewSQSConsumer\ninjects GUCSet · links OTel trace"]
         dlq_new["pkg/events.NewSQSDLQPublisher\nforwards to the queue's RedrivePolicy DLQ\nno SQS SDK import in the service"]

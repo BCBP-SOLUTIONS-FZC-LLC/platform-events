@@ -287,6 +287,8 @@ func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastErr
 	// metric never overcounts on a rolled-back transaction.
 	if deadLettered {
 		metrics.RecordOutboxDeadLetter(rec.EventType)
+	} else {
+		metrics.IncRetry("outbox_publish", rec.EventType)
 	}
 	return nil
 }

@@ -81,6 +81,9 @@ help:
 	@echo "  make fmt-check        - verify gofmt formatting (mirrors CI)"
 	@echo "  make vet              - go vet (default build + every test build tag)"
 	@echo "  make lint             - run golangci-lint (default build + every test build tag)"
+	@echo "  make metrics-lint     - observability standard gate (metric conformance, rule files, inventory)"
+	@echo "  make metrics-doc      - regenerate docs/observability/metrics-registry.md from the registry"
+	@echo "  make rules-check      - promtool check + unit tests for monitoring/prometheus (requires Docker)"
 	@echo "  make test             - unit + integration tests in parallel (requires Docker)"
 	@echo "  make test-ci          - unit + integration + e2e with race detector + merged coverage (used in CI)"
 	@echo "  make test-unit        - unit tests only (no Docker required)"
@@ -91,7 +94,7 @@ help:
 	@echo "  make build            - compile reference CLI to bin/"
 	@echo "  make cover            - coverage HTML report (runs test-ci)"
 	@echo "  make cover-func       - coverage summary by function (runs test-ci)"
-	@echo "  make ci               - tidy + fmt-check + vet + lint + test-ci + build"
+	@echo "  make ci               - tidy + fmt-check + vet + lint + metrics-lint + test-ci + build"
 	@echo "  make docker-up        - start LocalStack (SNS + SQS + Postgres)"
 	@echo "  make docker-build     - build the reference-CLI image as CI does (needs GO_PRIVATE_TOKEN)"
 	@echo "  make pin-base-images  - fetch + pin SHA digests for Dockerfile base images"
@@ -290,7 +293,35 @@ docker-down:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint test-ci build
+ci: tidy fmt-check vet lint metrics-lint test-ci build
+
+# -----------------------------
+# OBSERVABILITY STANDARD
+# -----------------------------
+
+# metrics-lint: Enterprise Platform Observability Standard gate — runtime
+# conformance of every registered collector against the metrics registry
+# (namespace tier, naming, _total/_seconds suffixes, required labels, label
+# vocabulary, registry compliance), rule-file governance (registry metrics
+# only, no Proposed metric as a query target, labels in vocabulary, runbook
+# anchors) and the generated inventory being up to date.
+# See docs/observability/README.md.
+.PHONY: metrics-lint
+metrics-lint:
+	$(GO) test -count=1 -run 'TestStandard_|TestRules_|TestInventory_|TestWrapCollision' ./test/unit/metrics/
+
+# metrics-doc: regenerate docs/observability/metrics-registry.md from the registry.
+.PHONY: metrics-doc
+metrics-doc:
+	$(GO) test -count=1 -run TestInventory ./test/unit/metrics/ -update
+
+# rules-check: promtool syntax check + alert unit tests (requires Docker).
+PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0
+
+.PHONY: rules-check
+rules-check:
+	docker run --rm -v "$(CURDIR)/monitoring/prometheus":/rules -w /rules --entrypoint promtool $(PROMETHEUS_IMAGE) check rules platform-events.rules.yml
+	docker run --rm -v "$(CURDIR)/monitoring/prometheus":/rules -w /rules --entrypoint promtool $(PROMETHEUS_IMAGE) test rules platform-events.rules.test.yml
 
 # -----------------------------
 # COVERAGE

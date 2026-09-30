@@ -84,7 +84,7 @@ env := events.NewEnvelope("billing.invoices.generated", "billing-worker",
 | Stable and globally unique | Use the canonical service name: `platform-iam`, `billing-service`, `inventory-worker`. It must be unique across all services in the organisation |
 | Immutable across deployments | Do not derive it from hostname, pod name, or any runtime variable — it must be the same value in every environment |
 | Environment-free | Never append `-dev`, `-staging`, `-prod`, or a region suffix. The environment is implicit in which AWS account/topic the event lands on; embedding it in `source` makes Loki/Tempo queries environment-specific and breaks dashboards when you promote code |
-| Set as a constant | Define it once as a package-level constant in the service (`const serviceName = "platform-iam"`) and pass it to `NewEnvelope` and `events.Init` from that single source of truth |
+| Set as a constant | Define it once as a package-level constant in the service (`const serviceName = "platform-iam"`) and pass it to `NewEnvelope` and `events.MetricsIdentity.Service` from that single source of truth |
 
 `source` is used for debugging, tracing (`sns.publish` span attribute), Prometheus metric labels, and consumer routing. Changing it severs observability continuity — historical log queries, dashboards, and alert rules that filter on `source` will silently stop matching.
 

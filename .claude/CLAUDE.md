@@ -12,7 +12,7 @@ Core capabilities:
 - **Outbox runner** — transactional outbox pattern over a Postgres table; guarantees at-least-once delivery without 2PC
 - **Inbox** (`pkg/inbox`) — consumer-side dedup: `processed_events` ledger (`ApplySchema`, `Store`, `Handler` wrapper, `Prune`), metric `events_inbox_duplicates_total`
 - **`GlueDecodeCodec`** — decode-only codec stripping the Glue Schema Registry wire header
-- **`DLQPublisher`** — forwards failed messages to the source queue's `RedrivePolicy` DLQ (`SendToDLQ`, `ResolveDLQ`); the only sanctioned SQS path for consumer services (they must not import the SQS SDK). Typed `*DLQError` + `ErrRetryable`; `mock.DLQPublisher` (validates input like the real one); metrics `events_dlq_forwarded_total` / `events_dlq_forward_duration_seconds`; span `sqs.dlq_forward`. Consumer option `WithDLQForwarding(dlq)` forwards malformed / over-`WithMaxReceiveCount` / decode-poison messages automatically (raw body + attributes); handlers get the raw message via `events.SourceMessageFromContext(ctx)` — never forward `env.JSON()`
+- **`DLQPublisher`** — forwards failed messages to the source queue's `RedrivePolicy` DLQ (`SendToDLQ`, `ResolveDLQ`); the only sanctioned SQS path for consumer services (they must not import the SQS SDK). Typed `*DLQError` + `ErrRetryable`; `mock.DLQPublisher` (validates input like the real one); metrics `platform_dlq_messages_total` (counted once via `port.DLQAttribution`) + `platform_dependency_request_seconds{dependency="sqs"}` (legacy `events_dlq_forwarded_total`); span `sqs.dlq_forward`. Consumer option `WithDLQForwarding(dlq)` forwards malformed / over-`WithMaxReceiveCount` / decode-poison messages automatically (raw body + attributes); handlers get the raw message via `events.SourceMessageFromContext(ctx)` — never forward `env.JSON()`
 - **Event-envelope types** — versioned, typed `Envelope[T]` carrying metadata (event ID, type, source, tenant, trace ID, timestamp) plus JSON-serialised payload
 - **HMAC helpers** — SHA-256 HMAC signing and verification for webhook and cross-service event authentication
 
@@ -38,6 +38,9 @@ make tidy            # go mod tidy
 make fmt             # go fmt ./...
 make vet             # go vet ./...
 make lint            # golangci-lint
+make metrics-lint    # Observability standard gate (metric conformance, rule files, inventory drift)
+make metrics-doc     # Regenerate docs/observability/metrics-registry.md from the registry
+make rules-check     # promtool check + alert unit tests for monitoring/prometheus (Docker)
 make test            # All tests (unit + integration), excludes smoke
 make test-ci         # All tests with race detector (used in CI)
 make test-unit       # Unit tests only
@@ -47,7 +50,7 @@ make race            # All tests with -race flag
 make build           # Compile reference CLI to bin/platform-events
 make cover           # Coverage HTML report (measures ./internal/... ./pkg/...)
 make cover-func      # Coverage summary by function (terminal)
-make ci              # tidy + vet + lint + test-ci + build (full CI pipeline)
+make ci              # tidy + fmt-check + vet + lint + metrics-lint + test-ci + build (full CI pipeline)
 make docker-up       # Start LocalStack (SNS + SQS + Postgres for outbox)
 make docker-down     # Stop LocalStack
 make clean           # Remove bin/ artefacts
@@ -279,23 +282,35 @@ The outbox pattern eliminates the dual-write problem: services write the event *
 
 HMAC keys must be ≥ 32 bytes; `Sign` returns an error (not a panic) if the key is shorter.
 
-### Metrics
+### Metrics — Enterprise Platform Observability Standard
 
-`pkg/events/metrics.Init(serviceName, buildVersion string)` registers:
-- `events_published_total{service, topic, event_type, status}` — counter
-- `events_publish_duration_seconds{service, topic, event_type}` — histogram
-- `events_consumed_total{service, queue, event_type, status}` — counter
-- `events_consume_duration_seconds{service, queue, event_type}` — histogram
-- `outbox_pending_total{service}` — gauge (set each poll cycle)
-- `outbox_published_total{service, event_type, status}` — counter
-- `outbox_attempts_total{service, event_type}` — counter
-- `events_codec_encode_total{service, topic, event_type, status}` — counter (`status`: `success`/`noop`/`error`); only incremented when `WithCodec` is configured
-- `events_codec_encode_duration_seconds{service, topic, event_type}` — histogram
-- `events_codec_decode_total{service, queue, event_type, status}` — counter (`status`: `success`/`error`); only incremented when `WithConsumerCodec` is configured
-- `events_codec_decode_duration_seconds{service, queue, event_type}` — histogram
-- `events_oversized_event_type_label_total{service}` — counter; incremented by `SanitizeEventType` when an `event_type` value exceeds 128 bytes and is replaced with `"__oversized__"`; alert on `rate() > 0`
+All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platform library, so Tier 2 (`<domain>_*`) and Tier 3 (`<domain>_<service>_*`) belong to the services. This is the same model as platform-pgcommon's `platform_db_*`. Full docs: `docs/observability/README.md`. Generated inventory: `docs/observability/metrics-registry.md`.
 
-`InitWithRegisterer(serviceName, buildVersion, prometheus.Registerer)` — for isolated test registries; bypasses `sync.Once`.
+- **Init.** `events.InitMetrics(events.MetricsIdentity{Domain, Service, Environment, Version}, registerer, ...events.MetricsOption) ([]RegistrationWarning, error)`.
+  - Injects `domain`/`service`/`environment` as const labels (rule 8). An empty Environment falls back to `APP_ENV` → `ENVIRONMENT` → `dev`.
+  - Registers the legacy metrics in parallel unless `events.WithoutLegacyMetrics()` is given.
+  - Error = invalid identity or legacy registration failure (nothing changes).
+  - Warning = a `platform_*` metric the registry refused (fail-soft, metric disabled). IAM services already own `platform_retry_total` / `platform_dependency_request_seconds` with other label sets.
+  - Registerer wrappers that inject identity labels are handled; each label is applied once and the wrapper wins.
+  - Helpers: `MetricsIdentityFromEnv`, `MetricsIdentityFromLabels` (gincommon interop), `MetricsEnvironmentFromEnv`, `MetricsRegistry()`.
+- **Deprecated entry points.** `events.Init` / `InitWithRegisterer` register legacy metrics only (SA1019).
+- **Registry = source of truth.** `internal/adapter/outbound/metrics/registry.go` holds tier, status (Canonical / Proposed / Deprecated), semantic definition, approved labels + values, cardinality, aggregation, `Supersedes` ↔ `SupersededBy`, and sunset. Change a metric → update the registry → `make metrics-doc`.
+- **Canonical:** `platform_messages_received_total{queue}`, `platform_messages_processed_total{queue,event_type}`, `platform_messages_failed_total{queue,event_type,reason}`, `platform_retry_total{operation,event_type}`, `platform_dlq_messages_total{operation,event_type,reason}`.
+- **Proposed** (shadow-emitted, never in alerts/SLO/HPA until ratified): `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}`, `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
+- **Deprecated legacy:** `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info`. Still authoritative where the successor is Proposed.
+- **Consumer semantics.**
+  - Every delivery is received once and ends processed, failed (+ retry), or dead-lettered.
+  - A dead-letter is counted **once**. `port.DLQAttribution` in the handler ctx carries the reason (`malformed` / `decode_error` / `max_receive_count` / `explicit`), and the DLQ publisher marks it recorded.
+  - A handler that calls `SendToDLQ` and returns nil is not counted as processed.
+- **Label rules.**
+  - `queue` / `topic` = name, never URL/ARN (`metrics.QueueName` / `TopicName`).
+  - `event_type` goes through `SanitizeEventType` (128 bytes, `__oversized__`).
+  - Prohibited: `tenant_id`, `event_id`, `user_id`, `email`, `request_id`, `session_id`, `message_id`, `trace_id`, `span_id`, `correlation_id`, `subject`, `actor`.
+- **CI.**
+  - `make metrics-lint` (in `Validate / Quality` and `make ci`) registers the real collectors and enforces tiers, naming (`_total` / `_seconds`), required labels, vocabulary and registry parity.
+  - The same target also checks the rule files (no Proposed metric outside comments, labels in vocabulary, runbook anchors) and inventory drift.
+  - `make rules-check` runs promtool on `monitoring/prometheus/platform-events.rules.yml` (+ `.test.yml`).
+- **Adding a metric.** Add the registry entry (Proposed + full packet), register it in `registerPlatform`, and add a recording function that nil-checks `platform.Load()`. Exercise it in `test/unit/metrics/standard_test.go` `exerciseAll`, then run `make metrics-doc`.
 
 ### Key Configuration Defaults
 
@@ -393,7 +408,7 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 GitHub Actions mirrors `iam-org-membership`'s pipeline — the org ruleset on `main` requires its job names (`Validate / Test / test`, `Validate / Quality / quality`, `Build image (cache)`, `Trivy CVE scan`, `Smoke tests`, `PR summary`), so **do not rename those jobs**. This is a **private module** with no production deployment; the Docker image is the reference CLI (`cmd/platform-events`), built only so CI can Trivy-scan and smoke-test the compiled binary.
 
 - **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → `.github/scripts/coverage-gate.sh` (≥ 95%).
-- **`validate-quality.yml`** (reusable) — `go mod verify`, HTML-entity check, RLS-6 grep, `gofmt`, tidy drift, `make vet` / `make lint` (each also with `-tags=integration,e2e`), `make vuln-check`, Dockerfile digest-pinning check. `golangci-lint` runs via `go tool` (the `tool` directive in `go.mod` is not propagated to consumers).
+- **`validate-quality.yml`** (reusable) — `go mod verify`, HTML-entity check, RLS-6 grep, `gofmt`, tidy drift, `make vet` / `make lint` (each also with `-tags=integration,e2e`), `make metrics-lint` + `make rules-check` (Observability Standard), `make vuln-check`, Dockerfile digest-pinning check. `golangci-lint` runs via `go tool` (the `tool` directive in `go.mod` is not propagated to consumers).
 - **`ci.yml`** (push/PR to main) — the two gates + `Build image (cache)` in parallel → `Trivy CVE scan` / `Smoke tests` → `Cross-language compatibility` → `PR summary`; on push, `Push image → GHCR` (Cosign-signed).
 - **`changelog-check.yml`** — PRs touching `internal/`, `pkg/`, `cmd/` must update `CHANGELOG.md`.
 - **`release.yml`** (`v*` tags) — **the same job graph as `ci.yml`** at the tag, behind a fail-fast tag + CHANGELOG `verify` job, plus 5-platform CLI binaries; the image is pushed (semver tags, signed, provenance) only after every gate passes, then the GitHub Release is published. Change a gate in `ci.yml` → change it in `release.yml` too. The Git tag is the **Go module release** consuming services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z`.
@@ -409,5 +424,5 @@ Standard-library `govulncheck` findings are fixed by bumping the `go` directive 
 - **New outbox migration:** add `NNN_description.up.sql` / `NNN_description.down.sql` to `pkg/outbox/migrations/`. The embedded FS is recompiled on next build; `outbox.ApplySchema` picks it up automatically via `platform-pgcommon`'s `migrate.Runner`.
 - **Replace logger:** the `port.Logger` interface is deliberately kept identical to `platform-gincommon`'s. Do not change method signatures — consuming services pass a single `ZapLogger` instance to both libraries.
 - **New Codec implementation** (e.g. AWS Glue Schema Registry): implement `port.Codec` (aliased as `events.Codec`) in the consuming service — this library does not implement one or depend on `aws-sdk-go-v2/service/glue`. Inject via `WithCodec` (publisher) / `WithConsumerCodec` (consumer).
-- **New metrics:** add counters/histograms inside `initMetricsWithRegisterer` in `internal/adapter/outbound/metrics/metrics.go`.
+- **New metrics:** follow "Adding a metric" under Metrics above — registry entry first (`internal/adapter/outbound/metrics/registry.go`), then `registerPlatform`, a recording function, `exerciseAll` in `test/unit/metrics/standard_test.go`, and `make metrics-doc`. Never invent a Canonical `platform_*` name; new names start as Proposed (rules 11/12).
 - **New use case:** add to `internal/core/service/`, depending only on `domain/` types and `port/` interfaces.

@@ -211,7 +211,6 @@ func (p *DLQPublisher) SendToDLQ(ctx context.Context, sourceQueueURL string, bod
 		attribute.String("events.dlq.source_queue", sourceQueueURL),
 	)
 
-	start := time.Now()
 	messageID, err := p.send(ctx, span, sourceQueueURL, body, attrs, reason, eventType)
 	status := "success"
 	if err != nil {
@@ -221,8 +220,13 @@ func (p *DLQPublisher) SendToDLQ(ctx context.Context, sourceQueueURL string, bod
 	} else {
 		span.SetAttributes(attribute.String("messaging.message_id", messageID))
 		span.SetStatus(codes.Ok, "")
+		// Count the dead-lettered message once, with the reason the consumer
+		// attributed (explicit for a direct call outside a consumer dispatch).
+		attribution := port.DLQAttributionFromContext(ctx)
+		metrics.IncDLQ("consume", eventType, attribution.Reason())
+		attribution.MarkRecorded()
 	}
-	metrics.RecordDLQForward(sourceQueueURL, eventType, status, time.Since(start).Seconds())
+	metrics.RecordDLQForward(sourceQueueURL, eventType, status)
 	return err
 }
 
@@ -312,7 +316,9 @@ func (p *DLQPublisher) send(ctx context.Context, span oteltrace.Span, sourceQueu
 		input.MessageDeduplicationId = aws.String(id)
 	}
 
+	sendStart := time.Now()
 	out, err := p.client.SendMessage(ctx, input)
+	metrics.ObserveDependency("sqs", "send_message", err, time.Since(sendStart))
 	if err != nil {
 		kind := domain.ErrDLQSendFailed
 		code := apiErrorCode(err)
@@ -490,10 +496,12 @@ func (p *DLQPublisher) lookup(ctx context.Context, sourceQueueURL string) (dlqTa
 		return dlqTarget{}, &domain.DLQError{Kind: kind, SourceQueue: sourceQueueURL, Cause: cause}
 	}
 
+	start := time.Now()
 	attrOut, err := p.client.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
 		QueueUrl:       aws.String(sourceQueueURL),
 		AttributeNames: []sqstypes.QueueAttributeName{sqstypes.QueueAttributeNameRedrivePolicy},
 	})
+	metrics.ObserveDependency("sqs", "get_queue_attributes", err, time.Since(start))
 	if err != nil {
 		return fail(domain.ErrDLQUnresolved, fmt.Errorf("GetQueueAttributes: %w", classifySQSError(err)))
 	}
@@ -511,10 +519,12 @@ func (p *DLQPublisher) lookup(ctx context.Context, sourceQueueURL string) (dlqTa
 		return fail(domain.ErrDLQInvalidRedrivePolicy, err)
 	}
 
+	start = time.Now()
 	urlOut, err := p.client.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{
 		QueueName:              aws.String(name),
 		QueueOwnerAWSAccountId: aws.String(account),
 	})
+	metrics.ObserveDependency("sqs", "get_queue_url", err, time.Since(start))
 	if err != nil {
 		return fail(domain.ErrDLQUnresolved, fmt.Errorf("GetQueueUrl %s: %w", targetARN, classifySQSError(err)))
 	}
