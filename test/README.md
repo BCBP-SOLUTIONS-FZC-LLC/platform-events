@@ -35,8 +35,9 @@ make cover          # coverage HTML report
 Run a single test:
 
 ```bash
-go test ./test/unit/envelope/...     -run TestEnvelopeSign -v
-go test ./test/integration/...       -tags=integration -run TestSNSPublishRoundTrip -v
+cd test   # test/ is its own Go module (replace → ../)
+go test ./unit/envelope/...     -run TestEnvelopeSign -v
+go test ./integration/...       -tags=integration -run TestSNSPublishRoundTrip -v
 ```
 
 Skip integration tests when Docker is unavailable:
@@ -82,7 +83,7 @@ clk := &fixtures.FakeClock{T: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 
 ### floci
 
-`fixtures.StartFloci(ctx, t)` starts a floci container (region `fixtures.FlociRegion` = `us-east-1`, account `000000000000`, static `test` / `test` credentials) and returns a `*fixtures.Floci` with ready SNS and SQS clients, the mapped `EndpointURL`, and helpers `CreateTopic`, `CreateQueue` and `SubscribeQueueToTopic` (raw delivery, as production requires). The container is terminated on `t.Cleanup`, and the test is skipped under `-short`.
+`fixtures.StartFloci(ctx, t)` returns the package's **shared** floci container, started on first use, as in iam-org-membership. Resources are isolated by name: `CreateTopic` / `CreateQueue` fail a test that reuses a name another test in the package already created, and each package's `TestMain` calls `fixtures.TerminateSharedFloci()`. The container runs (region `fixtures.FlociRegion` = `us-east-1`, account `000000000000`, static `test` / `test` credentials) and the returned `*fixtures.Floci` provides ready SNS and SQS clients, the mapped `EndpointURL`, and the helpers `CreateTopic`, `CreateQueue` and `SubscribeQueueToTopic` (raw delivery, as production requires). Tests are skipped under `-short`. Images are digest-pinned; refresh them with `make pin-base-images`.
 
 ```go
 //go:build integration

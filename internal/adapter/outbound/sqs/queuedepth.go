@@ -14,8 +14,10 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 )
 
-// minQueueDepthInterval bounds how often each replica polls SQS for depth.
-const minQueueDepthInterval = 10 * time.Second
+// MinQueueDepthInterval bounds how often each replica polls SQS for depth.
+// A variable only so the test suite can exercise repeated polls quickly; it is
+// in an internal package and not part of the public API.
+var MinQueueDepthInterval = 10 * time.Second
 
 // queueDepthCallTimeout bounds one GetQueueAttributes call.
 const queueDepthCallTimeout = 10 * time.Second
@@ -37,8 +39,8 @@ type queueAttributesAPI interface {
 // IAM: sqs:GetQueueAttributes on the queue and on its DLQ.
 func WithQueueDepthMetrics(interval time.Duration) ConsumerOption {
 	return func(c *sqsConsumer) {
-		if interval > 0 && interval < minQueueDepthInterval {
-			interval = minQueueDepthInterval
+		if interval > 0 && interval < MinQueueDepthInterval {
+			interval = MinQueueDepthInterval
 		}
 		c.queueDepthInterval = interval
 	}
@@ -48,6 +50,15 @@ func WithQueueDepthMetrics(interval time.Duration) ConsumerOption {
 // returns a function that waits for it to exit (after ctx is cancelled).
 func (c *sqsConsumer) startQueueDepthPoller(ctx context.Context) (wait func()) {
 	if c.queueDepthInterval <= 0 {
+		return func() {}
+	}
+	// Without the Tier 1 metrics there is nowhere to record the depth: polling
+	// would only cost SQS calls (and log IAM errors). InitMetrics must run
+	// before Start.
+	if p := metrics.CurrentPlatform(); p == nil || (p.QueueDepth == nil && p.DLQDepth == nil) {
+		if c.logger != nil {
+			c.logger.Warn("sqs: WithQueueDepthMetrics ignored — platform metrics are not initialised (call events.InitMetrics before Start)", map[string]any{"queue": c.queueURL})
+		}
 		return func() {}
 	}
 	api, ok := c.client.(queueAttributesAPI)
@@ -61,8 +72,9 @@ func (c *sqsConsumer) startQueueDepthPoller(ctx context.Context) (wait func()) {
 	wg.Go(func() {
 		ticker := time.NewTicker(c.queueDepthInterval)
 		defer ticker.Stop()
+		failing := map[string]string{} // queue URL → last logged error
 		for {
-			c.sampleQueueDepth(ctx, api)
+			c.sampleQueueDepth(ctx, api, failing)
 			select {
 			case <-ctx.Done():
 				return
@@ -76,8 +88,8 @@ func (c *sqsConsumer) startQueueDepthPoller(ctx context.Context) (wait func()) {
 // sampleQueueDepth reads the source queue's backlog and RedrivePolicy, then
 // the DLQ's backlog. Failures are logged and counted as dependency errors;
 // the gauges keep their last value.
-func (c *sqsConsumer) sampleQueueDepth(ctx context.Context, api queueAttributesAPI) {
-	attrs, ok := c.queueAttributes(ctx, api, c.queueURL,
+func (c *sqsConsumer) sampleQueueDepth(ctx context.Context, api queueAttributesAPI, failing map[string]string) {
+	attrs, ok := c.queueAttributes(ctx, api, failing, c.queueURL,
 		sqstypes.QueueAttributeNameApproximateNumberOfMessages, sqstypes.QueueAttributeNameRedrivePolicy)
 	if !ok {
 		return
@@ -94,7 +106,7 @@ func (c *sqsConsumer) sampleQueueDepth(ctx context.Context, api queueAttributesA
 	if !ok {
 		return
 	}
-	dlqAttrs, ok := c.queueAttributes(ctx, api, dlqURL, sqstypes.QueueAttributeNameApproximateNumberOfMessages)
+	dlqAttrs, ok := c.queueAttributes(ctx, api, failing, dlqURL, sqstypes.QueueAttributeNameApproximateNumberOfMessages)
 	if !ok {
 		return
 	}
@@ -103,7 +115,11 @@ func (c *sqsConsumer) sampleQueueDepth(ctx context.Context, api queueAttributesA
 	}
 }
 
-func (c *sqsConsumer) queueAttributes(ctx context.Context, api queueAttributesAPI, queueURL string, names ...sqstypes.QueueAttributeName) (map[string]string, bool) {
+// queueAttributes reads names from queueURL. A persistent failure (typically a
+// missing sqs:GetQueueAttributes permission) is logged once — and again only
+// if the error changes — with one recovery message, instead of on every poll;
+// every failure is still counted in platform_dependency_request_seconds.
+func (c *sqsConsumer) queueAttributes(ctx context.Context, api queueAttributesAPI, failing map[string]string, queueURL string, names ...sqstypes.QueueAttributeName) (map[string]string, bool) {
 	callCtx, cancel := context.WithTimeout(ctx, queueDepthCallTimeout)
 	defer cancel()
 	start := time.Now()
@@ -113,10 +129,17 @@ func (c *sqsConsumer) queueAttributes(ctx context.Context, api queueAttributesAP
 	}
 	metrics.ObserveDependency("sqs", "get_queue_attributes", err, time.Since(start))
 	if err != nil {
-		if c.logger != nil {
-			c.logger.Warn("sqs: queue depth sample failed", map[string]any{"queue": queueURL, "error": err.Error()})
+		if c.logger != nil && failing[queueURL] != err.Error() {
+			c.logger.Warn("sqs: queue depth sample failed (logged once until it recovers)", map[string]any{"queue": queueURL, "error": err.Error()})
 		}
+		failing[queueURL] = err.Error()
 		return nil, false
+	}
+	if _, was := failing[queueURL]; was {
+		delete(failing, queueURL)
+		if c.logger != nil {
+			c.logger.Info("sqs: queue depth sampling recovered", map[string]any{"queue": queueURL})
+		}
 	}
 	return out.Attributes, true
 }

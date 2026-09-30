@@ -24,12 +24,19 @@ endif
 
 export APP_NAME APP_ENV BUILD_VERSION
 
-# Test package groups (explicit to handle per-group build tags cleanly).
-# White-box tests that live alongside source (e.g. internal/core/service/)
-# are included in TEST_UNIT_PKGS so they run with coverage instrumentation.
-TEST_UNIT_PKGS := ./test/unit/... ./internal/core/service/...
-TEST_INT_PKGS  := ./test/integration/...
-TEST_E2E_PKGS  := ./test/e2e/...
+# Module layout — three modules so consumers of the library inherit only what
+# the library itself imports (same as platform-pgcommon):
+#   .       the library (what services `require`)
+#   test/   unit / integration / e2e / smoke suites + testcontainers fixtures
+#   tools/  golangci-lint (run via `go tool -modfile=tools/go.mod`)
+# White-box tests beside the sources (internal/core/service/*_test.go) stay in
+# the root module and run as ROOT_TEST_PKGS.
+ROOT_TEST_PKGS := ./internal/core/service/...
+TEST_UNIT_PKGS := ./unit/...
+TEST_INT_PKGS  := ./integration/...
+TEST_E2E_PKGS  := ./e2e/...
+TEST_MOD       := cd test &&
+LINT           := $(GO) tool -modfile=$(CURDIR)/tools/go.mod golangci-lint
 
 # Every build tag the test/ tree declares (integration: test/integration,
 # e2e: test/e2e). vet and lint run a second pass with all of them — CI's
@@ -111,18 +118,24 @@ help:
 .PHONY: pin-base-images
 pin-base-images:
 	@echo "Fetching SHA digests for Dockerfile base images..."
-	@GOLANG_DIGEST=$$(docker buildx imagetools inspect golang:1.26.6-alpine --format '{{.Manifest.Digest}}') && \
+	@GOLANG_DIGEST=$$(docker buildx imagetools inspect golang:1.26.8-alpine --format '{{.Manifest.Digest}}') && \
 	 DISTROLESS_DIGEST=$$(docker buildx imagetools inspect gcr.io/distroless/static-debian13:nonroot --format '{{.Manifest.Digest}}') && \
 	 sed -i.bak -E \
-	   -e "s|FROM golang:1.26.6-alpine(@sha256:[a-f0-9]+)?|FROM golang:1.26.6-alpine@$$GOLANG_DIGEST|" \
+	   -e "s|FROM golang:1.26.8-alpine(@sha256:[a-f0-9]+)?|FROM golang:1.26.8-alpine@$$GOLANG_DIGEST|" \
 	   -e "s|FROM gcr.io/distroless/static-debian13:nonroot(@sha256:[a-f0-9]+)?|FROM gcr.io/distroless/static-debian13:nonroot@$$DISTROLESS_DIGEST|" \
 	   Dockerfile && rm -f Dockerfile.bak && \
-	 echo "golang:1.26.6-alpine $$GOLANG_DIGEST" > .docker-digests && \
+	 echo "golang:1.26.8-alpine $$GOLANG_DIGEST" > .docker-digests && \
 	 echo "gcr.io/distroless/static-debian13:nonroot $$DISTROLESS_DIGEST" >> .docker-digests && \
 	 PROMETHEUS_DIGEST=$$(docker buildx imagetools inspect prom/prometheus:v3.5.0 --format '{{.Manifest.Digest}}') && \
 	 sed -i.bak -E "s|^PROMETHEUS_IMAGE \?= prom/prometheus:v3.5.0(@sha256:[a-f0-9]+)?|PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0@$$PROMETHEUS_DIGEST|" Makefile && rm -f Makefile.bak && \
 	 echo "prom/prometheus:v3.5.0 $$PROMETHEUS_DIGEST" >> .docker-digests && \
-	 echo "Digests written to .docker-digests — commit Dockerfile, Makefile and .docker-digests"
+	 for img in floci/floci:2.1.0 floci/floci:2.1.0-compat floci/floci-ui:0.5.0 postgres:16-alpine; do \
+	   d=$$(docker buildx imagetools inspect $$img --format '{{.Manifest.Digest}}') && \
+	   IMG=$$img D=$$d perl -pi -e 's/\Q$$ENV{IMG}\E(?:\@sha256:[a-f0-9]+)?(?=["\s]|$$)/$$ENV{IMG}\@$$ENV{D}/g' \
+	     docker-compose.yml test/fixtures/floci.go test/fixtures/db.go && \
+	   echo "$$img $$d" >> .docker-digests; \
+	 done && \
+	 echo "Digests written to .docker-digests — commit Dockerfile, Makefile, docker-compose.yml, test/fixtures and .docker-digests"
 
 # docker-build: build the reference-CLI image the way CI does. Needs a GitHub
 # token with read access to the private BCBP modules in GO_PRIVATE_TOKEN
@@ -142,6 +155,8 @@ docker-build:
 .PHONY: tidy
 tidy:
 	$(GO) mod tidy
+	cd test && $(GO) mod tidy
+	cd tools && $(GO) mod tidy
 
 .PHONY: fmt
 fmt:
@@ -150,7 +165,8 @@ fmt:
 .PHONY: vet
 vet:
 	$(GO) vet ./...
-	$(GO) vet -tags=$(ALL_TEST_TAGS) ./...
+	$(TEST_MOD) $(GO) vet ./...
+	$(TEST_MOD) $(GO) vet -tags=$(ALL_TEST_TAGS) ./...
 
 .PHONY: fmt-check
 fmt-check:
@@ -165,6 +181,8 @@ fmt-check:
 .PHONY: mod-verify
 mod-verify:
 	$(GO) mod verify
+	cd test && $(GO) mod verify
+	cd tools && $(GO) mod verify
 
 .PHONY: vuln-check
 vuln-check:
@@ -177,8 +195,8 @@ vuln-check:
 .PHONY: lint
 lint:
 	@echo "Running linter..."
-	$(GO) tool golangci-lint run ./...
-	$(GO) tool golangci-lint run --build-tags=$(ALL_TEST_TAGS) ./...
+	$(LINT) run ./...
+	$(TEST_MOD) $(LINT) run --build-tags=$(ALL_TEST_TAGS) ./...
 
 # -----------------------------
 # TESTS
@@ -187,32 +205,38 @@ lint:
 # run_suite runs one coverage-instrumented suite into .coverage/<name>.out.
 # Suites run in parallel (make -j3), so their logs interleave — on failure the
 # `--- FAIL:` lines are re-printed in a summary block at the end.
-#   $(1) = suite name   $(2) = go test packages + flags
+#   $(1) = suite name   $(2) = go test packages + flags   $(3) = module prefix
+#   ($(TEST_MOD) for the test/ module, empty for the root module)
 define run_suite
-	{ $(GO) test $(2) \
+	rm -f $(CURDIR)/.coverage/$(1).exitcode $(CURDIR)/.coverage/$(1).out; \
+	{ $(3) $(GO) test $(2) \
 	  -coverpkg=$(COVER_PKG_LIST) \
-	  -coverprofile=.coverage/$(1).out \
-	  2>&1; echo $$? >.coverage/$(1).exitcode; } | tee .coverage/$(1).raw; \
-	_exit=$$(cat .coverage/$(1).exitcode 2>/dev/null || echo 1); \
+	  -coverprofile=$(CURDIR)/.coverage/$(1).out \
+	  2>&1; echo $$? >$(CURDIR)/.coverage/$(1).exitcode; } | tee $(CURDIR)/.coverage/$(1).raw; \
+	_exit=$$(cat $(CURDIR)/.coverage/$(1).exitcode 2>/dev/null || echo 1); \
 	[ "$$_exit" = "0" ] || { \
 	  printf '\n\n=== FAILING $(1) TESTS (see full log above for details) ===\n'; \
-	  grep '^--- FAIL:' .coverage/$(1).raw || printf '(no --- FAIL lines — check for DATA RACE or panic above)\n'; \
+	  grep '^--- FAIL:' $(CURDIR)/.coverage/$(1).raw || printf '(no --- FAIL lines — check for DATA RACE or panic above)\n'; \
 	  printf '=============================================================\n\n'; \
 	}; \
 	exit "$$_exit"
 endef
 
+.PHONY: _test-root
+_test-root: | .coverage
+	$(call run_suite,root,$(ROOT_TEST_PKGS) -race -count=1 -timeout 120s,)
+
 .PHONY: _test-unit
 _test-unit: | .coverage
-	$(call run_suite,unit,$(TEST_UNIT_PKGS) -race -count=1 -timeout 120s)
+	$(call run_suite,unit,$(TEST_UNIT_PKGS) -race -count=1 -timeout 120s,$(TEST_MOD))
 
 .PHONY: _test-integration
 _test-integration: | .coverage
-	$(call run_suite,integration,$(TEST_INT_PKGS) -tags=integration -race -count=1 -timeout 300s)
+	$(call run_suite,integration,$(TEST_INT_PKGS) -tags=integration -race -count=1 -timeout 300s,$(TEST_MOD))
 
 .PHONY: _test-e2e
 _test-e2e: | .coverage
-	$(call run_suite,e2e,$(TEST_E2E_PKGS) -tags=e2e -race -count=1 -timeout 300s)
+	$(call run_suite,e2e,$(TEST_E2E_PKGS) -tags=e2e -race -count=1 -timeout 300s,$(TEST_MOD))
 
 .PHONY: test
 test:
@@ -220,16 +244,17 @@ test:
 
 .PHONY: _test-unit-plain _test-integration-plain
 _test-unit-plain:
-	$(GO) test $(TEST_UNIT_PKGS) -count=1 -timeout 120s -v
+	$(GO) test $(ROOT_TEST_PKGS) -count=1 -timeout 120s -v
+	$(TEST_MOD) $(GO) test $(TEST_UNIT_PKGS) -count=1 -timeout 120s -v
 _test-integration-plain:
-	$(GO) test $(TEST_INT_PKGS) -tags=integration -count=1 -timeout 300s -v
+	$(TEST_MOD) $(GO) test $(TEST_INT_PKGS) -tags=integration -count=1 -timeout 300s -v
 
 # Merge the per-suite profiles into a single coverage.out (max-count
 # strategy — any suite covering a block wins). Mirrors iam-org-membership.
 .PHONY: _merge-coverage
 _merge-coverage:
 	@python3 scripts/merge_coverage.py \
-	  .coverage/unit.out .coverage/integration.out .coverage/e2e.out \
+	  .coverage/root.out .coverage/unit.out .coverage/integration.out .coverage/e2e.out \
 	  > coverage.out
 	@echo "==> coverage.out merged from all suites (max-count strategy)"
 
@@ -238,16 +263,17 @@ _merge-coverage:
 # Includes e2e tests (requires Docker on the runner).
 .PHONY: test-ci
 test-ci: | .coverage
-	$(MAKE) -j3 _test-unit _test-integration _test-e2e
+	$(MAKE) -j4 _test-root _test-unit _test-integration _test-e2e
 	$(MAKE) _merge-coverage
 
 .PHONY: test-unit
 test-unit:
-	$(GO) test $(TEST_UNIT_PKGS) -count=1 -timeout 60s -v
+	$(GO) test $(ROOT_TEST_PKGS) -count=1 -timeout 60s -v
+	$(TEST_MOD) $(GO) test $(TEST_UNIT_PKGS) -count=1 -timeout 60s -v
 
 .PHONY: test-integration
 test-integration:
-	$(GO) test $(TEST_INT_PKGS) -tags=integration -count=1 -timeout 300s -v
+	$(TEST_MOD) $(GO) test $(TEST_INT_PKGS) -tags=integration -count=1 -timeout 300s -v
 
 # test-int: kept as an alias — referenced by README / CLAUDE.md / CONTRIBUTING.
 .PHONY: test-int
@@ -255,15 +281,15 @@ test-int: test-integration
 
 .PHONY: test-e2e
 test-e2e:
-	$(GO) test $(TEST_E2E_PKGS) -tags=e2e -count=1 -timeout 300s -v
+	$(TEST_MOD) $(GO) test $(TEST_E2E_PKGS) -tags=e2e -count=1 -timeout 300s -v
 
 .PHONY: test-smoke
 test-smoke:
-	$(GO) test ./test/smoke/... -tags=smoke -count=1 -timeout 60s -v
+	$(TEST_MOD) $(GO) test ./smoke/... -tags=smoke -count=1 -timeout 60s -v
 
 .PHONY: race
 race:
-	$(MAKE) -j3 _test-unit _test-integration _test-e2e
+	$(MAKE) -j4 _test-root _test-unit _test-integration _test-e2e
 
 # -----------------------------
 # BUILD
@@ -312,16 +338,23 @@ ci: tidy fmt-check vet lint metrics-lint test-ci build
 # See docs/observability/README.md.
 .PHONY: metrics-lint
 metrics-lint:
-	$(GO) test -count=1 -run 'TestStandard_|TestRules_|TestMonitoring_|TestInventory_|TestWrapCollision' ./test/unit/metrics/
+	$(TEST_MOD) $(GO) test -count=1 -run 'TestStandard_|TestRules_|TestMonitoring_|TestInventory_|TestWrapCollision' ./unit/metrics/
 
 # metrics-doc: regenerate docs/observability/metrics-registry.md from the registry.
 .PHONY: metrics-doc
 metrics-doc:
-	$(GO) test -count=1 -run TestInventory ./test/unit/metrics/ -update
+	$(TEST_MOD) $(GO) test -count=1 -run TestInventory ./unit/metrics/ -update
 
 # rules-check: promtool syntax check + alert unit tests (requires Docker).
 # Digest-pinned like the Dockerfile base images; refreshed by pin-base-images.
 PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
+
+# dashboards-check: PromQL syntax gate for monitoring/grafana/*.json (same
+# script as platform-pgcommon; requires Docker and jq). Governance — registry
+# metrics, labels, "(Proposed)"/"(legacy)" titles — is metrics-lint's job.
+.PHONY: dashboards-check
+dashboards-check:
+	PROMETHEUS_IMAGE=$(PROMETHEUS_IMAGE) bash .github/scripts/dashboard-promql.sh
 
 .PHONY: rules-check
 rules-check:

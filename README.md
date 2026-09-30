@@ -3,7 +3,7 @@
 The platform's shared **event-driven messaging library** — the single sanctioned path for every service that publishes or consumes domain events. It owns the canonical event envelope, the SNS publisher, the SQS consumer loop, the transactional outbox, consumer-side deduplication (inbox), dead-letter forwarding, HMAC signing, and the messaging-layer observability every service would otherwise re-implement. It is consumed as a private Go module and is **never deployed on its own**.
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`
-**Module:** Go 1.26.6 · private module · library only (`cmd/platform-events` is a reference CLI that validates config and prints version info, not a server — CI builds, scans and smoke-tests it as a container image)
+**Module:** Go 1.26 (`go 1.26.0`, `toolchain go1.26.8`) · private module · library only (`cmd/platform-events` is a reference CLI that validates config and prints version info, not a server — CI builds, scans and smoke-tests it as a container image)
 **Design:** Clean Architecture — public API in `pkg/`, AWS/Postgres adapters in `internal/adapter/`, SDK-free core in `internal/core/`. Design narrative, sequence diagrams and invariants: [ARCHITECTURE.md](ARCHITECTURE.md). The wire format is byte-compatible with the Python sibling [`platform-eventcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-eventcommon); the `interop` CI job enforces it.
 
 ---
@@ -192,7 +192,8 @@ platform-events/
 ├── .github/workflows/ + scripts/      # CI: ci, validate-test, validate-quality, changelog-check, release
 ├── Dockerfile · .docker-digests       # Reference-CLI image (digest-pinned) for CI build / Trivy / smoke
 ├── .githooks/pre-commit               # tidy (+ drift check) + fmt-check + lint; installed via `make setup`
-└── test/                              # unit/ (no Docker), integration/ + e2e/ (testcontainers), smoke/ (live AWS), fixtures/
+├── test/                              # own module: unit/ (no Docker), integration/ + e2e/ (testcontainers: one shared floci per package), smoke/ (live AWS), fixtures/
+└── tools/                             # own module: golangci-lint (go tool -modfile=tools/go.mod)
 ```
 
 ### Dependency rules
@@ -301,7 +302,7 @@ Production defaults, backpressure tuning and the service adoption checklist: [Op
 
 ### Prerequisites
 
-- Go 1.26.6+
+- Go 1.26+ (the `toolchain go1.26.8` line makes the go command fetch 1.26.8 automatically for this repository's own builds; consumers are not pinned to a patch release)
 - Docker — testcontainers-go starts floci (`floci/floci:2.1.0`) + Postgres for the integration and e2e suites; `make docker-up` for manual runs
 - `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (`GONOSUMDB` too) and an SSH key registered with the BCBP org — the Makefile exports both
 
@@ -316,6 +317,10 @@ make test-unit   # no Docker needed
 make docker-up   # optional: floci (SNS + SQS) on :4574, floci-ui on :4505, Postgres on :5538
 ```
 
+### Module layout
+
+Three Go modules, the same layout as platform-pgcommon, so consuming services inherit only what the library itself imports: `.` (the library), `test/` (every suite and fixture; `replace …platform-events => ../`) and `tools/` (golangci-lint, run through `go tool -modfile=tools/go.mod`). The library's `go.mod` went from 289 to 55 lines, and testcontainers and the linter's dependency tree are gone from it. White-box tests beside the sources (`internal/core/service/*_test.go`) stay in the root module. `make tidy`, `vet`, `lint`, `mod-verify` and every `test-*` target cover all three modules.
+
 ### Common commands
 
 | Command | Description |
@@ -328,6 +333,8 @@ make docker-up   # optional: floci (SNS + SQS) on :4574, floci-ui on :4505, Post
 | `make metrics-lint` | Observability Standard gate: registered-collector conformance (tiers, naming, required labels, vocabulary, registry parity), governance of rule files, dashboards and autoscaling manifests, inventory drift |
 | `make metrics-doc` | Regenerate `docs/observability/metrics-registry.md` from the metrics registry |
 | `make rules-check` | `promtool check rules` + alert unit tests for `monitoring/prometheus/` (Docker) |
+| `make dashboards-check` | PromQL syntax gate for `monitoring/grafana/*.json`: every panel and variable query checked with promtool (Docker, jq) |
+| `make pin-base-images` | Re-pin every image this repository runs by digest: Dockerfile, promtool, docker-compose, testcontainers fixtures (recorded in `.docker-digests`) |
 | `make mod-verify` | `go mod verify` |
 | `make vuln-check` | `govulncheck` (pinned version) on `./internal/...` + `./pkg/...` |
 | `make test` | Unit + integration in parallel (Docker required; e2e is separate) |
@@ -351,8 +358,9 @@ When suites run in parallel their logs interleave; a failing suite re-prints its
 ### Running a single test
 
 ```bash
-go test ./test/unit/sqs/...    -run TestSendToDLQ_Success_PopulatesAttributes -v
-go test ./test/integration/... -tags=integration -run TestDLQPublisher_ForwardsToRedriveTarget -v
+cd test   # the suites are their own module
+go test ./unit/sqs/...    -run TestSendToDLQ_Success_PopulatesAttributes -v
+go test ./integration/... -tags=integration -run TestDLQPublisher_ForwardsToRedriveTarget -v
 go test -short ./test/integration/...   # -short skips every test that needs Docker
 ```
 
@@ -461,7 +469,7 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 
 ### Coverage
 
-CI (`ci.yml` → `make cover-func`) fails below **95%** total, measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live under `test/`, a separate package tree, so every run uses `-coverpkg`; `make test-ci` merges the unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.0%** (verified 2026-09-30).
+CI (`ci.yml` → `make cover-func`) fails below **95%** total, measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.0%** (verified 2026-09-30).
 
 ---
 
@@ -557,7 +565,7 @@ Five workflow files, mirroring `iam-org-membership` — the org's reference pipe
 
 - **`ci.yml`** — orchestrator on push / PR to `main`. `Validate / Test`, `Validate / Quality` and `Build image (cache)` run in parallel; `Trivy CVE scan` and `Smoke tests` gate on the test job and the image; `Cross-language compatibility` (`platform-interop-tests`) gates on the test job; `PR summary` posts one status comment per PR; on push to `main`, `Push image → GHCR` publishes and Cosign-signs the reference-CLI image. Docs-only commits (`**.md`, `docs/architecture/**`, `docs/guides/**`) skip the pipeline.
 - **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 95%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
-- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make vuln-check` → Dockerfile digest-pinning check.
+- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make dashboards-check` (dashboard PromQL) → `make vuln-check` → digest-pinning check (Dockerfile, docker-compose and the testcontainers images).
 - **`changelog-check.yml`** — fails a PR touching `internal/`, `pkg/` or `cmd/` without a `CHANGELOG.md` update.
 - **`release.yml`** — on `v*.*.*` tags: the same job graph as `ci.yml` plus verify / binaries / publish — see [Releasing](#releasing).
 

@@ -3,7 +3,9 @@ package fixtures
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -23,7 +25,9 @@ const (
 	// FlociImage is the emulator image the integration and e2e suites run.
 	// The docker-compose dev stack uses the -compat variant (AWS CLI bundled
 	// for its healthcheck and init hook).
-	FlociImage = "floci/floci:2.1.0"
+	// Digest-pinned like every image this repository runs (refreshed by
+	// `make pin-base-images`, recorded in .docker-digests).
+	FlociImage = "floci/floci:2.1.0@sha256:f5aa8c18302cedb4f2385f5c4e455b3efc77fee6bf7b6e5d1712b2817ba102db"
 	// FlociRegion and FlociAccount are the emulator's default region and
 	// account; floci treats region as an isolation boundary, so clients must
 	// use FlociRegion.
@@ -37,15 +41,52 @@ type Floci struct {
 	EndpointURL string
 	SNSClient   *sns.Client
 	SQSClient   *sqs.Client
+
+	mu    sync.Mutex
+	names map[string]string // resource name → test that created it
 }
 
-// StartFloci starts a floci container and returns the helper. The container
-// is terminated when t.Cleanup runs. Skipped under -short (no Docker needed).
+// One floci container per test binary (package), like iam-org-membership:
+// starting a container per test made the suites spend most of their time
+// booting emulators. Tests stay isolated by using unique resource names —
+// CreateTopic / CreateQueue fail the test on a name another test already used.
+var shared struct {
+	once sync.Once
+	emu  *Floci
+	err  error
+}
+
+// StartFloci returns the package's shared floci container, starting it on
+// first use. Skipped under -short (no Docker needed). Call
+// TerminateSharedFloci from the package's TestMain: CI disables the
+// testcontainers reaper (Ryuk), so nothing else removes the container.
 func StartFloci(ctx context.Context, t *testing.T) *Floci {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("skipping integration test — requires Docker (pass -short to skip)")
 	}
+	shared.once.Do(func() { shared.emu, shared.err = startFloci() })
+	if shared.err != nil {
+		t.Fatalf("floci: %v", shared.err)
+	}
+	return shared.emu
+}
+
+// TerminateSharedFloci stops the package's shared container, if one was
+// started. Call it from TestMain after m.Run.
+func TerminateSharedFloci() {
+	if shared.emu != nil {
+		_ = shared.emu.Container.Terminate(context.Background())
+	}
+}
+
+// flociStartupTimeout bounds pulling and booting the emulator.
+const flociStartupTimeout = 2 * time.Minute
+
+func startFloci() (*Floci, error) {
+	// Not the calling test's ctx: the container outlives that test.
+	ctx, cancel := context.WithTimeout(context.Background(), flociStartupTimeout)
+	defer cancel()
 
 	req := testcontainers.ContainerRequest{
 		Image:        FlociImage,
@@ -54,30 +95,25 @@ func StartFloci(ctx context.Context, t *testing.T) *Floci {
 			"FLOCI_DEFAULT_REGION":     FlociRegion,
 			"FLOCI_DEFAULT_ACCOUNT_ID": FlociAccount,
 		},
-		WaitingFor: wait.ForLog("Ready.").WithOccurrence(1),
+		WaitingFor: wait.ForLog("Ready.").WithOccurrence(1).WithStartupTimeout(flociStartupTimeout),
 	}
-
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
 		Started:          true,
 	})
 	if err != nil {
-		t.Fatalf("floci: failed to start container: %v", err)
+		return nil, fmt.Errorf("failed to start container: %w", err)
 	}
-
-	t.Cleanup(func() {
-		_ = container.Terminate(context.Background())
-	})
-
 	host, err := container.Host(ctx)
 	if err != nil {
-		t.Fatalf("floci: failed to get host: %v", err)
+		_ = container.Terminate(context.Background())
+		return nil, fmt.Errorf("failed to get host: %w", err)
 	}
 	port, err := container.MappedPort(ctx, "4566")
 	if err != nil {
-		t.Fatalf("floci: failed to get port: %v", err)
+		_ = container.Terminate(context.Background())
+		return nil, fmt.Errorf("failed to get port: %w", err)
 	}
-
 	endpointURL := fmt.Sprintf("http://%s:%s", host, port.Port())
 
 	// floci accepts any credentials, but the SDK signs requests, so it needs
@@ -87,27 +123,36 @@ func StartFloci(ctx context.Context, t *testing.T) *Floci {
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
 	)
 	if err != nil {
-		t.Fatalf("floci: failed to load AWS config: %v", err)
+		_ = container.Terminate(context.Background())
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
-
-	snsClient := sns.NewFromConfig(awsCfg, func(o *sns.Options) {
-		o.BaseEndpoint = aws.String(endpointURL)
-	})
-	sqsClient := sqs.NewFromConfig(awsCfg, func(o *sqs.Options) {
-		o.BaseEndpoint = aws.String(endpointURL)
-	})
-
 	return &Floci{
 		Container:   container,
 		EndpointURL: endpointURL,
-		SNSClient:   snsClient,
-		SQSClient:   sqsClient,
+		SNSClient:   sns.NewFromConfig(awsCfg, func(o *sns.Options) { o.BaseEndpoint = aws.String(endpointURL) }),
+		SQSClient:   sqs.NewFromConfig(awsCfg, func(o *sqs.Options) { o.BaseEndpoint = aws.String(endpointURL) }),
+		names:       map[string]string{},
+	}, nil
+}
+
+// claim records that t owns name, failing t if another test already used it
+// in this shared container (SNS/SQS creates are idempotent, so a reused name
+// would silently share a topic or queue — and its messages — between tests).
+func (f *Floci) claim(t *testing.T, kind, name string) {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := kind + "/" + name
+	if owner, ok := f.names[key]; ok && owner != t.Name() {
+		t.Fatalf("floci: %s %q already created by %s in this package's shared container — use a unique name", kind, name, owner)
 	}
+	f.names[key] = t.Name()
 }
 
 // CreateTopic creates an SNS topic and returns its ARN.
 func (f *Floci) CreateTopic(ctx context.Context, t *testing.T, name string) string {
 	t.Helper()
+	f.claim(t, "topic", name)
 	out, err := f.SNSClient.CreateTopic(ctx, &sns.CreateTopicInput{
 		Name: aws.String(name),
 	})
@@ -120,6 +165,7 @@ func (f *Floci) CreateTopic(ctx context.Context, t *testing.T, name string) stri
 // CreateQueue creates an SQS queue and returns its URL.
 func (f *Floci) CreateQueue(ctx context.Context, t *testing.T, name string) string {
 	t.Helper()
+	f.claim(t, "queue", name)
 	out, err := f.SQSClient.CreateQueue(ctx, &sqs.CreateQueueInput{
 		QueueName: aws.String(name),
 	})

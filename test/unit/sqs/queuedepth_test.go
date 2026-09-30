@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
@@ -123,7 +124,7 @@ func TestQueueDepth_ErrorsCountedAndLogged(t *testing.T) {
 	}, "error counted")
 	_, ok := gaugeValue(t, reg, "platform_queue_depth", map[string]string{"queue": testQueue})
 	assert.False(t, ok)
-	assert.Contains(t, warnMessages(logger), "sqs: queue depth sample failed")
+	assert.Contains(t, warnMessages(logger), "sqs: queue depth sample failed (logged once until it recovers)")
 }
 
 func TestQueueDepth_ClientWithoutCapabilityWarns(t *testing.T) {
@@ -189,4 +190,68 @@ func TestQueueDepth_UnusableRedrivePolicyOrDLQFailure(t *testing.T) {
 			assert.False(t, ok)
 		})
 	}
+}
+
+func TestQueueDepth_SkippedWithoutPlatformMetrics(t *testing.T) {
+	prev := metrics.ReplacePlatform(nil)
+	t.Cleanup(func() { metrics.ReplacePlatform(prev) })
+	client := &depthClient{mockSQSClient: mockSQSClient{receiveMessageFn: idleReceive}}
+	client.attrFn = func(string) (map[string]string, error) { return map[string]string{}, nil }
+	logger := runDepthConsumer(t, client, internalsqs.WithQueueDepthMetrics(time.Minute))
+	eventually(t, func() bool {
+		for _, m := range warnMessages(logger) {
+			if m == "sqs: WithQueueDepthMetrics ignored — platform metrics are not initialised (call events.InitMetrics before Start)" {
+				return true
+			}
+		}
+		return false
+	}, "warning logged")
+	time.Sleep(100 * time.Millisecond)
+	assert.Empty(t, client.called(), "no SQS calls when there is nowhere to record the depth")
+}
+
+// A persistent failure (e.g. missing sqs:GetQueueAttributes) is logged once,
+// not on every poll, and recovery is logged once.
+func TestQueueDepth_PersistentFailureLoggedOnce(t *testing.T) {
+	prevMin := internalsqs.MinQueueDepthInterval
+	internalsqs.MinQueueDepthInterval = 10 * time.Millisecond
+	t.Cleanup(func() { internalsqs.MinQueueDepthInterval = prevMin })
+	reg := initPlatformMetrics(t)
+
+	var mu sync.Mutex
+	fail := true
+	client := &depthClient{mockSQSClient: mockSQSClient{receiveMessageFn: idleReceive}}
+	client.attrFn = func(string) (map[string]string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fail {
+			return nil, errors.New("AccessDenied")
+		}
+		return map[string]string{"ApproximateNumberOfMessages": "4"}, nil
+	}
+	logger := runDepthConsumer(t, client, internalsqs.WithQueueDepthMetrics(10*time.Millisecond))
+
+	eventually(t, func() bool { return len(client.called()) >= 5 }, "several polls")
+	count := func(msg string) (n int) {
+		for _, e := range logger.Entries() {
+			if e.Message == msg {
+				n++
+			}
+		}
+		return n
+	}
+	assert.Equal(t, 1, count("sqs: queue depth sample failed (logged once until it recovers)"))
+	assert.GreaterOrEqual(t, histogramCount(t, reg, "platform_dependency_request_seconds", map[string]string{"dependency": "sqs", "operation": "get_queue_attributes", "outcome": "error"}), uint64(5),
+		"every failure is still counted")
+
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+	eventually(t, func() bool {
+		v, ok := gaugeValue(t, reg, "platform_queue_depth", map[string]string{"queue": testQueue})
+		return ok && v == 4
+	}, "recovered")
+	eventually(t, func() bool { return count("sqs: queue depth sampling recovered") == 1 }, "recovery logged once")
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, 1, count("sqs: queue depth sampling recovered"))
 }

@@ -6,7 +6,7 @@ This is an internal shared library for BCBP Solutions platform services. This gu
 
 - Go 1.26+ (matches `go.mod`)
 - Docker (required for integration tests via `testcontainers-go`)
-- `golangci-lint` is managed as a Go tool — no separate install needed (`go tool golangci-lint run`)
+- `golangci-lint` is managed as a Go tool in its own `tools/` module — no separate install needed (`make lint`, or `go tool -modfile=tools/go.mod golangci-lint run`)
 
 ## Development setup
 

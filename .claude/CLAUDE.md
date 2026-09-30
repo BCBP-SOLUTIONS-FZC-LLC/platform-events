@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Repo Is
 
-`platform-events` is a **private Go shared library** (module: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26.6) that provides reusable SNS publisher and SQS consumer primitives for platform services. It lives in a **private GitHub repository** and is consumed as a Go module dependency by internal platform services — it is never deployed as a standalone server.
+`platform-events` is a **private Go shared library** (module: `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, `go 1.26.0` + `toolchain go1.26.8`) that provides reusable SNS publisher and SQS consumer primitives for platform services. It lives in a **private GitHub repository** and is consumed as a Go module dependency by internal platform services — it is never deployed as a standalone server.
 
 Core capabilities:
 - `Publisher` interface + AWS SNS implementation
@@ -58,11 +58,14 @@ make clean           # Remove bin/ artefacts
 
 To run a single test:
 ```bash
-go test ./test/unit/envelope/...   -run TestEnvelopeSign -v
-go test ./test/integration/...     -run TestSNSPublishRoundTrip -v
+cd test   # the suites are their own module
+go test ./unit/envelope/...   -run TestEnvelopeSign -v
+go test ./integration/...     -tags=integration -run TestSNSPublishRoundTrip -v
 ```
 
-**Coverage note:** tests live under `test/` (a separate package tree from sources). Always use `-coverpkg=./internal/...,./pkg/...` to get meaningful numbers; running `go test ./...` without it shows 0% for source packages. `make cover` and `make cover-func` handle this correctly.
+**Module layout:** Three Go modules, the same layout as platform-pgcommon, so consuming services inherit only what the library itself imports: `.` (the library), `test/` (every suite and fixture; `replace …platform-events => ../`) and `tools/` (golangci-lint, run through `go tool -modfile=tools/go.mod`). The library's `go.mod` went from 289 to 55 lines, and testcontainers and the linter's dependency tree are gone from it. White-box tests beside the sources (`internal/core/service/*_test.go`) stay in the root module. `make tidy`, `vet`, `lint`, `mod-verify` and every `test-*` target cover all three modules.
+
+**Coverage note:** tests live in the separate `test/` module. Always use `-coverpkg=./internal/...,./pkg/...` to get meaningful numbers; running `go test ./...` without it shows 0% for source packages. `make cover` and `make cover-func` handle this correctly.
 
 **Testcontainers note:** integration tests spin up floci (`floci/floci:2.1.0` — open-source, always-free AWS emulator, the platform's LocalStack replacement, same as iam-org-membership; fixture `test/fixtures/floci.go`) and Postgres via `testcontainers-go`. Docker must be running locally. Pass `-short` to skip integration tests without a Docker daemon.
 
@@ -416,7 +419,7 @@ GitHub Actions mirrors `iam-org-membership`'s pipeline — the org ruleset on `m
 - **`changelog-check.yml`** — PRs touching `internal/`, `pkg/`, `cmd/` must update `CHANGELOG.md`.
 - **`release.yml`** (`v*` tags) — **the same job graph as `ci.yml`** at the tag, behind a fail-fast tag + CHANGELOG `verify` job, plus 5-platform CLI binaries; the image is pushed (semver tags, signed, provenance) only after every gate passes, then the GitHub Release is published. Change a gate in `ci.yml` → change it in `release.yml` too. The Git tag is the **Go module release** consuming services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z`.
 
-Standard-library `govulncheck` findings are fixed by bumping the `go` directive in `go.mod` (CI reads the toolchain from it via `go-version-file`). Base images are re-pinned with `make pin-base-images`.
+Standard-library `govulncheck` findings are fixed by bumping the `toolchain` line (in all three `go.mod` files) and the Dockerfile builder image together. The `go` directive stays at `1.26.0` so consumers are not pinned to a patch release; CI reads the toolchain via `go-version-file`, the same as platform-pgcommon. Every image this repository runs is digest-pinned and re-pinned with `make pin-base-images`: the Dockerfile, promtool, docker-compose and the testcontainers fixtures, all recorded in `.docker-digests` and checked in CI.
 
 ## Extending the Library
 

@@ -91,8 +91,13 @@ func LibraryVersionFrom(bi *debug.BuildInfo) string {
 		if dep.Path != modulePath {
 			continue
 		}
-		if dep.Replace != nil && dep.Replace.Version != "" {
-			return dep.Replace.Version
+		if dep.Replace != nil {
+			// A module replacement keeps its version; a filesystem
+			// replacement (replace … => ../path) has none: a local build.
+			if dep.Replace.Version != "" {
+				return dep.Replace.Version
+			}
+			return "devel"
 		}
 		if dep.Version != "" && dep.Version != "(devel)" {
 			return dep.Version
@@ -103,6 +108,12 @@ func LibraryVersionFrom(bi *debug.BuildInfo) string {
 		if v := bi.Main.Version; v != "" && v != "(devel)" {
 			return v
 		}
+		return "devel"
+	}
+	// This repository's own sub-modules (test/, tools/) build the library
+	// from source. Test binaries carry no dependency list in their build
+	// info, so this is how the suites see a local build.
+	if strings.HasPrefix(bi.Main.Path, modulePath+"/") {
 		return "devel"
 	}
 	return "unknown"

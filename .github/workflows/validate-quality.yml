@@ -42,7 +42,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
-            go.mod
+            test/go.sum
+            tools/go.sum
 
       - name: Configure private module access
         run: |
@@ -54,10 +55,14 @@ jobs:
         env:
           GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
           GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-        run: go mod download
+        run: |
+          go mod download
+          (cd test && go mod download)
+          (cd tools && go mod download)
 
+      # Three modules (library, test/, tools/) — see the Makefile's module layout.
       - name: Verify modules
-        run: go mod verify
+        run: make mod-verify
 
       # Workflow files must use literal operators, not HTML entity encodings.
       - name: Reject HTML-escaped operators in workflow files
@@ -97,8 +102,8 @@ jobs:
       - name: Tidy check
         run: |
           make tidy
-          if ! git diff --exit-code go.mod go.sum; then
-            echo "::error file=go.mod,title=Module drift::go.mod or go.sum is stale — run 'go mod tidy' and commit the result."
+          if ! git diff --exit-code go.mod go.sum test/go.mod test/go.sum tools/go.mod tools/go.sum; then
+            echo "::error file=go.mod,title=Module drift::A go.mod or go.sum is stale — run 'make tidy' (tidies all three modules) and commit the result."
             exit 1
           fi
 
@@ -120,6 +125,11 @@ jobs:
       - name: Prometheus rules
         run: make rules-check
 
+      # PromQL syntax gate for the reference Grafana dashboard (promtool via a
+      # generated rule file; same script as platform-pgcommon).
+      - name: Dashboard PromQL
+        run: make dashboards-check
+
       - name: Vulnerability check
         run: |
           if ! make vuln-check; then
@@ -128,13 +138,20 @@ jobs:
           fi
 
       # Enforce digest-pinned FROM lines in the Dockerfile. Floating tags (e.g.
-      # golang:1.26.6-alpine without @sha256:...) can be silently overwritten by
+      # golang:1.26.8-alpine without @sha256:...) can be silently overwritten by
       # upstream maintainers, breaking supply-chain guarantees. Run
       # `make pin-base-images` (requires docker) to update the pinned digests.
       - name: Dockerfile base image digest check
         run: |
           if grep -E '^FROM [^ @]+:[^ @]+( AS .+)?$' Dockerfile; then
-            echo "::error file=Dockerfile,title=Unpinned base image::Dockerfile FROM lines must use digest-pinned references (e.g. golang:1.26.6-alpine@sha256:...). Run 'make pin-base-images' to update."
+            echo "::error file=Dockerfile,title=Unpinned base image::Dockerfile FROM lines must use digest-pinned references (e.g. golang:1.26.8-alpine@sha256:...). Run 'make pin-base-images' to update."
             exit 1
           fi
           echo "Dockerfile base images are digest-pinned."
+          # The same policy covers the local stack and the testcontainers images.
+          if grep -nE '^\s*image:\s*[^@[:space:]]+\s*$' docker-compose.yml \
+             || grep -nE '(Image\s*[:=]|FlociImage\s*=)\s*"[^"@]+"' test/fixtures/*.go; then
+            echo "::error title=Unpinned image::docker-compose.yml and test/fixtures images must be digest-pinned. Run 'make pin-base-images' to update."
+            exit 1
+          fi
+          echo "docker-compose and testcontainers images are digest-pinned."

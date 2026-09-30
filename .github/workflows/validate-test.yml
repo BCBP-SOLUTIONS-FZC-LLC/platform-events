@@ -51,7 +51,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
-            go.mod
+            test/go.sum
+            tools/go.sum
 
       # Store credentials so go mod download can fetch private BCBP modules
       # (platform-pgcommon).
@@ -65,17 +66,21 @@ jobs:
         env:
           GOPRIVATE: github.com/BCBP-SOLUTIONS-FZC-LLC/*
           GONOSUMDB: github.com/BCBP-SOLUTIONS-FZC-LLC/*
-        run: go mod download
+        run: |
+          go mod download
+          (cd test && go mod download)
 
       - name: Verify modules
-        run: go mod verify
+        run: |
+          go mod verify
+          (cd test && go mod verify)
 
       # Mandatory blocking gate: the full suite with -race and coverage. Any
       # data race detected here blocks all downstream jobs (trivy, smoke,
       # push, release). Do NOT remove or skip. e2e runs inside this step
       # (unlike iam-org-membership) because its outbox pipeline tests carry
       # real coverage of the runner and adapters.
-      - name: Tests — unit · integration · e2e (race + coverage)
+      - name: Tests — root · unit · integration · e2e (race + coverage)
         env:
           TESTCONTAINERS_RYUK_DISABLED: 'true'
         run: make test-ci

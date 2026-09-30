@@ -492,7 +492,7 @@ func TestStandard_LabelValueHelpers(t *testing.T) {
 	assert.Equal(t, "unknown", internalmetrics.QueueName(""))
 	assert.Equal(t, "iam-events", internalmetrics.TopicName(testTopicARN))
 	assert.Equal(t, "unknown", internalmetrics.TopicName(""))
-	assert.Equal(t, "devel", internalmetrics.LibraryVersion(), "this module's own test binary")
+	assert.Equal(t, "devel", internalmetrics.LibraryVersion(), "a test binary of this repository's test/ module")
 
 	var nilPlatform *internalmetrics.Platform
 	_, ok := nilPlatform.Identity()
@@ -532,6 +532,8 @@ func TestStandard_LibraryVersionFrom(t *testing.T) {
 		"dependency release":    {dep(debug.Module{Path: mod, Version: "v1.6.0"}), "v1.6.0"},
 		"dependency replaced":   {dep(debug.Module{Path: mod, Version: "v1.6.0", Replace: &debug.Module{Path: "../fork", Version: "v1.6.1-fork"}}), "v1.6.1-fork"},
 		"dependency local path": {dep(debug.Module{Path: mod, Version: "(devel)"}), "devel"},
+		"filesystem replace":    {dep(debug.Module{Path: mod, Version: "v0.0.0", Replace: &debug.Module{Path: "../"}}), "devel"},
+		"repo sub-module":       {&debug.BuildInfo{Main: debug.Module{Path: mod + "/test", Version: "(devel)"}}, "devel"},
 		"main module release":   {&debug.BuildInfo{Main: debug.Module{Path: mod, Version: "v1.6.0"}}, "v1.6.0"},
 		"main module devel":     {&debug.BuildInfo{Main: debug.Module{Path: mod, Version: "(devel)"}}, "devel"},
 		"not linked":            {&debug.BuildInfo{Main: debug.Module{Path: "example.com/svc"}}, "unknown"},

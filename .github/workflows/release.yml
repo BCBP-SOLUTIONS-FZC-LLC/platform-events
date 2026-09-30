@@ -321,7 +321,8 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: |
             go.sum
-            go.mod
+            test/go.sum
+            tools/go.sum
 
       # The cross-compile below needs the private platform-pgcommon module.
       - name: Configure private module access
