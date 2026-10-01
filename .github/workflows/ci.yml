@@ -37,10 +37,10 @@ name: CI
 "on":
   push:
     branches: [main, master]
-    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**']
+    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**', 'docs/lld/**']
   pull_request:
     branches: [main, master]
-    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**']
+    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**', 'docs/lld/**']
   workflow_dispatch:
 
 permissions:

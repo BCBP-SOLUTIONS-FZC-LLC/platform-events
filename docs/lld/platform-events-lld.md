@@ -273,7 +273,7 @@ PK `processed_events_pkey (event_id, consumer)`; `idx_processed_events_processed
 | Symbol | Signature / behaviour |
 |---|---|
 | `Config` | `Pool`, `Store` (tests), `Publisher`, `Logger`, `PollInterval` (5s), `BatchSize` (50), `MaxAttempts` (5), `ClaimLeaseDuration` (10m), `DrainTimeout` (30s), `PublishConcurrency` (1), `PublishTimeout` (10s), `GaugeInterval` (15s), `StartupJitter` (0), `RetryBackoff` (1s), `MaxRetryBackoff` (5m) |
-| `NewRunner` | `(cfg Config) (*Runner, error)` — error if the lease is shorter than `BatchSize×PublishTimeout+1m`; panics on nil `Publisher` or nil `Pool`+`Store` |
+| `NewRunner` | `(cfg Config) (*Runner, error)` — error if the lease is shorter than `BatchSize×PublishTimeout+1m` (30s minimum when `PublishTimeout` is disabled); panics on nil `Publisher` or nil `Pool`+`Store` |
 | `Runner` | `Start(ctx) error`, `Stop() error`, `Ready() <-chan struct{}`, `ListDeadLetters`, `ReprocessDeadLetters`, `ReprocessDeadLettersWith`, `DiscardDeadLetters`, `PrunePublished` (30s internal DB timeout each) |
 | `Enqueue` | `(ctx, tx pgcommon.Tx, env events.Envelope[json.RawMessage]) error` — validates fields, canonical UUID, ≤ 240 KiB serialised |
 | `EnqueueOrdered` | `(ctx, tx, env, orderingKey string) error` — key non-empty, valid UTF-8, no NUL, ≤ `MaxOrderingKeyLen` (256) |
@@ -368,7 +368,7 @@ flowchart TD
 
 ### 7.3 Outbox poll cycle
 
-1. **Gauges** (every `GaugeInterval`, or `PollInterval` if longer): pending / leased / blocked counts (capped at 100 000), oldest-pending age, then the waiting-record sweep (`PromoteWaiting`).
+1. **Gauges** (every `GaugeInterval`, or `PollInterval` if longer): pending / leased counts (capped at 100 000), the waiting-record sweep (`PromoteWaiting`), then the blocked count and oldest-pending age.
 2. **Claim** (`RunInTx`, 5s): `SELECT … WHERE published_at IS NULL AND scheduled_at <= NOW() AND (ordering_key IS NULL OR NOT EXISTS earlier-unpublished) ORDER BY scheduled_at, id LIMIT $batch FOR UPDATE SKIP LOCKED`, then lease `scheduled_at = NOW() + ClaimLeaseDuration`.
 3. **Publish**: `PublishConcurrency = 1` → `Publisher.PublishBatch`; `> 1` → parallel `Publish` with `PublishTimeout` per record.
 4. **Settle each record**:
@@ -573,7 +573,7 @@ Concurrency: consumer worker pool bounded by `WithConcurrency`; one visibility e
 | Smoke | `test/smoke` (`-tags smoke`) | live AWS (`SMOKE_*`) |
 | Rules | `monitoring/prometheus/*.test.yml` | promtool |
 
-`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **99.0%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, fmt-check, vet, lint (incl. tagged files), metrics-lint, rules-check, dashboards-check, test-ci, build.
+`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **99.0%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, fmt-check, vet, lint (incl. tagged files), docs-check, metrics-lint, rules-check, dashboards-check, test-ci, build.
 
 ---
 

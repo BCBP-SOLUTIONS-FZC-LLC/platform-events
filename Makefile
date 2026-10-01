@@ -350,9 +350,6 @@ metrics-doc:
 # Digest-pinned like the Dockerfile base images; refreshed by pin-base-images.
 PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
 
-# dashboards-check: PromQL syntax gate for monitoring/grafana/*.json (same
-# script as platform-pgcommon; requires Docker and jq). Governance — registry
-# metrics, labels, "(Proposed)"/"(legacy)" titles — is metrics-lint's job.
 # docs-check: diagram drift gate — every docs/architecture/mermaid/*.mmd must
 # be embedded byte-identically in ARCHITECTURE.md (same script as
 # platform-pgcommon v1.4.2).
@@ -360,6 +357,9 @@ PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60
 docs-check:
 	bash .github/scripts/docs-mermaid-sync.sh
 
+# dashboards-check: PromQL syntax gate for monitoring/grafana/*.json (same
+# script as platform-pgcommon; requires Docker and jq). Governance — registry
+# metrics, labels, "(Proposed)"/"(legacy)" titles — is metrics-lint's job.
 .PHONY: dashboards-check
 dashboards-check:
 	PROMETHEUS_IMAGE=$(PROMETHEUS_IMAGE) bash .github/scripts/dashboard-promql.sh

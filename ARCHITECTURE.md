@@ -1013,7 +1013,7 @@ When goroutine 1 finishes:
 | Fail-soft metrics registration | `InitMetrics` validates the identity first (an invalid one changes nothing) and returns a `RegistrationWarning` instead of failing for a `platform_*` metric the registry refuses; deprecated `Init` is guarded by `sync.Once` and is a no-op once `InitMetrics` ran |
 | OTel initialised by consuming service | `platform-events` calls `otel.Tracer(...)` — no-op if no provider registered; no double-init |
 | Graceful consumer shutdown | `Stop()` waits `DrainTimeout` (30 s) for in-flight handlers before returning; received-but-undispatched messages are handed back (visibility 0) |
-| Graceful runner shutdown | `Runner.Stop()` ends the re-poll loop, waits up to `DrainTimeout` (30 s) for the in-flight batch, then returns a non-nil error; set Helm `terminationGracePeriodSeconds` > `DrainTimeout` |
+| Graceful runner shutdown | `Runner.Stop()` ends the re-poll loop, waits up to `DrainTimeout` (30 s) for the in-flight batch and returns an error only if it has not finished by then; set Helm `terminationGracePeriodSeconds` > `DrainTimeout` |
 | Poll-failure backoff | On a failed poll cycle the runner backs off exponentially (1s→30s) instead of retrying every `PollInterval` |
 | Parallel publish bounded | `PublishConcurrency` caps concurrent publishes per batch (default 1 uses SNS `PublishBatch`, up to 10 per API call); values `> 1` use per-record `Publish` in parallel goroutines; per-record `PublishTimeout` (10s) prevents one hung call stalling the batch |
 | Shutdown ≠ dead-letter | Records stranded by context cancellation are released with `ReleaseLease` — no attempt counted — so rolling restarts never dead-letter a record |
