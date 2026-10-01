@@ -1,7 +1,7 @@
 github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEKWjV8V+WSxDXJ4NFATAsZjh8iIbsQIg=
 github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
-github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon v1.5.1 h1:O8bpRedNxJTzYlOkajGmYIsgjPrwWGGrFKmTso1DE34=
-github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon v1.5.1/go.mod h1:ykQPvlEb4OiieX5FSETmE5wZvfV+8N5WI8JfZrQnRy0=
+github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2 v2.0.0 h1:3hYEwfzcLsnl6xNSBhLKE7U+VFqV7OvSJb47y4XBKIs=
+github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2 v2.0.0/go.mod h1:Cg8wnK+VglnJxBTZs2LWaOyZMMzZk83kVwci7KqqQyQ=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/aws/aws-sdk-go-v2 v1.47.1 h1:uOIZnp4PK3ZhKI0dNrJrhTEsLxbpXHTAJlwoS1pvAtw=

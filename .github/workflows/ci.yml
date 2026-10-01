@@ -325,7 +325,7 @@ jobs:
     name: Cross-language compatibility
     needs: [changes, validate-test]
     if: needs.changes.outputs.code == 'true'
-    uses: BCBP-SOLUTIONS-FZC-LLC/platform-interop-tests/.github/workflows/interop.yml@935be0c760c5104f41aefdbde0ae7b4f618da657 # main @ 2026-10-02 (platform-interop-tests#2, Tier 1 metrics-check) — pinned: it receives a private token
+    uses: BCBP-SOLUTIONS-FZC-LLC/platform-interop-tests/.github/workflows/interop.yml@5475fcdd4ec3676253f0c7171bc378a2231bd4a9 # main as of 2026-10-02 (platform-interop-tests#3 + #4: module-path-aware go-probe + private module fetch) — pinned: it receives a private token
     with:
       # This repo's own PR/branch ref; the other libraries default to their main
       # branch (see platform-interop-tests/README.md) — this job exists to catch

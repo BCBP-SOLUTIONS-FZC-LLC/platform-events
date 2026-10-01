@@ -15,9 +15,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
+	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/adapter/outbound/sqs"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/test/fixtures"
 )
 
 // Batches are received whole (one receive per MaxMessages, not per free

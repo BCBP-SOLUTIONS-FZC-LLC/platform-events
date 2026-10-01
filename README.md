@@ -2,7 +2,7 @@
 
 The platform's shared **event-driven messaging library** — the single sanctioned path for every service that publishes or consumes domain events. It owns the canonical event envelope, the SNS publisher, the SQS consumer loop, the transactional outbox, consumer-side deduplication (inbox), dead-letter forwarding, HMAC signing, and the messaging-layer observability every service would otherwise re-implement. It is consumed as a private Go module and is **never deployed on its own**.
 
-**Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`
+**Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events` (Go module `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2`)
 **Module:** Go 1.26 (`go 1.26.0`, `toolchain go1.26.8`) · private module · library only (`cmd/platform-events` is a reference CLI that validates config and prints version info, not a server — CI builds, scans and smoke-tests it as a container image)
 **Design:** Clean Architecture — public API in `pkg/`, AWS/Postgres adapters in `internal/adapter/`, SDK-free core in `internal/core/`. Design narrative, sequence diagrams and invariants: [ARCHITECTURE.md](ARCHITECTURE.md); low-level design (data model, API contract, flows, failure handling): [docs/lld/platform-events-lld.md](docs/lld/platform-events-lld.md). The wire format is byte-compatible with the Python sibling [`platform-eventcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-eventcommon); the `interop` CI job enforces it.
 
@@ -241,7 +241,7 @@ This is a **private module**. Configure Go before fetching:
 ```bash
 go env -w GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*
 git config --global url."ssh://git@github.com/".insteadOf "https://github.com/"   # SSH key registered with the org
-go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@v1.6.1
+go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2@v2.0.0
 ```
 
 **CI / Docker builds:** add a GitHub PAT (classic `repo` scope, or fine-grained Contents: Read on all `BCBP-SOLUTIONS-FZC-LLC/*` repos) as the repository secret `GO_PRIVATE_TOKEN`, and configure git credentials before `go mod download`:
@@ -565,8 +565,8 @@ This is a library — it is never deployed; consuming services pin a Git tag. Th
 | **PATCH** | Bug fix, performance improvement, documentation correction |
 
 ```bash
-git tag -a v1.6.1 -m "v1.6.1"
-git push origin v1.6.1     # triggers release.yml
+git tag -a v2.0.0 -m "v2.0.0"
+git push origin v2.0.0     # triggers release.yml
 ```
 
 `release.yml` is the **same pipeline as `ci.yml`**, run at the tag: a fast `Verify tag + CHANGELOG` job (tag = checkout, `## [X.Y.Z]` section present), then the identical `Validate / Test`, `Validate / Quality`, `Build image (cache)`, `Trivy CVE scan` (CRITICAL / HIGH / UNKNOWN), `Smoke tests` and `Cross-language compatibility` gates, plus 5-platform CLI binaries. Only after **all** of them pass does `Push image → GHCR` publish the image (`vX.Y.Z`, `vX.Y`, `vX`, `latest`) — a cache hit of the exact image that was scanned and smoke-tested — with SBOM, SLSA provenance and a Cosign keyless signature, and `GitHub Release` publishes the notes from the matching `CHANGELOG.md` section with binaries, checksums, SBOM and provenance attached. SemVer rules and supported versions: [VERSIONING.md](VERSIONING.md).

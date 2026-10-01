@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/test/fixtures"
 )
 
 // TestMain registers the Tier 1 metrics once before all tests in this

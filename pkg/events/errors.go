@@ -1,6 +1,6 @@
 package events
 
-import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/core/domain"
 
 // Sentinel errors for envelope validation. Use errors.Is to branch in consuming services.
 var (

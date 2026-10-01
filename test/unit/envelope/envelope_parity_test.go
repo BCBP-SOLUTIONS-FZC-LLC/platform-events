@@ -5,8 +5,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 )
 
 // TestEnvelopeFieldParity ensures that domain.Envelope and events.Envelope have

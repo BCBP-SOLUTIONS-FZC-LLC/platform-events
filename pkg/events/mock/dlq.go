@@ -5,10 +5,10 @@ import (
 	"maps"
 	"sync"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
-	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/adapter/outbound/metrics"
+	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/adapter/outbound/sqs"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/core/port"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 )
 
 // DLQMessage is a message recorded by DLQPublisher.

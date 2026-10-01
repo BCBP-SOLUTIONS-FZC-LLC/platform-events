@@ -1,6 +1,6 @@
 package outbox
 
-import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/core/domain"
 
 // DLQFilter selects records in outbox_dead_letters for [Runner.ListDeadLetters],
 // [Runner.ReprocessDeadLettersWith], and [Runner.DiscardDeadLetters].

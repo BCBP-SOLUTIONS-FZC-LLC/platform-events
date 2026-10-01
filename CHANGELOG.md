@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-10-02
+
+### Changed — BREAKING: module path is now `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2`
+
+The export removals below are a MAJOR change under [VERSIONING.md](VERSIONING.md), so this release is `v2.0.0`, and Go semantic import versioning moves the module to a `/v2` path. It now depends on `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2 v2.0.0` (the same cutover in platform-pgcommon). To upgrade:
+
+```bash
+go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2@v2.0.0 github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2@v2.0.0
+# rewrite imports: .../platform-events/pkg/... → .../platform-events/v2/pkg/... (and the same for platform-pgcommon)
+go mod tidy
+```
+
+`v1.x` stays available at the unsuffixed path and receives security fixes only (see VERSIONING.md).
+
 ### Removed — BREAKING: legacy (pre-standard) metrics, no compatibility period
 
 platform-events now emits **only** its Tier 1 `platform_*` metrics. The pre-standard `events_*` / `outbox_*` / `sqs_*` metrics and `platform_events_build_info`, which v1.6.0 emitted in parallel, are gone. The Enterprise Platform Observability Standard's compatibility period (old and new names in parallel until a sunset) **does not apply: no release of the platform libraries emitting the legacy names was ever deployed to dev or production**, so there are no dashboards, alerts, SLOs or HPAs to migrate gradually. The central Platform Observability Registry (platform-gincommon) records every removed name with status `removed` and its successors. Every `platform_*` metric is unchanged: name, labels, values, buckets and help text.

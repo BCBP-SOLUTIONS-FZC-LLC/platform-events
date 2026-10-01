@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/service"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/core/service"
 )
 
 // Sign returns the hex-encoded HMAC-SHA256 signature of payload using key.

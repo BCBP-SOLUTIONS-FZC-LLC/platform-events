@@ -36,7 +36,11 @@ fi
   cat release-notes.md
   echo ""
   echo "---"
-  echo "**Go module:** \`go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@${RELEASE_TAG}\`"
+  # Major versions >= 2 live under a /vN module path (Go semantic import versioning).
+  major=${RELEASE_TAG#v}; major=${major%%.*}
+  module_path=github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events
+  if [ "$major" -ge 2 ] 2>/dev/null; then module_path="${module_path}/v${major}"; fi
+  echo "**Go module:** \`go get ${module_path}@${RELEASE_TAG}\`"
   echo "**Reference CLI image:** \`${IMAGE_NAME}:${IMAGE_VERSION}\`"
   echo "**Digest:** \`${IMAGE_DIGEST}\`"
   echo "**Verify:** the image is Cosign keyless-signed; each binary ships with a \`.sha256\`."

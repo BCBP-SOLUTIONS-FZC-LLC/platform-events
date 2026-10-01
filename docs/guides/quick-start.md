@@ -8,11 +8,11 @@ End-to-end wiring of the publisher, outbox and consumer in a service. One of the
 
 ```go
 import (
-    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
-    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
-    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
-    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/config"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/outbox"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/migrate"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
     "github.com/prometheus/client_golang/prometheus"
 )
 

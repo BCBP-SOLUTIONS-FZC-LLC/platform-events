@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/core/port"
 )
 
 // FakeClock implements port.Clock with a fixed, advanceable time for testing.

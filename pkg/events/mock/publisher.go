@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 )
 
 // Publisher is a thread-safe in-memory Publisher for use in unit tests.

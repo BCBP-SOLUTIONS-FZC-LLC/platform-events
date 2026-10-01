@@ -6,18 +6,19 @@
 |---|---|
 | Document type | Low-Level Design (LLD) |
 | Library | `platform-events` — shared Go library (never deployed as a service) |
-| Go module | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events` (`go 1.26.0`, `toolchain go1.26.8`) |
-| Status | v1.6.1 — released 2026-10-02 (PR #14) |
+| Go module | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2` (`go 1.26.0`, `toolchain go1.26.8`) |
+| Status | v2.0.0 — module `…/platform-events/v2` (2026-10-02; legacy removal PR #15 + `/v2` module path) |
 | Base documents | [`ARCHITECTURE.md`](../../ARCHITECTURE.md), [`README.md`](../../README.md), [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md), [`EVENT_SCHEMA_GOVERNANCE.md`](../../EVENT_SCHEMA_GOVERNANCE.md), [`docs/observability/`](../observability/README.md) |
 | Sibling libraries | `platform-pgcommon` v1.5.1 (database, transactions, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
 | Consumers | Platform services (e.g. `iam-org-membership`, whose LLD §7 / §9 / §20 rely on the outbox and consumer contracts defined here) |
-| Deployment stage | Library — consumed via `go get …@v1.6.1` (see §13.4) |
+| Deployment stage | Library — consumed via `go get …/platform-events/v2@v2.0.0` (see §13.4) |
 
 ### Revision history
 
 | Rev | Date | Change |
 |---|---|---|
-| 2.10 | 2026-10-02 | Unreleased: legacy (pre-standard) metrics removed with no compatibility period (nothing was ever deployed). Only Tier 1 `platform_*` metrics; identity mandatory (`events.Init`, `InitWithRegisterer`, `WithoutLegacyMetrics`, `MetricsIdentity.Version`, `MetricStatusDeprecated` removed; `MetricsIdentityFromEnv(domain, service)`); registry drops `Supersedes` / `SupersededBy` / `Sunset`. Reference rules, dashboard, KEDA and runbook moved to the successors; alerts on Proposed metrics live in `*.proposed` groups with `metric_status: proposed` (§11.2, D-11..D-14). |
+| 2.11 | 2026-10-02 | v2.0.0: the export removals of rev 2.10 are MAJOR, so the module path moves to `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2` (Go semantic import versioning) and depends on `platform-pgcommon/v2 v2.0.0`; CHANGELOG `[Unreleased]` → `[2.0.0]`; status and §13.4. |
+| 2.10 | 2026-10-02 | PR #15: legacy (pre-standard) metrics removed with no compatibility period (nothing was ever deployed). Only Tier 1 `platform_*` metrics; identity mandatory (`events.Init`, `InitWithRegisterer`, `WithoutLegacyMetrics`, `MetricsIdentity.Version`, `MetricStatusDeprecated` removed; `MetricsIdentityFromEnv(domain, service)`); registry drops `Supersedes` / `SupersededBy` / `Sunset`. Reference rules, dashboard, KEDA and runbook moved to the successors; alerts on Proposed metrics live in `*.proposed` groups with `metric_status: proposed` (§11.2, D-11..D-14). |
 | 2.9 | 2026-10-02 | v1.6.1 released: CHANGELOG `[Unreleased]` → `[1.6.1]`; status, §13.4, OQ-9 closed. No design change. |
 | 2.8 | 2026-10-02 | platform-pgcommon v1.4.3 → v1.5.1 (§3.1, §13.4, §18.1): `Store.Process` callbacks must not end the transaction (`ErrTxEndedInCallback`); a NUL in `tenant_id` / `trace_id` makes an envelope malformed (§7.1, §10.3); `sslmode` warnings reach `OutboxConfigEnv.Warnings` (§12). CI: `changes` job replaces `paths-ignore` (OQ-11 closed), explicit reusable-workflow secrets, per-commit concurrency on `main`, `make ci-scripts-test` (§14). |
 | 2.7 | 2026-10-01 | Status alignment: §13.4 deployment stage (v1.6.1 pending on `fix/production-review`; `feat/observability-legacy-removal` waiting on it), OQ-7 closed, OQ-9…OQ-12 (v1.6.1 release, repository ruleset with stale required checks, docs-only PRs never reporting required checks, legacy-metric removal), §14 test inventory (`consumer_fifo_test.go`, `migrations_review_test.go`). No design change. |
@@ -64,7 +65,7 @@ This document is the low-level design for **`platform-events`**, the shared Go l
 
 Refined into an implementable specification, this document gives the exact tables and indexes the library creates in a service's database, the public signatures and their behavioural contracts, the state machines behind publish / consume / outbox / inbox, the invariants that hold across them, configuration, metrics, and the operational procedures a service owner needs. Where this LLD and the code disagree, **the code is authoritative**; the discrepancy is a documentation bug and this document is updated with the change.
 
-**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against `main` at v1.6.1 at revision 2.9 (merged coverage 98.5%, `make ci` green).
+**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against `main` at v2.0.0 at revision 2.11 (merged coverage 98.5%, `make ci` green).
 
 ### 1.1 Relationship to the architecture documents
 
@@ -1051,14 +1052,14 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 
 ### 13.4 Deployment stage
 
-| Item | State (2026-10-01) |
+| Item | State (2026-10-02) |
 |---|---|
-| Latest tag | `v1.6.1` (CHANGELOG `[1.6.1]`; previous `v1.6.0`, `v1.5.0`) |
+| Latest tag | `v2.0.0` (CHANGELOG `[2.0.0]`; module path `/v2`; previous `v1.6.1`, `v1.6.0`) |
 | Source | PR #12 (`feat/observability-standard`) and release PR #13 merged to `main`; tag `v1.6.0` on `e11be6b`, GitHub Release published |
 | v1.6.1 | Two production-review rounds (FIFO per-group consumer, DLQ dedup, migrations 003 / 010-down / 011, replay hardening, SNS trace attributes, CI hardening) and platform-pgcommon v1.5.1 — PR #14 |
-| Pending branch | `feat/observability-legacy-removal` (`d33cf9b`, "emit only Tier 1 platform_* metrics") — a breaking change; rebase on `fix/production-review` once merged |
-| Dependencies | platform-pgcommon v1.5.1, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
-| Consumers | Platform services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z` (`GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*`) |
+| v2.0.0 | Legacy (pre-standard) metrics removed (PR #15) and module path `/v2` with platform-pgcommon/v2 v2.0.0 |
+| Dependencies | platform-pgcommon/v2 v2.0.0, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
+| Consumers | Platform services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2@vX.Y.Z` (`GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*`) |
 
 ---
 
@@ -1220,7 +1221,7 @@ Collectors on the service's registerer; reference rules, dashboard and KEDA mani
 | Producing service | service → library | `Enqueue` / `EnqueueOrdered` in `RunInTx`; `Runner` lifecycle |
 | Consuming service | library → service | `Handler` contract (§5.4); `Store.Process` for exactly-once |
 | Event-type registry | service-owned | `EVENT_SCHEMA_GOVERNANCE.md` |
-| Version pin | service → library | `go get …/platform-events@vX.Y.Z`; `GOPRIVATE` |
+| Version pin | service → library | `go get …/platform-events/v2@vX.Y.Z`; `GOPRIVATE` |
 
 ### 18.8 Cross-service dependency table
 

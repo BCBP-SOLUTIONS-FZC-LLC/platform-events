@@ -1,6 +1,6 @@
 package events
 
-import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
+import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/core/port"
 
 // Codec is a pluggable schema-registry codec hook — see port.Codec for the
 // full Encode/Decode contract. Implement this to plug in AWS Glue Schema

@@ -10,7 +10,7 @@ assignees: ''
 A clear description of the bug.
 
 ## Library version
-`github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events vX.Y.Z`
+`github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2 vX.Y.Z`
 
 ## Go version
 `go version goX.Y.Z ...`
