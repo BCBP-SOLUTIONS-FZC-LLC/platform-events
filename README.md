@@ -469,7 +469,7 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 
 ### Coverage
 
-CI (`ci.yml` → `make cover-func`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.7%** (verified 2026-10-01).
+CI (`ci.yml` → `make cover-func`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **99.1%** (verified 2026-10-01).
 
 ---
 

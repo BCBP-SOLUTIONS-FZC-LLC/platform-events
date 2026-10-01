@@ -227,3 +227,11 @@ func TestEnqueue_OversizedPayload_ReturnsError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds safe SNS limit")
 }
+
+// A payload that is not valid JSON fails Enqueue before any SQL runs.
+func TestEnqueue_InvalidPayload_NoInsert(t *testing.T) {
+	tx := newStubTx(pgcommon.Tx.Exec)
+	env := events.NewEnvelope("bad.payload", "svc", json.RawMessage(`{not json`))
+	require.Error(t, outbox.Enqueue(context.Background(), tx, env))
+	assert.Empty(t, tx.execSQL, "nothing is inserted")
+}

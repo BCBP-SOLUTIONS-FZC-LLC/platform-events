@@ -1398,3 +1398,15 @@ func TestNewOutboxService_ZeroPublishConcurrency_DefaultsToOne(t *testing.T) {
 	tx := noopTx{}
 	_ = svc.Enqueue(context.Background(), tx, env) // error expected (tx is noop), no panic
 }
+
+// A payload that is not valid JSON fails OutboxService.Enqueue before the
+// store is called.
+func TestOutboxService_Enqueue_InvalidPayload_StoreNotCalled(t *testing.T) {
+	store := newMockStore()
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, nil, nil, 5, 1, 0)
+	env := domain.NewEnvelope("bad.payload", "svc", json.RawMessage(`{not json`))
+	require.Error(t, svc.Enqueue(context.Background(), noopTx{}, env))
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Empty(t, store.records)
+}

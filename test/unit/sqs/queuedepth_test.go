@@ -26,12 +26,18 @@ type depthClient struct {
 	mu     sync.Mutex
 	calls  []string
 	attrFn func(queueURL string) (map[string]string, error)
+	// blockUntilDone makes every call wait for the caller's context to end.
+	blockUntilDone bool
 }
 
-func (d *depthClient) GetQueueAttributes(_ context.Context, in *sqs.GetQueueAttributesInput, _ ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error) {
+func (d *depthClient) GetQueueAttributes(ctx context.Context, in *sqs.GetQueueAttributesInput, _ ...func(*sqs.Options)) (*sqs.GetQueueAttributesOutput, error) {
 	d.mu.Lock()
 	d.calls = append(d.calls, aws.ToString(in.QueueUrl))
 	d.mu.Unlock()
+	if d.blockUntilDone {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	attrs, err := d.attrFn(aws.ToString(in.QueueUrl))
 	if err != nil {
 		return nil, err
@@ -254,4 +260,25 @@ func TestQueueDepth_PersistentFailureLoggedOnce(t *testing.T) {
 	eventually(t, func() bool { return count("sqs: queue depth sampling recovered") == 1 }, "recovery logged once")
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, 1, count("sqs: queue depth sampling recovered"))
+}
+
+// Stopping the consumer while a depth sample is in flight is not a dependency
+// failure: nothing is counted or logged.
+func TestQueueDepth_StopMidCallNotCountedAsFailure(t *testing.T) {
+	reg := initPlatformMetrics(t)
+	client := &depthClient{mockSQSClient: mockSQSClient{receiveMessageFn: idleReceive}, blockUntilDone: true}
+	logger := &fixtures.MockLogger{}
+	c, err := internalsqs.NewWithClient(internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1, Logger: logger}, client,
+		func(context.Context, domain.Envelope[json.RawMessage]) error { return nil },
+		internalsqs.WithQueueDepthMetrics(time.Minute), internalsqs.WithDrainTimeout(time.Second))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = c.Start(ctx) }()
+
+	eventually(t, func() bool { return len(client.called()) == 1 }, "sample in flight")
+	cancel()
+	<-done
+	assert.Zero(t, histogramCount(t, reg, "platform_dependency_request_seconds", map[string]string{"dependency": "sqs", "operation": "get_queue_attributes", "outcome": "error"}))
+	assert.NotContains(t, warnMessages(logger), "sqs: queue depth sample failed (logged once until it recovers)")
 }

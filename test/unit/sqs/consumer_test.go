@@ -1876,7 +1876,10 @@ func TestDispatch_VisibilityExtension_NilReceiptHandle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _ = c.Start(ctx) }()
 
-	time.Sleep(150 * time.Millisecond)
+	// The extender ticks every max(visibilityTimeout/2, 1s) = 1s; wait past the
+	// first tick so the nil-receipt-handle check actually runs (asserting
+	// before it, as this test used to, proved nothing).
+	time.Sleep(1200 * time.Millisecond)
 	assert.False(t, visExtCalled.Load(), "visibility extension must not call SQS without a receipt handle")
 
 	close(handlerDone)

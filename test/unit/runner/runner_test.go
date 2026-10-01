@@ -31,6 +31,7 @@ type mockOutboxStore struct {
 	published map[string]bool
 	failed    map[string]string
 	claimErr  error
+	claims    int // ClaimBatch calls, for tests that watch the poll loop
 }
 
 func newMockOutboxStore() *mockOutboxStore {
@@ -56,6 +57,7 @@ func (s *mockOutboxStore) Enqueue(_ context.Context, _ pgcommon.Tx, rec domain.O
 func (s *mockOutboxStore) ClaimBatch(_ context.Context, n int) ([]domain.OutboxRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.claims++
 	if s.claimErr != nil {
 		return nil, s.claimErr
 	}
@@ -1540,3 +1542,39 @@ func TestRunner_DiscardDeadLetters_FilteredByFailedBefore(t *testing.T) {
 // ----------------------------
 // drainTicker: exercises the <-ticker.C drain branch after backoff
 // ----------------------------
+
+// After a ticker-path poll failure the runner backs off (1s) and then resumes
+// regular polling: the ticker is reset and claims continue.
+func TestRunner_TickerPollFails_BackoffThenResumes(t *testing.T) {
+	store := newMockOutboxStore()
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+	logger := &fixtures.MockLogger{}
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub, Logger: logger, PollInterval: 20 * time.Millisecond})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() { startDone <- r.Start(ctx) }()
+	defer func() { cancel(); require.NoError(t, <-startDone) }()
+
+	time.Sleep(10 * time.Millisecond)
+	store.setClaimErr(errors.New("transient db error"))
+	require.Eventually(t, func() bool {
+		for _, e := range logger.Entries() {
+			if e.Level == "ERROR" {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, 5*time.Millisecond, "ticker-path poll failure")
+
+	store.setClaimErr(nil)
+	store.mu.Lock()
+	before := store.claims
+	store.mu.Unlock()
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.claims >= before+3
+	}, 4*time.Second, 10*time.Millisecond, "polling resumes at the regular interval after the backoff")
+}

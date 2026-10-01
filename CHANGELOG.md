@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Tests
+
+- Merged coverage raised from 97.7% to 99.1%. New tests cover outbox/inbox store error paths (missing tables, Prune validation), SNS invalid-payload, batch marshal and codec failures, envelope `UnmarshalJSON` type errors, inbox `ApplySchema` DSN validation, outbox poll-failure backoff, queue-depth sampling interrupted by Stop, and baggage propagation into handlers.
+- Fixed `TestDispatch_VisibilityExtension_NilReceiptHandle`: it slept 150ms, shorter than the extender's 1s minimum tick, so it never exercised the extension path.
+
 ## [1.6.0] - 2026-10-01
 
 ### Upgrade notes (action required)
