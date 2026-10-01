@@ -168,7 +168,7 @@ func TestMarkFailed_AlreadyPublished_CountsNoRetry(t *testing.T) {
 	defer cleanup()
 	prev := metrics.CurrentPlatform()
 	t.Cleanup(func() { metrics.ReplacePlatform(prev) })
-	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "it", Environment: "test"}, prometheus.NewRegistry(), events.WithoutLegacyMetrics())
+	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "it", Environment: "test"}, prometheus.NewRegistry())
 	require.NoError(t, err)
 	retries := metrics.CurrentPlatform().Retries.WithLabelValues("outbox_publish", "mark.failed.gone")
 

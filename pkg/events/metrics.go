@@ -8,30 +8,13 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 )
 
-// Init registers the legacy (pre-standard) metrics using the default
-// registerer. Panics if serviceName is empty. Idempotent.
-//
-// Deprecated: use InitMetrics, which also registers the Tier 1 platform_*
-// metrics required by the Enterprise Platform Observability Standard (with
-// the mandatory domain/service/environment labels).
-func Init(serviceName, buildVersion string) {
-	metrics.Init(serviceName, buildVersion)
-}
-
-// InitWithRegisterer registers the legacy metrics on reg, bypassing the
-// sync.Once guard (test isolation). Panics if serviceName is empty.
-//
-// Deprecated: use InitMetrics.
-func InitWithRegisterer(serviceName, buildVersion string, reg prometheus.Registerer) {
-	metrics.InitWithRegisterer(serviceName, buildVersion, reg)
-}
-
 // MetricsIdentity is the Enterprise Platform Observability Standard's
 // required label set for Tier 1 metrics: Domain, Service and Environment are
 // applied as const labels to every platform_* metric, centrally, so no call
-// site can omit or misspell them. Version is applied to the legacy build-info
-// gauge only. Values must be lowercase [a-z][a-z0-9_-]{0,62}. It is the same
-// shape and rule as platform-pgcommon's pgmetrics.Identity.
+// site can omit or misspell them. The identity is mandatory: there is no way
+// to register platform-events' metrics without one. Values must be lowercase
+// [a-z][a-z0-9_-]{0,62}. It is the same shape and rule as platform-pgcommon's
+// pgmetrics.Identity.
 type MetricsIdentity = metrics.Identity
 
 // RegistrationWarning reports a platform_* metric that could not be
@@ -43,24 +26,8 @@ type RegistrationWarning = metrics.RegistrationWarning
 type MetricsOption func(*metricsOptions)
 
 type metricsOptions struct {
-	legacy         bool
 	eventTypeLimit int
 	eventTypes     []string
-}
-
-// WithoutLegacyMetrics stops registering the Deprecated events_* / outbox_* /
-// sqs_* metrics. Use it once a service has migrated its dashboards, alerts,
-// recording rules, SLOs and HPA references to the platform_* metrics
-// (Backward Compatibility steps 7–8).
-//
-// Until the Proposed platform_* successors are ratified, the reference alerts
-// (monitoring/prometheus) for the producer side — outbox backlog, pending
-// unknown, poll failing, duplicate-delivery risk, publish errors and SQS
-// receive failing — query the legacy metrics, because alerting on a Proposed
-// metric is forbidden. Dropping them silences those alerts with no
-// replacement, so keep legacy metrics on while you rely on them.
-func WithoutLegacyMetrics() MetricsOption {
-	return func(o *metricsOptions) { o.legacy = false }
 }
 
 // WithEventTypeLimit sets how many distinct event_type label values the
@@ -84,24 +51,23 @@ func WithEventTypes(types ...string) MetricsOption {
 	return func(o *metricsOptions) { o.eventTypes = append(o.eventTypes, types...) }
 }
 
-// InitMetrics registers the Tier 1 platform_* metrics with id's
-// {domain, service, environment} const labels and — during the compatibility
-// period, unless WithoutLegacyMetrics is given — the legacy metrics in
-// parallel, and makes them the active set. Call it once at startup, before
-// publishing or consuming.
+// InitMetrics registers the Tier 1 platform_* metrics — the only metrics
+// platform-events emits — with id's {domain, service, environment} const
+// labels, and makes them the active set. Call it once at startup, before
+// publishing or consuming; until then every recording call is a no-op.
 //
 // Call it once per process. Calling it again with the same identity and
 // registerer reuses the registered collectors; calling it with a different
 // identity leaves the first identity's series registered with frozen values —
 // there is no unregister — so don't re-initialise with another identity.
 //
-// It returns an error, changing nothing, for an invalid identity or a legacy
-// registration failure. A platform_* metric that cannot be registered (the
-// registry already holds that name with another shape) is disabled and
-// returned as a warning — log the warnings:
+// It returns an error, changing nothing, for an invalid identity. A
+// platform_* metric that cannot be registered (the registry already holds
+// that name with another shape) is disabled and returned as a warning — log
+// the warnings:
 //
 //	warnings, err := events.InitMetrics(events.MetricsIdentity{
-//	    Domain: "iam", Service: "event-consumer", Version: buildVersion,
+//	    Domain: "iam", Service: "event-consumer", Environment: "prod",
 //	}, registry)
 //
 // A nil reg means prometheus.DefaultRegisterer. A registerer that already
@@ -113,7 +79,7 @@ func WithEventTypes(types ...string) MetricsOption {
 // An empty Environment is filled from the service's environment variables
 // (MetricsEnvironmentFromEnv: APP_ENV, then ENVIRONMENT, else "dev").
 func InitMetrics(id MetricsIdentity, reg prometheus.Registerer, opts ...MetricsOption) ([]RegistrationWarning, error) {
-	o := metricsOptions{legacy: true}
+	var o metricsOptions
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -124,7 +90,7 @@ func InitMetrics(id MetricsIdentity, reg prometheus.Registerer, opts ...MetricsO
 	if id.Environment == "" {
 		id.Environment, source = metrics.Environment()
 	}
-	warnings, err := metrics.InitWithIdentity(id, reg, o.legacy)
+	warnings, err := metrics.InitWithIdentity(id, reg)
 	if err != nil {
 		if source != "" && source != "default" {
 			err = fmt.Errorf("%w (environment %q was read from %s)", err, id.Environment, source)
@@ -147,23 +113,22 @@ func MetricsEnvironmentFromEnv() string {
 // environment: Environment from MetricsEnvironmentFromEnv, Service from
 // APP_NAME when service is empty. Domain has no environment variable — it is
 // the service's fixed business domain (e.g. "iam").
-func MetricsIdentityFromEnv(domain, service, version string) MetricsIdentity {
+func MetricsIdentityFromEnv(domain, service string) MetricsIdentity {
 	if service == "" {
 		service = metrics.ServiceName()
 	}
-	return MetricsIdentity{Domain: domain, Service: service, Environment: MetricsEnvironmentFromEnv(), Version: version}
+	return MetricsIdentity{Domain: domain, Service: service, Environment: MetricsEnvironmentFromEnv()}
 }
 
 // MetricsIdentityFromLabels builds a MetricsIdentity from a const-label map
-// using the standard's label names — domain, service, environment, version —
-// e.g. platform-gincommon's MetricsConstLabels(), so platform-events' metrics
-// carry the values the service's own metrics do.
+// using the standard's label names — domain, service, environment — e.g.
+// platform-gincommon's MetricsConstLabels(), so platform-events' metrics carry
+// the values the service's own metrics do. Other keys are ignored.
 func MetricsIdentityFromLabels(labels map[string]string) MetricsIdentity {
 	return MetricsIdentity{
 		Domain:      labels[metrics.LabelDomain],
 		Service:     labels[metrics.LabelService],
 		Environment: labels[metrics.LabelEnvironment],
-		Version:     labels[metrics.LabelVersion],
 	}
 }
 
@@ -174,9 +139,8 @@ type MetricsRegistryEntry = metrics.RegistryEntry
 
 // Metric registry statuses.
 const (
-	MetricStatusCanonical  = metrics.StatusCanonical
-	MetricStatusProposed   = metrics.StatusProposed
-	MetricStatusDeprecated = metrics.StatusDeprecated
+	MetricStatusCanonical = metrics.StatusCanonical
+	MetricStatusProposed  = metrics.StatusProposed
 )
 
 // MetricsRegistry returns every metric platform-events registers, for

@@ -1,8 +1,8 @@
 flowchart TD
     A([Runner.Start called]) --> JIT["sleep StartupJitter\n(random 0 → StartupJitter;\ndefault 0 — desyncs replicas)"]
     JIT --> P[pollOnce\nimmediate first poll on startup]
-    P --> PM["SetOutboxPending(pendingCount)\noutbox_pending_total gauge\n(queried before claiming)"]
-    PM --> LM["SetOutboxLeased(leasedCount)\noutbox_leased_total gauge\n(queried before claiming)"]
+    P --> PM["SetOutboxPending(pendingCount)\nplatform_outbox_pending_events gauge\n(queried before claiming)"]
+    PM --> LM["SetOutboxLeased(leasedCount)\nplatform_outbox_leased_events gauge\n(queried before claiming)"]
     LM --> C["SELECT … FOR UPDATE SKIP LOCKED\nWHERE published_at IS NULL\n  AND scheduled_at ≤ NOW()\nORDER BY scheduled_at, id  LIMIT BatchSize"]
     C -- 0 rows --> B[wait PollInterval tick]
     B --> P
@@ -12,11 +12,11 @@ flowchart TD
     E -- unmarshal error --> F["MarkFailed attempts++, last_error\nscheduled_at = NOW() + backoff\nif attempts ≥ MaxAttempts → dead-letter"]
     F --> D
     E -- ok --> G[Publisher.Publish]
-    G -- success --> H["MarkPublished\npublished_at = NOW()\noutbox_published_total{success}++"]
+    G -- success --> H["MarkPublished\npublished_at = NOW()\nplatform_outbox_publish_attempts_total{outcome=success}++"]
     H --> D
     G -- transient error\n(Throttling · ServiceUnavailable\n· InternalFailure · RequestTimeout · timeout) --> RI["ReleaseLease — attempts unchanged\nscheduled_at = NOW() + shared backoff\n(an SNS outage never dead-letters)"]
     RI --> D
-    G -- permanent error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() + RetryBackoff·2^(n-1)\noutbox_published_total{error}++"]
+    G -- permanent error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() + RetryBackoff·2^(n-1)\nplatform_outbox_publish_attempts_total{outcome=error}++"]
     I --> J{attempts ≥ MaxAttempts?}
     J -- yes --> K["INSERT outbox_dead_letters\nDELETE outbox_events\nplatform_dlq_messages_total{operation=outbox_publish}++"]
     J -- no  --> D

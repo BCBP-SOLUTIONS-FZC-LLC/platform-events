@@ -6,7 +6,7 @@
     "observability-standard",
     "tier1"
   ],
-  "description": "Reference dashboard for services using platform-events. Canonical Tier 1 panels first, Proposed metrics as shadow panels, legacy panels only where still authoritative. Metric contract: docs/observability/metrics-registry.md. CI-linted (make metrics-lint).",
+  "description": "Reference dashboard for services using platform-events. Canonical Tier 1 panels first, then Proposed Tier 1 panels (awaiting governance ratification). platform-events emits only platform_* metrics. Metric contract: docs/observability/metrics-registry.md. CI-linted (make metrics-lint).",
   "schemaVersion": 39,
   "version": 1,
   "editable": true,
@@ -329,7 +329,7 @@
     },
     {
       "type": "row",
-      "title": "Shadow \u2014 Proposed Tier 1 (graph only; not for alerts, SLOs or HPA until ratified)",
+      "title": "Proposed Tier 1 \u2014 awaiting ratification (alerts on these live in the *.proposed rule groups)",
       "collapsed": false,
       "id": 7,
       "gridPos": {
@@ -650,21 +650,8 @@
       "description": "Non-zero: a producer sends event types over 128 bytes or beyond the per-process limit (WithEventTypeLimit)."
     },
     {
-      "type": "row",
-      "title": "Legacy \u2014 authoritative until the Proposed successors are ratified",
-      "collapsed": false,
-      "id": 17,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 66
-      },
-      "panels": []
-    },
-    {
       "type": "timeseries",
-      "title": "Outbox backlog (legacy)",
+      "title": "Outbox publish error ratio (Proposed)",
       "id": 18,
       "datasource": {
         "type": "prometheus",
@@ -674,30 +661,30 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 67
+        "y": 66
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "unit": "percentunit"
         },
         "overrides": []
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (service) (outbox_pending_total{service=~\"$service\"})",
-          "legendFormat": "{{service}}",
+          "expr": "sum(rate(platform_outbox_publish_attempts_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",outcome=\"error\"}[$__rate_interval])) / sum(rate(platform_outbox_publish_attempts_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"}[$__rate_interval]))",
+          "legendFormat": "error ratio",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           }
         }
       ],
-      "description": "-1 = the pending-count query failed. Successor: platform_outbox_pending_events."
+      "description": "Share of outbox publish attempts that failed. Failed attempts are retried with backoff and dead-lettered after the last attempt (platform_dlq_messages_total{operation=\"outbox_publish\"})."
     },
     {
       "type": "timeseries",
-      "title": "Outbox publish errors (legacy)",
+      "title": "Outbox runner errors by operation (Proposed)",
       "id": 19,
       "datasource": {
         "type": "prometheus",
@@ -707,7 +694,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 67
+        "y": 66
       },
       "fieldConfig": {
         "defaults": {
@@ -718,15 +705,15 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (service) (rate(outbox_published_total{service=~\"$service\",status=\"error\"}[$__rate_interval]))",
-          "legendFormat": "{{service}}",
+          "expr": "sum by (operation) (rate(platform_outbox_errors_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           }
         }
       ],
-      "description": "Successor: platform_outbox_publish_attempts_total{outcome=\"error\"}."
+      "description": "Runner steps failing outside a publish attempt: poll, unmarshal, mark_published (duplicate-delivery risk) and the gauge queries (pending_count, leased_count, oldest_pending, blocked_count). A failing gauge query leaves its gauge at the last value."
     }
   ]
 }

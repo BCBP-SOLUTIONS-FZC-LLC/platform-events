@@ -46,11 +46,11 @@ type OutboxStore interface {
 	OldestPendingAge(ctx context.Context) (time.Duration, error)
 
 	// PendingCount returns the number of records not yet published.
-	// Used to update the outbox_pending_total Prometheus gauge each poll cycle.
+	// Used to update the platform_outbox_pending_events gauge each poll cycle.
 	PendingCount(ctx context.Context) (int64, error)
 
 	// LeasedCount returns the number of records currently claimed by a runner
-	// (scheduled_at > NOW() and published_at IS NULL). Used for the outbox_leased_total gauge.
+	// (scheduled_at > NOW() and published_at IS NULL). Used for the platform_outbox_leased_events gauge.
 	LeasedCount(ctx context.Context) (int64, error)
 
 	// ReprocessDeadLetters moves up to limit records from outbox_dead_letters back

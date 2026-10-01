@@ -24,8 +24,7 @@ type Ledger interface {
 //
 //   - the envelope ID must parse as a UUID, else an error (→ retry / DLQ);
 //   - an ID already recorded is acknowledged without calling next, and
-//     counted in platform_duplicate_messages_total{queue,event_type} (and the
-//     legacy events_inbox_duplicates_total{consumer});
+//     counted in platform_duplicate_messages_total{queue,event_type};
 //   - otherwise next runs, and the ID is recorded only when next returns nil
 //     without having dead-lettered the message (SendToDLQ), so a redriven
 //     message is processed.
@@ -49,7 +48,7 @@ func Handler(ledger Ledger, next events.Handler) events.Handler {
 			return err
 		}
 		if seen {
-			recordDuplicate(ctx, ledger.Consumer(), env.Type)
+			recordDuplicate(ctx, env.Type)
 			return nil
 		}
 		if err := next(ctx, env); err != nil {
@@ -64,8 +63,7 @@ func Handler(ledger Ledger, next events.Handler) events.Handler {
 	}
 }
 
-func recordDuplicate(ctx context.Context, consumer, eventType string) {
-	metrics.RecordInboxDuplicate(consumer)
+func recordDuplicate(ctx context.Context, eventType string) {
 	queueURL := ""
 	if src, ok := port.SourceMessageFromContext(ctx); ok {
 		queueURL = src.QueueURL

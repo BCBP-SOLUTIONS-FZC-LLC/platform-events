@@ -319,7 +319,7 @@ jobs:
   interop:
     name: Cross-language compatibility
     needs: validate-test
-    uses: BCBP-SOLUTIONS-FZC-LLC/platform-interop-tests/.github/workflows/interop.yml@87107db3ca534faf15bd1d71d90baa498c3a7f0b # main @ 2026-08-18 — pinned: it receives a private token
+    uses: BCBP-SOLUTIONS-FZC-LLC/platform-interop-tests/.github/workflows/interop.yml@935be0c760c5104f41aefdbde0ae7b4f618da657 # main @ 2026-10-02 (platform-interop-tests#2, Tier 1 metrics-check) — pinned: it receives a private token
     with:
       platform_events_ref: ${{ github.event.inputs.tag || github.ref_name }}
     secrets:

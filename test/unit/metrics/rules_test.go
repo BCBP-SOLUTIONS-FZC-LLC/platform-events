@@ -1,11 +1,14 @@
 package metrics_test
 
 // Rule-file governance for monitoring/prometheus/*.rules.yml (Enterprise
-// Platform Observability Standard, rules 9–12 and Backward Compatibility):
+// Platform Observability Standard, rules 9–12):
 //
-//   - every metric an expression references is in the registry
-//   - no expression references a Proposed (unratified) metric — they may be
-//     named in comments only
+//   - every metric an expression references is in the registry (so no
+//     removed legacy name can come back)
+//   - a rule that depends on a Proposed (unratified) metric — directly or
+//     through a recording rule — lives in a *.proposed group, and every alert
+//     there carries metric_status: proposed; a *.proposed group holds only
+//     such rules, so a ratified metric's rules move to the Canonical groups
 //   - every label an expression filters or groups by belongs to the
 //     vocabulary of the metrics it references (or is `le`)
 //   - every alert has a severity, a summary and a runbook_url whose anchor
@@ -50,6 +53,7 @@ type ruleFile struct {
 var (
 	recordRef   = regexp.MustCompile(`\bplatform_events:[a-z0-9_:]+`)
 	metricRef   = regexp.MustCompile(`\b(?:platform|events|outbox|sqs)_[a-z0-9_]+`)
+	proposedGrp = regexp.MustCompile(`\.proposed(?:\.|$)`)
 	groupingRef = regexp.MustCompile(`\b(?:by|without)\s*\(([^)]*)\)`)
 	selectorRef = regexp.MustCompile(`\{([^}]*)\}`)
 	matcherName = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:=~|!~|!=|=)`)
@@ -135,9 +139,6 @@ func TestRules_RegistryCompliance(t *testing.T) {
 						if !assert.True(t, ok, "%s references %s, which is not in the metrics registry", name, ref) {
 							continue
 						}
-						assert.NotEqual(t, internalmetrics.StatusProposed, e.Status,
-							"%s uses Proposed metric %s as a live query target — forbidden until it is ratified (rules 11/12); use its legacy predecessor %v",
-							name, m, e.Supersedes)
 						for _, l := range append(slices.Clone(e.RequiredLabels), e.ApprovedLabels...) {
 							allowed[l] = true
 						}
@@ -170,28 +171,63 @@ func TestRules_RegistryCompliance(t *testing.T) {
 	}
 }
 
-// TestRules_ProposedMetricsOnlyInComments: the files name Proposed
-// successors, but only in comments.
-func TestRules_ProposedMetricsOnlyInComments(t *testing.T) {
-	paths, err := filepath.Glob(filepath.Join(rulesDir, "*.rules.yml"))
-	require.NoError(t, err)
-	mentions := 0
-	for _, p := range paths {
-		raw, err := os.ReadFile(p) //nolint:gosec // paths come from a fixed glob in the repo
-		require.NoError(t, err)
-		for i, line := range strings.Split(string(raw), "\n") {
-			for _, ref := range metricRefs(line) {
-				e, ok := internalmetrics.Lookup(baseMetric(ref))
-				if !ok || e.Status != internalmetrics.StatusProposed {
-					continue
+// TestRules_ProposedMetricsOnlyInProposedGroups: a rule that depends on a
+// Proposed metric (directly, or through a recording rule that does) must sit
+// in a *.proposed group — and every alert there must say so with
+// metric_status: proposed — while a *.proposed group may only hold such rules.
+func TestRules_ProposedMetricsOnlyInProposedGroups(t *testing.T) {
+	proposedRules := 0
+	for file, rf := range loadRuleFiles(t) {
+		// Recording rules depending on a Proposed metric (fixed point over
+		// recording rules that reference each other).
+		proposedRecord := map[string]bool{}
+		for changed := true; changed; {
+			changed = false
+			for _, g := range rf.Groups {
+				for _, r := range g.Rules {
+					if r.Record != "" && !proposedRecord[r.Record] && dependsOnProposed(r.Expr, proposedRecord) {
+						proposedRecord[r.Record] = true
+						changed = true
+					}
 				}
-				mentions++
-				assert.True(t, strings.HasPrefix(strings.TrimSpace(line), "#"),
-					"%s:%d: Proposed metric %s outside a comment", filepath.Base(p), i+1, ref)
+			}
+		}
+		for _, g := range rf.Groups {
+			inProposedGroup := proposedGrp.MatchString(g.Name)
+			for _, r := range g.Rules {
+				name := file + "/" + g.Name + "/" + r.Record + r.Alert
+				proposed := dependsOnProposed(r.Expr, proposedRecord)
+				if proposed {
+					proposedRules++
+				}
+				assert.Equal(t, proposed, inProposedGroup,
+					"%s: a rule depending on a Proposed metric must live in a *.proposed group, and only such rules may (rules 11/12)", name)
+				if r.Alert != "" && inProposedGroup {
+					assert.Equal(t, "proposed", r.Labels["metric_status"], "%s: alerts on Proposed metrics carry metric_status: proposed", name)
+				}
+				if r.Alert != "" && !inProposedGroup {
+					assert.NotContains(t, r.Labels, "metric_status", "%s: metric_status is reserved for alerts on Proposed metrics", name)
+				}
 			}
 		}
 	}
-	assert.Positive(t, mentions, "the rule files should name each legacy rule's post-ratification successor in a comment")
+	assert.Positive(t, proposedRules, "the producer / outbox / SQS-client rules depend on Proposed metrics")
+}
+
+// dependsOnProposed reports whether expr references a Proposed metric or a
+// recording rule in proposedRecord.
+func dependsOnProposed(expr string, proposedRecord map[string]bool) bool {
+	for _, ref := range metricRefs(expr) {
+		if e, ok := internalmetrics.Lookup(baseMetric(ref)); ok && e.Status == internalmetrics.StatusProposed {
+			return true
+		}
+	}
+	for _, rec := range recordRef.FindAllString(expr, -1) {
+		if proposedRecord[rec] {
+			return true
+		}
+	}
+	return false
 }
 
 // TestRules_EveryAlertHasARunbookSection: no orphan runbook sections either.

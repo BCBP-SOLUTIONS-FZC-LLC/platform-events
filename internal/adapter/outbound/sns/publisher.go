@@ -310,7 +310,7 @@ func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.Raw
 	// error rather than an opaque InvalidParameter.
 	p.fitAttributeLimit(input.MessageAttributes, env.Type)
 	if n := len(input.MessageAttributes); n > maxSNSMessageAttributes {
-		metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
+		metrics.IncPublished(p.topicARN, env.Type, "error")
 		if p.logger != nil {
 			p.logger.Error("sns: message attribute count exceeds SNS limit of 10", map[string]any{
 				"count":      n,
@@ -344,7 +344,7 @@ func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.Raw
 		span.SetAttributes(attribute.String("messaging.message_id", aws.ToString(out.MessageId)))
 	}
 
-	metrics.RecordPublish(p.topicARN, env.Type, status, dur.Seconds())
+	metrics.IncPublished(p.topicARN, env.Type, status)
 
 	return err
 }
@@ -395,7 +395,7 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 		// SQS subscription filter policies silently drop the message — no API
 		// error is returned because SNS accepts messages with arbitrary attribute sets.
 		if err := validateEnvelopeFields(env); err != nil {
-			metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
+			metrics.IncPublished(p.topicARN, env.Type, "error")
 			if marshalErr == nil {
 				marshalErr = &BatchError{}
 			}
@@ -427,7 +427,7 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 			// Marshal failures are deterministic; record the metric and skip
 			// this entry rather than aborting the chunk — other envelopes
 			// in the same chunk can still be delivered successfully.
-			metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
+			metrics.IncPublished(p.topicARN, env.Type, "error")
 			if marshalErr == nil {
 				marshalErr = &BatchError{}
 			}
@@ -463,7 +463,7 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 		// an opaque InvalidParameter from the API.
 		p.fitAttributeLimit(attrs, env.Type)
 		if n := len(attrs); n > maxSNSMessageAttributes {
-			metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
+			metrics.IncPublished(p.topicARN, env.Type, "error")
 			if marshalErr == nil {
 				marshalErr = &BatchError{}
 			}
@@ -559,7 +559,6 @@ func (p *snsPublisher) sendBatch(ctx context.Context, entries []snstypes.Publish
 	})
 	dur := time.Since(start)
 	metrics.ObserveDependency("sns", "publish_batch", err, dur)
-	perMsg := dur.Seconds() / float64(len(entries))
 
 	if err != nil {
 		if p.logger != nil {
@@ -572,7 +571,7 @@ func (p *snsPublisher) sendBatch(ctx context.Context, entries []snstypes.Publish
 		failures := make([]BatchFailure, 0, len(entries))
 		for _, entry := range entries {
 			id := aws.ToString(entry.Id)
-			metrics.RecordPublish(p.topicARN, entryEventType[id], "error", perMsg)
+			metrics.IncPublished(p.topicARN, entryEventType[id], "error")
 			failures = append(failures, requestFailure(id, err))
 		}
 		return failures
@@ -599,7 +598,7 @@ func (p *snsPublisher) sendBatch(ctx context.Context, entries []snstypes.Publish
 		if _, failed := failedIDs[id]; failed {
 			status = "error"
 		}
-		metrics.RecordPublish(p.topicARN, entryEventType[id], status, perMsg)
+		metrics.IncPublished(p.topicARN, entryEventType[id], status)
 	}
 	return failures
 }
@@ -694,21 +693,17 @@ func (p *snsPublisher) encodeEnvelopePayload(ctx context.Context, env domain.Env
 	dur := time.Since(start)
 	metrics.ObserveDependency("codec", "encode", err, dur)
 	if err != nil {
-		metrics.RecordCodecEncode(p.topicARN, env.Type, "error", dur.Seconds())
 		return env, fmt.Errorf("sns: codec encode failed: %w", err)
 	}
 	if schemaID == "" {
-		metrics.RecordCodecEncode(p.topicARN, env.Type, "noop", dur.Seconds())
 		return env, nil
 	}
 	wrapped, err := domain.WrapCodecPayload(encoded)
 	if err != nil {
-		metrics.RecordCodecEncode(p.topicARN, env.Type, "error", dur.Seconds())
 		return env, fmt.Errorf("sns: %w", err)
 	}
 	env.Payload = wrapped
 	env.SchemaID = schemaID
-	metrics.RecordCodecEncode(p.topicARN, env.Type, "success", dur.Seconds())
 	return env, nil
 }
 

@@ -99,9 +99,12 @@ See [EVENT_SCHEMA_GOVERNANCE.md](EVENT_SCHEMA_GOVERNANCE.md) for the full rulese
 
 ## Adding a new metric
 
-1. Declare the package-level var in `internal/adapter/outbound/metrics/metrics.go`.
-2. Initialise it inside `initMetricsWithRegisterer` and register it.
-3. Add a unit test in `test/unit/metrics/metrics_test.go` using `InitWithRegisterer` with `prometheus.NewRegistry()`.
+Only Tier 1 `platform_*` metrics are allowed (Enterprise Platform Observability Standard).
+
+1. Add its registry entry (ratification packet) to `internal/adapter/outbound/metrics/registry.go` — usually `StatusProposed` — and register it with the central Platform Observability Registry (platform-gincommon).
+2. Add a field to `Platform` and register it in `registerPlatform` in `internal/adapter/outbound/metrics/metrics.go`; add a nil-safe recording function.
+3. Exercise it in `exerciseAll` (`test/unit/metrics/standard_test.go`) and add a unit test in `test/unit/metrics/metrics_test.go` using `initPlatformMetrics` (or `fixtures.InitPlatformMetrics(t)` elsewhere), which registers on a fresh `prometheus.NewRegistry()`.
+4. `make metrics-doc` to regenerate the inventory, then `make metrics-lint`.
 
 ## Testing requirements
 

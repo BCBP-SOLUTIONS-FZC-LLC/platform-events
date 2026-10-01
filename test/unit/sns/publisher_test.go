@@ -13,7 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	smithy "github.com/aws/smithy-go"
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
@@ -704,8 +704,7 @@ func TestNewSNSPublisher_EmptyTopicARN_Error(t *testing.T) {
 // ----------------------------
 
 func TestPublish_WithMetrics(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("sns-publish-metrics", "v0.0.1", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	env := makeEnv("metrics.event")
 	client := successClient()
@@ -714,6 +713,7 @@ func TestPublish_WithMetrics(t *testing.T) {
 
 	err = p.Publish(context.Background(), env)
 	require.NoError(t, err)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CurrentPlatform().MessagesPublished.WithLabelValues("test", "metrics.event", "success")), 0)
 }
 
 // ----------------------------
@@ -721,8 +721,7 @@ func TestPublish_WithMetrics(t *testing.T) {
 // ----------------------------
 
 func TestPublishBatch_WithMetrics_Success(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("sns-batch-metrics", "v0.0.2", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	envs := []domain.Envelope[json.RawMessage]{
 		makeEnv("batch.one"),
@@ -734,6 +733,9 @@ func TestPublishBatch_WithMetrics_Success(t *testing.T) {
 
 	err = p.PublishBatch(context.Background(), envs)
 	require.NoError(t, err)
+	published := metrics.CurrentPlatform().MessagesPublished
+	assert.InDelta(t, 1, testutil.ToFloat64(published.WithLabelValues("test", "batch.one", "success")), 0)
+	assert.InDelta(t, 1, testutil.ToFloat64(published.WithLabelValues("test", "batch.two", "success")), 0)
 }
 
 // ----------------------------
@@ -741,8 +743,7 @@ func TestPublishBatch_WithMetrics_Success(t *testing.T) {
 // ----------------------------
 
 func TestPublishBatch_TransportError_WithLoggerAndMetrics(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("sns-batch-err-metrics", "v0.0.3", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	logger := &fixtures.MockLogger{}
 	env := makeEnv("fail.event")
@@ -761,6 +762,7 @@ func TestPublishBatch_TransportError_WithLoggerAndMetrics(t *testing.T) {
 	require.True(t, errors.As(err, &be), "expected *BatchError wrapping transport error")
 	require.Len(t, be.Failures, 1)
 	assert.Contains(t, be.Failures[0].Message, "transport failure")
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CurrentPlatform().MessagesPublished.WithLabelValues("test", "fail.event", "error")), 0)
 
 	entries := logger.Entries()
 	found := false

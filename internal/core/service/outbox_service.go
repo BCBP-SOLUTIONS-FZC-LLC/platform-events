@@ -567,7 +567,7 @@ func (s *OutboxService) publishRecord(ctx, bookkeepCtx context.Context, rec doma
 }
 
 // PendingCount returns the number of records in outbox_events that have not
-// yet been published. Callers use this to update the outbox_pending_total gauge.
+// yet been published. Callers use this to update the platform_outbox_pending_events gauge.
 func (s *OutboxService) PendingCount(ctx context.Context) (int64, error) {
 	return s.store.PendingCount(ctx)
 }

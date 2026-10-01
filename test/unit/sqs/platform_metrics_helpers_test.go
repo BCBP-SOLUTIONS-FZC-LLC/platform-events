@@ -7,20 +7,14 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
-// initPlatformMetrics registers the Tier 1 (and legacy) metrics on a fresh
-// registry for one test and restores the previous Tier 1 set afterwards.
+// initPlatformMetrics registers the Tier 1 metrics on a fresh registry for
+// one test and restores the previous Tier 1 set afterwards.
 func initPlatformMetrics(t *testing.T) *prometheus.Registry {
 	t.Helper()
-	prev := metrics.CurrentPlatform()
-	t.Cleanup(func() { metrics.ReplacePlatform(prev) })
-	reg := prometheus.NewRegistry()
-	warnings, err := metrics.InitWithIdentity(metrics.Identity{Domain: "iam", Service: "event-consumer", Environment: "test"}, reg, true)
-	require.NoError(t, err)
-	require.Empty(t, warnings)
-	return reg
+	return fixtures.InitPlatformMetrics(t)
 }
 
 // findMetric returns the series of family name whose labels include want.

@@ -15,7 +15,7 @@ sequenceDiagram
         SNSAdp ->> SNSAdp: Codec.Encode(ctx, env.Type, env.Payload) → encoded bytes, schemaID
         SNSAdp ->> SNSAdp: env.Payload = base64(encoded) as JSON string
         SNSAdp ->> SNSAdp: env.SchemaID = schemaID
-        Note over SNSAdp: encode error returns before the SNS API call — CodecEncodeTotal{status=error}.Inc()
+        Note over SNSAdp: encode error returns before the SNS API call — platform_dependency_request_seconds{codec,encode,outcome=error}
     end
 
     SNSAdp ->> SNSAdp: json.Marshal(env) → message body
@@ -29,15 +29,15 @@ sequenceDiagram
 
     alt success
         SNSAdp ->> OTel: span.End()
-        SNSAdp ->> SNSAdp: EventsPublishedTotal{status=success}.Inc()
+        SNSAdp ->> SNSAdp: platform_messages_published_total{outcome=success}.Inc()
     else transient (Throttled · InternalError · KMSThrottling · other throttle codes · HTTP 5xx/429 · timeout · no AWS answer: network/DNS/TLS/credentials)
         SNSAdp ->> SNSAdp: wrapIfRetryable → &RetryableError{Cause: err}
         SNSAdp ->> OTel: span.RecordError + codes.Error
-        SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
+        SNSAdp ->> SNSAdp: platform_messages_published_total{outcome=error}.Inc()
         Note over SNSAdp: caller (OutboxService) checks errors.Is(err, ErrRetryable) — does NOT count toward MaxAttempts
     else permanent error
         SNSAdp ->> OTel: span.RecordError + codes.Error
-        SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
+        SNSAdp ->> SNSAdp: platform_messages_published_total{outcome=error}.Inc()
     end
 
     SNSAdp -->>- Publisher: error or nil

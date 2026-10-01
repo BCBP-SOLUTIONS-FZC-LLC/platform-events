@@ -32,9 +32,8 @@ func dependencyCount(t *testing.T, p *metrics.Platform, op, outcome string) uint
 func TestPublisher_PlatformMetrics(t *testing.T) {
 	prev := metrics.CurrentPlatform()
 	t.Cleanup(func() { metrics.ReplacePlatform(prev) })
-	_, err := metrics.InitWithIdentity(metrics.Identity{Domain: "iam", Service: "svc", Environment: "test"}, prometheus.NewRegistry(), false)
+	_, err := metrics.InitWithIdentity(metrics.Identity{Domain: "iam", Service: "svc", Environment: "test"}, prometheus.NewRegistry())
 	require.NoError(t, err)
-	t.Cleanup(func() { metrics.InitWithRegisterer("sns-test", "v1", prometheus.NewRegistry()) })
 
 	fail := false
 	client := &mockSNSClient{

@@ -14,13 +14,13 @@ import (
 
 // Identity is the Tier 1 required label set, injected as const labels on
 // every platform_* metric so no call site can omit or misspell them (rule 8).
-// Version is applied to the legacy build-info gauge only: a per-build label
-// on Tier 1 metrics would multiply series on every deploy.
+// It carries no build version: a per-build label on Tier 1 metrics would
+// multiply series on every deploy (platform_library_info reports the
+// library's own module version instead).
 type Identity struct {
 	Domain      string // e.g. "iam", "workflow", "billing"
 	Service     string // e.g. "event-consumer"
 	Environment string // e.g. "dev", "staging", "prod"
-	Version     string // service build version, legacy build-info only
 }
 
 // identityValueRe bounds identity label values: lowercase, starts with a
@@ -161,17 +161,6 @@ var wrapCollision = regexp.MustCompile(`already existing label name "([a-zA-Z_][
 type registrar struct {
 	reg      prometheus.Registerer
 	injected map[string]bool
-	// added lists the collectors this registrar registered (not reused), so
-	// a failed registration step can be undone.
-	added []prometheus.Collector
-}
-
-// rollback unregisters the collectors registered since mark (len(added)).
-func (r *registrar) rollback(mark int) {
-	for _, c := range r.added[mark:] {
-		r.reg.Unregister(c)
-	}
-	r.added = r.added[:mark]
 }
 
 func newRegistrar(reg prometheus.Registerer) *registrar {
@@ -192,11 +181,8 @@ func (r *registrar) withoutInjected(labels prometheus.Labels) prometheus.Labels 
 // the registerer reports it already applies.
 func register[T prometheus.Collector](r *registrar, labels prometheus.Labels, droppable []string, build func(prometheus.Labels) T) (T, error) {
 	for range len(droppable) + 1 {
-		c, fresh, err := tryRegister(r.reg, build(r.withoutInjected(labels)))
+		c, _, err := tryRegister(r.reg, build(r.withoutInjected(labels)))
 		if err == nil {
-			if fresh {
-				r.added = append(r.added, c)
-			}
 			return c, nil
 		}
 		m := wrapCollision.FindStringSubmatch(err.Error())

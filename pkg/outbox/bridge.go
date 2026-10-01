@@ -41,13 +41,11 @@ func (b *publisherBridge) Publish(ctx context.Context, env domain.Envelope[json.
 		Payload:       env.Payload,
 	}
 	err := b.pub.Publish(ctx, pub)
-
-	metrics.RecordOutboxAttempt(env.Type)
 	status := "success"
 	if err != nil {
 		status = "error"
 	}
-	metrics.RecordOutboxPublished(env.Type, status)
+	metrics.IncOutboxPublishAttempt(env.Type, status)
 	return err
 }
 
@@ -73,12 +71,9 @@ func (b *publisherBridge) PublishBatch(ctx context.Context, envs []domain.Envelo
 	}
 	err := b.pub.PublishBatch(ctx, pubEnvs)
 
-	// Record metrics post-call so attempt and published counters are always
-	// consistent: a panicking publisher leaves both at 0 rather than creating a
-	// permanent mismatch (attempts > published{success+error}) on a Grafana dashboard.
-
-	// For partial failures (*events.BatchError), record per-message status so
-	// outbox_published_total accurately reflects which messages were delivered.
+	// Record metrics post-call, so a panicking publisher records nothing. For
+	// partial failures (*events.BatchError), record a per-message outcome so
+	// platform_outbox_publish_attempts_total reflects which messages were delivered.
 	var batchErr *events.BatchError
 	if errors.As(err, &batchErr) {
 		failedIDs := make(map[string]struct{}, len(batchErr.Failures))
@@ -86,11 +81,10 @@ func (b *publisherBridge) PublishBatch(ctx context.Context, envs []domain.Envelo
 			failedIDs[f.ID] = struct{}{}
 		}
 		for _, e := range envs {
-			metrics.RecordOutboxAttempt(e.Type)
 			if _, failed := failedIDs[e.ID]; failed {
-				metrics.RecordOutboxPublished(e.Type, "error")
+				metrics.IncOutboxPublishAttempt(e.Type, "error")
 			} else {
-				metrics.RecordOutboxPublished(e.Type, "success")
+				metrics.IncOutboxPublishAttempt(e.Type, "success")
 			}
 		}
 		return toDomainBatchError(batchErr)
@@ -101,8 +95,7 @@ func (b *publisherBridge) PublishBatch(ctx context.Context, envs []domain.Envelo
 		status = "error"
 	}
 	for _, e := range envs {
-		metrics.RecordOutboxAttempt(e.Type)
-		metrics.RecordOutboxPublished(e.Type, status)
+		metrics.IncOutboxPublishAttempt(e.Type, status)
 	}
 	return err
 }

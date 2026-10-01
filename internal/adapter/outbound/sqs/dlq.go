@@ -215,9 +215,7 @@ func (p *DLQPublisher) SendToDLQ(ctx context.Context, sourceQueueURL string, bod
 	)
 
 	messageID, err := p.send(ctx, span, sourceQueueURL, body, attrs, reason, eventType)
-	status := "success"
 	if err != nil {
-		status = "error"
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
 	} else {
@@ -229,7 +227,6 @@ func (p *DLQPublisher) SendToDLQ(ctx context.Context, sourceQueueURL string, bod
 		metrics.IncDLQ("consume", eventType, attribution.Reason())
 		attribution.MarkRecorded()
 	}
-	metrics.RecordDLQForward(sourceQueueURL, eventType, status)
 	return err
 }
 

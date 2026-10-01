@@ -120,7 +120,7 @@ func (s *Store) Process(ctx context.Context, env events.Envelope[json.RawMessage
 		return nil
 	}
 	if err == nil && duplicate {
-		recordDuplicate(ctx, s.consumer, env.Type)
+		recordDuplicate(ctx, env.Type)
 	}
 	return err
 }

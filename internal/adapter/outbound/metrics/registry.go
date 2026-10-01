@@ -19,9 +19,12 @@ package metrics
 // 2 (<domain>_*) and Tier 3 (<domain>_<service>_*) do not apply — services
 // add those for their own business signals.
 //
-// The historical events_* / outbox_* / sqs_* names fit no tier. They stay,
-// unchanged, as Deprecated legacy metrics for the compatibility period
-// (Backward Compatibility steps 1–8).
+// The pre-standard events_* / outbox_* / sqs_* names (and
+// platform_events_build_info) fit no tier and were removed outright — no
+// release emitting them was ever deployed, so the standard's compatibility
+// period did not apply. The central Platform Observability Registry
+// (platform-gincommon) keeps them as status "removed" with their successors;
+// that is the single historical record.
 
 // RegistryStatus is a metric's governance status.
 type RegistryStatus string
@@ -36,10 +39,6 @@ const (
 	// 11/12). Shadow-emitted only — no alert, recording rule, SLO or HPA may
 	// depend on it until governance marks it Canonical.
 	StatusProposed RegistryStatus = "proposed"
-
-	// StatusDeprecated: a non-compliant legacy metric kept for the
-	// compatibility period; removed after Sunset.
-	StatusDeprecated RegistryStatus = "deprecated"
 )
 
 // Tier is the standard's metric tier.
@@ -48,7 +47,6 @@ type Tier string
 // Tiers.
 const (
 	TierPlatform Tier = "platform" // Tier 1: platform_*
-	TierLegacy   Tier = "legacy"   // pre-standard name, fits no tier
 )
 
 // MetricType is the Prometheus metric type.
@@ -91,24 +89,15 @@ type RegistryEntry struct {
 	// AggregationNotes: how the metric is queried across services/domains.
 	AggregationNotes string
 
-	// Supersedes (Tier 1) names the legacy metrics this entry replaces;
-	// SupersededBy (Deprecated) names the successors.
-	Supersedes   []string
-	SupersededBy []string
-
-	// Sunset (Deprecated): earliest removal, subject to governance.
-	Sunset string
-
 	// GovernanceNotes records open questions for the reviewing body.
 	GovernanceNotes string
 }
 
-// Identity labels (Tier 1 required labels) and the legacy const label.
+// Identity labels (Tier 1 required labels).
 const (
 	LabelDomain      = "domain"
 	LabelService     = "service"
 	LabelEnvironment = "environment"
-	LabelVersion     = "version"
 )
 
 // PlatformRequiredLabels are the standard's mandated Tier 1 labels.
@@ -187,8 +176,6 @@ const (
 
 const proposedGovernance = "New platform_* name (not among the standard's canonical or registry-proposed examples); submitted under the Registry Ratification Requirement. Shadow-emitted until ratified."
 
-const legacySunset = "Not before the first release ≥ 2027-04-01 and only after every consumer has migrated dashboards, alerts, recording rules, SLOs and HPA to the platform_* successor (standard §Backward Compatibility steps 2–8); final date set by observability governance."
-
 func platformEntry(status RegistryStatus, e RegistryEntry) RegistryEntry {
 	e.Tier = TierPlatform
 	e.Status = status
@@ -197,22 +184,6 @@ func platformEntry(status RegistryStatus, e RegistryEntry) RegistryEntry {
 		e.GovernanceNotes = proposedGovernance
 	}
 	return e
-}
-
-func legacyEntry(name string, typ MetricType, labels []string, successors []string, def string) RegistryEntry {
-	return RegistryEntry{
-		Name:               name,
-		Type:               typ,
-		Tier:               TierLegacy,
-		Status:             StatusDeprecated,
-		SemanticDefinition: def,
-		RequiredLabels:     []string{LabelService},
-		ApprovedLabels:     labels,
-		Cardinality:        "Unchanged from pre-standard releases (queue/topic carry the full URL/ARN).",
-		AggregationNotes:   "Keep existing queries working during the compatibility period; migrate them to the successor.",
-		SupersededBy:       successors,
-		Sunset:             legacySunset,
-	}
 }
 
 // Registry returns every metric platform-events registers.
@@ -239,7 +210,6 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    queueAndType,
 			Cardinality:        "queue (≤5) × event_type (registered types a service consumes, typically ≤30).",
 			AggregationNotes:   `Success ratio: sum by (domain, service) (rate(platform_messages_processed_total[5m])) / sum by (domain, service) (rate(platform_messages_received_total[5m])).`,
-			Supersedes:         []string{"events_consumed_total"},
 			GovernanceNotes:    "Canonical name per the standard. event_type is an approved dimension.",
 		}),
 		platformEntry(StatusCanonical, RegistryEntry{
@@ -251,7 +221,6 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    queueAndType,
 			Cardinality:        "queue (≤5) × event_type (≤30) × reason (5); malformed always has event_type=unknown.",
 			AggregationNotes:   `Failure ratio: sum by (domain, service) (rate(platform_messages_failed_total[5m])) / sum by (domain, service) (rate(platform_messages_received_total[5m])). Poison producers: sum by (domain, service, queue) (rate(platform_messages_failed_total{reason="malformed"}[15m])).`,
-			Supersedes:         []string{"events_consumed_total"},
 			GovernanceNotes:    "Canonical name per the standard. The reason vocabulary is requested for approval.",
 		}),
 		platformEntry(StatusCanonical, RegistryEntry{
@@ -263,7 +232,6 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    eventType,
 			Cardinality:        "operation (2) × event_type (≤30).",
 			AggregationNotes:   "Retry pressure per service: sum by (domain, service, operation) (rate(platform_retry_total[5m])).",
-			Supersedes:         []string{"outbox_attempts_total"},
 			GovernanceNotes:    "Canonical name per the standard, but IAM services already register platform_retry_total with conflicting label sets ({target_service,endpoint}; {event_type,reason}). In such a service registration is refused and reported as a RegistrationWarning (fail-soft), so the reference alerts do not depend on this metric until governance approves ONE label vocabulary.",
 		}),
 		platformEntry(StatusCanonical, RegistryEntry{
@@ -275,7 +243,6 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    eventType,
 			Cardinality:        "operation (2) × event_type (≤30) × reason (5).",
 			AggregationNotes:   "Dead-letter inflow: sum by (domain, service, operation, reason) (increase(platform_dlq_messages_total[15m])). Any sustained non-zero rate needs attention.",
-			Supersedes:         []string{"events_consumed_total", "outbox_dead_letters_total", "events_dlq_forwarded_total"},
 			GovernanceNotes:    "Canonical name per the standard. operation and reason vocabularies are requested for approval.",
 		}),
 
@@ -288,8 +255,7 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    queueAndType,
 			Cardinality:        "queue (≤5) × event_type (≤30).",
 			AggregationNotes:   "Duplicate ratio: sum by (domain, service) (rate(platform_duplicate_messages_total[15m])) / sum by (domain, service) (rate(platform_messages_received_total[15m])).",
-			Supersedes:         []string{"events_inbox_duplicates_total"},
-			GovernanceNotes:    "Registry-proposed example in the standard. The legacy metric's consumer label is replaced by queue.",
+			GovernanceNotes:    "Registry-proposed example in the standard. Labelled by queue, not by the inbox ledger's consumer name, so it joins with the other consumer metrics.",
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_dependency_request_seconds",
@@ -299,12 +265,7 @@ func Registry() []RegistryEntry {
 			LabelValues:        map[string][]string{"dependency": DependencyValues, "operation": DependencyOperationValues, "outcome": OutcomeValues},
 			Cardinality:        "dependency × operation (10 valid pairs) × outcome (2) × 12 buckets.",
 			AggregationNotes:   `Error ratio: sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count{outcome="error"}[5m])) / sum by (domain, service, dependency) (rate(platform_dependency_request_seconds_count[5m])). p99 (long-poll receives excluded): histogram_quantile(0.99, sum by (le, domain, service, dependency, operation) (rate(platform_dependency_request_seconds_bucket{operation!="receive_message"}[5m]))).`,
-			Supersedes: []string{
-				"events_publish_duration_seconds", "events_codec_encode_total", "events_codec_encode_duration_seconds",
-				"events_codec_decode_total", "events_codec_decode_duration_seconds",
-				"sqs_receive_errors_total", "sqs_delete_errors_total", "sqs_visibility_extension_errors_total",
-			},
-			GovernanceNotes: "Registry-proposed example in the standard. IAM services register this name with conflicting label sets ({target_service,endpoint} vs {dependency,operation,outcome}); platform-events uses {dependency,operation,outcome}. Where a service's registry already holds another shape the metric is disabled with a RegistrationWarning (fail-soft).",
+			GovernanceNotes:    "Registry-proposed example in the standard. IAM services register this name with conflicting label sets ({target_service,endpoint} vs {dependency,operation,outcome}); platform-events uses {dependency,operation,outcome}. Where a service's registry already holds another shape the metric is disabled with a RegistrationWarning (fail-soft).",
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_event_propagation_seconds",
@@ -314,7 +275,7 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    queueAndType,
 			Cardinality:        "queue (≤5) × event_type (≤30) × 14 buckets.",
 			AggregationNotes:   "p95 propagation per consumer: histogram_quantile(0.95, sum by (le, domain, service, queue) (rate(platform_event_propagation_seconds_bucket[5m]))). Includes producer clock skew.",
-			GovernanceNotes:    "Registry-proposed example in the standard. New signal (no legacy predecessor).",
+			GovernanceNotes:    "Registry-proposed example in the standard. New signal.",
 		}),
 
 		platformEntry(StatusProposed, RegistryEntry{
@@ -358,7 +319,6 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    map[string]string{"topic": TopicLabelRule, "event_type": EventTypeLabelRule},
 			Cardinality:        "topic (≤3) × event_type (≤30) × outcome (2).",
 			AggregationNotes:   `Publish error ratio: sum by (domain, service, topic) (rate(platform_messages_published_total{outcome="error"}[5m])) / sum by (domain, service, topic) (rate(platform_messages_published_total[5m])).`,
-			Supersedes:         []string{"events_published_total"},
 			GovernanceNotes:    proposedGovernance + " The producer-side counterpart of platform_messages_received_total; requests approval of a topic label.",
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
@@ -369,7 +329,6 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    queueAndType,
 			Cardinality:        "queue (≤5) × event_type (≤30) × 14 buckets.",
 			AggregationNotes:   "p99 handler latency: histogram_quantile(0.99, sum by (le, domain, service, queue) (rate(platform_message_processing_duration_seconds_bucket[5m]))).",
-			Supersedes:         []string{"events_consume_duration_seconds"},
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_pending_events",
@@ -377,7 +336,6 @@ func Registry() []RegistryEntry {
 			SemanticDefinition: "Events in a service's transactional outbox that are due to be published (unpublished, not leased and not waiting out a retry backoff), sampled every outbox GaugeInterval (default 15s) and capped at 100000 (a reading of 100000 means at least that many). Left at its last value when the count query fails (see platform_outbox_errors_total{operation=\"pending_count\"}).",
 			Cardinality:        "One series per service instance.",
 			AggregationNotes:   "Backlog per service: max by (domain, service) (platform_outbox_pending_events) — every runner reads the same table, so use max, not sum.",
-			Supersedes:         []string{"outbox_pending_total"},
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_leased_events",
@@ -385,7 +343,6 @@ func Registry() []RegistryEntry {
 			SemanticDefinition: "Unpublished outbox events not yet due: claimed by a runner and being published, or waiting out a retry backoff. Sampled every GaugeInterval, capped at 100000.",
 			Cardinality:        "One series per service instance.",
 			AggregationNotes:   "max by (domain, service) (platform_outbox_leased_events).",
-			Supersedes:         []string{"outbox_leased_total"},
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_oldest_pending_age",
@@ -423,7 +380,6 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    eventType,
 			Cardinality:        "event_type (≤30) × outcome (2).",
 			AggregationNotes:   `Outbox publish error ratio: sum by (domain, service) (rate(platform_outbox_publish_attempts_total{outcome="error"}[5m])) / sum by (domain, service) (rate(platform_outbox_publish_attempts_total[5m])).`,
-			Supersedes:         []string{"outbox_published_total", "outbox_attempts_total"},
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_errors_total",
@@ -433,7 +389,6 @@ func Registry() []RegistryEntry {
 			LabelValues:        map[string][]string{"operation": OutboxErrorOperationValues},
 			Cardinality:        "operation (7).",
 			AggregationNotes:   "sum by (domain, service, operation) (rate(platform_outbox_errors_total[5m])) > 0.",
-			Supersedes:         []string{"outbox_poll_errors_total", "outbox_unmarshal_errors_total", "outbox_mark_published_errors_total"},
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_dead_letter_operations_total",
@@ -443,7 +398,6 @@ func Registry() []RegistryEntry {
 			LabelValues:        map[string][]string{"operation": DeadLetterOperationValues},
 			Cardinality:        "operation (2).",
 			AggregationNotes:   "Audit trail: sum by (domain, service, operation) (increase(platform_outbox_dead_letter_operations_total[1d])).",
-			Supersedes:         []string{"outbox_dead_letters_reprocessed_total", "outbox_dead_letters_discarded_total"},
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_telemetry_label_overflow_total",
@@ -453,7 +407,6 @@ func Registry() []RegistryEntry {
 			LabelValues:        map[string][]string{"label": OverflowLabelValues},
 			Cardinality:        "label (1).",
 			AggregationNotes:   "sum by (domain, service, label) (rate(platform_telemetry_label_overflow_total[15m])) > 0.",
-			Supersedes:         []string{"events_oversized_event_type_label_total"},
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_library_info",
@@ -464,36 +417,8 @@ func Registry() []RegistryEntry {
 			LabelValueRules:    map[string]string{"library_version": LibraryVersionLabelRule},
 			Cardinality:        "One series per service instance.",
 			AggregationNotes:   "Services still on an old version: count by (library_version) (platform_library_info{library=\"platform-events\"}).",
-			Supersedes:         []string{"platform_events_build_info"},
-			GovernanceNotes:    proposedGovernance + " Intended to be shared by every platform library (platform-pgcommon, platform-gincommon); the legacy build_info carried the service's own version, which is not in the Tier 1 vocabulary.",
+			GovernanceNotes:    proposedGovernance + " Intended to be shared by every platform library (platform-pgcommon, platform-gincommon). It carries the library's module version, never the service's own build version (not in the Tier 1 vocabulary).",
 		}),
-
-		// ── Legacy (Deprecated, compatibility period) ────────────────────
-		legacyEntry("platform_events_build_info", TypeGauge, []string{LabelVersion}, []string{"platform_library_info"}, "Legacy build-info gauge (always 1) carrying the service name and the service's build version."),
-		legacyEntry("events_published_total", TypeCounter, []string{"topic", "event_type", "status"}, []string{"platform_messages_published_total"}, "Legacy publish counter (status=success|error)."),
-		legacyEntry("events_publish_duration_seconds", TypeHistogram, []string{"topic", "event_type"}, []string{"platform_dependency_request_seconds"}, "Legacy SNS publish duration."),
-		legacyEntry("events_consumed_total", TypeCounter, []string{"queue", "event_type", "status"}, []string{"platform_messages_processed_total", "platform_messages_failed_total", "platform_dlq_messages_total"}, "Legacy consume counter (status=success|error|malformed|dlq_success|dlq_error)."),
-		legacyEntry("events_consume_duration_seconds", TypeHistogram, []string{"queue", "event_type"}, []string{"platform_message_processing_duration_seconds"}, "Legacy handler duration."),
-		legacyEntry("events_codec_encode_total", TypeCounter, []string{"topic", "event_type", "status"}, []string{"platform_dependency_request_seconds"}, "Legacy codec encode counter (status=success|noop|error)."),
-		legacyEntry("events_codec_encode_duration_seconds", TypeHistogram, []string{"topic", "event_type"}, []string{"platform_dependency_request_seconds"}, "Legacy codec encode duration."),
-		legacyEntry("events_codec_decode_total", TypeCounter, []string{"queue", "event_type", "status"}, []string{"platform_dependency_request_seconds"}, "Legacy codec decode counter (status=success|error)."),
-		legacyEntry("events_codec_decode_duration_seconds", TypeHistogram, []string{"queue", "event_type"}, []string{"platform_dependency_request_seconds"}, "Legacy codec decode duration."),
-		legacyEntry("outbox_pending_total", TypeGauge, nil, []string{"platform_outbox_pending_events"}, "Legacy pending-outbox gauge (-1 = stale reading)."),
-		legacyEntry("outbox_leased_total", TypeGauge, nil, []string{"platform_outbox_leased_events"}, "Legacy leased-outbox gauge."),
-		legacyEntry("outbox_published_total", TypeCounter, []string{"event_type", "status"}, []string{"platform_outbox_publish_attempts_total"}, "Legacy outbox publish outcome counter."),
-		legacyEntry("outbox_attempts_total", TypeCounter, []string{"event_type"}, []string{"platform_outbox_publish_attempts_total", "platform_retry_total"}, "Legacy outbox publish attempt counter."),
-		legacyEntry("outbox_dead_letters_total", TypeCounter, []string{"event_type"}, []string{"platform_dlq_messages_total"}, "Legacy outbox dead-letter counter."),
-		legacyEntry("outbox_dead_letters_reprocessed_total", TypeCounter, nil, []string{"platform_outbox_dead_letter_operations_total"}, "Legacy reprocessed dead-letter counter."),
-		legacyEntry("outbox_dead_letters_discarded_total", TypeCounter, nil, []string{"platform_outbox_dead_letter_operations_total"}, "Legacy discarded dead-letter counter."),
-		legacyEntry("sqs_receive_errors_total", TypeCounter, []string{"queue"}, []string{"platform_dependency_request_seconds"}, "Legacy ReceiveMessage error counter."),
-		legacyEntry("sqs_delete_errors_total", TypeCounter, []string{"queue"}, []string{"platform_dependency_request_seconds"}, "Legacy DeleteMessage error counter."),
-		legacyEntry("sqs_visibility_extension_errors_total", TypeCounter, []string{"queue"}, []string{"platform_dependency_request_seconds"}, "Legacy ChangeMessageVisibility error counter."),
-		legacyEntry("outbox_poll_errors_total", TypeCounter, nil, []string{"platform_outbox_errors_total"}, "Legacy outbox poll error counter."),
-		legacyEntry("outbox_unmarshal_errors_total", TypeCounter, nil, []string{"platform_outbox_errors_total"}, "Legacy outbox unmarshal error counter."),
-		legacyEntry("outbox_mark_published_errors_total", TypeCounter, nil, []string{"platform_outbox_errors_total"}, "Legacy MarkPublished error counter."),
-		legacyEntry("events_inbox_duplicates_total", TypeCounter, []string{"consumer"}, []string{"platform_duplicate_messages_total"}, "Legacy inbox duplicate counter."),
-		legacyEntry("events_dlq_forwarded_total", TypeCounter, []string{"queue", "event_type", "status"}, []string{"platform_dlq_messages_total"}, "Legacy DLQ forward counter (status=success|error)."),
-		legacyEntry("events_oversized_event_type_label_total", TypeCounter, nil, []string{"platform_telemetry_label_overflow_total"}, "Legacy oversized event_type counter."),
 	}
 }
 

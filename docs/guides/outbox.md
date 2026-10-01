@@ -242,7 +242,7 @@ log.Printf("discarded %d irrecoverable dead letters", n)
 
 `Envelope.ID` (UUID v7) is forwarded as the SNS `MessageDeduplicationID` on FIFO topics and as a message attribute on standard topics. Handlers must use `Envelope.ID` as their idempotency key — see [SQS Consumer § Implementing idempotency](consuming.md#implementing-idempotency) for concrete patterns.
 
-A large backlog in `outbox_events` usually indicates downstream delivery issues (SNS/SQS) or insufficient runner throughput — monitor `outbox_pending_total` and scale runners accordingly.
+A large backlog in `outbox_events` usually indicates downstream delivery issues (SNS/SQS) or insufficient runner throughput — monitor `platform_outbox_pending_events` (and `platform_outbox_oldest_pending_age`) and scale runners accordingly.
 
 ### Pruning published records
 

@@ -373,7 +373,7 @@ docs-check:
 
 # dashboards-check: PromQL syntax gate for monitoring/grafana/*.json (same
 # script as platform-pgcommon; requires Docker and jq). Governance — registry
-# metrics, labels, "(Proposed)"/"(legacy)" titles — is metrics-lint's job.
+# metrics, labels, "(Proposed)" titles — is metrics-lint's job.
 .PHONY: dashboards-check
 dashboards-check:
 	PROMETHEUS_IMAGE=$(PROMETHEUS_IMAGE) bash .github/scripts/dashboard-promql.sh

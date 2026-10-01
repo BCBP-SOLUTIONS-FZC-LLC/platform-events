@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -543,8 +543,7 @@ func TestRunner_Restart(t *testing.T) {
 // ----------------------------
 
 func TestPublisherBridge_PublishWithMetrics_Success(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("bridge-test", "v0.0.1", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	inner := &fixtures.MockPublisher{}
 	pub := &mockPublicPublisher{inner: inner}
@@ -554,11 +553,11 @@ func TestPublisherBridge_PublishWithMetrics_Success(t *testing.T) {
 	err := bridge.Publish(context.Background(), env)
 	require.NoError(t, err)
 	assert.Len(t, inner.Published(), 1)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CurrentPlatform().OutboxAttempts.WithLabelValues("bridge.event", "success")), 0)
 }
 
 func TestPublisherBridge_PublishWithMetrics_Error(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("bridge-err-test", "v0.0.2", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	inner := &fixtures.MockPublisher{}
 	inner.SetError(errors.New("publish failed"))
@@ -568,6 +567,7 @@ func TestPublisherBridge_PublishWithMetrics_Error(t *testing.T) {
 	env := domain.NewEnvelope("bridge.fail", "svc", json.RawMessage(`{}`))
 	err := bridge.Publish(context.Background(), env)
 	require.Error(t, err)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CurrentPlatform().OutboxAttempts.WithLabelValues("bridge.fail", "error")), 0)
 }
 
 // ----------------------------
@@ -575,8 +575,7 @@ func TestPublisherBridge_PublishWithMetrics_Error(t *testing.T) {
 // ----------------------------
 
 func TestRunner_PollOnce_UpdatesPendingGauge(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("poll-once-test", "v0.0.3", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	store := newMockOutboxStore()
 	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
@@ -1129,8 +1128,7 @@ func TestRunner_ReprocessDeadLetters_Error(t *testing.T) {
 // RecordUnmarshalError path. When a record payload cannot be unmarshalled the runner
 // must mark the record failed (not panic) and log an ERROR.
 func TestRunner_UnmarshalError_MarksRecordFailed(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("runner-unmarshal-err", "v0.0.1", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	store := newMockOutboxStore()
 	store.records = []domain.OutboxRecord{
@@ -1170,6 +1168,7 @@ func TestRunner_UnmarshalError_MarksRecordFailed(t *testing.T) {
 	defer store.mu.Unlock()
 	assert.Contains(t, store.failed, "bad-json-record", "invalid-JSON record must be marked failed")
 	assert.Empty(t, inner.Published(), "invalid-JSON record must not be published")
+	assert.Positive(t, outboxErrors(t, "unmarshal"), "platform_outbox_errors_total{operation=\"unmarshal\"}")
 }
 
 // ----------------------------
@@ -1189,8 +1188,7 @@ func (s *markPublishedErrStore) MarkPublished(_ context.Context, _ string) error
 // RecordMarkPublishedError path. After a successful publish, if MarkPublished fails
 // the runner must log the error and continue (the record will be re-delivered).
 func TestRunner_MarkPublishedError_LogsError(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("runner-mark-published-err", "v0.0.2", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	base := newMockOutboxStore()
 	store := &markPublishedErrStore{mockOutboxStore: base}
@@ -1238,6 +1236,7 @@ func TestRunner_MarkPublishedError_LogsError(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected ERROR log when MarkPublished fails after successful publish")
+	assert.Positive(t, outboxErrors(t, "mark_published"), "platform_outbox_errors_total{operation=\"mark_published\"}")
 }
 
 // ----------------------------
@@ -1269,8 +1268,7 @@ func (s *errPendingStore) LeasedCount(_ context.Context) (int64, error) {
 // When metrics are registered and PendingCount returns an error the runner must log a
 // WARN (not an ERROR) and set the gauge to -1, then continue the poll cycle normally.
 func TestRunner_PollOnce_PendingCountError(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("poll-once-pend-err", "v0.0.1", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	base := newMockOutboxStore()
 	store := &errPendingStore{
@@ -1303,14 +1301,14 @@ func TestRunner_PollOnce_PendingCountError(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected WARN log when PendingCount returns an error")
+	assert.Positive(t, outboxErrors(t, "pending_count"), "platform_outbox_errors_total{operation=\"pending_count\"}")
 }
 
 // TestRunner_PollOnce_LeasedCountError exercises the leasedErr != nil branch in pollOnce.
 // When metrics are registered and LeasedCount returns an error the runner must log a
 // WARN (not an ERROR) and continue the poll cycle without setting the leased gauge.
 func TestRunner_PollOnce_LeasedCountError(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("poll-once-leased-err", "v0.0.2", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	base := newMockOutboxStore()
 	store := &errPendingStore{
@@ -1342,6 +1340,7 @@ func TestRunner_PollOnce_LeasedCountError(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "expected WARN log when LeasedCount returns an error")
+	assert.Positive(t, outboxErrors(t, "leased_count"), "platform_outbox_errors_total{operation=\"leased_count\"}")
 }
 
 // ----------------------------
@@ -1654,7 +1653,7 @@ func TestRunner_ReadyBeforeStart(t *testing.T) {
 // The backlog gauges refresh on GaugeInterval, not every poll: a fast poll
 // must not multiply the COUNT queries on the database.
 func TestRunner_GaugesRefreshOnTheirOwnInterval(t *testing.T) {
-	metrics.InitWithRegisterer("gauge-interval", "v0", prometheus.NewRegistry())
+	fixtures.InitPlatformMetrics(t)
 	store := newMockOutboxStore()
 	r, err := outbox.NewRunner(outbox.Config{
 		Store:         store,
@@ -1677,10 +1676,7 @@ func TestRunner_GaugesRefreshOnTheirOwnInterval(t *testing.T) {
 // The oldest-pending-age gauge is refreshed with the backlog gauges; a failed
 // query leaves it unchanged and is counted.
 func TestRunner_OldestPendingAgeGauge(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "runner-test", Environment: "dev"}, reg)
-	require.NoError(t, err)
-	t.Cleanup(func() { metrics.InitWithRegisterer("runner-reset", "v0", prometheus.NewRegistry()) })
+	reg := fixtures.InitPlatformMetrics(t)
 
 	run := func(store *mockOutboxStore) {
 		r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}}, PollInterval: time.Hour})
@@ -1717,10 +1713,7 @@ func TestRunner_OldestPendingAgeGauge(t *testing.T) {
 // key's backlog drains in one tick instead of one record per PollInterval;
 // and it samples the ordering-blocked gauge.
 func TestRunner_RepollsWhilePublishingAndGauges(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "strict-test", Environment: "dev"}, reg)
-	require.NoError(t, err)
-	t.Cleanup(func() { metrics.InitWithRegisterer("runner-reset", "v0", prometheus.NewRegistry()) })
+	reg := fixtures.InitPlatformMetrics(t)
 
 	store := newMockOutboxStore()
 	store.blocked = 2
@@ -1759,9 +1752,7 @@ func TestRunner_RepollsWhilePublishingAndGauges(t *testing.T) {
 
 // Failed gauge queries are logged and leave the gauges unchanged.
 func TestRunner_GaugeQueryErrorsLogged(t *testing.T) {
-	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "gauge-err", Environment: "dev"}, prometheus.NewRegistry())
-	require.NoError(t, err)
-	t.Cleanup(func() { metrics.InitWithRegisterer("runner-reset", "v0", prometheus.NewRegistry()) })
+	fixtures.InitPlatformMetrics(t)
 	store := newMockOutboxStore()
 	store.blockedErr = errors.New("db down")
 	store.oldestErr = errors.New("db down")
@@ -1888,4 +1879,13 @@ func TestRunner_StopEndsRepollLoop(t *testing.T) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	assert.Less(t, len(store.published), 500, "the loop stopped before draining everything")
+}
+
+// outboxErrors returns platform_outbox_errors_total{operation=op} of the
+// active Tier 1 set.
+func outboxErrors(t *testing.T, op string) float64 {
+	t.Helper()
+	p := metrics.CurrentPlatform()
+	require.NotNil(t, p)
+	return testutil.ToFloat64(p.OutboxErrors.WithLabelValues(op))
 }

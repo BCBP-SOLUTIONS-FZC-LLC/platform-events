@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed — BREAKING: legacy (pre-standard) metrics, no compatibility period
+
+platform-events now emits **only** its Tier 1 `platform_*` metrics. The pre-standard `events_*` / `outbox_*` / `sqs_*` metrics and `platform_events_build_info`, which v1.6.0 emitted in parallel, are gone. The Enterprise Platform Observability Standard's compatibility period (old and new names in parallel until a sunset) **does not apply: no release of the platform libraries emitting the legacy names was ever deployed to dev or production**, so there are no dashboards, alerts, SLOs or HPAs to migrate gradually. The central Platform Observability Registry (platform-gincommon) records every removed name with status `removed` and its successors. Every `platform_*` metric is unchanged: name, labels, values, buckets and help text.
+
+- **Exported API removed / changed (`pkg/events`):**
+  - `Init(serviceName, buildVersion)` and `InitWithRegisterer(serviceName, buildVersion, reg)` — removed. They registered only the legacy metrics, without the mandatory identity. Use `InitMetrics(events.MetricsIdentity{Domain: "<domain>", Service: "<service>"}, reg)` (the identity is mandatory; an empty `Environment` is read from `APP_ENV` → `ENVIRONMENT` → `dev`) and log the returned `RegistrationWarning`s.
+  - `WithoutLegacyMetrics()` — removed; drop the option (there is nothing left to switch off).
+  - `MetricsIdentity.Version` — removed. It fed only the legacy build-info gauge; `platform_library_info` reports the platform-events module version. Drop the field from composite literals.
+  - `MetricsIdentityFromEnv(domain, service, version)` → `MetricsIdentityFromEnv(domain, service)`.
+  - `MetricsIdentityFromLabels` ignores a `version` key.
+  - `MetricStatusDeprecated` — removed; `MetricsRegistry()` returns only Canonical and Proposed Tier 1 entries.
+  - `MetricsRegistryEntry` — fields `Supersedes`, `SupersededBy` and `Sunset` removed (the lineage lives in the central registry); the `legacy` tier no longer exists.
+  - `InitMetrics` — same signature; it returns an error only for an invalid or missing identity (there is no legacy registration to fail). Platform metrics stay fail-soft (`RegistrationWarning`).
+- **Metric migration** (label sets differ — rewrite the query, don't just rename):
+
+| Removed | Successor |
+|---|---|
+| `events_published_total{topic,event_type,status}` | `platform_messages_published_total{topic,event_type,outcome}` — `topic` is the topic **name**, not the ARN; `status` → `outcome` |
+| `events_publish_duration_seconds` | `platform_dependency_request_seconds{dependency="sns",operation=~"publish\|publish_batch"}` — per SNS call, not per event |
+| `events_consumed_total{status="success"}` | `platform_messages_processed_total` |
+| `events_consumed_total{status=~"error\|malformed"}` | `platform_messages_failed_total{reason}` (`handler_error`, `handler_panic`, `malformed`, `decode_error`) |
+| `events_consumed_total{status="dlq_success"}` / `{status="dlq_error"}` | `platform_dlq_messages_total{operation="consume",reason}` / `platform_messages_failed_total{reason="dead_letter_error"}` |
+| `events_consume_duration_seconds` | `platform_message_processing_duration_seconds` |
+| `events_codec_encode_total`, `events_codec_encode_duration_seconds` | `platform_dependency_request_seconds{dependency="codec",operation="encode",outcome}` (`noop` encodes are plain successes) |
+| `events_codec_decode_total`, `events_codec_decode_duration_seconds` | `platform_dependency_request_seconds{dependency="codec",operation="decode",outcome}` |
+| `outbox_pending_total` | `platform_outbox_pending_events` — never `-1`: a failed count keeps the last value and increments `platform_outbox_errors_total{operation="pending_count"}` |
+| `outbox_leased_total` | `platform_outbox_leased_events` |
+| `outbox_published_total{event_type,status}` | `platform_outbox_publish_attempts_total{event_type,outcome}` |
+| `outbox_attempts_total{event_type}` | `sum without (outcome) (platform_outbox_publish_attempts_total)`; attempts left for retry: `platform_retry_total{operation="outbox_publish"}` |
+| `outbox_dead_letters_total` | `platform_dlq_messages_total{operation="outbox_publish",reason="max_attempts"}` |
+| `outbox_dead_letters_reprocessed_total` / `outbox_dead_letters_discarded_total` | `platform_outbox_dead_letter_operations_total{operation="reprocess"}` / `{operation="discard"}` |
+| `outbox_poll_errors_total` / `outbox_unmarshal_errors_total` / `outbox_mark_published_errors_total` | `platform_outbox_errors_total{operation="poll"}` / `{operation="unmarshal"}` / `{operation="mark_published"}` |
+| `sqs_receive_errors_total{queue}` | `platform_dependency_request_seconds_count{dependency="sqs",operation="receive_message",outcome="error"}` — **no `queue` label** (per service) |
+| `sqs_delete_errors_total` / `sqs_visibility_extension_errors_total` | same, `operation="delete_message"` / `operation="change_message_visibility"` |
+| `events_inbox_duplicates_total{consumer}` | `platform_duplicate_messages_total{queue,event_type}` |
+| `events_dlq_forwarded_total{status="success"}` | `platform_dlq_messages_total{operation="consume",reason}` (counted once per dead-lettered message) |
+| `events_dlq_forwarded_total{status="error"}` | `platform_dependency_request_seconds_count{dependency="sqs",operation="send_message",outcome="error"}` |
+| `events_oversized_event_type_label_total` | `platform_telemetry_label_overflow_total{label="event_type"}` — also counts values over the per-process limit (`__other__`) |
+| `platform_events_build_info{service,version}` | `platform_library_info{library,library_version}` — the library version, not the service's build version |
+
+### Changed
+
+- **Reference monitoring moved to the successors.** `monitoring/prometheus/platform-events.rules.yml`: the producer, outbox and SQS-client recording rules and alerts (`PlatformEventsPublishErrors`, `…OutboxBacklog`, `…OutboxPendingUnknown`, `…OutboxPollFailing`, `…OutboxDuplicateDeliveryRisk`, `…SQSReceiveFailing`) now query `platform_*` metrics, aggregated by `{domain, service, environment}`. Their successors are still **Proposed and await governance ratification**, so they live in the new `platform_events.proposed.recording` / `platform_events.proposed.alerts` groups and every alert there carries `metric_status: proposed` for routing. `PlatformEventsOversizedEventType` is renamed `PlatformEventsEventTypeLabelOverflow` (it now also fires on `__other__`). The Grafana dashboard's legacy row is replaced by Proposed outbox panels; the KEDA example scales on `platform_outbox_pending_events` and carries `observability.platform/metric-status: proposed`.
+- **`make metrics-lint`** now fails if any removed legacy name is registered or emitted, requires rules on Proposed metrics to sit in `*.proposed` groups (alerts labelled `metric_status: proposed`), and requires the KEDA annotation on manifests scaling on a Proposed metric.
+- **Tests:** `test/fixtures.InitPlatformMetrics(t)` / `MustInitPlatformMetrics()` replace the legacy `InitWithRegisterer` test reset. `TestStandard_ExportScrape` writes a full scrape to `$METRICS_SCRAPE_OUT` for `metricslint check`.
+
 ## [1.6.1] - 2026-10-02
 
 ### Upgrade notes

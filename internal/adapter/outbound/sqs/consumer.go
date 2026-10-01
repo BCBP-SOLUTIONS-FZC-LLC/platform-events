@@ -463,7 +463,6 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 			default:
 			}
 			metrics.ObserveDependency("sqs", "receive_message", err, rcvDur)
-			metrics.RecordSQSReceiveError(c.queueURL)
 			if c.logger != nil {
 				c.logger.Error("sqs: receive message failed", map[string]any{"error": err.Error()})
 			}
@@ -814,7 +813,6 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			metrics.ObserveDependency("codec", "decode", decErr, dur)
 		}
 		if decErr != nil {
-			metrics.RecordCodecDecode(c.queueURL, env.Type, "error", dur.Seconds())
 			metrics.IncFailed(c.queueURL, env.Type, "decode_error")
 			if timedOut() {
 				metrics.IncTimeout(c.queueURL, env.Type, "decode")
@@ -838,7 +836,6 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			return
 		}
 		env.Payload = decoded
-		metrics.RecordCodecDecode(c.queueURL, env.Type, "success", dur.Seconds())
 	}
 
 	// Route to dead-letter handler when ApproximateReceiveCount reaches the threshold.
@@ -877,9 +874,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			}
 			dur := time.Since(start)
 
-			dlhStatus := "success"
 			if dlhErr != nil {
-				dlhStatus = "error"
 				// A failed DLQ forward was already logged by forwardToDLQ.
 				if c.logger != nil && !errors.Is(dlhErr, errDLQForwardFailed) {
 					c.logger.Error("sqs: dead-letter handler failed — message left visible for retry", map[string]any{
@@ -900,9 +895,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 					"forwarded_to_dlq":          c.dlq != nil,
 				})
 			}
-			// Emit the same consume metrics for DLH invocations so dashboards and
-			// alerts can distinguish DLH activity from normal handler activity.
-			metrics.RecordConsume(c.queueURL, env.Type, "dlq_"+dlhStatus, dur.Seconds())
+
 			if c.deadLetterHandler != nil {
 				metrics.ObserveProcessingDuration(c.queueURL, env.Type, dur)
 			}
@@ -991,16 +984,13 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		panicErr := fmt.Errorf("handler panic: %v", handlerPanic)
 		span.RecordError(panicErr)
 		span.SetStatus(codes.Error, panicErr.Error())
-		metrics.RecordConsume(c.queueURL, env.Type, "error", dur.Seconds())
 		metrics.ObserveProcessingDuration(c.queueURL, env.Type, dur)
 		metrics.IncFailed(c.queueURL, env.Type, "handler_panic")
 		metrics.IncRetry("consume", env.Type)
 		panic(handlerPanic) // propagate to goroutine-level recovery for stack logging
 	}
 
-	status := "success"
 	if handlerErr != nil {
-		status = "error"
 		span.RecordError(handlerErr)
 		span.SetStatus(codes.Error, handlerErr.Error())
 		if c.logger != nil {
@@ -1026,8 +1016,6 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		}
 	}
 	metrics.ObserveProcessingDuration(c.queueURL, env.Type, dur)
-
-	metrics.RecordConsume(c.queueURL, env.Type, status, dur.Seconds())
 	return settled
 }
 
@@ -1166,7 +1154,6 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) *visibilityExtender
 				}
 				metrics.ObserveDependency("sqs", "change_message_visibility", err, time.Since(visStart))
 				if err != nil {
-					metrics.RecordSQSVisibilityError(c.queueURL)
 					if c.logger != nil {
 						// A failed extension means the message may become visible again
 						// while the handler is still running, causing duplicate delivery.
@@ -1316,7 +1303,6 @@ func (c *sqsConsumer) handleMalformed(drainCtx context.Context, msg sqstypes.Mes
 		}
 		c.logger.Error("sqs: message body is not a valid event envelope", fields)
 	}
-	metrics.RecordConsume(c.queueURL, "unknown", "malformed", 0)
 	metrics.IncFailed(c.queueURL, "unknown", "malformed")
 	if c.dlq != nil && !c.forwardToDLQ(drainCtx, context.Background(), msg, "unknown", "malformed", "malformed message body: "+parseErr.Error()) {
 		metrics.IncRetry("consume", "unknown")
@@ -1467,7 +1453,6 @@ func (c *sqsConsumer) deleteMessage(msg sqstypes.Message) error {
 	})
 	metrics.ObserveDependency("sqs", "delete_message", err, time.Since(start))
 	if err != nil {
-		metrics.RecordSQSDeleteError(c.queueURL)
 		if c.logger != nil {
 			c.logger.Error("sqs: failed to delete message", map[string]any{
 				"message_id": aws.ToString(msg.MessageId),

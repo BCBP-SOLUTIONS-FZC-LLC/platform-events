@@ -211,7 +211,7 @@ func TestConsumer_QueueDepthMetrics(t *testing.T) {
 	prev := metrics.CurrentPlatform()
 	t.Cleanup(func() { metrics.ReplacePlatform(prev) })
 	reg := prometheus.NewRegistry()
-	_, err = events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "it", Environment: "test"}, reg, events.WithoutLegacyMetrics())
+	_, err = events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "it", Environment: "test"}, reg)
 	require.NoError(t, err)
 
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{QueueURL: sourceURL, Region: "us-east-1", EndpointURL: emu.EndpointURL, WaitSeconds: 1},
