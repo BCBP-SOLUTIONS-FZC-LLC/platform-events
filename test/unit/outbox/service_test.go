@@ -10,8 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -23,29 +21,11 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
-// noopTx is a minimal pgcommon.Tx stub used to avoid nil-tx panics when testing
-// OutboxService.Enqueue with a store that returns an error immediately.
-type noopTx struct{}
-
-func (noopTx) Begin(_ context.Context) (pgcommon.Tx, error) { return nil, errors.New("noop") }
-func (noopTx) Commit(_ context.Context) error               { return nil }
-func (noopTx) Rollback(_ context.Context) error             { return nil }
-func (noopTx) CopyFrom(_ context.Context, _ pgx.Identifier, _ []string, _ pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("noop")
-}
-func (noopTx) SendBatch(_ context.Context, _ *pgx.Batch) pgx.BatchResults { return nil }
-func (noopTx) LargeObjects() pgx.LargeObjects                             { return pgx.LargeObjects{} }
-func (noopTx) Prepare(_ context.Context, _, _ string) (*pgconn.StatementDescription, error) {
-	return nil, errors.New("noop")
-}
-func (noopTx) Exec(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, nil
-}
-func (noopTx) Query(_ context.Context, _ string, _ ...any) (pgcommon.Rows, error) {
-	return nil, errors.New("noop")
-}
-func (noopTx) QueryRow(_ context.Context, _ string, _ ...any) pgcommon.Row { return nil }
-func (noopTx) Conn() *pgx.Conn                                             { return nil }
+// noopTx is a non-nil pgcommon.Tx for OutboxService.Enqueue tests whose
+// store ignores the transaction. Embedding the interface (left nil) provides
+// every method without naming a pgx type; calling one would panic, flagging an
+// unexpected use of the transaction.
+type noopTx struct{ pgcommon.Tx }
 
 var _ pgcommon.Tx = noopTx{}
 

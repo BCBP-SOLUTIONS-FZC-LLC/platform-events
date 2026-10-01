@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **pgcommon-only now covers tests too.** The last two pgx imports, both in unit-test `pgx.Tx` fakes, are gone: `noopTx` embeds `pgcommon.Tx`, and `stubTx` infers `Exec`'s result type from `pgcommon.Tx` itself (`newStubTx(pgcommon.Tx.Exec)`). The depguard `pgcommon-only` rule applies to every file and also rejects `golang-migrate`. No file in the repository imports pgx, `database/sql` or golang-migrate; pgx is only an indirect dependency through platform-pgcommon.
 - **Shared Postgres container per test package**, with a fresh database per `fixtures.NewTestDB` (both schemas applied, dropped `WITH (FORCE)` on cleanup) instead of a container per test. The integration suite drops from about 116s to about 15s.
 - **Shared floci resources are cleaned up per test:** `CreateTopic` / `CreateQueue` delete what they created when the test ends. Before this, a repeat run (`-count=2`) reused the previous run's queues and read their leftover messages. Found by running the suites twice in one process, which now pass, integration under `-race`.
 - `make ci` runs the same gates as CI (`mod-verify`, `rules-check`, `dashboards-check` added). `.dockerignore` excludes `tools/` and `monitoring/`, so neither invalidates the image build cache. `InitMetrics` documents that it is called once per process. Two README / `test/README.md` commands updated for the `test/` module.

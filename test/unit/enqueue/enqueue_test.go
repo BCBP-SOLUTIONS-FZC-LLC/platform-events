@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -18,67 +16,40 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 )
 
-// stubTx implements pgcommon.Tx for testing — only Exec is meaningful.
-type stubTx struct {
+// stubTx is a pgcommon.Tx for Enqueue tests: it records Exec and returns
+// execErr. The embedded interface (left nil) provides every other method —
+// Enqueue must not call them, and doing so panics. T is Exec's result type
+// (pgx's CommandTag), inferred by newStubTx from pgcommon.Tx itself, so the
+// stub never names a pgx package: database access in this repository goes
+// through platform-pgcommon only, tests included.
+type stubTx[T any] struct {
+	pgcommon.Tx
 	execSQL  string
-	execArgs []interface{}
+	execArgs []any
 	execErr  error
 }
 
-func (s *stubTx) Begin(_ context.Context) (pgcommon.Tx, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (s *stubTx) Commit(_ context.Context) error {
-	return nil
-}
-
-func (s *stubTx) Rollback(_ context.Context) error {
-	return nil
-}
-
-func (s *stubTx) CopyFrom(_ context.Context, _ pgx.Identifier, _ []string, _ pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("not implemented")
-}
-
-func (s *stubTx) SendBatch(_ context.Context, _ *pgx.Batch) pgx.BatchResults {
-	return nil
-}
-
-func (s *stubTx) LargeObjects() pgx.LargeObjects {
-	return pgx.LargeObjects{}
-}
-
-func (s *stubTx) Prepare(_ context.Context, _, _ string) (*pgconn.StatementDescription, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (s *stubTx) Exec(_ context.Context, sql string, arguments ...any) (pgconn.CommandTag, error) {
+func (s *stubTx[T]) Exec(_ context.Context, sql string, arguments ...any) (T, error) {
 	s.execSQL = sql
 	s.execArgs = append(s.execArgs, arguments...)
-	return pgconn.CommandTag{}, s.execErr
+	var tag T
+	return tag, s.execErr
 }
 
-func (s *stubTx) Query(_ context.Context, _ string, _ ...any) (pgcommon.Rows, error) {
-	return nil, errors.New("not implemented")
+// newStubTx returns an empty stubTx. Pass pgcommon.Tx.Exec: its method
+// expression fixes T to the interface's Exec result type.
+func newStubTx[T any](_ func(pgcommon.Tx, context.Context, string, ...any) (T, error)) *stubTx[T] {
+	return &stubTx[T]{}
 }
 
-func (s *stubTx) QueryRow(_ context.Context, _ string, _ ...any) pgcommon.Row {
-	return nil
-}
-
-func (s *stubTx) Conn() *pgx.Conn {
-	return nil
-}
-
-var _ pgcommon.Tx = (*stubTx)(nil)
+var _ pgcommon.Tx = newStubTx(pgcommon.Tx.Exec)
 
 // ----------------------------
 // Enqueue: success
 // ----------------------------
 
 func TestEnqueue_Success(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.NewEnvelope("order.placed", "billing", json.RawMessage(`{"amount":100}`),
 		events.WithTenantID("acme"),
 		events.WithTraceID("trace-001"),
@@ -99,7 +70,8 @@ func TestEnqueue_Success(t *testing.T) {
 // ----------------------------
 
 func TestEnqueue_ExecError(t *testing.T) {
-	tx := &stubTx{execErr: errors.New("db error")}
+	tx := newStubTx(pgcommon.Tx.Exec)
+	tx.execErr = errors.New("db error")
 	env := events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`), events.WithTenantID("acme"))
 
 	err := outbox.Enqueue(context.Background(), tx, env)
@@ -123,7 +95,7 @@ func TestEnqueue_NilTx_ReturnsError(t *testing.T) {
 }
 
 func TestEnqueue_EmptyID_ReturnsError(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.Envelope[json.RawMessage]{Type: "x.y", Source: "svc", Payload: json.RawMessage(`{}`)}
 	err := outbox.Enqueue(context.Background(), tx, env)
 	require.Error(t, err)
@@ -131,7 +103,7 @@ func TestEnqueue_EmptyID_ReturnsError(t *testing.T) {
 }
 
 func TestEnqueue_EmptyType_ReturnsError(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.Envelope[json.RawMessage]{ID: "01926e4f-dead-7000-beef-000000000001", Source: "svc", Payload: json.RawMessage(`{}`)}
 	err := outbox.Enqueue(context.Background(), tx, env)
 	require.Error(t, err)
@@ -139,7 +111,7 @@ func TestEnqueue_EmptyType_ReturnsError(t *testing.T) {
 }
 
 func TestEnqueue_EmptySource_ReturnsError(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.Envelope[json.RawMessage]{ID: "01926e4f-dead-7000-beef-000000000001", Type: "x.y", Payload: json.RawMessage(`{}`)}
 	err := outbox.Enqueue(context.Background(), tx, env)
 	require.Error(t, err)
@@ -147,7 +119,7 @@ func TestEnqueue_EmptySource_ReturnsError(t *testing.T) {
 }
 
 func TestEnqueue_ValidEnvelope_NoExecOnValidationPass(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`), events.WithTenantID("acme"))
 	err := outbox.Enqueue(context.Background(), tx, env)
 	require.NoError(t, err)
@@ -159,7 +131,7 @@ func TestEnqueue_ValidEnvelope_NoExecOnValidationPass(t *testing.T) {
 // ----------------------------
 
 func TestEnqueue_FieldsForwardedCorrectly(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.NewEnvelope("user.created", "iam", json.RawMessage(`{"name":"alice"}`),
 		events.WithTenantID("tenant123"),
 		events.WithTraceID("trace-xyz"),
@@ -180,7 +152,7 @@ func TestEnqueue_FieldsForwardedCorrectly(t *testing.T) {
 }
 
 func TestEnqueue_EmptyTenantID_Succeeds(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.Envelope[json.RawMessage]{
 		ID:        "01926e4f-dead-7000-beef-000000000001",
 		Type:      "x.y",
@@ -194,7 +166,7 @@ func TestEnqueue_EmptyTenantID_Succeeds(t *testing.T) {
 }
 
 func TestEnqueue_SystemTenantID_Succeeds(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.NewEnvelope("system.gc", "scheduler", json.RawMessage(`{}`), events.WithSystemTenant())
 	err := outbox.Enqueue(context.Background(), tx, env)
 	require.NoError(t, err)
@@ -202,7 +174,7 @@ func TestEnqueue_SystemTenantID_Succeeds(t *testing.T) {
 }
 
 func TestEnqueue_ZeroTimestamp_ReturnsError(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.Envelope[json.RawMessage]{
 		ID:     "01926e4f-dead-7000-beef-000000000001",
 		Type:   "x.y",
@@ -215,7 +187,7 @@ func TestEnqueue_ZeroTimestamp_ReturnsError(t *testing.T) {
 }
 
 func TestEnqueue_NullByteInID_ReturnsError(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.Envelope[json.RawMessage]{
 		ID:        "bad\x00id",
 		Type:      "x.y",
@@ -228,7 +200,7 @@ func TestEnqueue_NullByteInID_ReturnsError(t *testing.T) {
 }
 
 func TestEnqueue_NullByteInType_ReturnsError(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	env := events.Envelope[json.RawMessage]{
 		ID:        "01926e4f-dead-7000-beef-000000000001",
 		Type:      "x\x00y",
@@ -241,7 +213,7 @@ func TestEnqueue_NullByteInType_ReturnsError(t *testing.T) {
 }
 
 func TestEnqueue_OversizedPayload_ReturnsError(t *testing.T) {
-	tx := &stubTx{}
+	tx := newStubTx(pgcommon.Tx.Exec)
 	// Build a payload that exceeds 240 KB after JSON serialisation.
 	bigPayload := make([]byte, 250*1024)
 	for i := range bigPayload {
