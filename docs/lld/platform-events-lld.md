@@ -11,12 +11,13 @@
 | Base documents | [`ARCHITECTURE.md`](../../ARCHITECTURE.md), [`README.md`](../../README.md), [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md), [`EVENT_SCHEMA_GOVERNANCE.md`](../../EVENT_SCHEMA_GOVERNANCE.md), [`docs/observability/`](../observability/README.md) |
 | Sibling libraries | `platform-pgcommon` v1.4.3 (database, transactions, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
 | Consumers | Platform services (e.g. `iam-org-membership`, whose LLD §7 / §9 / §20 rely on the outbox and consumer contracts defined here) |
-| Deployment stage | Library — consumed via `go get …@v1.6.0` (see §13.4) |
+| Deployment stage | Library — consumed via `go get …@v1.6.0`; v1.6.1 (production-review fixes) on branch `fix/production-review`, not yet pushed (see §13.4) |
 
 ### Revision history
 
 | Rev | Date | Change |
 |---|---|---|
+| 2.7 | 2026-10-01 | Status alignment: §13.4 deployment stage (v1.6.1 pending on `fix/production-review`; `feat/observability-legacy-removal` waiting on it), OQ-7 closed, OQ-9…OQ-12 (v1.6.1 release, repository ruleset with stale required checks, docs-only PRs never reporting required checks, legacy-metric removal), §14 test inventory (`consumer_fifo_test.go`, `migrations_review_test.go`). No design change. |
 | 2.6 | 2026-10-01 | Second review round: FIFO group messages get the running message's handler-timeout budget (re-armed per dispatch), one message per receive without a visibility timeout, a failed delete stops the group (§7.1); SNS drops `baggage` / `tracestate` before failing on the 10-attribute limit (§7.2); `Enqueue` rejects NUL (§10.3); replay inserts first with `ON CONFLICT` and counts skipped rows after commit (§8.6); 003 also rebuilds an INVALID index; `AWS_DEFAULT_REGION` fallback and `SQS_DRAIN_TIMEOUT` (§12); `mock.Consumer` validates and decodes (M-2); `SystemTenantID` does not disable RLS (E-7). |
 | 2.5 | 2026-10-01 | Production review of v1.6.0: FIFO source queues processed per message group in order (§7.1); FIFO DLQ dedup ID unique per forward (§10.3); a `dataschema` on a non-string `data` is passed through (§7.3, EVT-5); migration 010 down releases waiting records, 003 rebuilds only when the shape differs, new 011 `(failed_at, id)` dead-letter index (§4, §19.5); replay skips IDs already in `outbox_events` (§8.6); shutdown mid-batch releases at once (§8.4); metrics rollback on legacy failure; extension calls bounded; DSN masking of `sslpassword`. |
 | 2.4 | 2026-10-01 | v1.6.0 released: CHANGELOG `[Unreleased]` folded into `[1.6.0]`; status, §13.4 deployment stage, OQ-8 closed, release appendix. No design change. |
@@ -60,7 +61,7 @@ This document is the low-level design for **`platform-events`**, the shared Go l
 
 Refined into an implementable specification, this document gives the exact tables and indexes the library creates in a service's database, the public signatures and their behavioural contracts, the state machines behind publish / consume / outbox / inbox, the invariants that hold across them, configuration, metrics, and the operational procedures a service owner needs. Where this LLD and the code disagree, **the code is authoritative**; the discrepancy is a documentation bug and this document is updated with the change.
 
-**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `fix/production-review` (v1.6.0 + `[Unreleased]`) at revision 2.6 (merged coverage 98.5%, `make ci` green).
+**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `fix/production-review` (v1.6.0 + `[Unreleased]`) at revision 2.7 (merged coverage 98.5%, `make ci` green).
 
 ### 1.1 Relationship to the architecture documents
 
@@ -1050,7 +1051,9 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | Item | State (2026-10-01) |
 |---|---|
 | Latest tag | `v1.6.0` (CHANGELOG `[1.6.0]`; previous `v1.5.0`) |
-| Source | PR #12 (`feat/observability-standard`) merged to `main` |
+| Source | PR #12 (`feat/observability-standard`) and release PR #13 merged to `main`; tag `v1.6.0` on `e11be6b`, GitHub Release published |
+| Next release | `v1.6.1` — CHANGELOG `[Unreleased]` (two production-review rounds: FIFO per-group consumer, DLQ dedup, migrations 003 / 010-down / 011, replay hardening, SNS trace attributes, CI hardening) on branch `fix/production-review`, committed locally, not yet pushed |
+| Pending branch | `feat/observability-legacy-removal` (`d33cf9b`, "emit only Tier 1 platform_* metrics") — a breaking change; rebase on `fix/production-review` once merged |
 | Dependencies | platform-pgcommon v1.4.3, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
 | Consumers | Platform services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z` (`GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*`) |
 
@@ -1065,11 +1068,11 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | Location | Covers |
 |---|---|
 | `internal/core/service/*_test.go` (root module, white-box) | Outbox service retry / backoff policy, transient classification, canonical-ID matching |
-| `test/unit/{clock,config,domain,enqueue,envelope,glue,hmac,inbox,metrics,mock,outbox,port,publisher,runner,sns,sqs}` | Each package against mocks and a fake clock; SNS error classification table; consumer state machine (extension, deadlines, hand-back, panics); metrics conformance (`standard_test.go` `exerciseAll`) |
+| `test/unit/{clock,config,domain,enqueue,envelope,glue,hmac,inbox,metrics,mock,outbox,port,publisher,runner,sns,sqs}` | Each package against mocks and a fake clock; SNS error classification table and trace-attribute shedding; consumer state machine (extension, deadlines, hand-back, panics) and FIFO group semantics (`consumer_fifo_test.go`: order, failure / failed-delete hold, handler-timeout budget, receive size, `dataschema` pass-through); metrics conformance (`standard_test.go` `exerciseAll`) |
 
 ### 14.2 Integration tests (testcontainers-go)
 
-`test/integration` (`-tags integration`): one floci container (`floci/floci:2.1.0`, digest-pinned) and one Postgres container per package (`TestMain`); a fresh database per `NewTestDB`, topics / queues deleted on cleanup. Files: `sns_test.go`, `sqs_test.go`, `codec_test.go`, `dlq_test.go`, `outbox_test.go`, `outbox_ordering_test.go`, `outboxstore_test.go`, `outboxstore_errors_test.go`, `store_error_paths_test.go`, `inbox_test.go`, `inbox_process_test.go`. `-short` skips them without Docker.
+`test/integration` (`-tags integration`): one floci container (`floci/floci:2.1.0`, digest-pinned) and one Postgres container per package (`TestMain`); a fresh database per `NewTestDB`, topics / queues deleted on cleanup. Files: `sns_test.go`, `sqs_test.go`, `codec_test.go`, `dlq_test.go`, `outbox_test.go`, `outbox_ordering_test.go`, `outboxstore_test.go`, `outboxstore_errors_test.go`, `store_error_paths_test.go`, `inbox_test.go`, `inbox_process_test.go`, `migrations_review_test.go` (migration 003 rebuild rules incl. an INVALID index, 010 down / up, 011, replay with an ID already in `outbox_events`, `MarkFailed` on a published record). `-short` skips them without Docker.
 
 ### 14.3 Contract tests
 
@@ -1136,8 +1139,12 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | OQ-4 | Strict-ordering mode (blocking a key across dead-letters) — not supported; the `StrictOrdering` flag was removed; a dead-lettered head releases its key | Library owners | Decided |
 | OQ-5 | `PlatformEventsConsumerStalled` suppression uses the service-wide dead-letter rate (`platform_dlq_messages_total` has no `queue` label) | Observability standard owners | Accepted |
 | OQ-6 | platform-pgcommon's `release.yml` uses `docker/metadata-action` `latest=auto` (fixed here with `latest=false`) | pgcommon owners | Upstream fix pending (still open in v1.4.3) |
-| OQ-7 | Migration `010` changed during development; a dev database that applied an earlier draft needs `migrate down 1` and re-migrating | Release owner | Note for the PR |
+| OQ-7 | Migration `010` changed during development; a dev database that applied an earlier draft needs `migrate down 1` and re-migrating | Release owner | Closed — noted in PR #12, shipped in v1.6.0 |
 | OQ-8 | Release `v1.6.0`: push the branch, open the PR, tag after merge; update §13.4 | Release owner | Closed — tagged `v1.6.0` |
+| OQ-9 | Release `v1.6.1` from `fix/production-review` (push, PR, tag after merge; update §13.4) | Release owner | Pending |
+| OQ-10 | Repository ruleset `17023503` ("protect-main-branch") still requires the old check names `Test` / `Build` / `lint` / `vet` / `coverage`, which no workflow emits — every PR needs a bypass merge; the org ruleset already requires the current jobs | Repository admins | Open — drop the stale required checks |
+| OQ-11 | `ci.yml` `paths-ignore` skips the whole pipeline for docs-only PRs, so the org-required checks never report and such PRs cannot merge without a bypass | Library owners | Open — run the pipeline on all pull requests (keep the skip for pushes) |
+| OQ-12 | Remove the legacy `events_*` / `outbox_*` / `sqs_*` metrics (branch `feat/observability-legacy-removal`) — breaking; needs the Proposed successors ratified (OQ-1) and consumers migrated (sunset ≥ 2027-04-01) | Observability standard owners | Blocked on OQ-1 |
 
 **Known limitations (accepted by design):**
 

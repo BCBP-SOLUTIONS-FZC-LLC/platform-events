@@ -31,7 +31,7 @@ This library builds on two other BCBP platform libraries:
 | [`platform-gincommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon) | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon` | OTel tracing initialisation (`InitTracingFromEnv`, `EnsureTracing`); `port.Logger` interface (compatible — gincommon's `ZapLogger` can be injected directly); `RequestContext` carries `TraceID` / `TenantID` / `UserID` that populate `Envelope` fields |
 | [`platform-pgcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon) | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` | Connection pool (`pgcommon.Pool`) used by the outbox store; `pgcommon.RunInTx` composes business logic + `outbox.Enqueue` atomically; `migrate.Runner` applies the outbox schema (`outbox_events`, `outbox_dead_letters`); `SlowQueryTracer` surfaces slow outbox queries |
 
-See [`ARCHITECTURE.md`](../ARCHITECTURE.md) for detailed flow diagrams and invariant tables, and [`docs/lld/platform-events-lld.md`](../docs/lld/platform-events-lld.md) for the low-level design (data model, API contract, flows, retry classification, configuration). Keep the LLD's revision history and §16 "Deployment stage" current when behaviour or release state changes.
+See [`ARCHITECTURE.md`](../ARCHITECTURE.md) for detailed flow diagrams and invariant tables, and [`docs/lld/platform-events-lld.md`](../docs/lld/platform-events-lld.md) for the low-level design (data model, API contract, flows, retry classification, configuration). Keep the LLD's revision history, §13.4 "Deployment stage" and the §16 open-questions register current when behaviour or release state changes.
 
 ## Common Commands
 
@@ -402,8 +402,8 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 ## Test Layout
 
-- `test/unit/` — isolated unit tests per package: clock, config, domain, enqueue, envelope, glue, hmac, inbox, metrics (incl. the `make metrics-lint` conformance tests and inventory drift), mock (production fidelity), outbox, port, publisher, runner, sns (incl. failure classification), sqs (consumer, DLQ publisher, queue depth, visibility / timeout / shutdown paths)
-- `test/integration/` — floci (SNS round-trip, SQS consume loop, DLQ forwarding, codec) and Postgres (outbox store incl. per-key ordering and commit order, inbox `Store.Process`, error paths) — build tag `integration`
+- `test/unit/` — isolated unit tests per package: clock, config, domain, enqueue, envelope, glue, hmac, inbox, metrics (incl. the `make metrics-lint` conformance tests and inventory drift), mock (production fidelity), outbox, port, publisher, runner, sns (incl. failure classification), sqs (consumer, DLQ publisher, queue depth, visibility / timeout / shutdown paths, FIFO group semantics in `consumer_fifo_test.go`)
+- `test/integration/` — floci (SNS round-trip, SQS consume loop, DLQ forwarding, codec) and Postgres (outbox store incl. per-key ordering and commit order, inbox `Store.Process`, error paths, migration rules 003 / 010-down / 011 and replay collisions in `migrations_review_test.go`) — build tag `integration`
 - `test/e2e/` — publish → consume and outbox runner end to end — build tag `e2e`
 - `test/smoke/` — optional; requires live AWS resources (`SMOKE_SNS_TOPIC_ARN`, `SMOKE_SQS_QUEUE_URL`)
 - `test/fixtures/` — shared floci and Postgres containers (one per package; fresh database per `NewTestDB`, `NewEmptyTestDB` for schema tests), `MockLogger`, `FakeClock`

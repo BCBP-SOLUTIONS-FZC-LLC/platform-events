@@ -471,6 +471,8 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 - **`test/e2e/outbox_test.go`** — the full outbox pipeline end to end, including `TestOutbox_RollbackDoesNotPublish`: a rolled-back transaction's event must never be published.
 - **`test/integration/outboxstore_test.go`** — claiming, attempt counting and dead-lettering against real Postgres.
 - **`test/unit/sqs/consumer_test.go`** — consumer-loop semantics: retry-vs-delete, visibility extension, drain, and dead-letter routing on `ApproximateReceiveCount > n`.
+- **`test/unit/sqs/consumer_fifo_test.go`** — FIFO group order, a failure or failed delete holding the group, the handler-timeout budget of a busy group.
+- **`test/integration/migrations_review_test.go`** — migration 010 rolls back without stranding ordered records; 003 rebuilds only a wrong-shape or INVALID index.
 - **`test/unit/sqs/dlq_test.go`** + **`test/integration/dlq_test.go`** — `RedrivePolicy` parsing, ARN resolution, caching, error classification, and a real forward against floci.
 - **Interop** — `platform-interop-tests` checks `Envelope` JSON and HMAC canonicalisation byte-for-byte against the Python library.
 
