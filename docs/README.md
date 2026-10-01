@@ -14,12 +14,30 @@ Detailed how-to guides split out of the top-level README, which keeps a short, t
 | [`envelope.md`](guides/envelope.md) | Envelope construction, serialisation, payload typing, compatibility |
 | [`publishing.md`](guides/publishing.md) | Publishing rules, anti-patterns, SNS publisher, FIFO, attributes |
 | [`consuming.md`](guides/consuming.md) | SQS consumer, handler contract, error classification, poison messages, DLQ forwarding, idempotency |
-| [`outbox.md`](guides/outbox.md) | Outbox wiring, poll cycle, dead letters, pruning, replay |
+| [`outbox.md`](guides/outbox.md) | Outbox wiring, poll cycle, retries, per-key ordering, dead letters, pruning, replay |
 | [`codec.md`](guides/codec.md) | Schema-registry `Codec` hook |
 | [`hmac.md`](guides/hmac.md) | HMAC helpers and when to use them |
 | [`observability.md`](guides/observability.md) | Prometheus metrics, OpenTelemetry, logging correlation |
 | [`operations.md`](guides/operations.md) | Backpressure, production defaults, service adoption checklist |
 | [`testing-in-services.md`](guides/testing-in-services.md) | `mock.Publisher` / `mock.Consumer` / `mock.DLQPublisher` |
+
+---
+
+## Low-level design (`docs/lld/`)
+
+| Document | Covers |
+|----------|--------|
+| [`platform-events-lld.md`](lld/platform-events-lld.md) | Responsibilities and boundaries, module/package layout, data model (migrations 001–010), public API contract, envelope wire format, publish / consume / outbox / ordering / inbox flows, retry classification, configuration, observability, concurrency, security, testing, CI/CD, open questions |
+
+---
+
+## Observability (`docs/observability/`)
+
+| Document | Covers |
+|----------|--------|
+| [`README.md`](observability/README.md) | The Enterprise Platform Observability Standard as applied here: tiers, wiring, migration plan, Proposed metrics |
+| [`metrics-registry.md`](observability/metrics-registry.md) | Generated from the registry (`make metrics-doc`) — every metric, label and status |
+| [`runbook.md`](observability/runbook.md) | One section per alert in `monitoring/prometheus/platform-events.rules.yml` |
 
 ---
 

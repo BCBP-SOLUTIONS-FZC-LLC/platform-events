@@ -4,7 +4,7 @@ The platform's shared **event-driven messaging library** — the single sanction
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`
 **Module:** Go 1.26 (`go 1.26.0`, `toolchain go1.26.8`) · private module · library only (`cmd/platform-events` is a reference CLI that validates config and prints version info, not a server — CI builds, scans and smoke-tests it as a container image)
-**Design:** Clean Architecture — public API in `pkg/`, AWS/Postgres adapters in `internal/adapter/`, SDK-free core in `internal/core/`. Design narrative, sequence diagrams and invariants: [ARCHITECTURE.md](ARCHITECTURE.md). The wire format is byte-compatible with the Python sibling [`platform-eventcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-eventcommon); the `interop` CI job enforces it.
+**Design:** Clean Architecture — public API in `pkg/`, AWS/Postgres adapters in `internal/adapter/`, SDK-free core in `internal/core/`. Design narrative, sequence diagrams and invariants: [ARCHITECTURE.md](ARCHITECTURE.md); low-level design (data model, API contract, flows, failure handling): [docs/lld/platform-events-lld.md](docs/lld/platform-events-lld.md). The wire format is byte-compatible with the Python sibling [`platform-eventcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-eventcommon); the `interop` CI job enforces it.
 
 ---
 
@@ -68,12 +68,13 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | `Envelope[T]`, `NewEnvelope(type, source, payload, opts...)` | Typed event; UUID v7 `ID`, UTC `Timestamp`. Opts: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor`, `WithIPAddress`, `WithUserAgent`, `WithSchemaID` |
 | `ParseEnvelope[T](data)`, `Envelope.JSON()` | Validate-and-decode / canonical JSON |
 | `Publisher`, `NewSNSPublisher(SNSConfig, opts...)` | `Publish` / `PublishBatch`. Opts: `WithMessageGroupID`, `WithMessageDeduplicationID`, `WithAttributes`, `WithCodec` |
-| `Consumer`, `Handler`, `NewSQSConsumer(SQSConfig, handler, opts...)` | Long-poll loop. Opts: `WithConcurrency`, `WithVisibilityTimeout`, `WithDeadLetterHandler`, `WithMaxReceiveCount`, `WithDrainTimeout`, `WithConsumerCodec` |
+| `Consumer`, `Handler`, `NewSQSConsumer(SQSConfig, handler, opts...)` | Long-poll loop (nil handler → error). Opts: `WithConcurrency`, `WithVisibilityTimeout`, `WithDeadLetterHandler`, `WithMaxReceiveCount`, `WithDrainTimeout`, `WithConsumerCodec`, `WithDLQForwarding`, `WithHandlerTimeout`, `WithQueueDepthMetrics`, `WithMalformedBodyLogging` |
+| `SourceMessageFromContext(ctx)` | The raw received message (body + attributes) inside a handler — forward this to the DLQ, never `env.JSON()` |
 | `NewSQSConsumerWithClient`, `SQSClientLike` | Inject a fake SQS client to test the consumer loop itself |
 | `TraceIDFromContext(ctx)` | Envelope `TraceID` inside a handler |
 | `Codec`, `NoopCodec`, `GlueDecodeCodec` | Schema-registry hook; decode-only Glue header stripper |
 | `Sign`, `Verify`, `SignEnvelope`, `VerifyEnvelope` | HMAC-SHA256, constant-time verify |
-| `InitMetrics(MetricsIdentity, registerer, ...MetricsOption)` | Register the Tier 1 `platform_*` metrics (required `domain`/`service`/`environment` labels injected centrally) plus the legacy metrics during the compatibility period; `WithoutLegacyMetrics()`; `MetricsRegistry()`. `Init` / `InitWithRegisterer` are deprecated (legacy only) |
+| `InitMetrics(MetricsIdentity, registerer, ...MetricsOption)` | Register the Tier 1 `platform_*` metrics (required `domain`/`service`/`environment` labels injected centrally) plus the legacy metrics during the compatibility period; options `WithoutLegacyMetrics()`, `WithEventTypeLimit(n)`, `WithEventTypes(...)`; `MetricsRegistry()`. `Init` / `InitWithRegisterer` are deprecated (legacy only) |
 
 ### `pkg/events` — dead-letter forwarding
 
@@ -82,7 +83,7 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | `DLQPublisher`, `NewSQSDLQPublisher(DLQConfig)` | `SendToDLQ(ctx, sourceQueueURL, body, attrs, reason)` forwards to the source queue's `RedrivePolicy` DLQ; `ResolveDLQ` fails fast at startup |
 | `NewSQSDLQPublisherWithClient`, `DLQClientLike` | Test injection (`GetQueueAttributes`, `GetQueueUrl`, `SendMessage`) |
 | `DLQAttrEventType` · `DLQAttrReason` · `DLQAttrOriginalQueue` · `DLQAttrConsumerName` · `DLQAttrFailedAt` | Standard attributes added to every forwarded message |
-| `DLQError`, `ErrDLQ*`, `ErrRetryable` | Typed errors — see [Validation and errors](#validation-and-errors) |
+| `DLQError`, `ErrDLQ*`, `ErrRetryable` | Typed errors — see [Validation and errors](#validation-and-errors). `ErrRetryable` also marks transient publish / codec failures (`BatchFailure.Retryable` in batch errors) that the outbox retries without counting attempts |
 
 ### `pkg/events/mock` — test doubles
 
@@ -96,8 +97,9 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 
 | Symbol | Purpose |
 |---|---|
-| `Enqueue(ctx, tx, env)` | Insert inside the caller's `pgcommon.Tx` — no SNS call; rejects payloads > 240 KB |
-| `NewRunner(Config)`, `Runner.Start` / `Stop` / `Ready` | Poll → claim (`SKIP LOCKED` + lease) → publish → mark |
+| `Enqueue(ctx, tx, env)` | Insert inside the caller's `pgcommon.Tx` — no SNS call; requires a canonical lowercase UUID `ID`; rejects payloads > 240 KB |
+| `EnqueueOrdered(ctx, tx, env, key)` | Same, with an ordering key: a key's records are published one at a time, in enqueue order — [Outbox § Ordering](docs/guides/outbox.md#ordering) |
+| `NewRunner(Config)`, `Runner.Start` / `Stop` / `Ready` | Poll → claim (`SKIP LOCKED` + lease) → publish → mark; per-record retry backoff (`RetryBackoff` / `MaxRetryBackoff`), transient failures never count toward `MaxAttempts`; re-polls while batches publish |
 | `Runner.ListDeadLetters` / `ReprocessDeadLetters` / `ReprocessDeadLettersWith` / `DiscardDeadLetters` | Inspect / replay / discard `outbox_dead_letters` (`DLQFilter`, `DeadLetterRecord`) |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Batched delete of old published rows |
 | `ApplySchema(ctx, migrateRunner)`, `MigrationsTable` | Embedded migrations `001`–`010`, isolated `outbox_migrations` tracking table |
@@ -106,8 +108,9 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 
 | Symbol | Purpose |
 |---|---|
-| `Handler(ledger, next)` | Skips already-recorded envelope IDs; records an ID only after `next` succeeds |
-| `NewStore(pool, consumer)`, `Store.IsProcessed` / `MarkProcessed` / `Prune` | `processed_events` ledger on a `pgcommon.Pool` |
+| `Handler(ledger, next)` | Best-effort dedup: skips already-recorded envelope IDs; records an ID only after `next` succeeds (and did not dead-letter it) |
+| `NewStore(pool, consumer)`, `Store.Process(ctx, env, fn)` | `processed_events` ledger on a `pgcommon.Pool`; `Process` claims the ID inside one transaction with `fn`'s writes — exactly-once Postgres writes |
+| `Store.IsProcessed` / `MarkProcessed` / `Prune` | Ledger primitives and batched retention delete |
 | `ApplySchema`, `MigrationsTable` | Embedded schema, own `inbox_migrations` table |
 
 ### `pkg/config` — environment wiring
@@ -165,26 +168,27 @@ Clean Architecture — dependencies point inward; the core never imports an adap
 
 ```
 platform-events/
-├── cmd/platform-events/               # Reference CLI — prints version info (make build → bin/platform-events)
+├── cmd/platform-events/               # Reference CLI — prints version + resolved config, -strict validates (make build → bin/platform-events)
 ├── pkg/                               # Public API — the only packages services may import
 │   ├── events/                        # Envelope, Publisher, Consumer, DLQPublisher, Codec, GlueDecodeCodec, HMAC, InitMetrics / MetricsRegistry
 │   │   └── mock/                      # mock.Publisher, mock.Consumer, mock.DLQPublisher
-│   ├── outbox/                        # Enqueue, Runner, dead-letter API, ApplySchema + embedded migrations/
-│   ├── inbox/                         # processed_events ledger, Handler wrapper, ApplySchema + migrations/
+│   ├── outbox/                        # Enqueue, EnqueueOrdered, Runner, dead-letter API, ApplySchema + embedded migrations/ (001–010)
+│   ├── inbox/                         # processed_events ledger (Store.Process, Handler), ApplySchema + migrations/
 │   └── config/                        # Env loaders + wiring helpers
 ├── internal/
 │   ├── core/
 │   │   ├── domain/                    # Envelope, OutboxRecord, DLQFilter, DLQError, sentinel errors — no external deps
-│   │   ├── port/                      # Publisher, Consumer, Codec, Logger, Clock, OutboxStore interfaces
-│   │   └── service/                   # OutboxService, HMACService
+│   │   ├── port/                      # Publisher, Consumer, Codec, Logger, Clock, OutboxStore, DLQPublisher, DLQAttribution, SourceMessage
+│   │   └── service/                   # OutboxService (publish cycle, retry/backoff classification), HMACService
 │   └── adapter/outbound/
-│       ├── sns/                       # SNS publisher, batch split, retryable-error classification
-│       ├── sqs/                       # SQS consumer loop + DLQ publisher (RedrivePolicy resolution + cache)
+│       ├── sns/                       # SNS publisher, batch split (10 entries / 256 KiB), failure classification
+│       ├── sqs/                       # SQS consumer loop, DLQ publisher (RedrivePolicy resolution + cache), queue-depth sampler
 │       ├── outboxstore/               # Postgres outbox store (platform-pgcommon only)
 │       └── metrics/                   # Tier 1 platform_* + legacy metrics; registry.go = Platform Observability Registry entry
 ├── docs/
 │   ├── architecture/mermaid/          # 13 × .mmd diagram sources (embedded in ARCHITECTURE.md)
 │   ├── guides/                        # Detailed how-to guides (linked throughout this README)
+│   ├── lld/                           # Low-level design (platform-events-lld.md)
 │   └── observability/                 # Observability standard: model, generated metrics registry, runbook
 ├── monitoring/                        # Reference bundle: prometheus/ (rules, SLO, alerts, promtool tests), grafana/ (dashboard), kubernetes/ (KEDA)
 ├── scripts/merge_coverage.py          # Merges per-suite coverage profiles (max-count)
@@ -210,18 +214,18 @@ platform-events/
 
 | Concern | Technology | Notes |
 |---|---|---|
-| **Outbound events** | AWS SNS (standard or FIFO) | Attributes `EventType` · `TenantID` · `Source` · `EventID` · `Subject` for filter policies; `PublishBatch` splits at 10 |
-| **Inbound events** | AWS SQS | Long poll (≤ 20 s), `ApproximateReceiveCount`-based dead-letter routing; `RawMessageDelivery=true` required on SNS subscriptions |
+| **Outbound events** | AWS SNS (standard or FIFO) | Attributes `EventType` · `TenantID` · `Source` · `EventID` · `Subject` for filter policies; `PublishBatch` splits at 10 entries and 256 KiB per request |
+| **Inbound events** | AWS SQS | Long poll (≤ 20 s), visibility extended from receipt, `ApproximateReceiveCount`-based dead-letter routing; `RawMessageDelivery=true` required on SNS subscriptions |
 | **Dead letters (producer)** | Postgres `outbox_dead_letters` | Records that exhausted `MaxAttempts`; managed via the `Runner` DLQ API |
 | **Dead letters (consumer)** | The queue's SQS DLQ | Via `RedrivePolicy`, or forwarded explicitly with `DLQPublisher` |
-| **Outbox / inbox** | PostgreSQL via `platform-pgcommon` | `outbox_events`, `outbox_dead_letters`, `processed_events`; own migration tracking tables |
+| **Outbox / inbox** | PostgreSQL via `platform-pgcommon` | `outbox_events` (with optional per-key ordering), `outbox_dead_letters`, `processed_events`; own migration tracking tables |
 | **Schema registry** | Pluggable `Codec` | No SDK dependency; `GlueDecodeCodec` strips the AWS Glue header on consume |
 
 ### Shared library dependencies
 
 | Library | Version | Purpose |
 |---|---|---|
-| `platform-pgcommon` | v1.1.0 | `pgcommon.Pool`, `RunInTx`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas |
+| `platform-pgcommon` | v1.4.1 | `pgcommon.Pool`, `RunInTx`, `ConfigFromEnv`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas, `Tx`/`Conn`/`Rows` aliases (pgx is never imported directly) |
 | `platform-gincommon` | — (not a dependency) | Interface-compatible only: its `ZapLogger` satisfies `port.Logger`, and its `RequestContext` supplies `TenantID` / `TraceID` for envelopes |
 
 ---
@@ -468,7 +472,7 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 
 ### Coverage
 
-CI (`ci.yml` → `make cover-func`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **99.1%** (verified 2026-10-01).
+CI (`ci.yml` → `make cover-func`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **99.0%** (verified 2026-10-01).
 
 ---
 
@@ -655,12 +659,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, adding adapters, t
 |---|---|
 | [`.claude/CLAUDE.md`](.claude/CLAUDE.md) | Guidance for Claude Code working in this repo |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Layer model, sequence diagrams, failure lifecycle, invariants, performance |
+| [`docs/lld/platform-events-lld.md`](docs/lld/platform-events-lld.md) | Low-level design: data model, public API contract, flows, retry classification, configuration, observability |
+| [`docs/observability/`](docs/observability/README.md) | Observability standard: tier model, generated metrics registry, runbook |
 | [`docs/README.md`](docs/README.md) | Mermaid diagram index and how to keep diagrams in sync |
 | [`docs/guides/quick-start.md`](docs/guides/quick-start.md) | End-to-end service wiring |
 | [`docs/guides/envelope.md`](docs/guides/envelope.md) | Envelope construction, serialisation, payload typing |
 | [`docs/guides/publishing.md`](docs/guides/publishing.md) | Publishing rules, anti-patterns, SNS publisher |
 | [`docs/guides/consuming.md`](docs/guides/consuming.md) | Handler contract, errors, poison messages, DLQ forwarding, idempotency |
-| [`docs/guides/outbox.md`](docs/guides/outbox.md) | Outbox wiring, dead letters, pruning, replay |
+| [`docs/guides/outbox.md`](docs/guides/outbox.md) | Outbox wiring, retries, ordering, dead letters, pruning, replay |
 | [`docs/guides/codec.md`](docs/guides/codec.md) | Schema-registry `Codec` hook |
 | [`docs/guides/hmac.md`](docs/guides/hmac.md) | HMAC helpers |
 | [`docs/guides/observability.md`](docs/guides/observability.md) | Metrics, tracing, logging correlation |

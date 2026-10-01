@@ -2,11 +2,13 @@
 
 This document describes the internal structure, dependency rules, and runtime data flows of `platform-events`.
 
-`platform-events` is a **private Go shared library** (`github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26) — never deployed on its own. It is linked into every platform service that publishes or consumes domain events and owns the **messaging boundary** of the platform: the canonical `Envelope[T]` wire format, the SNS publisher, the SQS consumer loop, the transactional outbox (`outbox_events` / `outbox_dead_letters`), consumer-side deduplication (`processed_events`), explicit dead-letter forwarding to a queue's SQS DLQ, HMAC helpers, and the `events_*` / `outbox_*` / `sqs_*` metrics and OTel spans around all of it. Consuming services never import the SNS/SQS SDK directly — depguard rules in service repositories forbid it — so every transport concern a service needs is an API here.
+`platform-events` is a **private Go shared library** (`github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`, Go 1.26) — never deployed on its own. It is linked into every platform service that publishes or consumes domain events and owns the **messaging boundary** of the platform: the canonical `Envelope[T]` wire format, the SNS publisher, the SQS consumer loop, the transactional outbox (`outbox_events` / `outbox_dead_letters`), consumer-side deduplication (`processed_events`), explicit dead-letter forwarding to a queue's SQS DLQ, HMAC helpers, per-key outbox ordering, and the Tier 1 `platform_*` metrics (plus the legacy `events_*` / `outbox_*` / `sqs_*` set during the compatibility period) and OTel spans around all of it. Consuming services never import the SNS/SQS SDK directly — depguard rules in service repositories forbid it — so every transport concern a service needs is an API here.
 
 > **Design intent:** this library centralises event publishing, consumption, and guaranteed delivery at the messaging boundary — ensuring uniform envelope format, tenant propagation, and observability across all consuming services without requiring each service to reimplement these concerns.
 
 The wire format is shared with the Python sibling library `platform-eventcommon`: both publish to and consume from the same topics and queues, and the `interop` CI job (`platform-interop-tests`) checks `Envelope` JSON and HMAC canonicalisation byte-for-byte on every build.
+
+Companion documents: the low-level design ([docs/lld/platform-events-lld.md](docs/lld/platform-events-lld.md)) specifies the data model, public API contract, flows and failure handling in detail; [docs/observability/](docs/observability/README.md) covers the metrics registry, alerts and runbook.
 
 **Does not own:** topic / queue / subscription / filter-policy / DLQ provisioning (Terraform/CDK); SQS `RedrivePolicy` values; reading, replaying or redriving the SQS DLQ (SQS console, `StartMessageMoveTask`); event type naming and payload schemas ([EVENT_SCHEMA_GOVERNANCE.md](EVENT_SCHEMA_GOVERNANCE.md)); schema-registry clients (services implement `Codec`); HMAC key storage/rotation; the business transaction itself (`pgcommon.RunInTx` in the caller); OTel providers and Prometheus exporters (initialised by the service).
 
@@ -256,7 +258,7 @@ sequenceDiagram
     alt success
         SNSAdp ->> OTel: span.End()
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=success}.Inc()
-    else retryable AWS error (ThrottlingException · ServiceUnavailable · InternalFailure · RequestTimeout)
+    else transient (Throttled · InternalError · KMSThrottling · other throttle codes · HTTP 5xx/429 · timeout · no AWS answer: network/DNS/TLS/credentials)
         SNSAdp ->> SNSAdp: wrapIfRetryable → &RetryableError{Cause: err}
         SNSAdp ->> OTel: span.RecordError + codes.Error
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
@@ -268,6 +270,8 @@ sequenceDiagram
 
     SNSAdp -->>- Publisher: error or nil
     Publisher -->>- Caller: error or nil
+
+    Note over Caller,SNS: PublishBatch: chunks of ≤10 entries, each split again so a request stays ≤256 KiB; per-entry failures and whole-request failures come back as BatchError with BatchFailure.Retryable (transient as above, or SenderFault=false; a codec error wrapping ErrRetryable)
 ```
 
 ---
@@ -389,90 +393,56 @@ The SQS consumer long-polls, dispatches each message to a bounded pool of handle
 
 ### Consume path
 
+1. **Receive.** The loop long-polls (`ReceiveMessage`, `WaitSeconds` default 20) for up to `MaxMessages` (default 10). Without `WithVisibilityTimeout` it asks only for as many messages as there are free workers.
+2. **Extend from receipt.** Each received message gets a visibility extender at once (`ChangeMessageVisibility` every max(`VisibilityTimeout/2`, 1s)), so messages waiting behind busy workers never reappear and are processed twice. With `WithHandlerTimeout`, a message still waiting when the timeout passes is handed back (visibility 0); `Stop` hands back undispatched messages immediately.
+3. **Validate.** The body must be an envelope with `id`, `type` and `source`. Anything else — invalid JSON, or an SNS notification wrapper from a subscription without `RawMessageDelivery` — is malformed: forwarded to the DLQ (`WithDLQForwarding`) or deleted, never passed to the handler; logged as size + SHA-256 only.
+4. **Enrich the context.** `sqs.HandlerContext` adds the tenant GUC (`pgcommon.WithGUCSet`, so pool queries are RLS-scoped), the envelope trace ID and the source message; dispatch adds the dead-letter attribution and, with `WithHandlerTimeout`, one deadline for decode, dead-letter handler and handler.
+5. **Decode** (when `SchemaID` is set): a codec failure leaves the message visible (forwarded to the DLQ once past `WithMaxReceiveCount`).
+6. **Route.** Past `WithMaxReceiveCount` (with a dead-letter handler and/or DLQ forwarding) the dead-letter handler runs and the message is forwarded unless the handler already did; otherwise the handler runs under span `sqs.receive` (linked to the producer's `traceparent`). `nil` deletes the message; an error or panic leaves it visible for retry.
+7. **Metrics.** `platform_messages_received_total`, then exactly one of processed / failed{reason} (+ retry) / dead-lettered; `platform_message_processing_duration_seconds`, `platform_event_propagation_seconds` (first receipt), `platform_messages_in_flight`, `platform_message_timeouts_total` (legacy `events_consumed_total` in parallel).
 
-1. **SQS consumer long-polls** the queue (`ReceiveMessage` with `WaitSeconds=20`).
-2. **Message body unmarshalled** into `Envelope[json.RawMessage]`.
-3. **Context enriched** — `pgcommon.WithGUCSet(ctx, GUCSet{TenantID: env.TenantID})` injected so all downstream pool calls enforce the event's tenant via RLS.
-4. **OTel span started** (`sqs.receive`) linked to the publisher's trace via `Envelope.TraceID`.
-5. **Handler called** with the enriched context. If it returns `nil`, the message is deleted. If it returns an error, the message stays visible for retry.
-6. **Metrics recorded** — `platform_messages_received_total`, then `platform_messages_processed_total` / `platform_messages_failed_total{reason}` / `platform_dlq_messages_total`, `platform_message_processing_duration_seconds`, `platform_event_propagation_seconds` (legacy `events_consumed_total` / `events_consume_duration_seconds` in parallel).
-
-> **Idempotency requirement:** handlers must be idempotent. SQS delivers messages at least once — a handler may be called more than once for the same `Envelope.ID` due to network retries, visibility timeout expiry, or consumer restarts. Use `Envelope.ID` (UUID v7) as the idempotency key. The recommended implementation is a `processed_events` Postgres table with `ON CONFLICT DO NOTHING` inside the same transaction as the side-effect write — see [Consuming guide § Implementing idempotency](docs/guides/consuming.md#implementing-idempotency) for full patterns and the common-mistakes table.
+> **Idempotency requirement:** handlers must be idempotent — SQS delivers at least once. Use `Envelope.ID` as the idempotency key: `inbox.Store.Process` for exactly-once Postgres writes, or `inbox.Handler` for best-effort dedup — see [Idempotency](#idempotency) and [Consuming guide § Implementing idempotency](docs/guides/consuming.md#implementing-idempotency).
 
 > Source: [`docs/architecture/mermaid/sqs-consume-flow.mmd`](docs/architecture/mermaid/sqs-consume-flow.mmd)
 
 ```mermaid
 sequenceDiagram
-    participant SQSAdp as adapter/outbound/sqs (loop)
+    participant Loop as adapter/outbound/sqs (receive loop)
     participant SQS as AWS SQS
-    participant pgcommon
-    participant OTel
+    participant Ext as visibility extender (per message)
+    participant Worker as worker (bounded by WithConcurrency)
     participant Handler
 
-    loop every poll
-        Note over SQSAdp: rcvCtx = context.WithTimeout(WaitSeconds + 5s)
-        SQSAdp ->>+ SQS: ReceiveMessage(WaitSeconds=20, MaxMessages=10)
-        SQS -->>- SQSAdp: []Message
-
-        par for each message (bounded by semaphore)
-            SQSAdp ->> SQSAdp: json.Unmarshal body → Envelope
-
-            alt unmarshal error (malformed message)
-                SQSAdp ->> SQSAdp: EventsConsumedTotal{status=malformed}.Inc()
-                SQSAdp ->> SQS: DeleteMessage
-            else valid Envelope
-                Note over SQSAdp: [Worker Goroutine Scope Starts]
-                SQSAdp ->> pgcommon: WithGUCSet(ctx, GUCSet{TenantID})
-                SQSAdp ->> SQSAdp: WithEnvelopeTraceID(ctx, env.TraceID)
-
-                opt env.SchemaID non-empty
-                    SQSAdp ->> SQSAdp: Codec.Decode(ctx, env.SchemaID, env.Payload) → plain JSON
-                    alt decode error (no Codec configured, or Decode failed)
-                        SQSAdp ->> SQSAdp: CodecDecodeTotal{status=error}.Inc()
-                        Note over SQSAdp: leave visible for retry — NOT deleted like malformed JSON (registry outage may be transient)
-                    else decode success
-                        SQSAdp ->> SQSAdp: env.Payload = decoded plain JSON
-                    end
+    loop until Stop / ctx cancelled
+        Loop ->>+ SQS: ReceiveMessage(WaitSeconds, MaxMessages — or free workers when no VisibilityTimeout)
+        SQS -->>- Loop: []Message
+        Loop ->> Ext: start one extender per message (ChangeMessageVisibility every max(VT/2, 1s))
+        Note over Ext: WithHandlerTimeout: a message still waiting when the timeout passes is handed back (visibility 0)
+        loop each message, as a worker slot frees
+            Loop ->> Worker: dispatch (Stop → undispatched messages handed back)
+            Worker ->> Worker: parse body; require id / type / source
+            alt not an envelope (malformed / SNS wrapper)
+                Worker ->> SQS: forward to DLQ (WithDLQForwarding) or DeleteMessage — never the handler
+            else valid envelope
+                Worker ->> Worker: handler ctx = tenant GUC + trace ID + source message + DLQ attribution; one WithHandlerTimeout deadline
+                opt SchemaID set
+                    Worker ->> Worker: Codec.Decode — failure: leave visible (forward to DLQ past WithMaxReceiveCount)
                 end
-
-                opt WithDeadLetterHandler set and ApproximateReceiveCount > WithMaxReceiveCount(n)
-                    SQSAdp ->>+ Handler: deadLetterHandler(ctx, Envelope)
-                    Note over Handler: may forward via DLQPublisher.SendToDLQ — see dlq-forward-flow.mmd
-                    Handler -->>- SQSAdp: nil or error
-                    Note over SQSAdp: nil → DeleteMessage · error → leave visible — EventsConsumedTotal{status=dlq_success or dlq_error}.Inc() — normal handler is skipped
+                alt receive count > WithMaxReceiveCount (with DLH and/or DLQ forwarding)
+                    Worker ->> Handler: dead-letter handler (if set), then forward to DLQ unless it did
+                    Worker ->> SQS: DeleteMessage once both succeed
+                else normal delivery
+                    Worker ->>+ Handler: handler(ctx, env)  — span sqs.receive linked to producer traceparent
+                    Handler -->>- Worker: nil / error / panic
+                    Worker ->> SQS: nil → DeleteMessage · error/panic → leave visible for retry
                 end
-
-                SQSAdp ->>+ OTel: Start span "sqs.receive"
-                OTel -->>- SQSAdp: handler ctx + span
-
-                Note over SQSAdp: DEFER STACK REGISTERED — 1. Recover panics and set span Error — 2. Clear/Reset DB GUC state — 3. Close OTel Span (.End)
-
-                SQSAdp ->>+ Handler: handler(ctx, Envelope)
-
-                alt Handler Panicked
-                    Note over Handler,SQSAdp: Panic caught by Defer Stack
-                    SQSAdp ->> OTel: span.SetStatus(Error) + RecordError
-                    SQSAdp ->> SQSAdp: EventsConsumedTotal{status=error}.Inc()
-                else handler returned nil
-                    Handler -->> SQSAdp: nil
-                    SQSAdp ->> SQS: DeleteMessage
-                    SQSAdp ->> SQSAdp: EventsConsumedTotal{status=success}.Inc()
-                    Note over SQSAdp,pgcommon: Connection returns to pool clean
-                else handler returned error
-                    Handler -->> SQSAdp: error
-                    SQSAdp ->> OTel: span.SetStatus(Error)
-                    SQSAdp ->> SQSAdp: EventsConsumedTotal{status=error}.Inc()
-                end
-
-                Note over SQSAdp: [Goroutine Exits] — Defer Stack executes in LIFO order: Resets GUC then Ends OTel Span
-                SQSAdp ->> pgcommon: ResetGUC / Release Connection
-                SQSAdp ->> OTel: span.End()
             end
+            Worker ->> Ext: stop extender
         end
     end
 ```
 
-Ensure `VisibilityTimeout` exceeds worst-case handler duration, or messages may be re-delivered while still processing.
+Set `VisibilityTimeout` (or `SQS_VISIBILITY_TIMEOUT`, 30s via `config.SQSConsumerOptions`) — without it nothing is extended — and `WithHandlerTimeout` so a hung handler cannot hold a message out of redrive.
 
 ---
 
@@ -492,9 +462,11 @@ erDiagram
         text trace_id "copied from Envelope, default empty"
         int attempts "incremented by MarkFailed"
         text last_error "truncated to 512 chars"
-        timestamptz created_at
-        timestamptz scheduled_at "next eligible poll time — doubles as the claim lease"
+        timestamptz created_at "enqueue time (reset on replay) — oldest-pending-age gauge"
+        timestamptz scheduled_at "next eligible time: claim lease, retry backoff, or 'infinity' while an ordered record waits"
         timestamptz published_at "NULL until MarkPublished"
+        text ordering_key "EnqueueOrdered key, NULL when unordered (migration 010)"
+        bigint ordering_seq "INSERT-time sequence for keyed records — order within a key"
     }
     outbox_dead_letters {
         uuid id PK "same id as the outbox_events row it replaced"
@@ -504,8 +476,9 @@ erDiagram
         text trace_id
         int attempts "value when dead-lettered"
         text last_error
-        timestamptz created_at "original enqueue time"
+        timestamptz created_at "enqueue time of the dead-lettered row"
         timestamptz failed_at "dead-letter time"
+        text ordering_key "kept through dead-lettering and replay (migration 010)"
     }
     processed_events {
         uuid event_id PK "Envelope.ID"
@@ -521,23 +494,26 @@ erDiagram
         boolean dirty
     }
     outbox_events ||--o| outbox_dead_letters : "moved after MaxAttempts (INSERT + DELETE, one tx)"
-    outbox_dead_letters ||--o| outbox_events : "ReprocessDeadLetters* moves back, attempts reset to 0"
+    outbox_dead_letters ||--o| outbox_events : "ReprocessDeadLetters* moves back: attempts 0, created_at reset, keyed rows join the back of their key"
 ```
 
 | Index | Table | Serves |
 |---|---|---|
 | `idx_outbox_events_pending (scheduled_at, id) WHERE published_at IS NULL` | `outbox_events` | `ClaimBatch` — the poll query's `ORDER BY scheduled_at, id` (migration 003) |
 | `idx_outbox_events_published_at WHERE published_at IS NOT NULL` | `outbox_events` | `PrunePublished` (migration 007) |
-| `idx_outbox_dead_letters_failed_at (failed_at DESC)` | `outbox_dead_letters` | Retention queries (migration 004) |
-| `idx_outbox_dead_letters_created_at (created_at ASC)` | `outbox_dead_letters` | `ListDeadLetters` ordering (migration 005) |
+| `idx_outbox_dead_letters_failed_at (failed_at DESC)` | `outbox_dead_letters` | `ListDeadLetters` / `ReprocessDeadLetters*` / `DiscardDeadLetters` ordering (oldest failure first) and retention queries (migration 004) |
+| `idx_outbox_dead_letters_created_at (created_at ASC)` | `outbox_dead_letters` | Ad-hoc inspection by enqueue time (migration 005; replay now orders by `failed_at`) |
 | `idx_outbox_dead_letters_event_type_tenant_id` | `outbox_dead_letters` | `DLQFilter` on `EventType` / `TenantID` (migration 008) |
+| `idx_outbox_events_unpublished_created (created_at) WHERE published_at IS NULL` | `outbox_events` | `OldestPendingAge` — `platform_outbox_oldest_pending_age` (migration 009) |
+| `idx_outbox_events_ordering (ordering_key, ordering_seq) WHERE published_at IS NULL AND ordering_key IS NOT NULL` + sequence `outbox_events_ordering_seq` | `outbox_events` | Per-key ordering: the enqueue-time "earlier unpublished?" check, head promotion, the claim guard (migration 010) |
 | `idx_processed_events_processed_at` | `processed_events` | `Store.Prune` |
 
 **Notes that matter operationally:**
 
 - **`payload` is the whole envelope, as JSONB.** `OutboxRecord.Payload` is `json.RawMessage`, not `[]byte`, so pgx binds it with its JSON codec — required under `platform-pgcommon`'s `PGBouncerMode` (simple protocol), where a `[]byte` would bind as `bytea` and fail with `SQLSTATE 22P02` (fixed in v1.3.1).
 - **None of these tables has row-level security.** They are written inside the caller's transaction (so a tenant GUC may be bound), but the runner claims across all tenants by design. Grant the service's app role access to them explicitly if its schema uses `FORCE ROW LEVEL SECURITY` elsewhere.
-- **`scheduled_at` doubles as the claim lease.** Claiming sets it to `NOW() + ClaimLeaseDuration`; a failed publish resets it to `NOW()`. A crashed runner's records become claimable again when the lease expires.
+- **`scheduled_at` doubles as the claim lease, the retry backoff and the ordering wait.** Claiming sets it to `NOW() + ClaimLeaseDuration`; a failed publish sets it to `NOW() + backoff` (per-record for permanent failures, shared for transient ones); an ordered record behind an unpublished record of its key waits at `'infinity'` until promoted. A crashed runner's records become claimable again when the lease expires.
+- **Migrations 009 and 010 are metadata-only or index-only on existing rows** (nullable columns, no default; `CREATE INDEX` without `CONCURRENTLY` — create the indexes concurrently by hand first on a large outbox). Since platform-pgcommon v1.4.1, `ApplySchema` fails with `migrate.ErrVersionNotInSource` when an older platform-events meets a database a newer one migrated: migrate down before rolling back.
 - **`processed_events` is keyed `(event_id, consumer)`,** so several consumers in one database dedup independently. Retention must exceed the 7-day SQS maximum message lifetime.
 
 ---
@@ -938,7 +914,7 @@ The library carries tenant context end to end but enforces isolation only where 
 
 ## Concurrency model
 
-`sqsConsumer` dispatches messages with a bounded semaphore (`WithConcurrency`). The semaphore limits concurrent handler goroutines; the receive loop is never blocked by slow handlers — it simply does not dispatch new goroutines when the semaphore is full until a slot frees up.
+`sqsConsumer` dispatches messages with a bounded semaphore (`WithConcurrency`). The receive loop takes up to `MaxMessages` per `ReceiveMessage`, starts a visibility extender for **every** received message at once, then dispatches them as slots free up — so messages waiting behind slow handlers stay hidden and are never processed twice. The next receive happens once the batch is dispatched. Without a visibility timeout there is no extension, so each receive asks only for as many messages as there are free workers.
 
 **Example — 10 messages received, `WithConcurrency(3)`:**
 
@@ -948,7 +924,7 @@ ReceiveMessage → 10 messages
 → goroutine 1: handle message A  (acquires slot)
 → goroutine 2: handle message B  (acquires slot)
 → goroutine 3: handle message C  (acquires slot)
-→ messages D–J: sem ← struct{}{} blocks until a slot is released
+→ messages D–J: kept invisible by their extenders; sem ← struct{}{} blocks until a slot is released
 
 When goroutine 1 finishes:
 → message D acquires the freed slot
@@ -961,9 +937,11 @@ When goroutine 1 finishes:
 
 | Signal | Metric | Meaning |
 |---|---|---|
-| Slow handlers | `events_consume_duration_seconds` p99 rising | Reduce concurrency or investigate handler latency |
+| Slow handlers | `platform_message_processing_duration_seconds` p99 rising (legacy `events_consume_duration_seconds`) | Raise concurrency or investigate handler latency |
+| Saturated / hung workers | `platform_messages_in_flight` at the concurrency limit; `platform_message_timeouts_total` | Every worker busy — set `WithHandlerTimeout` so hung handlers release their messages |
 | Handler errors | `platform_messages_failed_total{reason="handler_error"}` growing | Messages being retried; check handler logic |
-| Outbox backlog | `outbox_pending_total` growing | Publisher slow or SNS throttling; raise `PublishConcurrency` or check `outbox_published_total` |
+| Outbox backlog | `outbox_pending_total` growing; `platform_outbox_oldest_pending_age` climbing | Publisher slow, SNS throttling or a stalled outbox (transient failures never dead-letter); check `outbox_published_total` and the oldest rows' `last_error` |
+| Ordering wait | `platform_outbox_ordering_blocked_events` growing | A key's head record keeps failing and holds the key's later records |
 | Leased records | `outbox_leased_total` high | Many records in-flight; if combined with stalled `outbox_pending_total`, a runner may have crashed mid-batch — wait for `ClaimLeaseDuration` expiry or restart the runner |
 | Publish failures | `outbox_published_total{status=error}` | Check SNS connectivity and the `outbox_dead_letters` table |
 | DLQ forwards | `events_dlq_forwarded_total{status}` | `success` — consumers are dead-lettering poison messages · `error` — forward failed, original left on the source queue |
@@ -1032,28 +1010,33 @@ When goroutine 1 finishes:
 | Key length enforced | `Sign` returns `ErrKeyTooShort` for keys < 32 bytes; empty sig is rejected by `Verify` |
 | No SNS/SQS import in domain/port | Enforced by layered package structure |
 | TopicARN validated at construction | `NewSNSPublisher` returns an error on an empty or invalid `TopicARN` (must have prefix `arn:aws:sns:`, `arn:aws-cn:sns:`, or `arn:aws-us-gov:sns:`) to prevent invalid Prometheus label cardinality |
-| Idempotent metrics registration | `Init` is guarded by `sync.Once`; `InitWithRegisterer` bypasses it for test isolation |
+| Fail-soft metrics registration | `InitMetrics` validates the identity first (an invalid one changes nothing) and returns a `RegistrationWarning` instead of failing for a `platform_*` metric the registry refuses; deprecated `Init` is guarded by `sync.Once` and is a no-op once `InitMetrics` ran |
 | OTel initialised by consuming service | `platform-events` calls `otel.Tracer(...)` — no-op if no provider registered; no double-init |
-| Graceful consumer shutdown | `Stop()` waits `DrainTimeout` (30 s) for in-flight handlers before returning |
-| Graceful runner shutdown | `Runner.Stop()` waits up to `DrainTimeout` (30 s) for the in-flight batch, then returns a non-nil error; set Helm `terminationGracePeriodSeconds` > `DrainTimeout` |
+| Graceful consumer shutdown | `Stop()` waits `DrainTimeout` (30 s) for in-flight handlers before returning; received-but-undispatched messages are handed back (visibility 0) |
+| Graceful runner shutdown | `Runner.Stop()` ends the re-poll loop, waits up to `DrainTimeout` (30 s) for the in-flight batch, then returns a non-nil error; set Helm `terminationGracePeriodSeconds` > `DrainTimeout` |
 | Poll-failure backoff | On a failed poll cycle the runner backs off exponentially (1s→30s) instead of retrying every `PollInterval` |
 | Parallel publish bounded | `PublishConcurrency` caps concurrent publishes per batch (default 1 uses SNS `PublishBatch`, up to 10 per API call); values `> 1` use per-record `Publish` in parallel goroutines; per-record `PublishTimeout` (10s) prevents one hung call stalling the batch |
 | Shutdown ≠ dead-letter | Records stranded by context cancellation are released with `ReleaseLease` — no attempt counted — so rolling restarts never dead-letter a record |
 | `last_error` bounded | Error strings stored in `outbox_events`/`outbox_dead_letters` are truncated to 512 chars to prevent table bloat |
 | Envelope size bounded | `Enqueue` rejects serialised payloads > 240 KB (under the SNS 256 KB hard limit) |
 | `MarkFailed` serialized | The attempts read uses `SELECT … FOR UPDATE` so a lease-expiry re-claim cannot double-increment or dead-letter early |
-| Retryable errors don't exhaust attempts | SNS throttling/transient errors (`ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`) are wrapped in `domain.RetryableError`; `OutboxService` releases the lease without counting an attempt (shared backoff), so SNS throttling or an outage cannot dead-letter healthy records |
+| Transient errors don't exhaust attempts | Throttling (`Throttled`, `KMSThrottling`, `ThrottlingException`, …), SNS-side errors (`InternalError`, …), HTTP 5xx / 429, timeouts, failures with no AWS answer, and codec errors wrapping `ErrRetryable` are transient (`domain.RetryableError` / `BatchFailure.Retryable`); `OutboxService` releases the lease without counting an attempt, behind a backoff shared by all records, so an outage cannot dead-letter healthy records |
+| Permanent errors back off per record | `attempts++` and `scheduled_at = NOW() + RetryBackoff·2^(n−1)` (jittered, capped at `MaxRetryBackoff`); dead-lettered at `MaxAttempts` |
+| Failures match records in canonical form | `Enqueue` requires a canonical lowercase UUID; batch failure IDs are compared canonicalised, so a failed publish is never marked published |
+| Per-key order (opt-in) | `EnqueueOrdered`: `ordering_seq` drawn at INSERT; a record behind an unpublished one of its key waits at `scheduled_at = 'infinity'` until promoted; the claim query's guard never claims a record with an earlier unpublished one of its key |
+| Bounded re-poll | The runner re-polls only while batches publish and stops on a transient failure, an empty batch, or `Stop` |
+| Visibility from receipt | Every received message is extended from receipt until processed; `WithHandlerTimeout` bounds waiting and processing with one deadline, after which the message is handed back |
 | VisibilityTimeout bounded at 12h | `NewSQSConsumer` rejects `VisibilityTimeout > 12h` at construction — SQS API hard limit; prevents silent extension failures |
 | No SQS SDK import in consumer services | `events.DLQPublisher` is the only DLQ path; `mock.DLQPublisher` covers tests — services never need `aws-sdk-go-v2/service/sqs` |
 | DLQ forward never loses the original | `SendToDLQ` returns an error on any failure; callers return it so the source message stays visible. Invalid input is rejected before any AWS call |
 | DLQ lookup cached, failures not | `RedrivePolicy` is resolved once per source queue per publisher; a failed lookup is retried on the next call |
 | Standard DLQ attributes are authoritative | `DLQReason`, `OriginalQueue`, `FailedAt`, `ConsumerName` override caller-supplied values; `EventType` comes from the envelope body when parseable; `DLQReason` truncated to 1 KiB on a rune boundary |
-| Malformed messages deleted and counted | SQS messages that cannot be unmarshalled to `Envelope` are counted as `platform_messages_failed_total{reason="malformed"}` and deleted — immediately, or after a successful forward to the SQS DLQ with `WithDLQForwarding` — preventing poison-pill messages from blocking the queue |
+| Malformed messages never reach the handler | A body that is not JSON, or JSON without `id` / `type` / `source` (e.g. an SNS notification wrapper), is counted as `platform_messages_failed_total{reason="malformed"}` and deleted — immediately, or after a successful forward to the SQS DLQ with `WithDLQForwarding`; its body is logged only as size + SHA-256 |
 | SKIP LOCKED for horizontal scale | Multiple outbox runner instances claim disjoint batches; no distributed lock required |
 | Dead letters are queryable & observable | `outbox_dead_letters` is a Postgres table (retryable from SQL); `platform_dlq_messages_total{operation="outbox_publish"}` counter enables alerting |
-| Batch split at 10 | `PublishBatch` splits silently; partial failures return `BatchError` per message |
-| Sequential batch transport errors | When `PublishConcurrency=1`, a non-`BatchError` from SNS marks all records in the claimed batch failed — safe at-least-once, may over-count attempts if SNS partially succeeded |
-| Handlers must be idempotent | SQS delivers at least once; use `Envelope.ID` as the idempotency key. Recommended: `INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING` inside the same transaction — see [Consuming guide § Implementing idempotency](docs/guides/consuming.md#implementing-idempotency) |
+| Batch split at 10 entries / 256 KiB | `PublishBatch` splits silently by count and by request size; partial failures return `BatchError` per message |
+| Whole-request batch failures classified | When a `PublishBatch` request fails as a whole, every entry gets the same failure: `TransportError` + `Retryable` when transient, otherwise its AWS code (counted toward `MaxAttempts`) |
+| Handlers must be idempotent | SQS delivers at least once; use `Envelope.ID` as the idempotency key — `inbox.Store.Process` claims it inside the handler's transaction (exactly-once Postgres writes) — see [Consuming guide § Implementing idempotency](docs/guides/consuming.md#implementing-idempotency) |
 | No ordering by default | The outbox publishes a failed / backed-off record after later ones and replicas publish concurrently. Per-aggregate order is opt-in: records enqueued with `EnqueueOrdered` publish one at a time per key, in enqueue order |
 | Event types are immutable once published | Breaking payload changes require a new versioned type (`iam.user.created.v2`); additive `omitempty` fields are the only safe in-place evolution — see [EVENT_SCHEMA_GOVERNANCE.md § Event versioning](EVENT_SCHEMA_GOVERNANCE.md#event-versioning) |
 | Outbox required for transactional events | Direct `publisher.Publish` bypasses the transaction boundary and has no retry — event is silently lost on process crash. Domain events that drive downstream state **must** go through `outbox.Enqueue` inside `pgcommon.RunInTx`. See [Publishing guide § Publishing rules](docs/guides/publishing.md#publishing-rules). |
@@ -1141,7 +1124,7 @@ graph LR
 - **Smoke** (`test/smoke/`, `-tags=smoke`, live AWS) — manual only, before the first deploy to a new AWS account; excluded from CI and from lint.
 - **Interop** — `platform-interop-tests` (CI job `interop`) runs Go and Python probes against shared fixtures and compares envelope JSON and HMAC output byte-for-byte.
 
-`make test-ci` runs unit, integration and e2e in parallel with `-race`, each writing its own profile to `.coverage/`, merged by `scripts/merge_coverage.py` (max-count) into `coverage.out`. Coverage is measured over `./internal/...` + `./pkg/...` with `-coverpkg` (tests live in the separate `test/` module). CI fails below **97%**; the merged total is **99.1%** (verified 2026-10-01). `make vet` and `make lint` run a second pass with `-tags=integration,e2e`, so tagged test files are vetted and linted too.
+`make test-ci` runs unit, integration and e2e in parallel with `-race`, each writing its own profile to `.coverage/`, merged by `scripts/merge_coverage.py` (max-count) into `coverage.out`. Coverage is measured over `./internal/...` + `./pkg/...` with `-coverpkg` (tests live in the separate `test/` module). CI fails below **97%**; the merged total is **99.0%** (verified 2026-10-01). `make vet` and `make lint` run a second pass with `-tags=integration,e2e`, so tagged test files are vetted and linted too.
 
 ---
 

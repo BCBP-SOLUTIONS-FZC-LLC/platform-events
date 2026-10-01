@@ -1,68 +1,34 @@
 sequenceDiagram
-    participant SQSAdp as adapter/outbound/sqs (loop)
+    participant Loop as adapter/outbound/sqs (receive loop)
     participant SQS as AWS SQS
-    participant pgcommon
-    participant OTel
+    participant Ext as visibility extender (per message)
+    participant Worker as worker (bounded by WithConcurrency)
     participant Handler
 
-    loop every poll
-        Note over SQSAdp: rcvCtx = context.WithTimeout(WaitSeconds + 5s)
-        SQSAdp ->>+ SQS: ReceiveMessage(WaitSeconds=20, MaxMessages=10)
-        SQS -->>- SQSAdp: []Message
-
-        par for each message (bounded by semaphore)
-            SQSAdp ->> SQSAdp: json.Unmarshal body → Envelope
-
-            alt unmarshal error (malformed message)
-                SQSAdp ->> SQSAdp: EventsConsumedTotal{status=malformed}.Inc()
-                SQSAdp ->> SQS: DeleteMessage
-            else valid Envelope
-                Note over SQSAdp: [Worker Goroutine Scope Starts]
-                SQSAdp ->> pgcommon: WithGUCSet(ctx, GUCSet{TenantID})
-                SQSAdp ->> SQSAdp: WithEnvelopeTraceID(ctx, env.TraceID)
-
-                opt env.SchemaID non-empty
-                    SQSAdp ->> SQSAdp: Codec.Decode(ctx, env.SchemaID, env.Payload) → plain JSON
-                    alt decode error (no Codec configured, or Decode failed)
-                        SQSAdp ->> SQSAdp: CodecDecodeTotal{status=error}.Inc()
-                        Note over SQSAdp: leave visible for retry — NOT deleted like malformed JSON (registry outage may be transient)
-                    else decode success
-                        SQSAdp ->> SQSAdp: env.Payload = decoded plain JSON
-                    end
+    loop until Stop / ctx cancelled
+        Loop ->>+ SQS: ReceiveMessage(WaitSeconds, MaxMessages — or free workers when no VisibilityTimeout)
+        SQS -->>- Loop: []Message
+        Loop ->> Ext: start one extender per message (ChangeMessageVisibility every max(VT/2, 1s))
+        Note over Ext: WithHandlerTimeout: a message still waiting when the timeout passes is handed back (visibility 0)
+        loop each message, as a worker slot frees
+            Loop ->> Worker: dispatch (Stop → undispatched messages handed back)
+            Worker ->> Worker: parse body; require id / type / source
+            alt not an envelope (malformed / SNS wrapper)
+                Worker ->> SQS: forward to DLQ (WithDLQForwarding) or DeleteMessage — never the handler
+            else valid envelope
+                Worker ->> Worker: handler ctx = tenant GUC + trace ID + source message + DLQ attribution; one WithHandlerTimeout deadline
+                opt SchemaID set
+                    Worker ->> Worker: Codec.Decode — failure: leave visible (forward to DLQ past WithMaxReceiveCount)
                 end
-
-                opt WithDeadLetterHandler set and ApproximateReceiveCount > WithMaxReceiveCount(n)
-                    SQSAdp ->>+ Handler: deadLetterHandler(ctx, Envelope)
-                    Note over Handler: may forward via DLQPublisher.SendToDLQ — see dlq-forward-flow.mmd
-                    Handler -->>- SQSAdp: nil or error
-                    Note over SQSAdp: nil → DeleteMessage · error → leave visible — EventsConsumedTotal{status=dlq_success or dlq_error}.Inc() — normal handler is skipped
+                alt receive count > WithMaxReceiveCount (with DLH and/or DLQ forwarding)
+                    Worker ->> Handler: dead-letter handler (if set), then forward to DLQ unless it did
+                    Worker ->> SQS: DeleteMessage once both succeed
+                else normal delivery
+                    Worker ->>+ Handler: handler(ctx, env)  — span sqs.receive linked to producer traceparent
+                    Handler -->>- Worker: nil / error / panic
+                    Worker ->> SQS: nil → DeleteMessage · error/panic → leave visible for retry
                 end
-
-                SQSAdp ->>+ OTel: Start span "sqs.receive"
-                OTel -->>- SQSAdp: handler ctx + span
-
-                Note over SQSAdp: DEFER STACK REGISTERED — 1. Recover panics and set span Error — 2. Clear/Reset DB GUC state — 3. Close OTel Span (.End)
-
-                SQSAdp ->>+ Handler: handler(ctx, Envelope)
-
-                alt Handler Panicked
-                    Note over Handler,SQSAdp: Panic caught by Defer Stack
-                    SQSAdp ->> OTel: span.SetStatus(Error) + RecordError
-                    SQSAdp ->> SQSAdp: EventsConsumedTotal{status=error}.Inc()
-                else handler returned nil
-                    Handler -->> SQSAdp: nil
-                    SQSAdp ->> SQS: DeleteMessage
-                    SQSAdp ->> SQSAdp: EventsConsumedTotal{status=success}.Inc()
-                    Note over SQSAdp,pgcommon: Connection returns to pool clean
-                else handler returned error
-                    Handler -->> SQSAdp: error
-                    SQSAdp ->> OTel: span.SetStatus(Error)
-                    SQSAdp ->> SQSAdp: EventsConsumedTotal{status=error}.Inc()
-                end
-
-                Note over SQSAdp: [Goroutine Exits] — Defer Stack executes in LIFO order: Resets GUC then Ends OTel Span
-                SQSAdp ->> pgcommon: ResetGUC / Release Connection
-                SQSAdp ->> OTel: span.End()
             end
+            Worker ->> Ext: stop extender
         end
     end

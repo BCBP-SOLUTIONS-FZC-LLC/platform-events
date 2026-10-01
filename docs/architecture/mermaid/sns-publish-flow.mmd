@@ -30,7 +30,7 @@ sequenceDiagram
     alt success
         SNSAdp ->> OTel: span.End()
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=success}.Inc()
-    else retryable AWS error (ThrottlingException · ServiceUnavailable · InternalFailure · RequestTimeout)
+    else transient (Throttled · InternalError · KMSThrottling · other throttle codes · HTTP 5xx/429 · timeout · no AWS answer: network/DNS/TLS/credentials)
         SNSAdp ->> SNSAdp: wrapIfRetryable → &RetryableError{Cause: err}
         SNSAdp ->> OTel: span.RecordError + codes.Error
         SNSAdp ->> SNSAdp: EventsPublishedTotal{status=error}.Inc()
@@ -42,3 +42,5 @@ sequenceDiagram
 
     SNSAdp -->>- Publisher: error or nil
     Publisher -->>- Caller: error or nil
+
+    Note over Caller,SNS: PublishBatch: chunks of ≤10 entries, each split again so a request stays ≤256 KiB; per-entry failures and whole-request failures come back as BatchError with BatchFailure.Retryable (transient as above, or SenderFault=false; a codec error wrapping ErrRetryable)

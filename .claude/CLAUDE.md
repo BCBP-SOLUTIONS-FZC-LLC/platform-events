@@ -15,6 +15,10 @@ Core capabilities:
 - **`DLQPublisher`** — forwards failed messages to the source queue's `RedrivePolicy` DLQ (`SendToDLQ`, `ResolveDLQ`); the only sanctioned SQS path for consumer services (they must not import the SQS SDK). Typed `*DLQError` + `ErrRetryable`; `mock.DLQPublisher` (validates input like the real one); metrics `platform_dlq_messages_total` (counted once via `port.DLQAttribution`) + `platform_dependency_request_seconds{dependency="sqs"}` (legacy `events_dlq_forwarded_total`); span `sqs.dlq_forward`. Consumer option `WithDLQForwarding(dlq)` forwards malformed / over-`WithMaxReceiveCount` / decode-poison messages automatically (raw body + attributes); handlers get the raw message via `events.SourceMessageFromContext(ctx)` — never forward `env.JSON()`
 - **Event-envelope types** — versioned, typed `Envelope[T]` carrying metadata (event ID, type, source, tenant, trace ID, timestamp) plus JSON-serialised payload
 - **HMAC helpers** — SHA-256 HMAC signing and verification for webhook and cross-service event authentication
+- **Retry classification** — transient publish failures (throttling, SNS 5xx/429, timeouts, network, a codec wrapping `ErrRetryable`) never count toward the outbox's `MaxAttempts`; permanent ones back off per record (`RetryBackoff`) and dead-letter
+- **Per-key outbox ordering (opt-in)** — `outbox.EnqueueOrdered(ctx, tx, env, key)` publishes a key's records one at a time in enqueue order (migration 010)
+- **Observability** — Tier 1 `platform_*` metrics per the Enterprise Platform Observability Standard (`events.InitMetrics`), reference alert rules, dashboard and KEDA example in `monitoring/`
+- **Design reference** — the low-level design is `docs/lld/platform-events-lld.md`
 
 **Consuming services** must set `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (or `GONOSUMDB`/`GOFLAGS` equivalents) to fetch private module versions.
 
@@ -27,7 +31,7 @@ This library builds on two other BCBP platform libraries:
 | [`platform-gincommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon) | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon` | OTel tracing initialisation (`InitTracingFromEnv`, `EnsureTracing`); `port.Logger` interface (compatible — gincommon's `ZapLogger` can be injected directly); `RequestContext` carries `TraceID` / `TenantID` / `UserID` that populate `Envelope` fields |
 | [`platform-pgcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon) | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` | Connection pool (`pgcommon.Pool`) used by the outbox store; `pgcommon.RunInTx` composes business logic + `outbox.Enqueue` atomically; `migrate.Runner` applies the outbox schema (`outbox_events`, `outbox_dead_letters`); `SlowQueryTracer` surfaces slow outbox queries |
 
-See [`ARCHITECTURE.md`](../ARCHITECTURE.md) for detailed flow diagrams and invariant tables.
+See [`ARCHITECTURE.md`](../ARCHITECTURE.md) for detailed flow diagrams and invariant tables, and [`docs/lld/platform-events-lld.md`](../docs/lld/platform-events-lld.md) for the low-level design (data model, API contract, flows, retry classification, configuration). Keep the LLD's revision history and §16 "Deployment stage" current when behaviour or release state changes.
 
 ## Common Commands
 
@@ -74,32 +78,42 @@ go test ./integration/...     -tags=integration -run TestSNSPublishRoundTrip -v
 The library follows **Clean Architecture** — dependencies point inward; outer layers depend on inner layers, never the reverse.
 
 ```
-pkg/               ← public API surface (consumers import these)
-  events/          ← Envelope types, Publisher/Consumer interfaces, HMAC helpers
-  outbox/          ← Outbox runner (Postgres-backed, uses platform-pgcommon pool)
-  inbox/           ← Consumer dedup ledger (processed_events; Store, Handler, Prune)
+pkg/                       ← public API surface (consumers import these)
+  events/                  ← Envelope, Publisher/Consumer + options, DLQPublisher, Codec (+ GlueDecodeCodec),
+                             HMAC helpers, InitMetrics / MetricsIdentity / MetricsRegistry
+    mock/                  ← mock.Publisher, mock.Consumer, mock.DLQPublisher (production-faithful)
+  outbox/                  ← Runner (NewRunner/Config), Enqueue, EnqueueOrdered, ApplySchema, DLQ management
+    migrations/            ← embedded 001–010 (outbox_events, outbox_dead_letters, ordering_key/ordering_seq)
+  inbox/                   ← processed_events ledger: Store (Process, IsProcessed, MarkProcessed, Prune), Handler
+    migrations/            ← embedded 001 (processed_events)
+  config/                  ← env loading (LoadSNS/LoadSQS/LoadOutbox), RunnerConfigFromEnv, SQSConsumerOptions
 internal/
   core/
-    domain/        ← Entities: Envelope, OutboxRecord, domain errors (no external deps)
-    port/          ← Interfaces: Publisher, Consumer, Logger, Clock (owned by use-case layer)
-                      port.Logger is interface-compatible with platform-gincommon's ZapLogger
-    service/       ← Use Cases: OutboxService, HMACService
-  adapter/
-    outbound/
-      sns/         ← SNS Publisher implementation (aws-sdk-go-v2)
-      sqs/         ← SQS Consumer implementation (long-poll loop)
-      outboxstore/ ← Postgres outbox store (pgx via platform-pgcommon Pool + RunInTx)
-      metrics/     ← Prometheus counters + OTel spans
-  config/          ← Environment variable loading
-test/
-  unit/            ← Isolated unit tests per package
-  integration/     ← Tests against floci + Postgres containers
-  fixtures/        ← Shared helpers (MockPublisher, MockConsumer, MockLogger, fake clock)
-  testenv/         ← Loads .env-example for tests
+    domain/                ← Envelope, OutboxRecord (OrderingKey), BatchError/BatchFailure, DLQ errors, ErrRetryable
+    port/                  ← OutboxStore, Publisher, Consumer, Logger, Clock, Codec, DLQPublisher,
+                             DLQAttribution, SourceMessage (owned by the use-case layer)
+    service/               ← OutboxService (publish cycle, retry/backoff classification), HMACService
+  adapter/outbound/
+    sns/                   ← SNS publisher (batching by count + 256 KiB, failure classification)
+    sqs/                   ← SQS consumer (consumer.go), DLQPublisher (dlq.go), queue-depth sampler
+    outboxstore/           ← Postgres outbox store (platform-pgcommon Pool + RunInTx only)
+    metrics/               ← metrics registry (registry.go), identity, Tier 1 + legacy collectors
+cmd/platform-events/       ← reference CLI (prints resolved config; Docker image for Trivy/smoke)
+monitoring/                ← prometheus rules (+ promtool tests), grafana dashboard, KEDA example
+docs/                      ← guides/, observability/ (README, runbook, generated metrics-registry),
+                             architecture/mermaid/, lld/platform-events-lld.md
+test/                      ← separate Go module (replace … => ../)
+  unit/                    ← isolated unit tests per package
+  integration/             ← floci + Postgres containers (build tag integration)
+  e2e/                     ← end-to-end publish → consume, outbox (build tag e2e)
+  smoke/                   ← live AWS (build tag smoke; make test-smoke)
+  fixtures/                ← shared floci/Postgres containers, MockLogger, FakeClock
+  testenv/                 ← loads .env-example for tests
+tools/                     ← separate Go module: golangci-lint via `go tool -modfile=tools/go.mod`
 
 External dependencies (private modules):
-  platform-gincommon → OTel init, port.Logger interface, RequestContext (TraceID/TenantID source)
-  platform-pgcommon  → Pool, RunInTx, migrate.Runner (outbox schema), SlowQueryTracer
+  platform-pgcommon v1.4.1 → Pool, RunInTx, ConfigFromEnv, migrate.Runner, Tx/Conn/Rows aliases
+  platform-gincommon       → not imported: port.Logger matches its ZapLogger; tracing initialised by the service
 ```
 
 **Dependency rule:** `domain` ← `port` ← `service` ← `adapter` ← `pkg`. The `core/` layers never import `adapter/` or AWS SDK packages. Interfaces in `core/port/` are implemented in `adapter/outbound/` and injected inward.
@@ -378,11 +392,14 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 ## Test Layout
 
-- `test/unit/` — isolated unit tests per package (envelope, hmac, outbox service, config, metrics, mock publisher/consumer)
-- `test/integration/` — tests against floci (SNS publish round-trip, SQS consume loop, outbox runner end-to-end) and Postgres (outbox enqueue/publish/dead-letter)
+- `test/unit/` — isolated unit tests per package: clock, config, domain, enqueue, envelope, glue, hmac, inbox, metrics (incl. the `make metrics-lint` conformance tests and inventory drift), mock (production fidelity), outbox, port, publisher, runner, sns (incl. failure classification), sqs (consumer, DLQ publisher, queue depth, visibility / timeout / shutdown paths)
+- `test/integration/` — floci (SNS round-trip, SQS consume loop, DLQ forwarding, codec) and Postgres (outbox store incl. per-key ordering and commit order, inbox `Store.Process`, error paths) — build tag `integration`
+- `test/e2e/` — publish → consume and outbox runner end to end — build tag `e2e`
 - `test/smoke/` — optional; requires live AWS resources (`SMOKE_SNS_TOPIC_ARN`, `SMOKE_SQS_QUEUE_URL`)
-- `test/fixtures/` — shared helpers (`MockPublisher`, `MockConsumer`, `MockLogger`, `FakeClock`, floci bootstrap `StartFloci`)
+- `test/fixtures/` — shared floci and Postgres containers (one per package; fresh database per `NewTestDB`, `NewEmptyTestDB` for schema tests), `MockLogger`, `FakeClock`
 - `test/testenv/` — loads `.env-example` for tests
+- White-box tests stay beside the sources in the root module (`internal/core/service/*_test.go`).
+- Merged coverage (root + unit + integration + e2e, `-race`) is **99.0%**; the CI gate is 97%.
 
 ## Key Design Decisions
 
@@ -398,19 +415,21 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 **Dead-letter is a Postgres table, not SQS DLQ** — the outbox dead-letter table (`outbox_dead_letters`) is queryable, retryable, and auditable from standard SQL tooling. SQS DLQs are recommended for consumption-side failures; the outbox handles publish-side failures.
 
-**`Consumer` graceful drain on `Stop()`** — in-flight handlers are given `DrainTimeout` (default 30 s) to complete before `Stop()` returns. This matches `net/http.Server.Shutdown` semantics and ensures clean pod termination in Kubernetes without losing partially-processed messages.
+**`Consumer` graceful drain on `Stop()`** — in-flight handlers are given `DrainTimeout` (default 30 s) to complete before `Stop()` returns; received-but-undispatched messages are handed back to the queue (visibility 0). This matches `net/http.Server.Shutdown` semantics and ensures clean pod termination in Kubernetes without losing partially-processed messages. `Runner.Stop()` likewise ends the re-poll loop and drains the in-flight batch.
 
 **Nil-safe logger** — every component that accepts a `port.Logger` checks for `nil` before calling it. `SQSConsumer` with a nil logger runs silently. `OutboxRunner` with a nil logger skips per-record log lines but still updates metrics.
 
-**`ServiceName` required on metrics init** — `metrics.Init` panics on empty `ServiceName` to prevent invalid Prometheus const labels, matching the pattern established in `platform-gincommon`.
+**Metrics identity validated, registration fail-soft** — `events.InitMetrics` returns an error (changing nothing) for an invalid `MetricsIdentity` (empty or malformed `domain` / `service` / `environment`), and a `RegistrationWarning` — not a failure — for a `platform_*` metric the registry refuses (e.g. one an IAM service already registered with other labels). The deprecated `metrics.Init` still panics on an empty service name.
 
 **HMAC key length enforced at call time** — `Sign` returns `("", ErrKeyTooShort)` for keys < 32 bytes rather than silently using a weak key. Callers that ignore the error emit an empty signature, which `Verify` will reject (constant-time) — the system degrades safely.
 
 **OTel trace context propagated via message attributes** — the SNS publisher injects the W3C `traceparent` (and baggage) as message attributes. The consumer links its `sqs.receive` span to that producer span (async consumers start a new trace with a link rather than a parent) and puts the baggage in the handler ctx. `Envelope.TraceID` is carried separately for log correlation and RLS-style context (`events.TraceIDFromContext`).
 
-**`PublishBatch` splits automatically at 10** — SNS hard limit is 10 messages per `PublishBatch` call. The adapter splits silently rather than returning an error, so callers can pass arbitrarily-sized slices. Partial failures return a `BatchError` listing per-message errors; successful messages within the same batch are not retried.
+**`PublishBatch` splits automatically at 10 entries and 256 KiB** — SNS's hard limits per `PublishBatch` request. The adapter splits silently by count and by request size, so callers can pass arbitrarily-sized slices and one large event cannot fail its neighbours. Partial failures return a `BatchError` listing per-message errors with `Retryable` set for transient ones; successful messages within the same batch are not retried.
 
-**Idempotent Prometheus registration** — `metrics.Init` is guarded by `sync.Once`. `InitWithRegisterer` bypasses it for test isolation — same pattern as `platform-gincommon` and `platform-pgcommon`.
+**Idempotent Prometheus registration** — `InitMetrics` reuses already-registered collectors (also through `prometheus.WrapRegistererWith`); the deprecated `Init` is guarded by `sync.Once` and is a no-op once `InitMetrics` ran; `InitWithRegisterer` is the test reset (clears the Tier 1 set).
+
+**Retry classification is the outbox's safety valve** — a failure that says nothing about the message (throttling, SNS 5xx/429, timeouts, network/credentials, a codec wrapping `ErrRetryable`) releases the lease without counting an attempt and backs off on one shared schedule; anything else counts an attempt and backs off per record. Without this split a short SNS outage dead-letters the backlog. Custom publishers and codecs must follow it (`BatchFailure.Retryable` / `ErrRetryable`).
 
 **`port.Logger` is interface-compatible with platform-gincommon's `ZapLogger`** — `port.Logger` is `Debug` / `Info` / `Warn` / `Error`, each taking `(msg string, fields map[string]interface{})` — the shape of platform-gincommon's `ZapLogger`. A consuming service that already constructs a `ZapLogger` passes it directly to `SNSConfig.Logger`, `SQSConfig.Logger`, `DLQConfig.Logger` and `outbox.Config.Logger` without any adapter. Do not introduce a second logger abstraction.
 
