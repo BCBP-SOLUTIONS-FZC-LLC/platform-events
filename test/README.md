@@ -43,7 +43,7 @@ go test ./integration/...       -tags=integration -run TestSNSPublishRoundTrip -
 Skip integration tests when Docker is unavailable:
 
 ```bash
-go test -short ./test/integration/...
+cd test && go test -short -tags=integration ./integration/...
 ```
 
 ---
@@ -83,7 +83,7 @@ clk := &fixtures.FakeClock{T: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 
 ### floci
 
-`fixtures.StartFloci(ctx, t)` returns the package's **shared** floci container, started on first use, as in iam-org-membership. Resources are isolated by name: `CreateTopic` / `CreateQueue` fail a test that reuses a name another test in the package already created, and each package's `TestMain` calls `fixtures.TerminateSharedFloci()`. The container runs (region `fixtures.FlociRegion` = `us-east-1`, account `000000000000`, static `test` / `test` credentials) and the returned `*fixtures.Floci` provides ready SNS and SQS clients, the mapped `EndpointURL`, and the helpers `CreateTopic`, `CreateQueue` and `SubscribeQueueToTopic` (raw delivery, as production requires). Tests are skipped under `-short`. Images are digest-pinned; refresh them with `make pin-base-images`.
+`fixtures.StartFloci(ctx, t)` returns the package's **shared** floci container, started on first use, as in iam-org-membership. Isolation comes from the helpers: `CreateTopic` / `CreateQueue` delete what they created when the test ends, so repeat runs (`-count=N`) start from empty resources. They also fail a test that reuses a name another live test holds. Each package's `TestMain` calls `fixtures.TerminateSharedFloci()`. The container runs (region `fixtures.FlociRegion` = `us-east-1`, account `000000000000`, static `test` / `test` credentials) and the returned `*fixtures.Floci` provides ready SNS and SQS clients, the mapped `EndpointURL`, and the helpers `CreateTopic`, `CreateQueue` and `SubscribeQueueToTopic` (raw delivery, as production requires). Tests are skipped under `-short`. Images are digest-pinned; refresh them with `make pin-base-images`.
 
 ```go
 //go:build integration
@@ -132,7 +132,7 @@ func TestNewEnvelope_IDIsSet(t *testing.T) {
 
 1. Create or add to a file under `test/integration/`.
 2. Add `//go:build integration` at the top of the file.
-3. Use `fixtures.StartFloci(ctx, t)` for SNS/SQS, or `fixtures.NewTestDB(ctx, t)` (Postgres testcontainer) for outbox and inbox tests.
+3. Use `fixtures.StartFloci(ctx, t)` for SNS/SQS, or `fixtures.NewTestDB(ctx, t)` for outbox and inbox tests. It creates a fresh database, with both schemas applied, in the package's shared Postgres container and drops it in `cleanup`. Each package's `TestMain` calls `fixtures.TerminateSharedPostgres()` alongside `TerminateSharedFloci()`.
 4. Apply outbox migrations with `outbox.ApplySchema(ctx, runner)` when the test requires the schema.
 5. Always `defer cleanup()` immediately after starting containers.
 

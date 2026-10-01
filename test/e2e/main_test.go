@@ -9,10 +9,12 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
-// TestMain terminates the package's shared floci container (fixtures.StartFloci)
-// after the suite: CI runs with the testcontainers reaper disabled.
+// TestMain terminates the package's shared containers — floci
+// (fixtures.StartFloci) and Postgres (fixtures.NewTestDB) — after the suite:
+// CI runs with the testcontainers reaper disabled.
 func TestMain(m *testing.M) {
 	code := m.Run()
 	fixtures.TerminateSharedFloci()
+	fixtures.TerminateSharedPostgres()
 	os.Exit(code)
 }

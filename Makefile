@@ -101,7 +101,7 @@ help:
 	@echo "  make build            - compile reference CLI to bin/"
 	@echo "  make cover            - coverage HTML report (runs test-ci)"
 	@echo "  make cover-func       - coverage summary by function (runs test-ci)"
-	@echo "  make ci               - tidy + fmt-check + vet + lint + metrics-lint + test-ci + build"
+	@echo "  make ci               - tidy + mod-verify + fmt-check + vet + lint + metrics-lint + rules-check + dashboards-check + test-ci + build (the same gates as CI)"
 	@echo "  make docker-up        - start floci (SNS/SQS, :4574) + floci-ui (http://localhost:4505) + Postgres (:5538)"
 	@echo "  make docker-build     - build the reference-CLI image as CI does (needs GO_PRIVATE_TOKEN)"
 	@echo "  make pin-base-images  - fetch + pin SHA digests for Dockerfile base images"
@@ -323,7 +323,7 @@ docker-down:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy fmt-check vet lint metrics-lint test-ci build
+ci: tidy mod-verify fmt-check vet lint metrics-lint rules-check dashboards-check test-ci build
 
 # -----------------------------
 # OBSERVABILITY STANDARD

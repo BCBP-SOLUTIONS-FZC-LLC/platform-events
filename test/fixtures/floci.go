@@ -48,8 +48,9 @@ type Floci struct {
 
 // One floci container per test binary (package), like iam-org-membership:
 // starting a container per test made the suites spend most of their time
-// booting emulators. Tests stay isolated by using unique resource names —
-// CreateTopic / CreateQueue fail the test on a name another test already used.
+// booting emulators. Tests stay isolated because CreateTopic / CreateQueue
+// delete what they created when the test ends, and fail a test that reuses a
+// name another live test holds.
 var shared struct {
 	once sync.Once
 	emu  *Floci
@@ -135,18 +136,25 @@ func startFloci() (*Floci, error) {
 	}, nil
 }
 
-// claim records that t owns name, failing t if another test already used it
-// in this shared container (SNS/SQS creates are idempotent, so a reused name
-// would silently share a topic or queue — and its messages — between tests).
+// claim records that t owns name, failing t if another live test already
+// created it in this shared container (SNS/SQS creates are idempotent, so a
+// reused name would silently share a topic or queue — and its messages —
+// between tests). The name is released when t's cleanup deletes the resource.
 func (f *Floci) claim(t *testing.T, kind, name string) {
 	t.Helper()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	key := kind + "/" + name
-	if owner, ok := f.names[key]; ok && owner != t.Name() {
+	if owner, ok := f.names[key]; ok {
 		t.Fatalf("floci: %s %q already created by %s in this package's shared container — use a unique name", kind, name, owner)
 	}
 	f.names[key] = t.Name()
+}
+
+func (f *Floci) release(kind, name string) {
+	f.mu.Lock()
+	delete(f.names, kind+"/"+name)
+	f.mu.Unlock()
 }
 
 // CreateTopic creates an SNS topic and returns its ARN.
@@ -157,9 +165,17 @@ func (f *Floci) CreateTopic(ctx context.Context, t *testing.T, name string) stri
 		Name: aws.String(name),
 	})
 	if err != nil {
+		f.release("topic", name)
 		t.Fatalf("floci: CreateTopic %q failed: %v", name, err)
 	}
-	return aws.ToString(out.TopicArn)
+	arn := aws.ToString(out.TopicArn)
+	// Delete on cleanup (subscriptions go with it) so the next test — or a
+	// repeat run of this one (-count=N) — starts from an empty topic.
+	t.Cleanup(func() {
+		_, _ = f.SNSClient.DeleteTopic(context.Background(), &sns.DeleteTopicInput{TopicArn: aws.String(arn)})
+		f.release("topic", name)
+	})
+	return arn
 }
 
 // CreateQueue creates an SQS queue and returns its URL.
@@ -170,9 +186,16 @@ func (f *Floci) CreateQueue(ctx context.Context, t *testing.T, name string) stri
 		QueueName: aws.String(name),
 	})
 	if err != nil {
+		f.release("queue", name)
 		t.Fatalf("floci: CreateQueue %q failed: %v", name, err)
 	}
-	return aws.ToString(out.QueueUrl)
+	url := aws.ToString(out.QueueUrl)
+	// Delete on cleanup so no message outlives the test that sent it.
+	t.Cleanup(func() {
+		_, _ = f.SQSClient.DeleteQueue(context.Background(), &sqs.DeleteQueueInput{QueueUrl: aws.String(url)})
+		f.release("queue", name)
+	})
+	return url
 }
 
 // SubscribeQueueToTopic subscribes an SQS queue to an SNS topic with raw

@@ -361,7 +361,7 @@ When suites run in parallel their logs interleave; a failing suite re-prints its
 cd test   # the suites are their own module
 go test ./unit/sqs/...    -run TestSendToDLQ_Success_PopulatesAttributes -v
 go test ./integration/... -tags=integration -run TestDLQPublisher_ForwardsToRedriveTarget -v
-go test -short ./test/integration/...   # -short skips every test that needs Docker
+go test -short -tags=integration ./integration/...   # -short skips every test that needs Docker
 ```
 
 ### Developer tools
@@ -469,7 +469,7 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 
 ### Coverage
 
-CI (`ci.yml` → `make cover-func`) fails below **95%** total, measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.0%** (verified 2026-09-30).
+CI (`ci.yml` → `make cover-func`) fails below **95%** total, measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.7%** (verified 2026-10-01).
 
 ---
 

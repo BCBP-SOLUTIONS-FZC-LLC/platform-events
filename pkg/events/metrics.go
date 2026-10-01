@@ -70,6 +70,11 @@ func WithEventTypeLimit(n int) MetricsOption {
 // parallel, and makes them the active set. Call it once at startup, before
 // publishing or consuming.
 //
+// Call it once per process. Calling it again with the same identity and
+// registerer reuses the registered collectors; calling it with a different
+// identity leaves the first identity's series registered with frozen values —
+// there is no unregister — so don't re-initialise with another identity.
+//
 // It returns an error, changing nothing, for an invalid identity or a legacy
 // registration failure. A platform_* metric that cannot be registered (the
 // registry already holds that name with another shape) is disabled and

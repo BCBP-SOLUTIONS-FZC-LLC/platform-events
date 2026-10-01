@@ -50,7 +50,7 @@ make race            # All tests with -race flag
 make build           # Compile reference CLI to bin/platform-events
 make cover           # Coverage HTML report (measures ./internal/... ./pkg/...)
 make cover-func      # Coverage summary by function (terminal)
-make ci              # tidy + fmt-check + vet + lint + metrics-lint + test-ci + build (full CI pipeline)
+make ci              # tidy + mod-verify + fmt-check + vet + lint + metrics-lint + rules-check + dashboards-check + test-ci + build (the same gates as CI)
 make docker-up       # Start floci (SNS/SQS, :4574) + floci-ui (http://localhost:4505) + Postgres (:5538); demo topology via scripts/init-floci.sh
 make docker-down     # Stop the local containers
 make clean           # Remove bin/ artefacts
@@ -67,7 +67,7 @@ go test ./integration/...     -tags=integration -run TestSNSPublishRoundTrip -v
 
 **Coverage note:** tests live in the separate `test/` module. Always use `-coverpkg=./internal/...,./pkg/...` to get meaningful numbers; running `go test ./...` without it shows 0% for source packages. `make cover` and `make cover-func` handle this correctly.
 
-**Testcontainers note:** integration tests spin up floci (`floci/floci:2.1.0` — open-source, always-free AWS emulator, the platform's LocalStack replacement, same as iam-org-membership; fixture `test/fixtures/floci.go`) and Postgres via `testcontainers-go`. Docker must be running locally. Pass `-short` to skip integration tests without a Docker daemon.
+**Testcontainers note:** each test package shares one floci container (topics/queues deleted on test cleanup) and one Postgres container (a fresh database per `NewTestDB`, dropped on cleanup) — torn down by the package's `TestMain`. Integration tests spin up floci (`floci/floci:2.1.0` — open-source, always-free AWS emulator, the platform's LocalStack replacement, same as iam-org-membership; fixture `test/fixtures/floci.go`) and Postgres via `testcontainers-go`. Docker must be running locally. Pass `-short` to skip integration tests without a Docker daemon.
 
 ## Architecture
 
