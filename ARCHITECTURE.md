@@ -202,7 +202,7 @@ graph LR
 | `Runner.DiscardDeadLetters(ctx, filter, limit)` | Permanently deletes up to `limit` dead-letter records matching `DLQFilter`; use for poison-pill records that can never succeed; returns `(int64, error)` — always call `ListDeadLetters` first to confirm the selection |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Deletes published records older than `olderThan` from `outbox_events` (batched to `limit` rows). Call periodically (e.g. daily) to prevent unbounded table growth; choose `olderThan ≥` the longest consumer idempotency window (minimum 7 days is safe for most workloads) |
 | `Enqueue(ctx, tx pgcommon.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; validates non-empty `ID`/`Type`/`Source`, non-zero `Timestamp`, and absence of null bytes in string fields; rejects payloads > 240 KB |
-| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`008` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index, DLQ filter index) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
+| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`009` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index, DLQ filter index, unpublished `created_at` index) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
 | `MigrationsTable` | Exported constant (`"outbox_migrations"`) — the golang-migrate tracking table used by `ApplySchema`; isolated from the consuming service's `schema_migrations` to prevent version-number collisions |
 
 ### pkg/inbox
@@ -509,7 +509,7 @@ erDiagram
         timestamptz processed_at "Prune cut-off"
     }
     outbox_migrations {
-        bigint version PK "golang-migrate tracking for pkg/outbox (001–008)"
+        bigint version PK "golang-migrate tracking for pkg/outbox (001–009)"
         boolean dirty
     }
     inbox_migrations {

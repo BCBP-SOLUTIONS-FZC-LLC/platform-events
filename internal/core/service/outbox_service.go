@@ -558,6 +558,11 @@ func (s *OutboxService) PendingCount(ctx context.Context) (int64, error) {
 	return s.store.PendingCount(ctx)
 }
 
+// OldestPendingAge returns how long the oldest unpublished record has waited.
+func (s *OutboxService) OldestPendingAge(ctx context.Context) (time.Duration, error) {
+	return s.store.OldestPendingAge(ctx)
+}
+
 // LeasedCount returns the number of records currently claimed (leased) by a runner.
 func (s *OutboxService) LeasedCount(ctx context.Context) (int64, error) {
 	return s.store.LeasedCount(ctx)

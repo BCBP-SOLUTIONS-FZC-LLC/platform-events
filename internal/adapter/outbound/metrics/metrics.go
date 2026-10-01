@@ -86,6 +86,7 @@ type Platform struct {
 	ProcessingDuration *prometheus.HistogramVec // platform_message_processing_duration_seconds
 	OutboxPending      *prometheus.GaugeVec     // platform_outbox_pending_events
 	OutboxLeased       *prometheus.GaugeVec     // platform_outbox_leased_events
+	OutboxOldestAge    *prometheus.GaugeVec     // platform_outbox_oldest_pending_age
 	OutboxAttempts     *prometheus.CounterVec   // platform_outbox_publish_attempts_total
 	OutboxErrors       *prometheus.CounterVec   // platform_outbox_errors_total
 	OutboxDLOperations *prometheus.CounterVec   // platform_outbox_dead_letter_operations_total
@@ -476,6 +477,7 @@ func registerPlatform(r *registrar, id Identity) (*Platform, []RegistrationWarni
 		ProcessingDuration: histogram("platform_message_processing_duration_seconds", processingBuckets, "queue", "event_type"),
 		OutboxPending:      gauge("platform_outbox_pending_events"),
 		OutboxLeased:       gauge("platform_outbox_leased_events"),
+		OutboxOldestAge:    gauge("platform_outbox_oldest_pending_age"),
 		OutboxAttempts:     counter("platform_outbox_publish_attempts_total", "event_type", "outcome"),
 		OutboxErrors:       counter("platform_outbox_errors_total", "operation"),
 		OutboxDLOperations: counter("platform_outbox_dead_letter_operations_total", "operation"),
@@ -742,6 +744,32 @@ func RecordOutboxLeasedCountError() {
 	if p := platform.Load(); p != nil {
 		incOutboxError(p, "leased_count")
 	}
+}
+
+// SetOutboxOldestPendingAge records the age of the oldest unpublished outbox
+// event; a negative age signals a failed query (gauge left unchanged,
+// platform_outbox_errors_total{operation="oldest_pending"} counted).
+func SetOutboxOldestPendingAge(age time.Duration) {
+	p := platform.Load()
+	if p == nil {
+		return
+	}
+	if age < 0 {
+		if p.OutboxErrors != nil {
+			p.OutboxErrors.WithLabelValues("oldest_pending").Inc()
+		}
+		return
+	}
+	if p.OutboxOldestAge != nil {
+		p.OutboxOldestAge.WithLabelValues().Set(age.Seconds())
+	}
+}
+
+// HasOutboxOldestAgeMetric reports whether the oldest-pending-age gauge is
+// registered, so the runner can skip its query otherwise.
+func HasOutboxOldestAgeMetric() bool {
+	p := platform.Load()
+	return p != nil && p.OutboxOldestAge != nil
 }
 
 // HasOutboxPendingMetric reports whether any pending-outbox gauge is

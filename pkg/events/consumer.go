@@ -106,10 +106,12 @@ func WithQueueDepthMetrics(interval time.Duration) ConsumerOption {
 	return internalsqs.WithQueueDepthMetrics(interval)
 }
 
-// WithHandlerTimeout bounds each handler call: its context is cancelled after
-// d and the message's visibility is no longer extended, so a hung handler
-// cannot keep a message invisible — and out of the queue's redrive — forever;
-// it is redelivered and counts toward MaxReceiveCount. A handler that ignores
+// WithHandlerTimeout bounds the processing of each message (codec decode,
+// dead-letter handler and handler) with one deadline d from when a worker
+// picks it up: their contexts are cancelled at it and the message's
+// visibility is no longer extended, so a hung handler cannot keep a message
+// invisible — and out of the queue's redrive — forever; it is redelivered and
+// counts toward MaxReceiveCount. A handler that ignores
 // its context still holds its concurrency slot until it returns. Default 0
 // (unbounded); env SQS_HANDLER_TIMEOUT via config.SQSConsumerOptions.
 func WithHandlerTimeout(d time.Duration) ConsumerOption {

@@ -33,6 +33,8 @@ type mockOutboxStore struct {
 	released  map[string]string
 	// pendingCalls counts PendingCount queries (gauge refreshes).
 	pendingCalls int
+	oldestAge    time.Duration
+	oldestErr    error
 	claimErr     error
 	claims       int // ClaimBatch calls, for tests that watch the poll loop
 }
@@ -98,6 +100,11 @@ func (s *mockOutboxStore) ReleaseLease(_ context.Context, id, lastError string, 
 	return nil
 }
 
+func (s *mockOutboxStore) OldestPendingAge(context.Context) (time.Duration, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.oldestAge, s.oldestErr
+}
 func (s *mockOutboxStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *mockOutboxStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
 func (s *mockOutboxStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
@@ -1651,4 +1658,43 @@ func TestRunner_GaugesRefreshOnTheirOwnInterval(t *testing.T) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	assert.Equal(t, 1, store.pendingCalls, "one refresh on the first poll, none after within GaugeInterval")
+}
+
+// The oldest-pending-age gauge is refreshed with the backlog gauges; a failed
+// query leaves it unchanged and is counted.
+func TestRunner_OldestPendingAgeGauge(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "runner-test", Environment: "dev"}, reg)
+	require.NoError(t, err)
+	t.Cleanup(func() { metrics.InitWithRegisterer("runner-reset", "v0", prometheus.NewRegistry()) })
+
+	run := func(store *mockOutboxStore) {
+		r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}}, PollInterval: time.Hour})
+		require.NoError(t, err)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { defer close(done); _ = r.Start(ctx) }()
+		<-r.Ready()
+		cancel()
+		<-done
+	}
+	gauge := func() float64 {
+		mfs, err := reg.Gather()
+		require.NoError(t, err)
+		for _, mf := range mfs {
+			if mf.GetName() == "platform_outbox_oldest_pending_age" {
+				return mf.GetMetric()[0].GetGauge().GetValue()
+			}
+		}
+		return -1
+	}
+	store := newMockOutboxStore()
+	store.oldestAge = 90 * time.Second
+	run(store)
+	assert.InDelta(t, 90, gauge(), 0)
+
+	failing := newMockOutboxStore()
+	failing.oldestErr = errors.New("db down")
+	run(failing)
+	assert.InDelta(t, 90, gauge(), 0, "a failed query leaves the last value")
 }

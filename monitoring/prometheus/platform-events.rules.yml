@@ -194,6 +194,16 @@ groups:
           description: "The outbox pending-count query has failed for 10 minutes, so the backlog alert is blind."
           runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxpendingunknown"
 
+      # Delivery stopped although the backlog is small (transient failures —
+      # e.g. broken credentials — never dead-letter, so nothing else fires on a
+      # low-volume service). Proposed metric: enable once ratified.
+      # after ratification:
+      # - alert: PlatformEventsOutboxDeliveryStalled
+      #   expr: max by (domain, service, environment) (platform_outbox_oldest_pending_age) > 600
+      #   for: 10m
+      #   labels: {severity: critical}
+      #   (triage: docs/observability/README.md § Outbox delivery-stall signal)
+
       # after ratification: platform_outbox_errors_total{operation="poll"}
       - alert: PlatformEventsOutboxPollFailing
         expr: sum by (service) (rate(outbox_poll_errors_total[5m])) > 0

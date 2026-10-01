@@ -78,12 +78,14 @@ func WithDeadLetterHandler(fn port.Handler) ConsumerOption {
 	}
 }
 
-// WithHandlerTimeout bounds each handler call: the handler's context is
-// cancelled after d, and the message's visibility is no longer extended past
-// it, so a hung handler cannot hold a message invisible (and out of the
-// queue's redrive) indefinitely — it becomes visible again and is redelivered,
-// counting toward MaxReceiveCount. A handler that ignores its context still
-// occupies its concurrency slot until it returns. 0 (default) is unbounded.
+// WithHandlerTimeout bounds the processing of each message — codec decode,
+// dead-letter handler and handler — with one deadline d from when a worker
+// picks it up: their contexts are cancelled at it, and the message's
+// visibility is no longer extended past it, so a hung handler cannot hold a
+// message invisible (and out of the queue's redrive) indefinitely — it becomes
+// visible again and is redelivered, counting toward MaxReceiveCount. A handler
+// that ignores its context still occupies its concurrency slot until it
+// returns. 0 (default) is unbounded.
 func WithHandlerTimeout(d time.Duration) ConsumerOption {
 	return func(c *sqsConsumer) {
 		if d > 0 {
@@ -426,25 +428,9 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		// extra 5 s covers AWS control-plane overhead and TLS handshakes.
 		// We pass loopCtx as the parent so cancellation still propagates immediately
 		// on Stop(), even before the per-call deadline fires.
-		// Receive only as many messages as there are free workers. A received
-		// message's visibility timeout starts at once, but it is only extended
-		// once a worker picks it up — messages queued behind busy workers would
-		// reappear (and be processed twice, inflating their receive count) when
-		// handlers are slow. Wait for one free slot first; only this loop takes
-		// slots, so the free count can only grow until messages are dispatched.
-		select {
-		case sem <- struct{}{}:
-			<-sem
-		case <-loopCtx.Done():
-			drain()
-			return nil
-		}
-		input := *receiveInput
-		input.MaxNumberOfMessages = min(c.maxMessages, int32(cap(sem)-len(sem)))
-
 		rcvCtx, rcvCancel := context.WithTimeout(loopCtx, time.Duration(int(c.waitSeconds)+5)*time.Second)
 		rcvStart := time.Now()
-		out, err := c.client.ReceiveMessage(rcvCtx, &input)
+		out, err := c.client.ReceiveMessage(rcvCtx, receiveInput)
 		rcvDur := time.Since(rcvStart)
 		rcvCancel()
 		if err != nil {
@@ -482,13 +468,27 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		receiveBackoff = receiveBackoffInit // reset on success
 		metrics.ObserveDependency("sqs", "receive_message", nil, rcvDur)
 
-		for _, msg := range out.Messages {
+		// A received message's visibility clock starts at once. Extend every
+		// message from receipt — including those waiting for a busy worker —
+		// so a batch queued behind slow handlers never reappears and is
+		// processed twice (inflating its receive count towards the DLQ).
+		exts := make([]*visibilityExtender, len(out.Messages))
+		for i, msg := range out.Messages {
+			exts[i] = c.extendVisibility(msg)
+		}
+		for i, msg := range out.Messages {
+			ext := exts[i]
 			// Interruptible semaphore acquire: if loopCtx is cancelled while all
 			// concurrency slots are busy the blocking send would hold Start() forever,
 			// preventing drain() from ever being called and deadlocking Stop().
 			select {
 			case sem <- struct{}{}:
 			case <-loopCtx.Done():
+				// Undispatched messages: stop extending so they become visible
+				// for another consumer after their visibility timeout.
+				for _, e := range exts[i:] {
+					e.Stop()
+				}
 				drain()
 				return nil
 			}
@@ -509,7 +509,8 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 						}
 					}
 				}()
-				c.dispatch(drainCtx, loopCtx, msg)
+				defer ext.Stop()
+				c.dispatch(drainCtx, loopCtx, msg, ext)
 			})
 		}
 	}
@@ -588,7 +589,7 @@ func (c *sqsConsumer) Stop() error {
 //     so in-flight handlers can be signalled when the drain deadline fires.
 //   - loopCtx: the receive-loop context cancelled by Stop(); used for
 //     visibility-timeout extension (which must stop when the loop stops).
-func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.Message) {
+func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.Message, ext *visibilityExtender) {
 	tracer := otel.Tracer("platform-events")
 	receivedAt := time.Now()
 	metrics.ObserveReceived(c.queueURL)
@@ -600,7 +601,8 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		// Valid JSON is not necessarily an envelope: an SNS notification
 		// wrapper (subscription without RawMessageDelivery) decodes "Type"
 		// into env.Type — Go matches keys case-insensitively — and leaves the
-		// rest empty. Require what ParseEnvelope requires of a producer.
+		// rest empty. Require id, type and source; unlike ParseEnvelope, a
+		// missing time is tolerated (it only feeds the propagation metric).
 		parseErr = missingEnvelopeFields(env)
 	}
 	if parseErr != nil {
@@ -620,10 +622,18 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	receiveCount := approxReceiveCount(msg.Attributes)
 	overThreshold := c.maxReceiveCount > 0 && receiveCount > c.maxReceiveCount
 
-	// Keep the message hidden for everything dispatch does from here on —
-	// codec decode, the dead-letter handler and DLQ forward, and the handler —
-	// so slow work never lets it be redelivered (and processed twice).
-	defer c.extendVisibility(msg)()
+	// WithHandlerTimeout bounds the whole processing of this message — codec
+	// decode, dead-letter handler and handler — with ONE deadline from here:
+	// every context below derives from handlerBase, and the visibility
+	// extension stops at the same instant, so the message is never released
+	// for redelivery while its processing is still within its budget.
+	if c.handlerTimeout > 0 {
+		deadline := time.Now().Add(c.handlerTimeout)
+		ext.SetDeadline(deadline)
+		var cancelDeadline context.CancelFunc
+		handlerBase, cancelDeadline = context.WithDeadline(handlerBase, deadline)
+		defer cancelDeadline()
+	}
 	// Propagation is creation → FIRST receipt; a redelivery's age would add
 	// retry delay. A missing receive count (0) is treated as a first receipt.
 	if receiveCount <= 1 {
@@ -782,9 +792,6 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	// must run to completion during graceful shutdown). context.AfterFunc links
 	// the drain deadline so handlers are cancelled when drain timeout fires.
 	handlerCtx, handlerCancel := context.WithCancel(handlerBase)
-	if c.handlerTimeout > 0 {
-		handlerCtx, handlerCancel = context.WithTimeout(handlerBase, c.handlerTimeout)
-	}
 	stopDrain := context.AfterFunc(drainCtx, handlerCancel)
 	defer stopDrain()
 	defer handlerCancel()
@@ -857,12 +864,35 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	metrics.RecordConsume(c.queueURL, env.Type, status, dur.Seconds())
 }
 
-// extendVisibility keeps msg hidden while dispatch works on it: every
-// max(visibilityTimeout/2, 1s) it resets the visibility timeout. It returns the
-// function that stops the extension; call it when dispatch is done.
-func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) (stop func()) {
+// visibilityExtender keeps one received message hidden until stopped.
+type visibilityExtender struct {
+	stop     func()
+	deadline atomic.Int64 // UnixNano; 0 = no deadline
+}
+
+// Stop ends the extension and waits for its goroutine. Safe to call more
+// than once and on a nil extender.
+func (e *visibilityExtender) Stop() {
+	if e != nil && e.stop != nil {
+		e.stop()
+	}
+}
+
+// SetDeadline stops extending once t has passed (WithHandlerTimeout).
+func (e *visibilityExtender) SetDeadline(t time.Time) {
+	if e != nil {
+		e.deadline.Store(t.UnixNano())
+	}
+}
+
+// extendVisibility keeps msg hidden from receipt until Stop: every
+// max(visibilityTimeout/2, 1s) it resets the visibility timeout — while the
+// message waits for a worker and while it is processed — and stops early once
+// a deadline set with SetDeadline has passed.
+func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) *visibilityExtender {
+	ext := &visibilityExtender{}
 	if c.visibilityTimeout <= 0 || msg.ReceiptHandle == nil {
-		return func() {}
+		return ext
 	}
 	// Clamp to minimum 1s: int32 truncation would produce 0 for sub-second
 	// durations, which would make the message immediately re-visible.
@@ -871,11 +901,12 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) (stop func()) {
 	// extensions continue until dispatch completes, not until drain fires.
 	extCtx, extCancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	// With WithHandlerTimeout, stop extending once it has passed: a hung
-	// handler must not keep the message invisible (and out of redrive) forever.
-	var deadline time.Time
-	if c.handlerTimeout > 0 {
-		deadline = time.Now().Add(c.handlerTimeout)
+	var once sync.Once
+	ext.stop = func() {
+		once.Do(func() {
+			extCancel()
+			<-done
+		})
 	}
 	go func() {
 		defer close(done)
@@ -884,7 +915,10 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) (stop func()) {
 		for {
 			select {
 			case <-ticker.C:
-				if !deadline.IsZero() && time.Now().After(deadline) {
+				// With WithHandlerTimeout, stop extending once it has passed: a
+				// hung handler must not keep the message invisible (and out of
+				// redrive) forever.
+				if d := ext.deadline.Load(); d != 0 && time.Now().UnixNano() > d {
 					if c.logger != nil {
 						c.logger.Warn("sqs: handler timeout passed — no longer extending visibility; the message will be redelivered", map[string]any{
 							"message_id": aws.ToString(msg.MessageId),
@@ -921,10 +955,7 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) (stop func()) {
 			}
 		}
 	}()
-	return func() {
-		extCancel()
-		<-done
-	}
+	return ext
 }
 
 // decode runs the codec on a context that keeps parent's values, survives
@@ -1035,9 +1066,8 @@ var errDLQForwardFailed = errors.New("sqs: forward to DLQ failed")
 const maxDLQForwardTimeout = 30 * time.Second
 
 // dlqForwardTimeout returns the forward deadline: maxDLQForwardTimeout, capped
-// at half the configured visibility timeout (minimum 1s). A malformed message
-// is forwarded before visibility extension starts, so a forward outliving the
-// visibility timeout would let it be redelivered — and forwarded twice.
+// at half the configured visibility timeout (minimum 1s), so a forward never
+// outlives the message's visibility even if an extension call fails.
 func (c *sqsConsumer) dlqForwardTimeout() time.Duration {
 	if c.visibilityTimeout > 0 {
 		return max(min(maxDLQForwardTimeout, c.visibilityTimeout/2), time.Second)

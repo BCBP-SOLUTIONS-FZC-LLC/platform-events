@@ -83,6 +83,8 @@ func exerciseAll() {
 	internalmetrics.IncDuplicate("", et) // inbox outside the SQS consumer → queue="unknown"
 	internalmetrics.SetQueueDepth(testQueueURL, 42)
 	internalmetrics.AddInFlight(testQueueURL, 1)
+	internalmetrics.SetOutboxOldestPendingAge(90 * time.Second)
+	internalmetrics.SetOutboxOldestPendingAge(-1)
 	internalmetrics.SetDLQDepth(testQueueURL, 3)
 	for dep, ops := range internalmetrics.DependencyOperations {
 		for _, op := range ops {

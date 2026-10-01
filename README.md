@@ -100,7 +100,7 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | `NewRunner(Config)`, `Runner.Start` / `Stop` / `Ready` | Poll → claim (`SKIP LOCKED` + lease) → publish → mark |
 | `Runner.ListDeadLetters` / `ReprocessDeadLetters` / `ReprocessDeadLettersWith` / `DiscardDeadLetters` | Inspect / replay / discard `outbox_dead_letters` (`DLQFilter`, `DeadLetterRecord`) |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Batched delete of old published rows |
-| `ApplySchema(ctx, migrateRunner)`, `MigrationsTable` | Embedded migrations `001`–`008`, isolated `outbox_migrations` tracking table |
+| `ApplySchema(ctx, migrateRunner)`, `MigrationsTable` | Embedded migrations `001`–`009`, isolated `outbox_migrations` tracking table |
 
 ### `pkg/inbox` — consumer-side deduplication
 

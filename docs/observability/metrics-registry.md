@@ -24,6 +24,7 @@ platform-events' entry in the Platform Observability Registry (Enterprise Platfo
 | `platform_message_processing_duration_seconds` | histogram | platform | proposed | `domain`, `service`, `environment`, `queue`, `event_type` | `events_consume_duration_seconds` |
 | `platform_outbox_pending_events` | gauge | platform | proposed | `domain`, `service`, `environment` | `outbox_pending_total` |
 | `platform_outbox_leased_events` | gauge | platform | proposed | `domain`, `service`, `environment` | `outbox_leased_total` |
+| `platform_outbox_oldest_pending_age` | gauge | platform | proposed | `domain`, `service`, `environment` | — |
 | `platform_outbox_publish_attempts_total` | counter | platform | proposed | `domain`, `service`, `environment`, `event_type`, `outcome` | `outbox_published_total`, `outbox_attempts_total` |
 | `platform_outbox_errors_total` | counter | platform | proposed | `domain`, `service`, `environment`, `operation` | `outbox_poll_errors_total`, `outbox_unmarshal_errors_total`, `outbox_mark_published_errors_total` |
 | `platform_outbox_dead_letter_operations_total` | counter | platform | proposed | `domain`, `service`, `environment`, `operation` | `outbox_dead_letters_reprocessed_total`, `outbox_dead_letters_discarded_total` |
@@ -68,7 +69,7 @@ A label name means the same thing on every metric that uses it; each entry below
 | `topic` | requested | SNS topic name — the last segment of the topic ARN (e.g. `iam-events`, `orders.fifo`), never the full ARN. Bounded by the topics a service publishes to (typically 1–3). |
 | `event_type` | approved | Envelope `type` (`<domain>.<entity>.<past-tense-verb>[.v<N>]`), expected to come from the event-type registry in EVENT_SCHEMA_GOVERNANCE.md — and enforced in-process: at most 200 distinct values per process (`events.WithEventTypeLimit`), further ones recorded as `__other__`; values over 128 bytes as `__oversized__`; an empty or unparseable type as `unknown`. Replacements are counted in platform_telemetry_label_overflow_total. |
 | `reason` | approved | failures: `malformed`, `decode_error`, `handler_error`, `handler_panic`, `dead_letter_error`; dead-letters: `malformed`, `decode_error`, `max_receive_count`, `explicit`, `max_attempts` |
-| `operation` | approved | message flow: `consume`, `outbox_publish`; dependency calls: `publish`, `publish_batch`, `receive_message`, `delete_message`, `change_message_visibility`, `send_message`, `get_queue_attributes`, `get_queue_url`, `encode`, `decode`; outbox errors: `poll`, `unmarshal`, `mark_published`, `pending_count`, `leased_count`; dead-letter actions: `reprocess`, `discard` |
+| `operation` | approved | message flow: `consume`, `outbox_publish`; dependency calls: `publish`, `publish_batch`, `receive_message`, `delete_message`, `change_message_visibility`, `send_message`, `get_queue_attributes`, `get_queue_url`, `encode`, `decode`; outbox errors: `poll`, `unmarshal`, `mark_published`, `pending_count`, `leased_count`, `oldest_pending`; dead-letter actions: `reprocess`, `discard` |
 | `dependency` | approved | `codec` → `encode`, `decode`; `sns` → `publish`, `publish_batch`; `sqs` → `receive_message`, `delete_message`, `change_message_visibility`, `send_message`, `get_queue_attributes`, `get_queue_url` |
 | `outcome` | approved | `success`, `error` |
 | `label` | requested | `event_type` |
@@ -256,7 +257,7 @@ A label name means the same thing on every metric that uses it; each entry below
 ### `platform_outbox_pending_events`
 
 - **Type:** gauge · **Tier:** platform · **Status:** proposed
-- **Semantic definition:** Events in a service's transactional outbox that are waiting to be published (unpublished and not leased by a runner), sampled each outbox poll cycle. Left at its last value when the count query fails (see platform_outbox_errors_total{operation="pending_count"}).
+- **Semantic definition:** Events in a service's transactional outbox that are due to be published (unpublished, not leased and not waiting out a retry backoff), sampled every outbox GaugeInterval (default 15s) and capped at 100000 (a reading of 100000 means at least that many). Left at its last value when the count query fails (see platform_outbox_errors_total{operation="pending_count"}).
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** —
 - **Cardinality:** One series per service instance.
@@ -267,13 +268,24 @@ A label name means the same thing on every metric that uses it; each entry below
 ### `platform_outbox_leased_events`
 
 - **Type:** gauge · **Tier:** platform · **Status:** proposed
-- **Semantic definition:** Outbox events currently claimed by a runner and being published (leased, not yet published or released), sampled each poll cycle.
+- **Semantic definition:** Unpublished outbox events not yet due: claimed by a runner and being published, or waiting out a retry backoff. Sampled every GaugeInterval, capped at 100000.
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** —
 - **Cardinality:** One series per service instance.
 - **Aggregation:** max by (domain, service) (platform_outbox_leased_events).
 - **Supersedes:** `outbox_leased_total`
 - **Governance notes:** New platform_* name (not among the standard's canonical or registry-proposed examples); submitted under the Registry Ratification Requirement. Shadow-emitted until ratified.
+
+### `platform_outbox_oldest_pending_age`
+
+- **Type:** gauge · **Tier:** platform · **Status:** proposed
+- **Semantic definition:** Age of the oldest unpublished outbox event (now − created_at), 0 when nothing is unpublished, sampled every GaugeInterval. Transient publish failures never dead-letter, so this is the signal that delivery has stopped even when the backlog is small (e.g. a credential outage on a low-volume service).
+- **Required labels:** `domain`, `service`, `environment`
+- **Approved labels:** —
+- **Cardinality:** One series per service instance.
+- **Aggregation:** max by (domain, service) (platform_outbox_oldest_pending_age) — every runner reads the same table. Alert on it staying above the delivery-latency objective (e.g. > 600 for 10m) once ratified.
+- **Supersedes:** —
+- **Governance notes:** Proposed by platform-events. Left at its last value when the query fails (platform_outbox_errors_total{operation="oldest_pending"}).
 
 ### `platform_outbox_publish_attempts_total`
 
@@ -294,7 +306,7 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Semantic definition:** An outbox runner step that failed outside a publish attempt: poll (claiming a batch), unmarshal (a stored envelope that no longer parses), mark_published (an event published but not marked — it will be delivered again), pending_count / leased_count (a backlog gauge query).
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** `operation`
-  - `operation`: `poll`, `unmarshal`, `mark_published`, `pending_count`, `leased_count`
+  - `operation`: `poll`, `unmarshal`, `mark_published`, `pending_count`, `leased_count`, `oldest_pending`
 - **Cardinality:** operation (5).
 - **Aggregation:** sum by (domain, service, operation) (rate(platform_outbox_errors_total[5m])) > 0.
 - **Supersedes:** `outbox_poll_errors_total`, `outbox_unmarshal_errors_total`, `outbox_mark_published_errors_total`

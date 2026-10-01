@@ -19,46 +19,65 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
-// The consumer never receives more messages than it has free workers: a
-// received message's visibility clock starts at once, so messages queued
-// behind busy workers would reappear and be processed twice.
-func TestReceive_NeverMoreThanFreeWorkers(t *testing.T) {
+// Batches are received whole (one receive per MaxMessages, not per free
+// worker), and every message's visibility is extended from receipt: a message
+// waiting behind a busy worker must not reappear and be processed twice.
+func TestReceive_QueuedMessagesExtendedWhileWaiting(t *testing.T) {
 	var mu sync.Mutex
 	var requested []int32
-	release := make(chan struct{})
+	extended := map[string]int{}
+	var once atomic.Bool
+	var batch []sqstypes.Message
+	for i := range 3 {
+		m := makeSQSMessage(domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`)))
+		m.ReceiptHandle = aws.String("rh-" + string(rune('a'+i)))
+		batch = append(batch, m)
+	}
 	client := &mockSQSClient{
 		receiveMessageFn: func(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
 			mu.Lock()
 			requested = append(requested, in.MaxNumberOfMessages)
 			mu.Unlock()
-			var msgs []sqstypes.Message
-			for range in.MaxNumberOfMessages {
-				msgs = append(msgs, makeSQSMessage(domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`))))
+			if once.CompareAndSwap(false, true) {
+				return &sqs.ReceiveMessageOutput{Messages: batch}, nil
 			}
-			return &sqs.ReceiveMessageOutput{Messages: msgs}, nil
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		changeMessageVisibilityFn: func(_ context.Context, in *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+			mu.Lock()
+			extended[aws.ToString(in.ReceiptHandle)]++
+			mu.Unlock()
+			return &sqs.ChangeMessageVisibilityOutput{}, nil
 		},
 		deleteMessageFn: func(context.Context, *sqs.DeleteMessageInput, ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
 			return &sqs.DeleteMessageOutput{}, nil
 		},
 	}
-	var started atomic.Int32
+	release := make(chan struct{})
+	var handled atomic.Int32
 	c, err := internalsqs.NewWithClient(internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1}, client,
 		func(context.Context, domain.Envelope[json.RawMessage]) error {
-			started.Add(1)
+			handled.Add(1)
 			<-release
 			return nil
-		}, internalsqs.WithConcurrency(3), internalsqs.WithDrainTimeout(2*time.Second))
+		}, internalsqs.WithVisibilityTimeout(time.Second), internalsqs.WithDrainTimeout(3*time.Second)) // concurrency 1
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); _ = c.Start(ctx) }()
 
-	eventually(t, func() bool { return started.Load() == 3 }, "all three workers busy")
-	time.Sleep(100 * time.Millisecond) // no further receive while every worker is busy
+	eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return extended["rh-b"] >= 1 && extended["rh-c"] >= 1
+	}, "messages waiting for the busy worker are extended")
+	assert.Equal(t, int32(1), handled.Load(), "only one worker, the others are still queued")
 	mu.Lock()
-	assert.Equal(t, []int32{3}, requested, "asked for 3 (free workers), not MaxMessages=10, and nothing while busy")
+	assert.Equal(t, int32(10), requested[0], "the batch is received whole")
 	mu.Unlock()
 	close(release)
+	eventually(t, func() bool { return handled.Load() == 3 }, "all processed")
 	cancel()
 	<-done
 }
@@ -171,4 +190,86 @@ func TestDispatch_MissingTypeAndSource_Malformed(t *testing.T) {
 		}
 	}
 	assert.Contains(t, errText, "missing type, source")
+}
+
+// WithHandlerTimeout is one budget for the whole message: time spent in codec
+// decode is taken from the handler's deadline, matching when the visibility
+// extension stops.
+func TestHandlerTimeout_OneDeadlineAcrossDecodeAndHandler(t *testing.T) {
+	env := makeCodecEncodedEnvelope(t, "a.b.c", "schema-1", json.RawMessage(`{"a":1}`))
+	codec := &fakeCodec{decodeFn: func(context.Context, string, []byte) (json.RawMessage, error) {
+		time.Sleep(300 * time.Millisecond)
+		return json.RawMessage(`{"a":1}`), nil
+	}}
+	remaining := make(chan time.Duration, 1)
+	consumeOnce(t, withReceiveCount(makeSQSMessage(env), "1"), func(ctx context.Context, _ domain.Envelope[json.RawMessage]) error {
+		d, ok := ctx.Deadline()
+		require.True(t, ok)
+		remaining <- time.Until(d)
+		return nil
+	}, internalsqs.WithCodec(codec), internalsqs.WithHandlerTimeout(time.Second))
+	select {
+	case r := <-remaining:
+		assert.LessOrEqual(t, r, 750*time.Millisecond, "decode time is part of the budget")
+		assert.Greater(t, r, time.Duration(0))
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler not called")
+	}
+}
+
+// Stop while received messages still wait for a worker: their visibility
+// extension stops (they become visible to another consumer), and Start
+// returns once the in-flight handler drains.
+func TestStop_QueuedMessagesReleased(t *testing.T) {
+	var mu sync.Mutex
+	extended := map[string]int{}
+	var once atomic.Bool
+	var batch []sqstypes.Message
+	for i := range 3 {
+		m := makeSQSMessage(domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`)))
+		m.ReceiptHandle = aws.String("rh-" + string(rune('a'+i)))
+		batch = append(batch, m)
+	}
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			if once.CompareAndSwap(false, true) {
+				return &sqs.ReceiveMessageOutput{Messages: batch}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		changeMessageVisibilityFn: func(_ context.Context, in *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+			mu.Lock()
+			extended[aws.ToString(in.ReceiptHandle)]++
+			mu.Unlock()
+			return &sqs.ChangeMessageVisibilityOutput{}, nil
+		},
+		deleteMessageFn: func(context.Context, *sqs.DeleteMessageInput, ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+	}
+	started := make(chan struct{})
+	var handled atomic.Int32
+	c, err := internalsqs.NewWithClient(internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1}, client,
+		func(ctx context.Context, _ domain.Envelope[json.RawMessage]) error {
+			if handled.Add(1) == 1 {
+				close(started)
+			}
+			time.Sleep(300 * time.Millisecond)
+			return nil
+		}, internalsqs.WithVisibilityTimeout(time.Second), internalsqs.WithDrainTimeout(3*time.Second))
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() { defer close(done); _ = c.Start(context.Background()) }()
+	<-started
+	require.NoError(t, c.Stop())
+	<-done
+	mu.Lock()
+	before := extended["rh-c"]
+	mu.Unlock()
+	time.Sleep(1200 * time.Millisecond) // past an extension tick
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, before, extended["rh-c"], "no extension for an undispatched message after Stop")
+	assert.Equal(t, int32(1), handled.Load(), "queued messages are not processed after Stop")
 }

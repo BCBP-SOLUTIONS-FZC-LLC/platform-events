@@ -140,3 +140,9 @@ When a metric is ratified:
 4. Release.
 
 The lint then allows the metric in alerts, recording rules, SLOs and HPA.
+
+## Outbox delivery-stall signal (Proposed)
+
+`platform_outbox_oldest_pending_age` is the age in seconds of the oldest unpublished outbox event (0 when none). Transient publish failures — throttling, an SNS outage, network or credential problems — never dead-letter, so a stuck outbox on a low-volume service may never trip `PlatformEventsOutboxBacklog`; this gauge does. It is Proposed, so the alert `PlatformEventsOutboxDeliveryStalled` (`max by (domain, service, environment) (platform_outbox_oldest_pending_age) > 600` for 10m) ships commented out in `monitoring/prometheus/platform-events.rules.yml` until ratification. Graph it meanwhile.
+
+**Triage when it climbs:** the `last_error` of the oldest rows (`SELECT id, attempts, last_error FROM outbox_events WHERE published_at IS NULL ORDER BY created_at LIMIT 10`); `events_published_total{status="error"}`; IAM (`sns:Publish`) and the topic's KMS key; whether any runner is up (`outbox_poll_errors_total`, pod status). Delivery resumes by itself once the dependency is fixed (transient failures back off to at most `OUTBOX_MAX_RETRY_BACKOFF`, 5m by default).

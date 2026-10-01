@@ -155,7 +155,7 @@ var (
 
 	// OutboxErrorOperationValues: outbox runner steps that can fail outside
 	// a publish attempt.
-	OutboxErrorOperationValues = []string{"poll", "unmarshal", "mark_published", "pending_count", "leased_count"}
+	OutboxErrorOperationValues = []string{"poll", "unmarshal", "mark_published", "pending_count", "leased_count", "oldest_pending"}
 
 	// DeadLetterOperationValues: operator actions on outbox_dead_letters.
 	DeadLetterOperationValues = []string{"reprocess", "discard"}
@@ -370,7 +370,7 @@ func Registry() []RegistryEntry {
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_pending_events",
 			Type:               TypeGauge,
-			SemanticDefinition: "Events in a service's transactional outbox that are waiting to be published (unpublished and not leased by a runner), sampled each outbox poll cycle. Left at its last value when the count query fails (see platform_outbox_errors_total{operation=\"pending_count\"}).",
+			SemanticDefinition: "Events in a service's transactional outbox that are due to be published (unpublished, not leased and not waiting out a retry backoff), sampled every outbox GaugeInterval (default 15s) and capped at 100000 (a reading of 100000 means at least that many). Left at its last value when the count query fails (see platform_outbox_errors_total{operation=\"pending_count\"}).",
 			Cardinality:        "One series per service instance.",
 			AggregationNotes:   "Backlog per service: max by (domain, service) (platform_outbox_pending_events) — every runner reads the same table, so use max, not sum.",
 			Supersedes:         []string{"outbox_pending_total"},
@@ -378,10 +378,18 @@ func Registry() []RegistryEntry {
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_leased_events",
 			Type:               TypeGauge,
-			SemanticDefinition: "Outbox events currently claimed by a runner and being published (leased, not yet published or released), sampled each poll cycle.",
+			SemanticDefinition: "Unpublished outbox events not yet due: claimed by a runner and being published, or waiting out a retry backoff. Sampled every GaugeInterval, capped at 100000.",
 			Cardinality:        "One series per service instance.",
 			AggregationNotes:   "max by (domain, service) (platform_outbox_leased_events).",
 			Supersedes:         []string{"outbox_leased_total"},
+		}),
+		platformEntry(StatusProposed, RegistryEntry{
+			Name:               "platform_outbox_oldest_pending_age",
+			Type:               TypeGauge,
+			SemanticDefinition: "Age of the oldest unpublished outbox event (now − created_at), 0 when nothing is unpublished, sampled every GaugeInterval. Transient publish failures never dead-letter, so this is the signal that delivery has stopped even when the backlog is small (e.g. a credential outage on a low-volume service).",
+			Cardinality:        "One series per service instance.",
+			AggregationNotes:   "max by (domain, service) (platform_outbox_oldest_pending_age) — every runner reads the same table. Alert on it staying above the delivery-latency objective (e.g. > 600 for 10m) once ratified.",
+			GovernanceNotes:    "Proposed by platform-events. Left at its last value when the query fails (platform_outbox_errors_total{operation=\"oldest_pending\"}).",
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_publish_attempts_total",

@@ -321,6 +321,23 @@ func (s *Store) ReleaseLease(ctx context.Context, id, lastError string, retryAft
 	})
 }
 
+// OldestPendingAge returns how long the oldest unpublished record has been
+// waiting (database NOW() − created_at), 0 when nothing is unpublished. A
+// single probe of idx_outbox_events_unpublished_created (migration 009).
+func (s *Store) OldestPendingAge(ctx context.Context) (time.Duration, error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
+	defer cancel()
+	var secs float64
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+		return conn.QueryRow(ctx, `
+			SELECT COALESCE(EXTRACT(EPOCH FROM NOW() - MIN(created_at)), 0)::float8
+			FROM outbox_events
+			WHERE published_at IS NULL
+		`).Scan(&secs)
+	})
+	return time.Duration(max(secs, 0) * float64(time.Second)), err
+}
+
 // LeasedCount returns the number of unpublished records not yet due
 // (scheduled_at > NOW()): claimed by a runner, or waiting out a retry
 // backoff. They do not appear in PendingCount; together the two give the

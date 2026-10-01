@@ -62,11 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The lint exclusion for `test/smoke` used v1 syntax and was ignored. It now uses v2 `linters.exclusions.paths`.
 
 - **SQS consumer:**
-  - Each receive asked for `MaxMessages` (10) whatever the free workers, and a message only started extending its visibility once a worker picked it up. With slow handlers, messages queued behind busy workers reappeared and were processed twice — and with `WithMaxReceiveCount` / `WithDLQForwarding`, healthy messages were dead-lettered. Receives now ask for `min(MaxMessages, free workers)`.
+  - A message only started extending its visibility once a worker picked it up. With slow handlers, messages of a batch queued behind busy workers reappeared and were processed twice — and with `WithMaxReceiveCount` / `WithDLQForwarding`, healthy messages were dead-lettered. Every received message is now extended from receipt, while it waits and while it is processed; batches are still received whole (`MaxMessages`).
   - An SNS notification wrapper (subscription without `RawMessageDelivery`) decoded into an envelope with `Type = "Notification"` and no ID, so a handler ignoring unknown types deleted it as processed — silently losing the event. It is now malformed.
   - Malformed bodies were logged (first 512 bytes) at ERROR, putting tenant payloads in logs. Now logged as size + SHA-256 unless `WithMalformedBodyLogging` is set.
-  - New `WithHandlerTimeout` (`SQS_HANDLER_TIMEOUT`): a hung handler no longer keeps its message invisible — and out of the queue's redrive — forever.
-- **Outbox:** the backlog gauges ran two uncapped `COUNT(*)` queries every poll on every replica with a 2s timeout. Under a large backlog they timed out, the gauge read -1 and `PlatformEventsOutboxBacklog` went blind (and the KEDA example scaled in at the peak). They now run every `GaugeInterval` (15s, `OUTBOX_GAUGE_INTERVAL`) with a 5s timeout, capped at 100 000 rows; the KEDA example ignores -1 readings.
+  - New `WithHandlerTimeout` (`SQS_HANDLER_TIMEOUT`): a hung handler no longer keeps its message invisible — and out of the queue's redrive — forever. It is one deadline for the whole message (codec decode, dead-letter handler, handler) from when a worker picks it up, shared by the contexts and the visibility extension.
+- **Outbox:** the backlog gauges ran two uncapped `COUNT(*)` queries every poll on every replica with a 2s timeout. Under a large backlog they timed out, the gauge read -1 and `PlatformEventsOutboxBacklog` went blind (and the KEDA example scaled in at the peak). They now run every `GaugeInterval` (15s, `OUTBOX_GAUGE_INTERVAL`) with a 5s timeout, capped at 100 000 rows; the KEDA example ignores -1 readings and sets `ignoreNullValues: "false"` so a count failing for longer is not read as an empty backlog.
 - **Metrics:** `event_type` slots are first come, first served, so unknown types from a misbehaving producer could take all 200 and turn real types into `__other__`. New `events.WithEventTypes(...)` pre-registers the known types.
 - **SNS / SQS DLQ:** `UnknownError` (a body-less error response) is retryable only on 5xx / 429; a body-less 4xx from a proxy stays permanent.
 - **Config:** a backslash-escaped space in an unquoted keyword/value password (`password=a\ b`) is masked whole.
@@ -76,6 +76,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `events.WithHandlerTimeout`, `events.WithMalformedBodyLogging`, `events.WithEventTypes`, `outbox.Config.GaugeInterval`; env `SQS_HANDLER_TIMEOUT`, `OUTBOX_GAUGE_INTERVAL`.
+- Proposed metric `platform_outbox_oldest_pending_age` — age in seconds of the oldest unpublished outbox event; catches a stalled outbox whose backlog is too small for `PlatformEventsOutboxBacklog` (transient failures never dead-letter). Its alert ships commented out until ratification. Outbox migration `009` adds the partial index it reads (`CREATE INDEX` without `CONCURRENTLY` — on a large outbox, create it concurrently by hand first).
 - Proposed metric `platform_messages_in_flight{queue}` — messages a consumer replica is processing; at the concurrency limit for long means saturation or a hung handler.
 
 ### Changed

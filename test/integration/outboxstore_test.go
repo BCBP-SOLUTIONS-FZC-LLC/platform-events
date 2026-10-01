@@ -522,6 +522,33 @@ func TestOutboxStore_ReleaseLeaseAndRetryBackoff(t *testing.T) {
 	assert.Empty(t, lastErr, "published row untouched")
 }
 
+func TestOutboxStore_OldestPendingAge(t *testing.T) {
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	age, err := store.OldestPendingAge(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, age, "empty outbox")
+
+	rec := makeRecord("age.event")
+	require.NoError(t, pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+		if err := store.Enqueue(ctx, tx, rec); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE outbox_events SET created_at = NOW() - interval '10 minutes' WHERE id = $1`, rec.ID)
+		return err
+	}))
+	age, err = store.OldestPendingAge(ctx)
+	require.NoError(t, err)
+	assert.InDelta(t, (10 * time.Minute).Seconds(), age.Seconds(), 5)
+
+	require.NoError(t, store.MarkPublished(ctx, rec.ID))
+	age, err = store.OldestPendingAge(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, age, "published records do not count")
+}
+
 // ----------------------------
 // LeasedCount
 // ----------------------------

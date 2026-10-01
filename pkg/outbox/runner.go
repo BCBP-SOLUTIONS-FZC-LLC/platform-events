@@ -109,11 +109,11 @@ type Runner struct {
 	doneCh  chan struct{}      // closed when the active Start() goroutine has exited
 	started atomic.Bool        // guards against concurrent Start() calls
 
-	// readyCh is closed after the first successful poll cycle (or empty poll),
-	// signalling that the DB connection and schema are healthy. Expose via Ready().
 	// lastGauge is when the backlog gauges were last refreshed (poll loop only).
 	lastGauge time.Time
 
+	// readyCh is closed after the first successful poll cycle (or empty poll),
+	// signalling that the DB connection and schema are healthy. Expose via Ready().
 	// readyClosed records whether readyCh has been closed; guarded by mu.
 	readyCh     chan struct{}
 	readyClosed bool
@@ -360,6 +360,19 @@ func (r *Runner) refreshGauges(ctx context.Context) {
 			}
 		} else {
 			metrics.SetOutboxLeased(float64(n))
+		}
+	}
+	if metrics.HasOutboxOldestAgeMetric() {
+		oaCtx, oaCancel := context.WithTimeout(ctx, gaugeQueryTimeout)
+		age, ageErr := r.svc.OldestPendingAge(oaCtx)
+		oaCancel()
+		if ageErr != nil {
+			metrics.SetOutboxOldestPendingAge(-1)
+			if r.cfg.Logger != nil {
+				r.cfg.Logger.Warn("outbox: failed to query oldest pending age", map[string]any{"error": ageErr.Error()})
+			}
+		} else {
+			metrics.SetOutboxOldestPendingAge(age)
 		}
 	}
 }
