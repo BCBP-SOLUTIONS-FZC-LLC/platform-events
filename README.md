@@ -225,7 +225,7 @@ platform-events/
 
 | Library | Version | Purpose |
 |---|---|---|
-| `platform-pgcommon` | v1.4.2 | `pgcommon.Pool`, `RunInTx`, `ConfigFromEnv`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas, `Tx`/`Conn`/`Rows` aliases (pgx is never imported directly) |
+| `platform-pgcommon` | v1.4.3 | `pgcommon.Pool`, `RunInTx`, `ConfigFromEnv`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas, `Tx`/`Conn`/`Rows` aliases (pgx is never imported directly) |
 | `platform-gincommon` | — (not a dependency) | Interface-compatible only: its `ZapLogger` satisfies `port.Logger`, and its `RequestContext` supplies `TenantID` / `TraceID` for envelopes |
 
 ---

@@ -9,7 +9,7 @@
 | Go module | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events` (`go 1.26.0`, `toolchain go1.26.8`) |
 | Status | v1.6.0 + `[Unreleased]` — implemented on branch `feat/observability-standard` |
 | Base documents | [`ARCHITECTURE.md`](../../ARCHITECTURE.md), [`README.md`](../../README.md), [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md), [`EVENT_SCHEMA_GOVERNANCE.md`](../../EVENT_SCHEMA_GOVERNANCE.md), [`docs/observability/`](../observability/README.md) |
-| Sibling libraries | `platform-pgcommon` v1.4.2 (database, transactions, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
+| Sibling libraries | `platform-pgcommon` v1.4.3 (database, transactions, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
 | Consumers | Platform services (e.g. `iam-org-membership`, whose LLD §7 / §9 / §20 rely on the outbox and consumer contracts defined here) |
 | Deployment stage | Library — consumed via `go get`; v1.6.0 not yet tagged; branch unpushed (see §13.4) |
 
@@ -17,6 +17,7 @@
 
 | Rev | Date | Change |
 |---|---|---|
+| 2.3 | 2026-10-01 | platform-pgcommon v1.4.2 → v1.4.3 (documentation-only upstream release — pgcommon's own LLD and doc corrections; none of the corrected claims are repeated here). No code change. OQ-6 still open: v1.4.3's `release.yml` still has no `latest=false`. |
 | 2.2 | 2026-10-01 | Two-way gap audit against the code. Corrected: the layer rule is convention (only depguard is CI-enforced) and depguard skips `test/smoke` (§3.2); `port.Logger` has no `With`/`Named` (§3.3.1); `Enqueue` enforces a canonical UUID, v7 by convention (§4.2); the failure reason when a forward fails depends on the path (§8.7, §9.3); extender bound `WithConcurrency + MaxMessages` (§9.1); connection budget counts `PublishConcurrency` (§13.2); gauges refresh at the first poll after `GaugeInterval` (§8.4, §21.3); extension cadence `max(VT/2, 1s)` (§21.4); the CI `Smoke tests` job checks only the image (§14.4). Added: lifecycle semantics (§5.4, §5.6), `NewPublisherBridge` (O-12), remaining exported symbols (§5.5, §5.7, §5.8), receive-loop backoff and fixed per-call timeouts (§9.1), the bookkeeping budget (§8.4), DLQ send details (§10.3), inbox UUID rule (§7.4), queue-depth sampler and propagation details, label value sets, legacy successors and sunset (§11.2), a log catalogue (§11.4), CI gates and developer targets (§14), the `x-migrations-table` note (§19.4). Code: dead-letter list / replay / discard now order by `failed_at, id`, so a list-then-replay selects the same rows. |
 | 2.1 | 2026-10-01 | Accuracy pass against the code: public `DLQConfig` has no `Clock`; the consumer requires `id`/`type`/`source` (only `ParseEnvelope` also requires `time`); constructor errors vs clamped values (§12); all three `NewSNSPublisher` construction errors; envelope sentinels come from `ParseEnvelope` and outbox validation, not the SNS publisher; `ErrInvalidSignature` is reserved; white-box test scope; release appendix (`DLQPublisher` shipped in v1.5.0); gauge cadence max(`GaugeInterval`, `PollInterval`) in §21.3. |
 | 2.0 | 2026-10-01 | Restructured to the platform LLD convention (the `iam-org-membership` LLD's 21 sections): relationship table (§1.1), ownership split (§2.3), API IDs (§5), caching design with CACHE-n invariants (§6), event architecture with EVT-n invariants (§7), key flows (§8), FAIL-n / CONS-n / OPS-n invariant registers and a failure-scenario table (§9), security layers (§10), SLO guidance (§11.1), deployment and scaling (§13), data lifecycle (§15), sign-off register (§16), error taxonomy (§17), integration details (§18), migration strategy (§19), operational considerations (§20), performance (§21). No behaviour change. |
@@ -56,7 +57,7 @@ This document is the low-level design for **`platform-events`**, the shared Go l
 
 Refined into an implementable specification, this document gives the exact tables and indexes the library creates in a service's database, the public signatures and their behavioural contracts, the state machines behind publish / consume / outbox / inbox, the invariants that hold across them, configuration, metrics, and the operational procedures a service owner needs. Where this LLD and the code disagree, **the code is authoritative**; the discrepancy is a documentation bug and this document is updated with the change.
 
-**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `feat/observability-standard` at revision 2.2 (merged coverage 99.0%, `make ci` green).
+**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `feat/observability-standard` at revision 2.3 (merged coverage 99.0%, `make ci` green).
 
 ### 1.1 Relationship to the architecture documents
 
@@ -180,7 +181,7 @@ pkg/
 
 | Library | Version | Imported | Role |
 |---|---|---|---|
-| `platform-pgcommon` | v1.4.2 | Yes | All database access, transactions, configuration, migrations, RLS GUC context |
+| `platform-pgcommon` | v1.4.3 | Yes | All database access, transactions, configuration, migrations, RLS GUC context |
 | `platform-gincommon` | — | **No** | Interface compatibility only (`port.Logger`, `RequestContext` fields) |
 | `aws-sdk-go-v2` | v1.47.1 (sns v1.47.2, sqs v1.52.1) | Yes | SNS / SQS clients, smithy error types |
 | OpenTelemetry Go | — | Yes | Global tracer and propagator (`otel.Tracer`, `otel.GetTextMapPropagator`) |
@@ -1042,7 +1043,7 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | Latest tag | `v1.5.0` |
 | Next release | `v1.6.0` (CHANGELOG `[1.6.0]` + `[Unreleased]`), not yet tagged |
 | Branch | `feat/observability-standard`, unpushed; no PR open |
-| Dependencies | platform-pgcommon v1.4.2, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
+| Dependencies | platform-pgcommon v1.4.3, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
 | Consumers | Platform services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z` (`GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*`) |
 
 ---
@@ -1126,7 +1127,7 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | OQ-3 | A separate `timeout` reason on Canonical `platform_messages_failed_total` — rejected for now; timeouts are counted in the new Proposed `platform_message_timeouts_total{operation}` and failures keep `decode_error` / `dead_letter_error` / `handler_error` | Observability standard owners | Decided (new metric) |
 | OQ-4 | Strict-ordering mode (blocking a key across dead-letters) — not supported; the `StrictOrdering` flag was removed; a dead-lettered head releases its key | Library owners | Decided |
 | OQ-5 | `PlatformEventsConsumerStalled` suppression uses the service-wide dead-letter rate (`platform_dlq_messages_total` has no `queue` label) | Observability standard owners | Accepted |
-| OQ-6 | platform-pgcommon's `release.yml` uses `docker/metadata-action` `latest=auto` (fixed here with `latest=false`) | pgcommon owners | Upstream fix pending |
+| OQ-6 | platform-pgcommon's `release.yml` uses `docker/metadata-action` `latest=auto` (fixed here with `latest=false`) | pgcommon owners | Upstream fix pending (still open in v1.4.3) |
 | OQ-7 | Migration `010` changed during development; a dev database that applied an earlier draft needs `migrate down 1` and re-migrating | Release owner | Note for the PR |
 | OQ-8 | Release `v1.6.0`: push the branch, open the PR, tag after merge; update §13.4 | Release owner | Pending |
 
@@ -1170,7 +1171,7 @@ Consumer failure reasons and DLQ reasons are listed in §11.2; outbox error oper
 
 ### 18.1 Integration with `platform-pgcommon`
 
-Every database call goes through `*pgcommon.Pool` (`RunInTx`, `WithConn`); `ApplySchema` passes the embedded migration FS to `migrate.Runner` with the library's own migrations table. Upgrades of pgcommon are adopted per release (v1.4.1: `ErrVersionNotInSource` / `ErrMigrationDirty`; v1.4.2: docs only, diagram-sync script reused).
+Every database call goes through `*pgcommon.Pool` (`RunInTx`, `WithConn`); `ApplySchema` passes the embedded migration FS to `migrate.Runner` with the library's own migrations table. Upgrades of pgcommon are adopted per release (v1.4.1: `ErrVersionNotInSource` / `ErrMigrationDirty`; v1.4.2: docs only, diagram-sync script reused; v1.4.3: docs only — its LLD `docs/lld/platform-lld-pgcommon.md`).
 
 ### 18.2 Integration with `platform-gincommon`
 
@@ -1320,4 +1321,4 @@ Summary of the v1.6.0 + `[Unreleased]` changes this LLD reflects (full list in `
 | 6 | `WithDLQForwarding`, `DLQAttribution` (dead-letters counted once), `SourceMessageFromContext` (`DLQPublisher` itself shipped in v1.5.0) | §5.5, §8.7 |
 | 7 | Inbox `Store.Process` (exactly-once) and dead-letter awareness | §7.4 |
 | 8 | New Proposed metrics: `platform_messages_in_flight`, `platform_outbox_oldest_pending_age`, `platform_outbox_ordering_blocked_events`, `platform_message_timeouts_total` | §11.2 |
-| 9 | platform-pgcommon v1.4.2; release scripts parity; `latest=false`; `make docs-check` | §14, §16 |
+| 9 | platform-pgcommon v1.4.3; release scripts parity; `latest=false`; `make docs-check` | §14, §16 |

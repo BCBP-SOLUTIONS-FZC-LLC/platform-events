@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- **platform-pgcommon v1.4.2 is inherited** (from v1.4.0; v1.4.2 is documentation-only). The v1.4.1 upgrade notes that matter here:
+- **platform-pgcommon v1.4.3 is inherited** (from v1.4.0; v1.4.2 and v1.4.3 are documentation-only). The v1.4.1 upgrade notes that matter here:
   - `outbox.ApplySchema` / `inbox.ApplySchema` fail with `migrate.ErrVersionNotInSource` when the database was migrated by a newer platform-events, and with `migrate.ErrMigrationDirty` after an interrupted migration. Services that apply the schema at startup will refuse to start an older image after a newer one migrated — and this release adds outbox migrations `009` and `010`. Roll back by migrating the outbox schema down first (tracking table `outbox_migrations`), or run `ApplySchema` as a separate migration job.
   - The migration lock wait is the full `lock_timeout` (30s by default) instead of 15s.
   - `NewPool` rejects negative pool durations, and DSN `pool_*` parameters are now honoured.

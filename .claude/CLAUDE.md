@@ -113,7 +113,7 @@ test/                      ← separate Go module (replace … => ../)
 tools/                     ← separate Go module: golangci-lint via `go tool -modfile=tools/go.mod`
 
 External dependencies (private modules):
-  platform-pgcommon v1.4.2 → Pool, RunInTx, ConfigFromEnv, migrate.Runner, Tx/Conn/Rows aliases
+  platform-pgcommon v1.4.3 → Pool, RunInTx, ConfigFromEnv, migrate.Runner, Tx/Conn/Rows aliases
   platform-gincommon       → not imported: port.Logger matches its ZapLogger; tracing initialised by the service
 ```
 
