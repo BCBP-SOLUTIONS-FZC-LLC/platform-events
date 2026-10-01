@@ -130,6 +130,11 @@ jobs:
       - name: Dashboard PromQL
         run: make dashboards-check
 
+      # Every docs/architecture/mermaid/*.mmd embedded verbatim in
+      # ARCHITECTURE.md (docs-only changes: docs.yml).
+      - name: Architecture diagram sync
+        run: make docs-check
+
       - name: Vulnerability check
         run: |
           if ! make vuln-check; then

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- **platform-pgcommon v1.4.1 is inherited** (from v1.4.0). Its upgrade notes that matter here:
+- **platform-pgcommon v1.4.2 is inherited** (from v1.4.0; v1.4.2 is documentation-only). The v1.4.1 upgrade notes that matter here:
   - `outbox.ApplySchema` / `inbox.ApplySchema` fail with `migrate.ErrVersionNotInSource` when the database was migrated by a newer platform-events, and with `migrate.ErrMigrationDirty` after an interrupted migration. Services that apply the schema at startup will refuse to start an older image after a newer one migrated — and this release adds outbox migrations `009` and `010`. Roll back by migrating the outbox schema down first (tracking table `outbox_migrations`), or run `ApplySchema` as a separate migration job.
   - The migration lock wait is the full `lock_timeout` (30s by default) instead of 15s.
   - `NewPool` rejects negative pool durations, and DSN `pool_*` parameters are now honoured.
@@ -88,12 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` v1.4.0 → **v1.4.1** (root and `test/` modules); pgx stays v5.11.0. No code change was needed.
+- `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` v1.4.0 → **v1.4.2** (root and `test/` modules); pgx stays v5.11.0. No code change was needed.
 - AWS SDK for Go v2 upgraded: core v1.47.1, `service/sns` v1.47.2, `service/sqs` v1.52.1, `smithy-go` v1.28.2.
 - Release workflow parity with platform-pgcommon v1.4.1:
   - `verify-release-tag.sh` refuses a `workflow_dispatch` from a ref other than `main` or the tag, and a tag not reachable from `origin/main`.
   - `release-image-tags.sh`: the floating image tags `X.Y` / `X` / `latest` only move forward, so a hotfix of an older line no longer re-points them, and pre-releases never move them.
   - `changelog-section.sh`: a release candidate may use its base version's CHANGELOG section.
+- Docs parity with platform-pgcommon v1.4.2: `make docs-check` (`.github/scripts/docs-mermaid-sync.sh`) fails when a `docs/architecture/mermaid/*.mmd` is not embedded byte-identically in `ARCHITECTURE.md`. It runs in `make ci`, the pre-commit hook (re-run `make install-hooks`), `Validate / Quality`, and a new `docs.yml` workflow for the docs-only changes `ci.yml` skips. It caught one drifted diagram (layer model), now refreshed.
 
 ### Docs
 

@@ -101,7 +101,8 @@ help:
 	@echo "  make build            - compile reference CLI to bin/"
 	@echo "  make cover            - coverage HTML report (runs test-ci)"
 	@echo "  make cover-func       - coverage summary by function (runs test-ci)"
-	@echo "  make ci               - tidy + mod-verify + fmt-check + vet + lint + metrics-lint + rules-check + dashboards-check + test-ci + build (the same gates as CI)"
+	@echo "  make ci               - tidy + mod-verify + fmt-check + vet + lint + docs-check + metrics-lint + rules-check + dashboards-check + test-ci + build (the same gates as CI)"
+	@echo "  make docs-check       - every docs/architecture/mermaid/*.mmd embedded verbatim in ARCHITECTURE.md"
 	@echo "  make docker-up        - start floci (SNS/SQS, :4574) + floci-ui (http://localhost:4505) + Postgres (:5538)"
 	@echo "  make docker-build     - build the reference-CLI image as CI does (needs GO_PRIVATE_TOKEN)"
 	@echo "  make pin-base-images  - fetch + pin SHA digests for Dockerfile base images"
@@ -323,7 +324,7 @@ docker-down:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy mod-verify fmt-check vet lint metrics-lint rules-check dashboards-check test-ci build
+ci: tidy mod-verify fmt-check vet lint docs-check metrics-lint rules-check dashboards-check test-ci build
 
 # -----------------------------
 # OBSERVABILITY STANDARD
@@ -352,6 +353,13 @@ PROMETHEUS_IMAGE ?= prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60
 # dashboards-check: PromQL syntax gate for monitoring/grafana/*.json (same
 # script as platform-pgcommon; requires Docker and jq). Governance — registry
 # metrics, labels, "(Proposed)"/"(legacy)" titles — is metrics-lint's job.
+# docs-check: diagram drift gate — every docs/architecture/mermaid/*.mmd must
+# be embedded byte-identically in ARCHITECTURE.md (same script as
+# platform-pgcommon v1.4.2).
+.PHONY: docs-check
+docs-check:
+	bash .github/scripts/docs-mermaid-sync.sh
+
 .PHONY: dashboards-check
 dashboards-check:
 	PROMETHEUS_IMAGE=$(PROMETHEUS_IMAGE) bash .github/scripts/dashboard-promql.sh

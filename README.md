@@ -225,7 +225,7 @@ platform-events/
 
 | Library | Version | Purpose |
 |---|---|---|
-| `platform-pgcommon` | v1.4.1 | `pgcommon.Pool`, `RunInTx`, `ConfigFromEnv`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas, `Tx`/`Conn`/`Rows` aliases (pgx is never imported directly) |
+| `platform-pgcommon` | v1.4.2 | `pgcommon.Pool`, `RunInTx`, `ConfigFromEnv`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas, `Tx`/`Conn`/`Rows` aliases (pgx is never imported directly) |
 | `platform-gincommon` | — (not a dependency) | Interface-compatible only: its `ZapLogger` satisfies `port.Logger`, and its `RequestContext` supplies `TenantID` / `TraceID` for envelopes |
 
 ---
@@ -337,6 +337,7 @@ Three Go modules, the same layout as platform-pgcommon, so consuming services in
 | `make metrics-doc` | Regenerate `docs/observability/metrics-registry.md` from the metrics registry |
 | `make rules-check` | `promtool check rules` + alert unit tests for `monitoring/prometheus/` (Docker) |
 | `make dashboards-check` | PromQL syntax gate for `monitoring/grafana/*.json`: every panel and variable query checked with promtool (Docker, jq) |
+| `make docs-check` | Diagram drift gate: every `docs/architecture/mermaid/*.mmd` embedded byte-identically in `ARCHITECTURE.md` |
 | `make pin-base-images` | Re-pin every image this repository runs by digest: Dockerfile, promtool, docker-compose, testcontainers fixtures (recorded in `.docker-digests`) |
 | `make mod-verify` | `go mod verify` |
 | `make vuln-check` | `govulncheck` (pinned version) on `./internal/...` + `./pkg/...` |
@@ -349,7 +350,7 @@ Three Go modules, the same layout as platform-pgcommon, so consuming services in
 | `make race` | All three suites with `-race`, no coverage merge |
 | `make build` | Compile `bin/platform-events` and verify library packages compile |
 | `make cover` / `make cover-func` | Coverage HTML report / per-function summary (runs `test-ci`) |
-| `make ci` | `tidy` + `fmt-check` + `vet` + `lint` + `test-ci` + `build` |
+| `make ci` | `tidy` + `mod-verify` + `fmt-check` + `vet` + `lint` + `docs-check` + `metrics-lint` + `rules-check` + `dashboards-check` + `test-ci` + `build` — the same gates as CI |
 | `make docker-up` / `make docker-down` | Start/stop floci + floci-ui + Postgres (demo topology provisioned) |
 | `make docker-build` | Build the reference-CLI image the way CI does (needs `GO_PRIVATE_TOKEN`) |
 | `make pin-base-images` | Re-pin the Dockerfile base-image digests (updates `Dockerfile` + `.docker-digests`) |
@@ -569,9 +570,10 @@ git push origin v1.5.0     # triggers release.yml
 
 Five workflow files, mirroring `iam-org-membership` — the org's reference pipeline, whose job names are the required status checks on `main`:
 
+- **`docs.yml`** — on docs-only changes to `ARCHITECTURE.md` / `docs/architecture/**` (which `ci.yml` skips): the diagram sync check.
 - **`ci.yml`** — orchestrator on push / PR to `main`. `Validate / Test`, `Validate / Quality` and `Build image (cache)` run in parallel; `Trivy CVE scan` and `Smoke tests` gate on the test job and the image; `Cross-language compatibility` (`platform-interop-tests`) gates on the test job; `PR summary` posts one status comment per PR; on push to `main`, `Push image → GHCR` publishes and Cosign-signs the reference-CLI image. Docs-only commits (`**.md`, `docs/architecture/**`, `docs/guides/**`) skip the pipeline.
 - **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 97%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
-- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make dashboards-check` (dashboard PromQL) → `make vuln-check` → digest-pinning check (Dockerfile, docker-compose and the testcontainers images).
+- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make dashboards-check` (dashboard PromQL) → `make docs-check` (diagram sync) → `make vuln-check` → digest-pinning check (Dockerfile, docker-compose and the testcontainers images).
 - **`changelog-check.yml`** — fails a PR touching `internal/`, `pkg/` or `cmd/` without a `CHANGELOG.md` update.
 - **`release.yml`** — on `v*.*.*` tags: the same job graph as `ci.yml` plus verify / binaries / publish — see [Releasing](#releasing).
 

@@ -9,13 +9,14 @@
 | Go module | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events` (`go 1.26.0`, `toolchain go1.26.8`) |
 | Status | v1.6.0 + `[Unreleased]` — implemented on branch `feat/observability-standard` |
 | Base docs | [`README.md`](../../README.md), [`ARCHITECTURE.md`](../../ARCHITECTURE.md), [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md), [`EVENT_SCHEMA_GOVERNANCE.md`](../../EVENT_SCHEMA_GOVERNANCE.md), [`docs/observability/`](../observability/README.md) |
-| Sibling libraries | `platform-pgcommon` v1.4.1 (database, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
+| Sibling libraries | `platform-pgcommon` v1.4.2 (database, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
 | Deployment stage | Library — consumed via `go get`; v1.6.0 not yet tagged; branch unpushed (see §16) |
 
 ### Revision history
 
 | Rev | Date | Change |
 |---|---|---|
+| 1.1 | 2026-10-01 | platform-pgcommon v1.4.1 → v1.4.2 (documentation-only upstream release; no code change here). Added `make docs-check` (diagram drift gate, same script as pgcommon v1.4.2) to `make ci`, the pre-commit hook, `Validate / Quality` and a new `docs.yml` workflow; §14 updated. |
 | 1.0 | 2026-10-01 | Initial LLD, reflecting branch `feat/observability-standard` (v1.6.0 + Unreleased). |
 
 ### Table of Contents
@@ -132,7 +133,7 @@ pkg/
 
 | Library | Usage |
 |---|---|
-| `platform-pgcommon` v1.4.1 | `*pgcommon.Pool`, `RunInTx`, `Tx`/`TxOptions`/`Conn`/`ErrNoRows` aliases, `ConfigFromEnv`, `MigrationDSNFromEnv`, `migrate.Runner`, `WithGUCSet` (RLS tenant on the consumer handler context) |
+| `platform-pgcommon` v1.4.2 | `*pgcommon.Pool`, `RunInTx`, `Tx`/`TxOptions`/`Conn`/`ErrNoRows` aliases, `ConfigFromEnv`, `MigrationDSNFromEnv`, `migrate.Runner`, `WithGUCSet` (RLS tenant on the consumer handler context) |
 | `platform-gincommon` | Not imported. `port.Logger` (`Debug/Info/Warn/Error(msg, map[string]interface{})`) matches gincommon's `ZapLogger`; `RequestContext` supplies `TenantID` / `TraceID` for `WithTenantID` / `WithTraceID`. |
 
 Note: `migrate.Runner.Logger` is pgcommon's `domain.Logger` (variadic `Field`s), not `port.Logger`.
@@ -581,7 +582,8 @@ Concurrency: consumer worker pool bounded by `WithConcurrency`; one visibility e
 - **Required job names** (org ruleset on `main`, do not rename): `Validate / Test / test`, `Validate / Quality / quality`, `Build image (cache)`, `Trivy CVE scan`, `Smoke tests`, `PR summary`.
 - `ci.yml`: the two reusable gates + image build → Trivy / smoke → cross-language compatibility (interop workflow, pinned SHA) → PR summary (`always()`); push to GHCR (Cosign-signed) on `main`.
 - `changelog-check.yml`: changes under `internal/`, `pkg/`, `cmd/` require a `CHANGELOG.md` update.
-- `release.yml` (`v*` tags / dispatch): same job graph behind a `verify` job — `verify-release-tag.sh` (dispatch only from `main` or the tag; HEAD is the tag; tag reachable from `origin/main`), `verify-changelog-entry.sh` + `changelog-section.sh` (a release candidate may use its base version's section), `release-image-tags.sh` (floating `X.Y` / `X` / `latest` only move forward); `docker/metadata-action` with `flavor: latest=false`; 5-platform CLI binaries with `.sha256`; Cosign verify against `release.yml@<ref>`; GitHub Release notes from the CHANGELOG section. Scripts mirror platform-pgcommon v1.4.1.
+- `docs.yml`: docs-only changes to `ARCHITECTURE.md` / `docs/architecture/**` (skipped by `ci.yml`) run `make docs-check` — every `docs/architecture/mermaid/*.mmd` embedded byte-identically in `ARCHITECTURE.md`; the same check runs in `Validate / Quality`, `make ci` and the pre-commit hook.
+- `release.yml` (`v*` tags / dispatch): same job graph behind a `verify` job — `verify-release-tag.sh` (dispatch only from `main` or the tag; HEAD is the tag; tag reachable from `origin/main`), `verify-changelog-entry.sh` + `changelog-section.sh` (a release candidate may use its base version's section), `release-image-tags.sh` (floating `X.Y` / `X` / `latest` only move forward); `docker/metadata-action` with `flavor: latest=false`; 5-platform CLI binaries with `.sha256`; Cosign verify against `release.yml@<ref>`; GitHub Release notes from the CHANGELOG section. Release scripts mirror platform-pgcommon v1.4.1, the diagram-sync script v1.4.2 (pgcommon's own `release.yml` still lacks `latest=false` — see §15).
 - The Git tag is the Go module release (`go get …/platform-events@vX.Y.Z`).
 
 ---
@@ -611,5 +613,5 @@ Concurrency: consumer worker pool bounded by `WithConcurrency`; one visibility e
 | Latest tag | `v1.5.0` |
 | Next release | `v1.6.0` (CHANGELOG `[1.6.0]` + `[Unreleased]`), not yet tagged |
 | Branch | `feat/observability-standard`, unpushed; no PR open |
-| Dependencies | platform-pgcommon v1.4.1, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
+| Dependencies | platform-pgcommon v1.4.2, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
 | Consumers | Platform services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z` (`GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*`) |
