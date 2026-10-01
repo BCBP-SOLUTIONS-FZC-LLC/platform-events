@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Outbox:**
   - A short SNS outage (≈30s with the defaults) moved the whole pending backlog to `outbox_dead_letters`: failed records were retried every poll with no backoff, and transient failures used up attempts.
   - Rows written before `Enqueue` required canonical IDs, or replayed from `outbox_dead_letters`, could have a payload ID that differed in case from the stored ID; a failed batch publish of such a row was marked published. Failure IDs are now matched in canonical form.
+  - `ListDeadLetters`, `ReprocessDeadLetters(With)` and `DiscardDeadLetters` ordered only by `failed_at`, so dead letters failed in the same instant could be selected in a different order by each call, and a list-then-replay or list-then-discard could act on rows the list did not show. They now order by `failed_at, id`.
   - `Runner.Ready()` called before `Start` (the documented `go runner.Start(ctx); <-runner.Ready()` pattern) could return a channel that was never closed.
   - `ReprocessDeadLetters` / `ReprocessDeadLettersWith` replay in `failed_at` order, like `ListDeadLetters` / `DiscardDeadLetters`, so list-then-replay replays exactly the inspected records.
   - The backlog gauges ran two uncapped `COUNT(*)` queries every poll on every replica with a 2s timeout. Under a large backlog they timed out, the gauge read -1 and `PlatformEventsOutboxBacklog` went blind (and the KEDA example scaled in at the peak).

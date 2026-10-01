@@ -17,6 +17,7 @@
 
 | Rev | Date | Change |
 |---|---|---|
+| 2.2 | 2026-10-01 | Two-way gap audit against the code. Corrected: the layer rule is convention (only depguard is CI-enforced) and depguard skips `test/smoke` (§3.2); `port.Logger` has no `With`/`Named` (§3.3.1); `Enqueue` enforces a canonical UUID, v7 by convention (§4.2); the failure reason when a forward fails depends on the path (§8.7, §9.3); extender bound `WithConcurrency + MaxMessages` (§9.1); connection budget counts `PublishConcurrency` (§13.2); gauges refresh at the first poll after `GaugeInterval` (§8.4, §21.3); extension cadence `max(VT/2, 1s)` (§21.4); the CI `Smoke tests` job checks only the image (§14.4). Added: lifecycle semantics (§5.4, §5.6), `NewPublisherBridge` (O-12), remaining exported symbols (§5.5, §5.7, §5.8), receive-loop backoff and fixed per-call timeouts (§9.1), the bookkeeping budget (§8.4), DLQ send details (§10.3), inbox UUID rule (§7.4), queue-depth sampler and propagation details, label value sets, legacy successors and sunset (§11.2), a log catalogue (§11.4), CI gates and developer targets (§14), the `x-migrations-table` note (§19.4). Code: dead-letter list / replay / discard now order by `failed_at, id`, so a list-then-replay selects the same rows. |
 | 2.1 | 2026-10-01 | Accuracy pass against the code: public `DLQConfig` has no `Clock`; the consumer requires `id`/`type`/`source` (only `ParseEnvelope` also requires `time`); constructor errors vs clamped values (§12); all three `NewSNSPublisher` construction errors; envelope sentinels come from `ParseEnvelope` and outbox validation, not the SNS publisher; `ErrInvalidSignature` is reserved; white-box test scope; release appendix (`DLQPublisher` shipped in v1.5.0); gauge cadence max(`GaugeInterval`, `PollInterval`) in §21.3. |
 | 2.0 | 2026-10-01 | Restructured to the platform LLD convention (the `iam-org-membership` LLD's 21 sections): relationship table (§1.1), ownership split (§2.3), API IDs (§5), caching design with CACHE-n invariants (§6), event architecture with EVT-n invariants (§7), key flows (§8), FAIL-n / CONS-n / OPS-n invariant registers and a failure-scenario table (§9), security layers (§10), SLO guidance (§11.1), deployment and scaling (§13), data lifecycle (§15), sign-off register (§16), error taxonomy (§17), integration details (§18), migration strategy (§19), operational considerations (§20), performance (§21). No behaviour change. |
 | 1.1 | 2026-10-01 | platform-pgcommon v1.4.1 → v1.4.2 (documentation-only upstream release; no code change here). Added `make docs-check` (diagram drift gate, same script as pgcommon v1.4.2) to `make ci`, the pre-commit hook, `Validate / Quality` and a new `docs.yml` workflow. |
@@ -55,7 +56,7 @@ This document is the low-level design for **`platform-events`**, the shared Go l
 
 Refined into an implementable specification, this document gives the exact tables and indexes the library creates in a service's database, the public signatures and their behavioural contracts, the state machines behind publish / consume / outbox / inbox, the invariants that hold across them, configuration, metrics, and the operational procedures a service owner needs. Where this LLD and the code disagree, **the code is authoritative**; the discrepancy is a documentation bug and this document is updated with the change.
 
-**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `feat/observability-standard` at revision 2.0 (merged coverage 99.0%, `make ci` green).
+**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `feat/observability-standard` at revision 2.2 (merged coverage 99.0%, `make ci` green).
 
 ### 1.1 Relationship to the architecture documents
 
@@ -185,10 +186,10 @@ pkg/
 | OpenTelemetry Go | — | Yes | Global tracer and propagator (`otel.Tracer`, `otel.GetTextMapPropagator`) |
 | Prometheus client_golang | — | Yes | Collectors and registerer |
 
-### 3.2 Dependency rules (enforced in CI)
+### 3.2 Dependency rules
 
-- `domain` ← `port` ← `service` ← `adapter` ← `pkg`. `internal/core` never imports `adapter` or the AWS SDK.
-- **depguard `pgcommon-only`** (`.golangci.yml`, applies to every file incl. tests, fixtures and the CLI): denies `github.com/jackc/pgx`, `database/sql`, `github.com/golang-migrate/migrate`. pgx is an indirect dependency through pgcommon only. Test fakes embed `pgcommon.Tx`; a pgx-only type (e.g. `CommandTag`) is inferred via `newStubTx(pgcommon.Tx.Exec)` (`test/unit/enqueue/enqueue_test.go`).
+- `domain` ← `port` ← `service` ← `adapter` ← `pkg`. `internal/core` never imports `adapter` or the AWS SDK. **Convention, reviewed in PRs — no linter enforces it** (it holds today).
+- **depguard `pgcommon-only`** (`.golangci.yml`, CI-enforced; applies to every file incl. tests, fixtures and the CLI, except `test/smoke`, which is not linted): denies `github.com/jackc/pgx`, `database/sql`, `github.com/golang-migrate/migrate`. pgx is an indirect dependency through pgcommon only. Test fakes embed `pgcommon.Tx`; a pgx-only type (e.g. `CommandTag`) is inferred via `newStubTx(pgcommon.Tx.Exec)` (`test/unit/enqueue/enqueue_test.go`).
 - All transactions go through `pgcommon.RunInTx` (never `conn.Begin`), so pgcommon's PgBouncer GUC injection and per-transaction `StatementTimeout` / `LockTimeout` always apply.
 - `make lint` runs with and without `-tags=integration,e2e`, so tagged test files are held to the same rules.
 
@@ -196,7 +197,7 @@ pkg/
 
 #### 3.3.1 `platform-gincommon`
 
-Not imported. `port.Logger` (`Debug/Info/Warn/Error(msg string, fields map[string]interface{})`, `With`, `Named`) has the same method set as gincommon's `ZapLogger`, so one logger instance is passed to `SNSConfig.Logger`, `SQSConfig.Logger`, `DLQConfig.Logger` and `outbox.Config.Logger`. An HTTP handler that publishes passes `WithTenantID(rc.TenantID)`, `WithTraceID(rc.TraceID)` from `gincommon.GetRequestContext(c)`. Tracing is initialised by the service with `gincommon.InitTracingFromEnv()`; until then the library's spans are no-ops.
+Not imported. `port.Logger` (`Debug/Info/Warn/Error(msg string, fields map[string]interface{})` — nothing else) has the same method set as gincommon's `ZapLogger`, so one logger instance is passed to `SNSConfig.Logger`, `SQSConfig.Logger`, `DLQConfig.Logger` and `outbox.Config.Logger`. An HTTP handler that publishes passes `WithTenantID(rc.TenantID)`, `WithTraceID(rc.TraceID)` from `gincommon.GetRequestContext(c)`. Tracing is initialised by the service with `gincommon.InitTracingFromEnv()`; until then the library's spans are no-ops.
 
 #### 3.3.2 `platform-pgcommon`
 
@@ -233,7 +234,7 @@ All tables live in the **consuming service's** database. Schemas are applied by 
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | `UUID` PK | Envelope ID (UUID v7, canonical lowercase — enforced by `Enqueue`) |
+| `id` | `UUID` PK | Envelope ID — canonical lowercase UUID enforced by `Enqueue`; v7 by convention (`NewEnvelope`) |
 | `event_type` | `TEXT NOT NULL` | |
 | `payload` | `JSONB NOT NULL` | Whole serialised envelope (`json.RawMessage`, so pgx binds JSON even in PgBouncer simple-protocol mode) |
 | `tenant_id` | `TEXT NOT NULL DEFAULT ''` | |
@@ -308,7 +309,7 @@ PK `processed_events_pkey (event_id, consumer)`.
 | `outbox_dead_letters` | `idx_outbox_dead_letters_event_type_tenant_id` (008) | `(event_type, tenant_id)` | `DLQFilter` |
 | `processed_events` | `idx_processed_events_processed_at` | `(processed_at)` | `Prune` |
 
-List, replay and discard all order dead letters by `failed_at`, so a list-then-replay with the same filter and limit touches the same rows.
+List, replay and discard all order dead letters by `failed_at, id` (a total order), so a list-then-replay or list-then-discard with the same filter and limit selects the same rows, barring rows dead-lettered in between.
 
 ### 4.4 Migrations
 
@@ -382,6 +383,9 @@ The library's tables carry `tenant_id` but **no RLS policy**: the runner reads a
 | C-5 | `SQSConfig` | `QueueURL` (required), `Region`, `EndpointURL`, `MaxMessages` (1–10, default 10), `WaitSeconds` (default 20), `Logger` |
 | C-6 | `ConsumerOption` | `WithConcurrency(n)`, `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`, `WithMaxReceiveCount(n)`, `WithDrainTimeout(d)` (default 30s), `WithConsumerCodec(codec)`, `WithDLQForwarding(dlq)`, `WithQueueDepthMetrics(interval)` (min 10s), `WithHandlerTimeout(d)`, `WithMalformedBodyLogging()` |
 | C-7 | `SourceMessageFromContext` | `(ctx) (SourceMessage, bool)` — raw body + attributes as received (forward these, never `env.JSON()`) |
+| C-8 | `TraceIDFromContext` | `(ctx) string` — the envelope trace ID injected into the handler ctx |
+
+**Lifecycle (consumer and runner alike):** a second `Start` while running returns an "already running" error; both are restartable after `Stop`; `Stop` is safe before `Start` and more than once, and returns an error when the drain deadline passes (consumer: `DrainTimeout` + 5s housekeeping margin; runner: `DrainTimeout`). `Stop` affects only a `Start` already running — shut down by cancelling the `Start` ctx, then call `Stop` to wait for the drain.
 
 ### 5.5 DLQ, codec, HMAC, metrics (`pkg/events`)
 
@@ -400,6 +404,8 @@ The library's tables carry `tenant_id` but **no RLS policy**: the runner reads a
 | D-11 | `MetricsOption` | `WithoutLegacyMetrics()`, `WithEventTypeLimit(n)`, `WithEventTypes(types...)` |
 | D-12 | Metrics helpers | `MetricsIdentityFromEnv`, `MetricsIdentityFromLabels`, `MetricsEnvironmentFromEnv`, `MetricsRegistry()` |
 | D-13 | `Init` / `InitWithRegisterer` | Deprecated — legacy metrics only; `InitWithRegisterer` is the test reset |
+| D-14 | Registry types | `MetricsRegistryEntry`, `MetricStatusCanonical` / `MetricStatusProposed` / `MetricStatusDeprecated` (returned by `MetricsRegistry()`) |
+| D-15 | Sentinels | `ErrEnvelopeIDRequired` / `ErrEnvelopeTypeRequired` / `ErrEnvelopeSourceRequired`, `ErrKeyTooShort`, `ErrInvalidSignature` (reserved) — see §17 |
 
 ### 5.6 Outbox (`pkg/outbox`)
 
@@ -416,15 +422,16 @@ The library's tables carry `tenant_id` but **no RLS policy**: the runner reads a
 | O-9 | `Runner.PrunePublished` | `(ctx, olderThan time.Duration, limit int) (int64, error)` |
 | O-10 | `ApplySchema` | `(ctx, runner *migrate.Runner) error` |
 | O-11 | `DLQFilter` / `DeadLetterRecord` | filter `{EventType, TenantID, FailedBefore}`; record `{ID, EventType, TenantID, TraceID, Attempts, LastError, CreatedAt, FailedAt}` |
+| O-12 | `NewPublisherBridge` | `(pub events.Publisher) port.Publisher` — the adapter `NewRunner` uses; also records the outbox publish metrics. For wiring a `Config.Store` test double without `NewRunner` |
 
-O-6 … O-9 apply a 30s internal DB timeout each.
+O-6 … O-9 apply a 30s internal DB timeout each and order by `failed_at, id`. `Start` / `Stop` follow the lifecycle rules in §5.4.
 
 ### 5.7 Inbox (`pkg/inbox`)
 
 | ID | Symbol | Signature / behaviour |
 |---|---|---|
 | I-1 | `Handler` | `(ledger Ledger, next events.Handler) events.Handler` — best-effort dedup (separate transactions) |
-| I-2 | `Ledger` | `IsProcessed`, `MarkProcessed`, `Consumer` |
+| I-2 | `Ledger` | `IsProcessed(ctx, uuid.UUID)`, `MarkProcessed(ctx, uuid.UUID)`, `Consumer()` — implemented by `*Store` |
 | I-3 | `NewStore` | `(pool *pgcommon.Pool, consumer string) (*Store, error)` |
 | I-4 | `Store.Process` | `(ctx, env, fn func(ctx, tx pgcommon.Tx) error) error` — exactly-once Postgres writes |
 | I-5 | `Store.Prune` | `(ctx, retention time.Duration, batch int) (int64, error)` — `DefaultPruneBatch` = 5000 |
@@ -441,8 +448,8 @@ O-6 … O-9 apply a 30s internal DB timeout each.
 | K-5 | `LogWarnings` / `LogWarningsTo(logger, warnings)` | stderr / structured logger |
 | K-6 | `LoadOTel` / `OTelConfigEnv` | Deprecated — tracing config belongs to gincommon |
 | M-1 | `mock.Publisher` | Validates ID/Type/Source like SNS; `SetError`, `SetBatchError` (partial / `Retryable` failures), `Published`, `Reset` |
-| M-2 | `mock.Consumer` | `Inject(env)` runs the handler with the real handler context (`sqs.HandlerContext`: tenant GUC, trace ID, source message from `env.JSON()`, plus the `explicit` dead-letter attribution); `QueueURL` / `MockQueueURL` |
-| M-3 | `mock.DLQPublisher` | Same input validation as the SQS publisher; counts `platform_dlq_messages_total` and marks the attribution; `Sent`, `SetError`, `DLQURL` (default `mock://dlq`) |
+| M-2 | `mock.Consumer` | `SetHandler(h)`, `Start` / `Stop` / `IsRunning` (no polling); `Inject(env)` runs the handler with the real handler context (`sqs.HandlerContext`: tenant GUC, trace ID, source message from `env.JSON()`, plus the `explicit` dead-letter attribution); `QueueURL` / `MockQueueURL` |
+| M-3 | `mock.DLQPublisher` | Same input validation as the SQS publisher; counts `platform_dlq_messages_total` and marks the attribution; `Sent() []DLQMessage`, `SetError`, `DLQURL` (default `mock://dlq`) |
 
 ---
 
@@ -560,6 +567,7 @@ Within `v1.x` the library only adds optional (`omitempty`) fields; it never remo
 | Guarantee | Best-effort: crash after `next`, failed record, or concurrent copies can rerun `next` | Exactly-once Postgres writes; concurrent copies serialise on the claim |
 | Duplicate | ack + `platform_duplicate_messages_total` / `events_inbox_duplicates_total` | returns nil without calling `fn`, counted the same |
 | Dead-lettered by handler | not recorded (redrive is processed) | transaction rolled back (redrive is processed) |
+| Non-UUID envelope ID | error → message retried, then SQS redrive (never processed without dedup) | same |
 
 ### 7.5 Event invariants
 
@@ -623,7 +631,7 @@ pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx p
 
 ### 8.4 Outbox poll cycle
 
-1. **Gauges** (every `GaugeInterval`, or `PollInterval` if longer): pending / leased counts (capped at 100 000), the waiting-record sweep (`PromoteWaiting`), then the blocked count and oldest-pending age.
+1. **Gauges** (at the first poll tick after `GaugeInterval` has elapsed — every ⌈G/P⌉·P, e.g. 20s for G=15s, P=10s; 5s timeout): pending / leased counts (capped at 100 000), the waiting-record sweep (`PromoteWaiting`), then the blocked count and oldest-pending age.
 2. **Claim** (`RunInTx`, 5s): `SELECT … WHERE published_at IS NULL AND scheduled_at <= NOW() AND (ordering_key IS NULL OR NOT EXISTS earlier-unpublished) ORDER BY scheduled_at, id LIMIT $batch FOR UPDATE SKIP LOCKED`, then lease `scheduled_at = NOW() + ClaimLeaseDuration` in the same transaction. Records are handed back only after the claim commits.
 3. **Publish**: `PublishConcurrency = 1` → `Publisher.PublishBatch`; `> 1` → parallel `Publish` with `PublishTimeout` per record.
 4. **Settle each record**:
@@ -631,6 +639,8 @@ pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx p
    - transient → `ReleaseLease(id, err, sharedBackoff)` — no attempt counted; the shared backoff advances once per poll cycle and resets on the next success;
    - permanent → `MarkFailed(rec, err, MaxAttempts, backoff(n))` — `attempts++`, `scheduled_at = NOW() + RetryBackoff·2^(n−1)` (capped at `MaxRetryBackoff`, equal jitter); at `MaxAttempts` → move to `outbox_dead_letters` (and promote the key's next record) in one transaction;
    - shutdown mid-batch → `ReleaseLease(…, 0)`.
+
+   Settle writes run on a context detached from `Start`'s, with a budget of the publish budget (`⌈n / PublishConcurrency⌉ × PublishTimeout`, or 5m when `PublishTimeout` is off) + `(n+1) × 500ms`, so a batch published during shutdown is still recorded.
 5. **Re-poll** immediately while the last batch published at least one record and hit no transient failure, bounded by `PollInterval` and stopped by `Stop()`; otherwise wait for the next tick. A failed claim backs off 1s → 30s.
 6. `Ready()` closes after the first successful (or empty) poll.
 
@@ -673,7 +683,7 @@ Each call is recorded in `platform_outbox_dead_letter_operations_total{operation
 | Decode failure past `WithMaxReceiveCount` | forward (`decode_error`) → delete |
 | `ApproximateReceiveCount > WithMaxReceiveCount` | `WithDeadLetterHandler(fn)` (if set) → forward (`max_receive_count`, unless the handler already forwarded) → delete |
 | Handler decides | handler calls `dlq.SendToDLQ(…, explicit)` with `SourceMessageFromContext`, returns nil → delete; counted as dead-lettered, not processed |
-| Forward fails | failed `dead_letter_error`; message stays visible |
+| Forward fails | message stays visible + retry; the failure keeps the path's reason — `malformed`, `decode_error`, or `dead_letter_error` on the max-receive-count path |
 
 Without `WithDLQForwarding`, SQS's own `RedrivePolicy` moves messages after its `maxReceiveCount`; the library's threshold should be lower than SQS's so the library sees and counts the message first.
 
@@ -708,11 +718,25 @@ The pod's `terminationGracePeriodSeconds` must exceed both drain timeouts.
 | Component | Goroutines | Bound |
 |---|---|---|
 | SQS consumer | 1 receive loop; worker pool | `WithConcurrency` (default 1) |
-| Visibility extension | 1 extender per received message, from receipt until settle | `MaxMessages` × in-flight receives |
+| Visibility extension | 1 extender per received message, from receipt until settle | `WithConcurrency + MaxMessages` (one receive outstanding; each message takes a worker slot before the next receive) |
 | Queue-depth sampler | 1 (opt-in) | `WithQueueDepthMetrics` interval ≥ 10s |
 | Outbox runner | 1 poll goroutine | — |
 | Outbox publish | `PublishConcurrency` workers when > 1 | `PublishConcurrency` |
 | Runner replicas | any number | `FOR UPDATE SKIP LOCKED` — no contention, no distributed lock |
+
+**Fixed timeouts and backoffs** (not configurable):
+
+| Call | Bound |
+|---|---|
+| `ReceiveMessage` | `WaitSeconds + 5s`; on error back off 1s → 30s (×2 plus 0–50% jitter), reset on success |
+| `DeleteMessage` | 10s |
+| `ChangeMessageVisibility` | extension: no per-call timeout (cancelled when the extender stops); hand-back (visibility 0): 5s |
+| DLQ forward (resolve + `SendMessage`) | `min(30s, VisibilityTimeout/2)`, ≥ 1s (30s without a visibility timeout) |
+| `GetQueueAttributes` (depth sampler) | 10s |
+| AWS config load in constructors | 10s |
+| Outbox claim | 5s; a failed poll backs off 1s → 30s |
+| Outbox gauge queries | 5s |
+| Outbox DLQ management / prune | 30s |
 
 The extender's state machine (`waiting` → `dispatched` → `released`; `Claim` / `Release` / `SetDeadline`) guarantees a message is extended while it waits for a worker and is released exactly once — by the worker on settle, or by the receive loop on hand-back.
 
@@ -750,7 +774,8 @@ The extender's state machine (`waiting` → `dispatched` → `released`; `Claim`
 | Malformed body (incl. SNS wrapper) | failed `malformed` (+ dead-lettered `malformed` when forwarded) | DLQ forward then delete, or delete |
 | Decode failure | failed `decode_error` + retry; past threshold forwarded (`decode_error`) | visible / forwarded |
 | Over `WithMaxReceiveCount` | dead-lettered `max_receive_count` | dead-letter handler → DLQ forward → delete |
-| Dead-letter handler or forward fails | failed `dead_letter_error` + retry | visible |
+| Dead-letter handler or forward fails (max-receive-count path) | failed `dead_letter_error` + retry | visible |
+| Forward fails (malformed / decode path) | failed `malformed` / `decode_error` + retry | visible |
 | Handler exceeds `WithHandlerTimeout` | context cancelled; `platform_message_timeouts_total{operation=handler}`; outcome per the handler's return | per outcome |
 | `DeleteMessage` fails | logged, `sqs_delete_errors_total` | redelivered (duplicate) |
 
@@ -834,7 +859,7 @@ All AWS calls use the SDK's TLS endpoints; `EndpointURL` / `AWS_ENDPOINT_URL` is
 
 - `Enqueue`: required fields, canonical UUID, no NUL bytes, ≤ 240 KiB; `EnqueueOrdered`: key ≤ 256 bytes, valid UTF-8, no NUL.
 - Consumer: a body must be JSON with `id`, `type` and `source` (`ParseEnvelope` additionally requires `time`); malformed bodies never reach handlers; the codec is gated on `dataschema`.
-- `DLQPublisher`: rejects invalid input (`ErrDLQInvalidMessage`); diagnostic attributes always override caller values; more than SQS's 10 attributes → the lowest-priority caller attributes are dropped and logged, or rejected with `ErrDLQInvalidMessage` under `StrictAttributes`.
+- `DLQPublisher`: rejects invalid input before any AWS call (`ErrDLQInvalidMessage`: empty body / reason, characters SQS disallows, invalid attribute names, body + attributes > 1 MiB); `DLQReason` truncated to 1024 bytes; empty-valued caller attributes dropped; diagnostic attributes always override caller values; more than SQS's 10 attributes → caller attributes kept in priority order `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical, the rest dropped and logged — or rejected under `StrictAttributes`. `EventType` comes from the body when it parses as an envelope, else `attrs["EventType"]`, else `unknown`. A FIFO DLQ gets `MessageGroupId` = `MessageDeduplicationId` = the envelope ID, or SHA-256 of the body when there is no valid ID.
 - HMAC: keys ≥ 32 bytes (`ErrKeyTooShort`), constant-time `hmac.Equal`, `Verify` returns false on any decode error, canonical JSON for envelopes.
 
 ### 10.4 Authorization (IAM permissions)
@@ -842,7 +867,7 @@ All AWS calls use the SDK's TLS endpoints; `EndpointURL` / `AWS_ENDPOINT_URL` is
 | Component | Actions |
 |---|---|
 | SNS publisher | `sns:Publish` (+ `kms:GenerateDataKey`, `kms:Decrypt` for encrypted topics) |
-| SQS consumer | `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`; `sqs:GetQueueAttributes` for depth sampling and DLQ resolution |
+| SQS consumer | `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility`; `sqs:GetQueueAttributes` for DLQ resolution and depth sampling — the latter on the source queue **and** the DLQ |
 | DLQ publisher | `sqs:GetQueueAttributes` on the source queue, `sqs:GetQueueUrl`, `sqs:SendMessage` on the DLQ (+ KMS for encrypted DLQs) |
 | Outbox / inbox | DML on the library tables; DDL only for the migration role (`MIGRATION_DATABASE_URL`) |
 
@@ -896,11 +921,13 @@ Registered by `events.InitMetrics` with `{domain, service, environment}` const l
 | Proposed | `platform_telemetry_label_overflow_total` | Counter | `label` |
 | Proposed | `platform_library_info` | Gauge | `library`, `library_version` |
 
-Label vocabulary: `reason` (failed) ∈ `malformed`, `decode_error`, `handler_error`, `handler_panic`, `dead_letter_error`; `reason` (DLQ) ∈ `malformed`, `decode_error`, `max_receive_count`, `explicit`, `max_attempts`; `operation` (flow) ∈ `consume`, `outbox_publish`; outbox errors ∈ `poll`, `unmarshal`, `mark_published`, `pending_count`, `leased_count`, `oldest_pending`, `blocked_count`; timeouts ∈ `decode`, `dead_letter_handler`, `handler`. `event_type` is sanitised: ≤ 128 bytes (`__oversized__`), ≤ 200 distinct per process (`__other__`; raise with `WithEventTypeLimit`, pre-register with `WithEventTypes`), invalid UTF-8 repaired, empty → `unknown`.
+Label vocabulary: `reason` (failed) ∈ `malformed`, `decode_error`, `handler_error`, `handler_panic`, `dead_letter_error`; `reason` (DLQ) ∈ `malformed`, `decode_error`, `max_receive_count`, `explicit`, `max_attempts`; `operation` (flow) ∈ `consume`, `outbox_publish`; outbox errors ∈ `poll`, `unmarshal`, `mark_published`, `pending_count`, `leased_count`, `oldest_pending`, `blocked_count`; timeouts ∈ `decode`, `dead_letter_handler`, `handler`; dead-letter operations ∈ `reprocess`, `discard`; `outcome` ∈ `success`, `error`; `dependency` ∈ `sns` (`publish`, `publish_batch`), `sqs` (`receive_message`, `delete_message`, `change_message_visibility`, `send_message`, `get_queue_attributes`, `get_queue_url`), `codec` (`encode`, `decode`). `event_type` is sanitised: ≤ 128 bytes (`__oversized__`), ≤ 200 distinct per process (`__other__`; raise with `WithEventTypeLimit`, pre-register with `WithEventTypes`), invalid UTF-8 repaired, empty → `unknown`.
 
 Registration is fail-soft: a `platform_*` collector the registerer refuses (e.g. an IAM service already owns `platform_retry_total` with other labels) is disabled and reported as a `RegistrationWarning`; invalid identity or a legacy registration failure is an error and changes nothing.
 
-Legacy (Deprecated, emitted in parallel unless `WithoutLegacyMetrics`): `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info` — authoritative where the successor is Proposed.
+Legacy (Deprecated, emitted in parallel unless `WithoutLegacyMetrics`): `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info` — authoritative where the successor is Proposed. Every legacy metric has a Tier 1 successor (table in `docs/observability/metrics-registry.md` § Deprecated, e.g. `outbox_pending_total` → `platform_outbox_pending_events`, `outbox_{poll,unmarshal,mark_published}_errors_total` → `platform_outbox_errors_total`, `events_codec_*` / `sqs_*_errors_total` → `platform_dependency_request_seconds`). Sunset: not before the first release ≥ 2027-04-01, and only after every consumer has migrated dashboards, alerts, rules, SLOs and HPA.
+
+Signal details: the depth sampler reads `ApproximateNumberOfMessages` only (in-flight messages are not counted; use `platform_messages_in_flight`), logs a failing queue once until it recovers (then one Info), and is disabled with a Warn when `InitMetrics` has not run or the client lacks `GetQueueAttributes`. Propagation clamps negative clock skew to 0 and skips envelopes with a zero `time`.
 
 **Rules, dashboards, autoscaling:**
 
@@ -924,6 +951,20 @@ Global tracer provider and propagator only; no-op until the service initialises 
 ### 11.4 Structured logs
 
 All logs go through the injected `port.Logger` (nil → silent). Notable fields: `queue`, `message_id`, `event_type`, `body_sha256` (malformed), `source_queue` / `dlq_url` / `dlq_arn` (DLQ). Payloads are never logged; `config.LogWarningsTo` logs configuration fall-backs at startup.
+
+| Component | Message (abridged) | Level |
+|---|---|---|
+| outbox | failed to mark published — may be re-delivered | Error |
+| outbox | poll cycle failed; panic recovered | Error |
+| outbox | promoted ordered records left waiting | Info |
+| outbox | failed to promote waiting ordered records; gauge count / age query failed | Warn |
+| outboxstore | MarkPublished matched no rows (lease lost) | Warn |
+| sqs | receive message failed; message body is not a valid event envelope; codec decode failed | Error |
+| sqs | message waited past the handler timeout — released; handler timeout passed — no longer extending | Warn |
+| sqs | failed to extend message visibility; drain timeout exceeded | Warn |
+| sqs | could not resolve DLQ at startup; dropped message attributes over the SQS limit | Warn |
+| sqs | queue depth sample failed (once until recovery) / recovered | Warn / Info |
+| sns | `WithAttributes` key conflicts with a reserved attribute | Warn |
 
 ---
 
@@ -988,7 +1029,7 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 
 - **Outbox throughput** per runner ≈ `BatchSize` per poll, re-polling immediately while batches publish; raise `PublishConcurrency` for per-record parallelism or add replicas.
 - **Consumer throughput** ≈ `WithConcurrency × replicas / handler latency`; receives are sized to free workers when no visibility timeout is set.
-- **Connection budget**: the runner uses one connection per claim / settle / gauge operation at a time; inbox `Process` holds one per in-flight handler — size `PG_MAX_CONNS` ≥ consumer concurrency + 2.
+- **Connection budget**: the runner uses one connection for claim / gauge operations and up to `PublishConcurrency` at once for settles (parallel `Publish` workers); inbox `Process` holds one per in-flight handler — size `PG_MAX_CONNS` ≥ consumer concurrency + `PublishConcurrency` + 1.
 
 ### 13.3 Reference CLI image
 
@@ -1008,7 +1049,7 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 
 ## 14. Testing Strategy
 
-`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **99.0%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, fmt-check, vet, lint (incl. tagged files), docs-check, metrics-lint, rules-check, dashboards-check, test-ci, build.
+`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **99.0%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, fmt-check, vet, lint (incl. tagged files), docs-check, metrics-lint, rules-check, dashboards-check, test-ci, build. `Validate / Quality` additionally runs an HTML-entity check, the RLS-6 grep, `make vuln-check` and the Dockerfile digest-pinning check; `changelog-check.yml` requires a `CHANGELOG.md` entry for PRs touching `internal/`, `pkg/` or `cmd/`; `release.yml` also builds CLI binaries for 5 platforms. Developer targets: `setup`, `install-hooks`, `test-unit` / `test-int` / `test-e2e` / `test-smoke`, `cover` / `cover-func`, `docker-up` / `docker-down`, `pin-base-images`.
 
 ### 14.1 Unit tests
 
@@ -1033,7 +1074,8 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | Suite | Runs against |
 |---|---|
 | `test/e2e` (`-tags e2e`) | floci + Postgres: publish → consume, outbox end to end |
-| `test/smoke` (`-tags smoke`) | live AWS (`SMOKE_*`); also the CI `Smoke tests` job against the built image |
+| `test/smoke` (`-tags smoke`, `make test-smoke`) | live AWS (`SMOKE_*`); never run in CI |
+| CI `Smoke tests` job (`.github/scripts/smoke-tests.sh`) | the built CLI image: size ≤ 50 MB and a non-zero exit under `-strict` without config |
 
 ### 14.5 Canonical behaviour cases
 
@@ -1190,7 +1232,7 @@ The library's migrations are versioned separately in `outbox_migrations` / `inbo
 
 ### 19.4 Historical upgrade notes
 
-`ARCHITECTURE.md` § Migration 003 — production upgrade runbook covers the pending-index migration for tables that predate it.
+`ARCHITECTURE.md` § Migration 003 — production upgrade runbook covers the pending-index migration for tables that predate it. `CHANGELOG.md` `[Unreleased]` → Upgrade notes: a service that passed its own `x-migrations-table` re-runs outbox migrations `001`–`010` into `outbox_migrations` once (all idempotent).
 
 ### 19.5 Rollback
 
@@ -1252,11 +1294,11 @@ Served by `idx_outbox_events_pending (scheduled_at, id) WHERE published_at IS NU
 
 ### 21.3 Gauges and counts
 
-Counts are `COUNT(*)` over a `LIMIT MaxCountedRows` (100 000) subquery, so a refresh is bounded; `OldestPendingAge` is a single probe of index 009; refreshes run every max(`GaugeInterval`, `PollInterval`) — checked inside the poll — not on every poll.
+Counts are `COUNT(*)` over a `LIMIT MaxCountedRows` (100 000) subquery, so a refresh is bounded; `OldestPendingAge` is a single probe of index 009; refreshes run at the first poll tick after `GaugeInterval` has elapsed (every ⌈G/P⌉·P) — not on every poll.
 
 ### 21.4 Consumer
 
-Visibility extension calls are per message every `VisibilityTimeout/2`; receives are batched (≤ 10). Long-poll receive latency includes the wait — exclude `receive_message` from latency views.
+Visibility extension calls are per message every `max(VisibilityTimeout/2, 1s)`; receives are batched (≤ 10). Long-poll receive latency includes the wait — exclude `receive_message` from latency views.
 
 ### 21.5 Tuning
 

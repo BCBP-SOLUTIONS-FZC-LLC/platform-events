@@ -567,7 +567,7 @@ func (s *Store) ListDeadLetters(ctx context.Context, filter domain.DLQFilter, li
 	query := fmt.Sprintf(`
 		SELECT id, event_type, tenant_id, trace_id, attempts, last_error, created_at, failed_at
 		FROM outbox_dead_letters%s
-		ORDER BY failed_at ASC
+		ORDER BY failed_at ASC, id ASC
 		LIMIT $%d
 	`, where, len(args))
 
@@ -614,7 +614,7 @@ func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQF
 			DELETE FROM outbox_dead_letters
 			WHERE id IN (
 				SELECT id FROM outbox_dead_letters%s
-				ORDER BY failed_at ASC
+				ORDER BY failed_at ASC, id ASC
 				LIMIT $%d
 			)
 			RETURNING id, event_type, payload, tenant_id, trace_id, created_at, ordering_key
@@ -660,7 +660,7 @@ func (s *Store) DiscardDeadLetters(ctx context.Context, filter domain.DLQFilter,
 		DELETE FROM outbox_dead_letters
 		WHERE id IN (
 			SELECT id FROM outbox_dead_letters%s
-			ORDER BY failed_at ASC
+			ORDER BY failed_at ASC, id ASC
 			LIMIT $%d
 		)
 	`, where, limitArg)
@@ -698,7 +698,7 @@ func (s *Store) ReprocessDeadLetters(ctx context.Context, limit int) (int, error
 				DELETE FROM outbox_dead_letters
 				WHERE id IN (
 					SELECT id FROM outbox_dead_letters
-					ORDER BY failed_at
+					ORDER BY failed_at ASC, id ASC
 					LIMIT $1
 				)
 				RETURNING id, event_type, payload, tenant_id, trace_id, created_at, ordering_key

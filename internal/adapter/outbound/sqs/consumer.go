@@ -458,9 +458,9 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 				drain()
 				return nil
 			}
-			// Add ±25% jitter so concurrent consumer instances do not
-			// retry in lock-step after a shared SQS error, preventing a
-			// thundering-herd on recovery.
+			// Double the delay plus a random 0–50% of the current one, so
+			// concurrent consumer instances do not retry in lock-step after
+			// a shared SQS error (thundering herd on recovery).
 			jitter := time.Duration(rand.Int64N(int64(receiveBackoff) / 2))
 			receiveBackoff = min(receiveBackoff*2+jitter, receiveBackoffMax)
 			continue
