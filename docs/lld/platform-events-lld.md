@@ -17,6 +17,7 @@
 
 | Rev | Date | Change |
 |---|---|---|
+| 2.1 | 2026-10-01 | Accuracy pass against the code: public `DLQConfig` has no `Clock`; the consumer requires `id`/`type`/`source` (only `ParseEnvelope` also requires `time`); constructor errors vs clamped values (§12); all three `NewSNSPublisher` construction errors; envelope sentinels come from `ParseEnvelope` and outbox validation, not the SNS publisher; `ErrInvalidSignature` is reserved; white-box test scope; release appendix (`DLQPublisher` shipped in v1.5.0); gauge cadence max(`GaugeInterval`, `PollInterval`) in §21.3. |
 | 2.0 | 2026-10-01 | Restructured to the platform LLD convention (the `iam-org-membership` LLD's 21 sections): relationship table (§1.1), ownership split (§2.3), API IDs (§5), caching design with CACHE-n invariants (§6), event architecture with EVT-n invariants (§7), key flows (§8), FAIL-n / CONS-n / OPS-n invariant registers and a failure-scenario table (§9), security layers (§10), SLO guidance (§11.1), deployment and scaling (§13), data lifecycle (§15), sign-off register (§16), error taxonomy (§17), integration details (§18), migration strategy (§19), operational considerations (§20), performance (§21). No behaviour change. |
 | 1.1 | 2026-10-01 | platform-pgcommon v1.4.1 → v1.4.2 (documentation-only upstream release; no code change here). Added `make docs-check` (diagram drift gate, same script as pgcommon v1.4.2) to `make ci`, the pre-commit hook, `Validate / Quality` and a new `docs.yml` workflow. |
 | 1.0 | 2026-10-01 | Initial LLD, reflecting branch `feat/observability-standard` (v1.6.0 + Unreleased). |
@@ -362,7 +363,7 @@ The library's tables carry `tenant_id` but **no RLS policy**: the runner reads a
 | ID | Symbol | Signature / behaviour |
 |---|---|---|
 | P-1 | `Publisher` | `Publish(ctx, Envelope[json.RawMessage]) error`; `PublishBatch(ctx, []Envelope[json.RawMessage]) error` |
-| P-2 | `NewSNSPublisher` | `(cfg SNSConfig, opts ...PublisherOption) (Publisher, error)` — error on empty `TopicARN` |
+| P-2 | `NewSNSPublisher` | `(cfg SNSConfig, opts ...PublisherOption) (Publisher, error)` — error on an empty `TopicARN`, a non-SNS ARN, or a FIFO (`.fifo`) topic without `WithMessageGroupID` |
 | P-3 | `SNSConfig` | `TopicARN` (required), `Region`, `EndpointURL`, `Logger` |
 | P-4 | `PublisherOption` | `WithMessageGroupID(fn)`, `WithMessageDeduplicationID(fn)`, `WithAttributes(map)`, `WithCodec(codec)` |
 | P-5 | `BatchError` / `BatchFailure` | `Failures []BatchFailure{ID, Code, Message, Retryable}` — returned by `PublishBatch` for partial / whole failures |
@@ -388,7 +389,7 @@ The library's tables carry `tenant_id` but **no RLS policy**: the runner reads a
 |---|---|---|
 | D-1 | `DLQPublisher` | `SendToDLQ(ctx, sourceQueueURL string, body []byte, attrs map[string]string, reason string) error`; `ResolveDLQ(ctx, sourceQueueURL) (string, error)` |
 | D-2 | `NewSQSDLQPublisher` / `…WithClient` | `(cfg DLQConfig[, client DLQClientLike]) (DLQPublisher, error)` |
-| D-3 | `DLQConfig` | `Region`, `EndpointURL`, `ConsumerName`, `Logger`, `Clock`, `CacheTTL` (0 → 15m, negative → no expiry), `StrictAttributes` |
+| D-3 | `DLQConfig` | `Region`, `EndpointURL`, `ConsumerName`, `Logger`, `CacheTTL` (0 → 15m, negative → no expiry), `StrictAttributes` |
 | D-4 | `DLQAttr*` | `EventType`, `DLQReason`, `OriginalQueue`, `ConsumerName`, `FailedAt` (always override caller attributes of the same name) |
 | D-5 | `DLQError` | `Kind` ∈ `ErrDLQNotConfigured`, `ErrDLQInvalidRedrivePolicy`, `ErrDLQUnresolved`, `ErrDLQSendFailed`, `ErrDLQInvalidMessage`; `SourceQueue`; `Cause` |
 | D-6 | `ErrRetryable` | Sentinel for transient failures (AWS throttling / 5xx / network / timeouts; a codec's registry outage). A custom `Codec` or `Publisher` wraps it with `%w`. |
@@ -564,7 +565,7 @@ Within `v1.x` the library only adds optional (`omitempty`) fields; it never remo
 
 | # | Invariant |
 |---|-----------|
-| EVT-1 | **One wire format.** Every event on the platform bus is an `Envelope` serialised by `Envelope.JSON`; `ParseEnvelope` rejects a body missing `id`, `type`, `source` or `time`, and the consumer routes it to the malformed path. |
+| EVT-1 | **One wire format.** Every event on the platform bus is an `Envelope` serialised by `Envelope.JSON`; `ParseEnvelope` rejects a body missing `id`, `type`, `source` or `time`; the consumer requires `id`, `type` and `source` (a missing `time` is tolerated — it only feeds the propagation metric) and routes anything else to the malformed path. |
 | EVT-2 | **The envelope ID is the idempotency key.** It is a canonical lowercase UUID v7, forwarded as `EventID` attribute and FIFO `MessageDeduplicationId`, and is the `processed_events.event_id`. |
 | EVT-3 | **At-least-once delivery.** Both the outbox (publish before mark) and SQS can deliver more than once; consumers must be idempotent (§7.4). |
 | EVT-4 | **Routing without the body.** `EventType`, `TenantID`, `Source`, `EventID`, `Subject` are message attributes, so filter policies never need the payload; audit fields (`actor`, `ip_address`, `user_agent`) are never attributes. |
@@ -832,7 +833,7 @@ All AWS calls use the SDK's TLS endpoints; `EndpointURL` / `AWS_ENDPOINT_URL` is
 ### 10.3 Input validation
 
 - `Enqueue`: required fields, canonical UUID, no NUL bytes, ≤ 240 KiB; `EnqueueOrdered`: key ≤ 256 bytes, valid UTF-8, no NUL.
-- Consumer: `ParseEnvelope` required fields; malformed bodies never reach handlers; the codec is gated on `dataschema`.
+- Consumer: a body must be JSON with `id`, `type` and `source` (`ParseEnvelope` additionally requires `time`); malformed bodies never reach handlers; the codec is gated on `dataschema`.
 - `DLQPublisher`: rejects invalid input (`ErrDLQInvalidMessage`); diagnostic attributes always override caller values; more than SQS's 10 attributes → the lowest-priority caller attributes are dropped and logged, or rejected with `ErrDLQInvalidMessage` under `StrictAttributes`.
 - HMAC: keys ≥ 32 bytes (`ErrKeyTooShort`), constant-time `hmac.Equal`, `Verify` returns false on any decode error, canonical JSON for envelopes.
 
@@ -963,7 +964,7 @@ Loaded by `pkg/config` (invalid values → default + entry in `Warnings`).
 
 `OTEL_*` variables and log settings are not read by the library.
 
-Constraints validated at construction: `MaxMessages` 1–10; visibility timeout ≤ 12h; queue-depth interval ≥ 10s; `ClaimLeaseDuration` ≥ `BatchSize×PublishTimeout+1m` (≥ 30s with `PublishTimeout` disabled).
+Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `ClaimLeaseDuration` < `BatchSize×PublishTimeout+1m` (< 30s with `PublishTimeout` disabled). Clamped instead: `MaxMessages` outside 1–10 → 10 (warned when set); `WaitSeconds` unset → 20 and above 20 → 20; a queue-depth interval under 10s → 10s.
 
 ---
 
@@ -1013,7 +1014,7 @@ Constraints validated at construction: `MaxMessages` 1–10; visibility timeout 
 
 | Location | Covers |
 |---|---|
-| `internal/core/service/*_test.go` (root module, white-box) | Outbox service retry / backoff policy, transient classification, HMAC |
+| `internal/core/service/*_test.go` (root module, white-box) | Outbox service retry / backoff policy, transient classification, canonical-ID matching |
 | `test/unit/{clock,config,domain,enqueue,envelope,glue,hmac,inbox,metrics,mock,outbox,port,publisher,runner,sns,sqs}` | Each package against mocks and a fake clock; SNS error classification table; consumer state machine (extension, deadlines, hand-back, panics); metrics conformance (`standard_test.go` `exerciseAll`) |
 
 ### 14.2 Integration tests (testcontainers-go)
@@ -1103,9 +1104,9 @@ Constraints validated at construction: `MaxMessages` 1–10; visibility timeout 
 
 | Error | Package | Returned by | Meaning / caller action |
 |---|---|---|---|
-| `ErrEnvelopeIDRequired`, `ErrEnvelopeTypeRequired`, `ErrEnvelopeSourceRequired` | `events` | `ParseEnvelope`, publisher validation | Malformed envelope — permanent |
+| `ErrEnvelopeIDRequired`, `ErrEnvelopeTypeRequired`, `ErrEnvelopeSourceRequired` | `events` | `ParseEnvelope`, outbox service validation (`Enqueue`) | Malformed envelope — permanent. The SNS publisher reports missing fields with its own (unwrapped) error, which does not match these sentinels with `errors.Is` |
 | `ErrKeyTooShort` | `events` | `Sign`, `SignEnvelope` | HMAC key < 32 bytes — configuration bug |
-| `ErrInvalidSignature` | `events` | signature helpers | Reject the request |
+| `ErrInvalidSignature` | `events` | Reserved — not currently returned (`Verify` / `VerifyEnvelope` report a mismatch as `false`) | Use it for your own signature-check errors if wanted |
 | `ErrRetryable` (via `RetryableError`) | `events` (domain) | `Publish`, `PublishBatch`, codecs, `DLQPublisher` | Transient — retry later; the outbox releases without counting |
 | `*BatchError` / `BatchFailure{Retryable}` | `events` | `PublishBatch` | Per-entry failures; retry only failed entries |
 | `*DLQError{Kind: ErrDLQNotConfigured}` | `events` | `ResolveDLQ`, `SendToDLQ`, consumer `Start` | Source queue has no `RedrivePolicy` |
@@ -1251,7 +1252,7 @@ Served by `idx_outbox_events_pending (scheduled_at, id) WHERE published_at IS NU
 
 ### 21.3 Gauges and counts
 
-Counts are `COUNT(*)` over a `LIMIT MaxCountedRows` (100 000) subquery, so a refresh is bounded; `OldestPendingAge` is a single probe of index 009; refreshes run every `GaugeInterval`, not per poll.
+Counts are `COUNT(*)` over a `LIMIT MaxCountedRows` (100 000) subquery, so a refresh is bounded; `OldestPendingAge` is a single probe of index 009; refreshes run every max(`GaugeInterval`, `PollInterval`) — checked inside the poll — not on every poll.
 
 ### 21.4 Consumer
 
@@ -1274,7 +1275,7 @@ Summary of the v1.6.0 + `[Unreleased]` changes this LLD reflects (full list in `
 | 3 | Per-record retry backoff (`RetryBackoff`, `MaxRetryBackoff`), shared transient backoff per poll cycle, immediate re-poll | §8.4 |
 | 4 | Per-key ordering (`EnqueueOrdered`, migration 010, waiting rows, promotion, sweep) | §4, §8.5 |
 | 5 | Consumer rework: extension from receipt, single handler deadline, hand-back on `Stop`, malformed hashing, panic recovery | §7.1 |
-| 6 | `DLQPublisher`, `WithDLQForwarding`, `DLQAttribution` (counted once) | §5.5, §8.7 |
+| 6 | `WithDLQForwarding`, `DLQAttribution` (dead-letters counted once), `SourceMessageFromContext` (`DLQPublisher` itself shipped in v1.5.0) | §5.5, §8.7 |
 | 7 | Inbox `Store.Process` (exactly-once) and dead-letter awareness | §7.4 |
 | 8 | New Proposed metrics: `platform_messages_in_flight`, `platform_outbox_oldest_pending_age`, `platform_outbox_ordering_blocked_events`, `platform_message_timeouts_total` | §11.2 |
 | 9 | platform-pgcommon v1.4.2; release scripts parity; `latest=false`; `make docs-check` | §14, §16 |
