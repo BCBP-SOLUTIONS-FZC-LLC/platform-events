@@ -53,7 +53,7 @@ Every service in the platform needs the same messaging guarantees — no lost ev
 
 **Design principles:** events are facts, not commands (producers never direct consumers) · fail fast on misconfiguration (`NewSNSPublisher` rejects an empty/invalid `TopicARN`, `NewSQSConsumer` an empty `QueueURL`, `ResolveDLQ` a missing `RedrivePolicy` — at startup, not first use) · make safe usage the default · keep business logic free from messaging plumbing · centralise cross-cutting concerns.
 
-This is enforced structurally: `internal/core/domain` and `internal/core/port` import no AWS SDK, and `pkg/*` is the only surface services can import — Go's `internal/` rule blocks the rest.
+`internal/core/domain` and `internal/core/port` import no AWS SDK (a convention checked in review), and `pkg/*` is the only surface services can import — Go's `internal/` rule blocks the rest.
 
 ---
 
@@ -206,9 +206,11 @@ platform-events/
 | `internal/core/domain` | Nothing internal; no AWS SDK |
 | `internal/core/port` | `domain` only |
 | `internal/core/service` | `domain`, `port` |
-| `internal/adapter/outbound/*` | `domain`, `port`, `metrics`; the AWS SDK and pgx are confined here |
+| `internal/adapter/outbound/*` | `domain`, `port`, `metrics`; the AWS SDK is confined here (pgx is never imported — platform-pgcommon only) |
 | `pkg/*` | Adapters and core; re-exports the public surface via type aliases |
 | `cmd/`, `test/` | Everything above |
+
+The layer rules are a convention checked in review; CI enforces the depguard rule `pgcommon-only` (no `pgx`, `database/sql` or `golang-migrate` imports anywhere but `test/smoke`), and Go's `internal/` rule keeps services on `pkg/`.
 
 ### Storage and messaging
 

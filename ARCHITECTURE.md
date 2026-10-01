@@ -346,7 +346,7 @@ A numbered walkthrough of what happens between a domain mutation and a processed
 
 > **Ordering:** By default the transactional outbox does **not** preserve publish order, even per aggregate on a FIFO topic: when a record fails (or backs off), later records — including the same aggregate's — are still published, and the failed one goes out after them; several runner replicas also publish concurrently. A FIFO `MessageGroupID` keeps the order SNS *receives*, which is then already out of order.
 
-**Per-key ordering (opt-in per record).** Enqueue with `outbox.EnqueueOrdered(ctx, tx, env, key)` — key = the aggregate, e.g. `"user/<id>"`; requires migration `010`. Records with the same key are published one at a time, in enqueue order, across all runner replicas; records enqueued with `Enqueue` are unaffected. Enqueue order is INSERT order (a sequence, `ordering_seq`), so take the aggregate's row lock (the business `UPDATE` of that row, or `SELECT … FOR UPDATE`) **before** `EnqueueOrdered` — two transactions enqueuing for one key then insert in commit order. A record enqueued while an earlier one of its key is unpublished waits (`scheduled_at = 'infinity'`, so claims never scan it) and is promoted once the key's head is marked published (best-effort, in a follow-up transaction) or inside the transaction that dead-letters it; a sweep with the gauge refresh (every `GaugeInterval`, or `PollInterval` if longer) catches a record enqueued while its head was being published, or whose promotion failed (promotion is best-effort after the publish is marked). Trade-offs: a failing head holds its key until it is published or dead-lettered after `MaxAttempts` (watch `platform_outbox_ordering_blocked_events`); a replayed dead letter joins the back of its key; a key publishes one record per claim, so the runner re-polls at once while batches publish. On a FIFO topic derive `WithMessageGroupID` from the same key so SNS keeps the order. Without ordering keys, consumers that need order use a per-aggregate sequence number in the payload.
+**Per-key ordering (opt-in per record).** Enqueue with `outbox.EnqueueOrdered(ctx, tx, env, key)` — key = the aggregate, e.g. `"user/<id>"`; requires migration `010`. Records with the same key are published one at a time, in enqueue order, across all runner replicas; records enqueued with `Enqueue` are unaffected. Enqueue order is INSERT order (a sequence, `ordering_seq`), so take the aggregate's row lock (the business `UPDATE` of that row, or `SELECT … FOR UPDATE`) **before** `EnqueueOrdered` — two transactions enqueuing for one key then insert in commit order. A record enqueued while an earlier one of its key is unpublished waits (`scheduled_at = 'infinity'`, so claims never scan it) and is promoted once the key's head is marked published (best-effort, in a follow-up transaction) or inside the transaction that dead-letters it; a sweep with the gauge refresh (at the first poll after `GaugeInterval` has elapsed) catches a record enqueued while its head was being published, or whose promotion failed (promotion is best-effort after the publish is marked). Trade-offs: a failing head holds its key until it is published or dead-lettered after `MaxAttempts` (watch `platform_outbox_ordering_blocked_events`); a replayed dead letter joins the back of its key; a key publishes one record per claim, so the runner re-polls at once while batches publish. On a FIFO topic derive `WithMessageGroupID` from the same key so SNS keeps the order. Without ordering keys, consumers that need order use a per-aggregate sequence number in the payload.
 
 > **⚠️ Publishing rule (mandatory):** all domain events tied to a database write **must** go through `outbox.Enqueue` inside a `pgcommon.RunInTx` callback. Calling `publisher.Publish` directly for transactional events introduces an unrecoverable crash window — the DB write commits but the event is silently lost if the process dies before the SNS call. `publisher.Publish` is only valid for best-effort, non-transactional notifications where event loss is explicitly acceptable. See [Publishing guide § Publishing rules](docs/guides/publishing.md#publishing-rules) for the full decision table and crash-window diagram.
 
@@ -501,8 +501,8 @@ erDiagram
 |---|---|---|
 | `idx_outbox_events_pending (scheduled_at, id) WHERE published_at IS NULL` | `outbox_events` | `ClaimBatch` — the poll query's `ORDER BY scheduled_at, id` (migration 003) |
 | `idx_outbox_events_published_at WHERE published_at IS NOT NULL` | `outbox_events` | `PrunePublished` (migration 007) |
-| `idx_outbox_dead_letters_failed_at (failed_at DESC)` | `outbox_dead_letters` | `ListDeadLetters` / `ReprocessDeadLetters*` / `DiscardDeadLetters` ordering (oldest failure first) and retention queries (migration 004) |
-| `idx_outbox_dead_letters_created_at (created_at ASC)` | `outbox_dead_letters` | Ad-hoc inspection by enqueue time (migration 005; replay now orders by `failed_at`) |
+| `idx_outbox_dead_letters_failed_at (failed_at DESC)` | `outbox_dead_letters` | `ListDeadLetters` / `ReprocessDeadLetters*` / `DiscardDeadLetters` ordering (`failed_at, id` — oldest failure first, a total order so list → replay / discard select the same rows) and retention queries (migration 004) |
+| `idx_outbox_dead_letters_created_at (created_at ASC)` | `outbox_dead_letters` | Ad-hoc inspection by enqueue time (migration 005; replay now orders by `failed_at, id`) |
 | `idx_outbox_dead_letters_event_type_tenant_id` | `outbox_dead_letters` | `DLQFilter` on `EventType` / `TenantID` (migration 008) |
 | `idx_outbox_events_unpublished_created (created_at) WHERE published_at IS NULL` | `outbox_events` | `OldestPendingAge` — `platform_outbox_oldest_pending_age` (migration 009) |
 | `idx_outbox_events_ordering (ordering_key, ordering_seq) WHERE published_at IS NULL AND ordering_key IS NOT NULL` + sequence `outbox_events_ordering_seq` | `outbox_events` | Per-key ordering: the enqueue-time "earlier unpublished?" check, head promotion, the claim guard (migration 010) |
@@ -745,7 +745,7 @@ sequenceDiagram
 flowchart TD
     A([Dead-letter record in outbox_dead_letters\nevent_type · tenant_id · attempts · last_error · failed_at]) --> INSPECT
 
-    INSPECT["Step 1 — Inspect\nrunner.ListDeadLetters(ctx, DLQFilter{...}, limit)\nreturns []DeadLetterRecord ordered by failed_at ASC\n—no mutation, safe to call repeatedly—"]
+    INSPECT["Step 1 — Inspect\nrunner.ListDeadLetters(ctx, DLQFilter{...}, limit)\nreturns []DeadLetterRecord ordered by failed_at, id (oldest first)\n—no mutation, safe to call repeatedly—"]
 
     INSPECT --> DECIDE{Root cause\nfixed?}
 
@@ -914,7 +914,11 @@ The library carries tenant context end to end but enforces isolation only where 
 
 ## Concurrency model
 
-`sqsConsumer` dispatches messages with a bounded semaphore (`WithConcurrency`). The receive loop takes up to `MaxMessages` per `ReceiveMessage`, starts a visibility extender for **every** received message at once, then dispatches them as slots free up — so messages waiting behind slow handlers stay hidden and are never processed twice. The next receive happens once the batch is dispatched. Without a visibility timeout there is no extension, so each receive asks only for as many messages as there are free workers.
+`sqsConsumer` dispatches messages with a bounded semaphore (`WithConcurrency`). The receive loop takes up to `MaxMessages` per `ReceiveMessage`, starts a visibility extender for **every** received message at once, then dispatches them as slots free up — so messages waiting behind slow handlers stay hidden and are never processed twice. The next receive happens once the batch is dispatched. Without a visibility timeout there is no extension, so each receive asks only for as many messages as there are free workers. At most `WithConcurrency + MaxMessages` extenders exist at once (one receive is outstanding, and each message takes a worker slot before the next receive).
+
+**Lifecycle.** `Start` on a consumer or runner that is already running returns an error; both are restartable after `Stop`. `Stop` is safe before `Start` and more than once, and returns an error when the drain deadline passes (consumer `DrainTimeout` + 5 s, runner `DrainTimeout`). Shut down by cancelling the `Start` ctx, then calling `Stop` to wait for the drain.
+
+**Connection budget.** The outbox runner uses one connection for claims and gauges and up to `PublishConcurrency` at once for settles; `inbox.Store.Process` holds one per in-flight handler — size `PG_MAX_CONNS` ≥ consumer concurrency + `PublishConcurrency` + 1.
 
 **Example — 10 messages received, `WithConcurrency(3)`:**
 
@@ -953,7 +957,8 @@ When goroutine 1 finishes:
 
 - **Claim** — `SELECT … FOR UPDATE SKIP LOCKED` over pending rows, then a lease `UPDATE scheduled_at = NOW() + ClaimLeaseDuration` in the same transaction. Concurrent runners claim disjoint batches with no distributed lock. `NewRunner` rejects a `ClaimLeaseDuration` too short for `BatchSize × PublishTimeout`, so a lease cannot expire while its batch is still publishing.
 - **`MarkFailed`** — reads `attempts` with `SELECT … FOR UPDATE` (deliberately **not** `SKIP LOCKED`: a second runner that re-claimed after lease expiry must block, not skip) so attempts can never be double-incremented and a record can never be dead-lettered early.
-- **Shutdown** — records stranded by context cancellation are released with `ReleaseLease` (claimable immediately, no attempt counted), so rolling restarts never push a record towards the dead-letter table.
+- **Shutdown** — records stranded by context cancellation are released with `ReleaseLease` (claimable immediately, no attempt counted), so rolling restarts never push a record towards the dead-letter table. Settle writes run on a context detached from `Start`'s, budgeted at the publish budget + `(n+1) × 500 ms`, so a batch published during shutdown is still recorded.
+- **Dead-letter management** — `ListDeadLetters`, `ReprocessDeadLetters*` and `DiscardDeadLetters` order by `failed_at, id`, so a list followed by a replay or discard with the same filter and limit acts on the rows the list showed (barring rows dead-lettered in between).
 
 ### Idempotency
 
