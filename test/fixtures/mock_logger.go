@@ -4,7 +4,7 @@ package fixtures
 import (
 	"sync"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/core/port"
 )
 
 // LogEntry represents a single log call captured by MockLogger.

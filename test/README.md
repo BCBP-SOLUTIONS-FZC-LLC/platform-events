@@ -116,7 +116,7 @@ package envelope_test
 import (
     "testing"
 
-    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
     "github.com/stretchr/testify/require"
 )
 
@@ -147,8 +147,8 @@ import (
     "context"
     "testing"
 
-    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
-    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
+    "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/test/fixtures"
     "github.com/stretchr/testify/require"
 )
 
@@ -184,5 +184,5 @@ The CI gate requires **≥97%** combined coverage (same as platform-pgcommon).
 `testenv` loads `.env-example` into the process environment for tests that read env vars (e.g. `internal/config` tests). Import it for its side effects:
 
 ```go
-import _ "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/testenv"
+import _ "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/test/testenv"
 ```

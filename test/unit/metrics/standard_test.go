@@ -44,8 +44,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	internalmetrics "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
+	internalmetrics "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/internal/adapter/outbound/metrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events"
 )
 
 var testIdentity = events.MetricsIdentity{Domain: "iam", Service: "event-consumer", Environment: "prod"}
@@ -537,7 +537,7 @@ func TestStandard_PropagationClampsSkewAndIgnoresZero(t *testing.T) {
 }
 
 func TestStandard_LibraryVersionFrom(t *testing.T) {
-	const mod = "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events"
+	const mod = "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2"
 	dep := func(m debug.Module) *debug.BuildInfo {
 		return &debug.BuildInfo{Main: debug.Module{Path: "example.com/svc", Version: "v9.9.9"}, Deps: []*debug.Module{{Path: "other/mod", Version: "v1.0.0"}, &m}}
 	}

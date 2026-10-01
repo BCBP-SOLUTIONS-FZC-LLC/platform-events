@@ -9,7 +9,7 @@ Mocks for `Publisher`, `Consumer` and `DLQPublisher`, and wiring them in tests. 
 `pkg/events/mock` ships ready-made, thread-safe test doubles so consuming services never need to stand up an AWS emulator (floci) or SNS just to run a unit test.
 
 ```go
-import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events/mock"
+import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/events/mock"
 ```
 
 ### Mock Publisher

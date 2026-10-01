@@ -49,8 +49,9 @@ See [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envel
 
 | Version | Status | Go module | Supported until |
 |---------|--------|-----------|-----------------|
-| `v1.6.x` | **Current** | `@v1.6.1` | Active; patch releases as needed |
-| `v1.0.x` – `v1.5.x` | Superseded | `@v1.5.0` … `@v1.0.0` | Upgrade to `v1.6.x` — MINOR releases are backward compatible (read the `[1.6.0]` and `[1.6.1]` upgrade notes) |
+| `v2.0.x` | **Current** | `…/platform-events/v2@v2.0.0` | Active; patch releases as needed |
+| `v1.6.x` | Previous major | `@v1.6.1` | Security fixes only (see below). Upgrade to `v2` — read the `[2.0.0]` upgrade notes (module path `/v2`, Tier 1 metrics only) |
+| `v1.0.x` – `v1.5.x` | Superseded | `@v1.5.0` … `@v1.0.0` | Upgrade to `v2.0.x` |
 | `< v1.0.0` | — | — | No tagged releases before `v1.0.0` |
 
 When a new **MAJOR** line ships (e.g. `v2`), the previous major receives **security fixes only** for a period defined by the platform team (typically 6 months after `v2.0.0`).
@@ -68,14 +69,16 @@ Set the same variable in CI pipelines that build consuming services. See [README
 Pin in your service `go.mod`:
 
 ```bash
-go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@v1.0.0
+go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2@v2.0.0
 ```
+
+From `v2.0.0` the module path ends in `/v2` (Go semantic import versioning): import `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/pkg/...`. `v1.x` stays at the unsuffixed path.
 
 | Pin style | Use when |
 |-----------|----------|
-| `@v1.0.0` | Production; exact reproducibility |
-| `@v1.0.3` | Production; latest patch on `1.0` |
-| `@v1.2.0` | Accept new minors on `1.x` (still SemVer-safe) |
+| `@v2.0.0` | Production; exact reproducibility |
+| `@v2.0.3` | Production; latest patch on `2.0` |
+| `@v2.2.0` | Accept new minors on `2.x` (still SemVer-safe) |
 | `@latest` | Experiments only; not recommended for prod |
 
 Go resolves versions from **Git tags** pushed to this private repository — there is no public module proxy involved.

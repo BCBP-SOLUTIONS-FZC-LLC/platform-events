@@ -1,4 +1,4 @@
-module github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/tools
+module github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2/tools
 
 go 1.26.0
 

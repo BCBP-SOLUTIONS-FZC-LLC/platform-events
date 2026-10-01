@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/v2/pkg/pgcommon"
 )
 
 // SNSConfigEnv holds environment-derived SNS publisher configuration.

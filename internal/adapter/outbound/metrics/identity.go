@@ -71,7 +71,7 @@ func ServiceName() string {
 }
 
 // modulePath is this library's Go module path.
-const modulePath = "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events"
+const modulePath = "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/v2"
 
 // LibraryVersion returns the platform-events module version the running
 // binary was built with: the dependency version in a consuming service,
