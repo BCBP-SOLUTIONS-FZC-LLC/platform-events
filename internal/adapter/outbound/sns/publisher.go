@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"strings"
 	"time"
 
@@ -56,6 +55,9 @@ type BatchFailure struct {
 	ID      string
 	Code    string
 	Message string
+	// Retryable reports a transient failure (throttling, SNS-side error,
+	// timeout) that the outbox retries without counting an attempt.
+	Retryable bool
 }
 
 func (e *BatchError) Error() string {
@@ -308,39 +310,19 @@ func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.Raw
 // All chunks are always attempted — a transport error in one chunk does not
 // prevent remaining chunks from being sent.
 func (p *snsPublisher) PublishBatch(ctx context.Context, envs []domain.Envelope[json.RawMessage]) error {
-	var batchErr *BatchError
-
+	var failures []BatchFailure
 	for i := 0; i < len(envs); i += maxSNSBatchSize {
 		end := min(i+maxSNSBatchSize, len(envs))
-		chunk := envs[i:end]
-		if err := p.publishChunk(ctx, chunk); err != nil {
-			if batchErr == nil {
-				batchErr = &BatchError{}
-			}
-			if be, ok := errors.AsType[*BatchError](err); ok {
-				batchErr.Failures = append(batchErr.Failures, be.Failures...)
-			} else {
-				// Transport-level error: record every message in the chunk as failed
-				// so callers know which IDs were not delivered. Remaining chunks are
-				// still attempted below.
-				for _, env := range chunk {
-					batchErr.Failures = append(batchErr.Failures, BatchFailure{
-						ID:      env.ID,
-						Code:    "TransportError",
-						Message: err.Error(),
-					})
-				}
-			}
-		}
+		failures = append(failures, p.publishChunk(ctx, envs[i:end])...)
 	}
-
-	if batchErr != nil && len(batchErr.Failures) > 0 {
-		return batchErr
+	if len(failures) > 0 {
+		return &BatchError{Failures: failures}
 	}
 	return nil
 }
 
-func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[json.RawMessage]) error {
+// publishChunk publishes up to 10 envelopes and returns the ones that failed.
+func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[json.RawMessage]) []BatchFailure {
 	tracer := otel.Tracer("platform-events")
 	ctx, span := tracer.Start(ctx, "sns.publish.batch", oteltrace.WithSpanKind(oteltrace.SpanKindProducer))
 	defer span.End()
@@ -461,15 +443,66 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 		entries = append(entries, entry)
 	}
 
-	// If all entries failed to marshal, skip the API call entirely.
-	if len(entries) == 0 {
-		if marshalErr != nil {
-			span.RecordError(marshalErr)
-			span.SetStatus(codes.Error, marshalErr.Error())
-		}
-		return marshalErr
+	// SNS caps a PublishBatch request at 256 KiB in total (bodies plus
+	// attributes), not just 10 entries: send the chunk in as many requests as
+	// that takes, so one large event cannot fail its neighbours with
+	// BatchRequestTooLong. An entry over the limit on its own goes alone and
+	// fails with SNS's own (permanent) error.
+	var failures []BatchFailure
+	if marshalErr != nil {
+		failures = append(failures, marshalErr.Failures...)
 	}
+	for _, group := range groupBySize(entries, maxSNSBatchBytes) {
+		failures = append(failures, p.sendBatch(ctx, group, entryEventType)...)
+	}
+	if len(failures) > 0 {
+		resultErr := &BatchError{Failures: failures}
+		span.RecordError(resultErr)
+		span.SetStatus(codes.Error, resultErr.Error())
+		return failures
+	}
+	span.SetStatus(codes.Ok, "")
+	return nil
+}
 
+// maxSNSBatchBytes is SNS's limit on the total size of one PublishBatch
+// request's messages and attributes.
+const maxSNSBatchBytes = 256 * 1024
+
+// entrySize is the size SNS counts toward the request limit: the message
+// body plus every attribute's name, data type and value.
+func entrySize(e snstypes.PublishBatchRequestEntry) int {
+	n := len(aws.ToString(e.Message))
+	for k, v := range e.MessageAttributes {
+		n += len(k) + len(aws.ToString(v.DataType)) + len(aws.ToString(v.StringValue)) + len(v.BinaryValue)
+	}
+	return n
+}
+
+// groupBySize splits entries, in order, into groups whose total entrySize
+// stays within limit. An entry larger than limit forms a group of its own.
+func groupBySize(entries []snstypes.PublishBatchRequestEntry, limit int) [][]snstypes.PublishBatchRequestEntry {
+	var groups [][]snstypes.PublishBatchRequestEntry
+	var cur []snstypes.PublishBatchRequestEntry
+	size := 0
+	for _, e := range entries {
+		n := entrySize(e)
+		if len(cur) > 0 && size+n > limit {
+			groups = append(groups, cur)
+			cur, size = nil, 0
+		}
+		cur = append(cur, e)
+		size += n
+	}
+	if len(cur) > 0 {
+		groups = append(groups, cur)
+	}
+	return groups
+}
+
+// sendBatch sends one PublishBatch request and returns its failures: one per
+// entry SNS rejected, or one per entry when the whole request failed.
+func (p *snsPublisher) sendBatch(ctx context.Context, entries []snstypes.PublishBatchRequestEntry, entryEventType map[string]string) []BatchFailure {
 	start := time.Now()
 	out, err := p.client.PublishBatch(ctx, &sns.PublishBatchInput{
 		TopicArn:                   aws.String(p.topicARN),
@@ -477,10 +510,9 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 	})
 	dur := time.Since(start)
 	metrics.ObserveDependency("sns", "publish_batch", err, dur)
+	perMsg := dur.Seconds() / float64(len(entries))
 
 	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
 		if p.logger != nil {
 			p.logger.Error("sns: batch publish failed", map[string]any{
 				"topic": p.topicARN,
@@ -488,89 +520,67 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 				"error": err.Error(),
 			})
 		}
-		perMsg := dur.Seconds() / float64(len(entries))
+		failures := make([]BatchFailure, 0, len(entries))
 		for _, entry := range entries {
-			eventType := entryEventType[aws.ToString(entry.Id)]
-			metrics.RecordPublish(p.topicARN, eventType, "error", perMsg)
+			id := aws.ToString(entry.Id)
+			metrics.RecordPublish(p.topicARN, entryEventType[id], "error", perMsg)
+			failures = append(failures, requestFailure(id, err))
 		}
-		// Merge any marshal failures accumulated before the API call so callers
-		// see the correct Code ("MarshalError" vs "TransportError") for each entry.
-		if marshalErr != nil {
-			combined := &BatchError{Failures: make([]BatchFailure, 0, len(marshalErr.Failures)+len(entries))}
-			combined.Failures = append(combined.Failures, marshalErr.Failures...)
-			for _, entry := range entries {
-				combined.Failures = append(combined.Failures, BatchFailure{
-					ID:      aws.ToString(entry.Id),
-					Code:    "TransportError",
-					Message: err.Error(),
-				})
-			}
-			return combined
-		}
-		// Wrap transport-level errors so the outbox service's failureThreshold()
-		// correctly identifies retryable failures (ThrottlingException, ServiceUnavailable)
-		// and uses maxAttempts+1 instead of maxAttempts, preventing premature dead-lettering.
-		return wrapIfRetryable(err)
+		return failures
 	}
 
-	// Build a set of failed IDs for O(1) lookup.
 	failedIDs := make(map[string]struct{}, len(out.Failed))
+	var failures []BatchFailure
 	for _, f := range out.Failed {
-		failedIDs[aws.ToString(f.Id)] = struct{}{}
+		id := aws.ToString(f.Id)
+		failedIDs[id] = struct{}{}
+		code := aws.ToString(f.Code)
+		_, retryableCode := retryableErrorCodes[code]
+		failures = append(failures, BatchFailure{
+			ID:      id,
+			Code:    code,
+			Message: aws.ToString(f.Message),
+			// SenderFault=false: SNS's side failed, so the same entry can succeed later.
+			Retryable: retryableCode || !f.SenderFault,
+		})
 	}
-
-	perMsg := dur.Seconds() / float64(len(entries))
-	for _, env := range envs {
-		if _, hadMarshalErr := func() (struct{}, bool) {
-			if marshalErr != nil {
-				for _, f := range marshalErr.Failures {
-					if f.ID == env.ID {
-						return struct{}{}, true
-					}
-				}
-			}
-			return struct{}{}, false
-		}(); hadMarshalErr {
-			continue // already recorded as error during entry building
-		}
-		_, failed := failedIDs[env.ID]
+	for _, entry := range entries {
+		id := aws.ToString(entry.Id)
 		status := "success"
-		if failed {
+		if _, failed := failedIDs[id]; failed {
 			status = "error"
 		}
-		metrics.RecordPublish(p.topicARN, env.Type, status, perMsg)
+		metrics.RecordPublish(p.topicARN, entryEventType[id], status, perMsg)
 	}
+	return failures
+}
 
-	// Merge API failures with any marshal failures collected during entry building.
-	var resultErr *BatchError
-	if len(out.Failed) > 0 {
-		resultErr = &BatchError{}
-		for _, f := range out.Failed {
-			resultErr.Failures = append(resultErr.Failures, BatchFailure{
-				ID:      aws.ToString(f.Id),
-				Code:    aws.ToString(f.Code),
-				Message: aws.ToString(f.Message),
-			})
-		}
+// requestFailure describes an entry of a request that failed as a whole.
+// Only a transient error (throttling, SNS-side failure, timeout, network) is
+// "TransportError" and retryable; a permanent one (authorization, missing
+// topic, request too long, …) carries its AWS error code and counts toward
+// the outbox's MaxAttempts.
+func requestFailure(id string, err error) BatchFailure {
+	err = wrapIfRetryable(err)
+	if errors.Is(err, domain.ErrRetryable) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return BatchFailure{ID: id, Code: "TransportError", Message: err.Error(), Retryable: true}
 	}
-	if marshalErr != nil {
-		if resultErr == nil {
-			resultErr = &BatchError{}
-		}
-		resultErr.Failures = append(resultErr.Failures, marshalErr.Failures...)
+	code := "PublishError"
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
+		code = apiErr.ErrorCode()
 	}
-	if resultErr != nil {
-		span.RecordError(resultErr)
-		span.SetStatus(codes.Error, resultErr.Error())
-		return resultErr
-	}
-	span.SetStatus(codes.Ok, "")
-	return nil
+	return BatchFailure{ID: id, Code: code, Message: err.Error()}
 }
 
 // retryableErrorCodes are AWS SNS error codes that indicate a transient failure
 // which should not count toward maxAttempts in the outbox service.
 var retryableErrorCodes = map[string]struct{}{
+	// SNS's own codes (aws-sdk-go-v2/service/sns/types): ThrottledException,
+	// InternalErrorException, KMSThrottlingException.
+	"Throttled":     {},
+	"InternalError": {},
+	"KMSThrottling": {},
+	// Generic AWS / smithy transient codes.
 	"Throttling":                    {},
 	"ThrottlingException":           {},
 	"RequestThrottled":              {},
@@ -583,17 +593,32 @@ var retryableErrorCodes = map[string]struct{}{
 // wrapIfRetryable wraps err in a domain.RetryableError when the underlying
 // error indicates a transient failure that should not exhaust maxAttempts.
 // Covers AWS API throttle/service errors and network-level timeouts.
+//
+// An error SNS answered (an AWS API error) is retryable only for the codes in
+// retryableErrorCodes. An error without one never reached a verdict from SNS —
+// network, DNS, TLS, timeouts, credential resolution — and is retryable too,
+// except the SDK's client-side validation and serialization errors, which
+// will fail the same way every time.
 func wrapIfRetryable(err error) error {
+	if err == nil || errors.Is(err, domain.ErrRetryable) {
+		return err
+	}
 	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
 		if _, ok := retryableErrorCodes[apiErr.ErrorCode()]; ok {
 			return &domain.RetryableError{Cause: err}
 		}
+		return err
 	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return &domain.RetryableError{Cause: err}
+	if _, ok := errors.AsType[smithy.InvalidParamsError](err); ok {
+		return err
 	}
-	return err
+	if _, ok := errors.AsType[*smithy.InvalidParamsError](err); ok {
+		return err
+	}
+	if _, ok := errors.AsType[*smithy.SerializationError](err); ok {
+		return err
+	}
+	return &domain.RetryableError{Cause: err}
 }
 
 // encodeEnvelopePayload runs the configured codec (if any) on env's payload.

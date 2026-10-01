@@ -9,11 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- **`outbox.Enqueue` requires the canonical lowercase UUID form for the envelope ID** (what `events.NewEnvelope` produces). Uppercase, braced or unhyphenated IDs are rejected: Postgres stores the ID canonicalised, and the mismatch with the payload's ID made a failed batch publish look delivered.
+- **Custom `events.Publisher` implementations:** a `BatchFailure` is now treated as transient only when `Retryable` is set (or its Code is `TransportError`). A whole-batch failure from the SNS publisher is `TransportError` only when transient; a permanent one keeps its AWS code and counts toward `MaxAttempts`.
+
 - **Outbox retries back off, and transient failures no longer count toward `MaxAttempts`.** A permanent publish failure now retries after `RetryBackoff·2^(attempt-1)` (default 1s, capped at `MaxRetryBackoff` = 5m, jittered) instead of on the next poll. With the defaults the first retries still land on the next poll (the backoff is shorter than the 5s `PollInterval`), so a poison record reaches `outbox_dead_letters` in about the same ~25s; larger `MaxAttempts` values now spread out up to 5m apart. Transport errors, throttling and timeouts release the lease without counting an attempt, so an SNS outage builds a backlog (watch `PlatformEventsOutboxBacklog`) instead of dead-lettering it. Tune with `outbox.Config.RetryBackoff` / `MaxRetryBackoff` or `OUTBOX_RETRY_BACKOFF` / `OUTBOX_MAX_RETRY_BACKOFF`.
 - **`outbox.ApplySchema` always tracks its migrations in `outbox_migrations`**, also when the DSN sets `x-migrations-table` (inbox already did this). A service that passed its own tracking table re-runs outbox migrations 001–008 into `outbox_migrations` once; every one is idempotent (`IF NOT EXISTS`).
 
 ### Fixed
 
+- **Outbox / SNS publisher (regression in the unreleased retry change):**
+  - Every whole-batch SNS failure was labelled `TransportError`, so permanent ones (`BatchRequestTooLong`, `AuthorizationError`, `NotFound`, `KMSAccessDenied`, …) were retried forever without counting attempts, holding the healthy records of the same chunk with them. Failures now carry `BatchFailure.Retryable`. Only throttling, SNS-side errors, timeouts and failures without an AWS API error (network, DNS, TLS, credentials) are transient.
+  - SNS's own throttle and internal codes (`Throttled`, `InternalError`, `KMSThrottling`) were not recognised as transient, so throttling used up attempts. Per-entry failures with `SenderFault=false` are transient too.
+  - `PublishBatch` splits each 10-message chunk by SNS's 256 KiB request limit as well, so one large event no longer fails its neighbours with `BatchRequestTooLong`.
+  - With `PublishConcurrency > 1`, the shared transient backoff advanced once per failed record, so a one-second SNS blip parked a 50-record batch for 5 minutes. It now advances once per poll cycle.
+- **Inbox:**
+  - A message the handler dead-lettered (`SendToDLQ`, then nil) was recorded as processed, so a DLQ redrive after the fix was acked as a duplicate and never processed. It is no longer recorded.
+  - New `Store.Process(ctx, env, fn)` claims the ID inside the handler's transaction, so Postgres writes happen exactly once, including for concurrent copies and a failed record step. `Handler`'s best-effort semantics are now documented, and the `Prune` retention guidance is corrected.
 - **Outbox:**
   - A short SNS outage (≈30s with the defaults) moved the whole pending backlog to `outbox_dead_letters`: failed records were retried on every poll with no backoff, and transient failures still used up attempts (the old `MaxAttempts+1` threshold only bought one extra try). Records stranded by shutdown no longer count an attempt either (`port.OutboxStore.ReleaseLease`).
   - `Runner.Ready()` called before `Start` (the documented `go runner.Start(ctx); <-runner.Ready()` pattern) could return a channel that was never closed.
@@ -30,7 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A failed `InitMetrics` (invalid identity) no longer resets the `event_type` cap.
 - **Alert rules:**
   - `PlatformEventsMessagesDeadLettered` missed the first dead-letter of each `event_type` / reason per pod, because `platform_dlq_messages_total` series are born at 1. The recording rule now counts series born in the window.
-  - `PlatformEventsConsumerStalled` no longer fires on a service whose messages are all dead-lettered on purpose.
+  - `PlatformEventsConsumerStalled` no longer fires on a queue whose messages are all dead-lettered on purpose. Dead-lettering on one queue cannot hide a stall on another: it suppresses only when the service's dead-letter rate covers the stalled queue's traffic.
+  - The dead-letter recording rule treats a series as new only if it had no sample in the hour before the window, so a scrape gap no longer re-counts old dead-letters.
   - The promtool tests now start those series absent instead of at 0, which had hidden the gap.
 - **CI:**
   - The release image signature check only accepted tag refs, so a manual `workflow_dispatch` release failed after pushing the image. It now verifies the exact `release.yml@<ref>` identity.

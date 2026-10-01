@@ -120,3 +120,16 @@ func TestHandler_PlatformDuplicateMetric(t *testing.T) {
 	assert.InDelta(t, 1, testutil.ToFloat64(p.DuplicateMessages.WithLabelValues("orders", "T")), 0)
 	assert.InDelta(t, 1, testutil.ToFloat64(p.DuplicateMessages.WithLabelValues("unknown", "T")), 0)
 }
+
+// A handler that dead-letters the message (SendToDLQ, then nil) did not
+// process it: inbox must not record it, so a DLQ redrive is processed.
+func TestHandler_DeadLetteredNotRecorded(t *testing.T) {
+	ledger := newLedger()
+	h := inbox.Handler(ledger, func(ctx context.Context, _ events.Envelope[json.RawMessage]) error {
+		port.DLQAttributionFromContext(ctx).MarkRecorded() // what DLQPublisher.SendToDLQ does
+		return nil
+	})
+	ctx, _ := port.WithDLQAttribution(context.Background(), "explicit")
+	require.NoError(t, h(ctx, env(uuid.NewString())))
+	assert.Equal(t, 0, ledger.marks)
+}

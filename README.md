@@ -263,7 +263,7 @@ Every domain event tied to a DB write goes through `outbox.Enqueue` inside `pgco
 
 ### 4. Idempotency
 
-Wrap handlers with `inbox.Handler(store, next)`, or use the `processed_events ... ON CONFLICT DO NOTHING` pattern inside the handler's transaction — [Implementing idempotency](docs/guides/consuming.md#implementing-idempotency).
+Wrap handlers with `inbox.Handler(store, next)` (best-effort: the check, the handler and the record are separate transactions), or — for Postgres writes — run them through `store.Process(ctx, env, func(ctx, tx) error {…})`, which claims the ID inside the handler's transaction so the writes happen exactly once. Neither records a message the handler dead-lettered, so a DLQ redrive is processed — [Implementing idempotency](docs/guides/consuming.md#implementing-idempotency).
 
 ### 5. Dead-letter forwarding
 

@@ -1,6 +1,8 @@
 package service
 
 import (
+	"github.com/google/uuid"
+
 	"context"
 	"encoding/json"
 	"errors"
@@ -55,12 +57,15 @@ type OutboxService struct {
 	retryBackoff       time.Duration
 	maxRetryBackoff    time.Duration
 
-	// transientStreak counts consecutive transient publish failures (transport
-	// errors, throttling, timeouts) across records. Those failures describe
-	// the publisher, not a record, so they back off together — an SNS outage
-	// slows every retry instead of hammering SNS each poll — and reset on the
-	// next successful publish.
-	transientStreak atomic.Int32
+	// Transient publish failures (transport errors, throttling, timeouts)
+	// describe the publisher, not a record, so they share one backoff: an SNS
+	// outage slows every retry instead of hammering SNS each poll. The streak
+	// advances at most once per poll cycle (pollGen) — however many records
+	// that cycle failed — and resets on the next successful publish.
+	pollGen        atomic.Uint64
+	transientMu    sync.Mutex
+	transientGen   uint64
+	transientCount int
 }
 
 // NewOutboxService creates an OutboxService with all required dependencies.
@@ -152,6 +157,12 @@ func (s *OutboxService) Enqueue(ctx context.Context, tx pgcommon.Tx, env domain.
 	if strings.ContainsRune(env.ID, '\x00') || strings.ContainsRune(env.Type, '\x00') || strings.ContainsRune(env.Source, '\x00') {
 		return fmt.Errorf("outbox: envelope fields (ID, Type, Source) must not contain null bytes")
 	}
+	// The ID is stored in a uuid column and read back in canonical form, while
+	// publish failures are reported under the ID in the payload: anything but
+	// the canonical spelling would make a failed publish look delivered.
+	if id, err := uuid.Parse(env.ID); err != nil || id.String() != env.ID {
+		return fmt.Errorf("outbox: envelope ID %q must be a canonical lowercase UUID — use events.NewEnvelope to construct envelopes", env.ID)
+	}
 	b, err := json.Marshal(env)
 	if err != nil {
 		return err
@@ -177,6 +188,7 @@ func (s *OutboxService) Enqueue(ctx context.Context, tx pgcommon.Tx, env domain.
 // and marked as failed; the batch continues. Returns ctx.Err() if the context
 // is cancelled mid-batch so the runner can distinguish shutdown from DB errors.
 func (s *OutboxService) PublishBatch(ctx context.Context, batchSize int) error {
+	s.beginPoll()
 	records, err := s.store.ClaimBatch(ctx, batchSize)
 	if err != nil {
 		return err
@@ -317,7 +329,7 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 		err = s.publisher.PublishBatch(pubCtx, envs)
 	}()
 	if err == nil {
-		s.transientStreak.Store(0)
+		s.resetTransient()
 		for _, it := range items {
 			s.markPublished(bookkeepCtx, it.rec, it.env)
 		}
@@ -337,15 +349,15 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 		failed := make(map[string]failInfo, len(batchErr.Failures))
 		anyTransient := false
 		for _, f := range batchErr.Failures {
-			// "TransportError" is the code used by publishChunk for transport-level
-			// failures (ThrottlingException, ServiceUnavailable, etc.): retried
-			// without consuming an attempt.
-			transient := f.Code == "TransportError"
+			// Retryable failures (throttling, service-side errors, timeouts —
+			// Code "TransportError" for publishers that predate the flag) are
+			// retried without consuming an attempt; anything else counts.
+			transient := f.Retryable || f.Code == "TransportError"
 			anyTransient = anyTransient || transient
 			failed[f.ID] = failInfo{msg: truncateError(f.Message), transient: transient}
 		}
 		if len(failed) < len(items) {
-			s.transientStreak.Store(0) // something got through
+			s.resetTransient() // something got through
 		}
 		var transientDelay time.Duration
 		if anyTransient {
@@ -406,11 +418,28 @@ func isTransient(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, domain.ErrRetryable)
 }
 
-// nextTransientDelay advances the shared transient-failure streak and returns
-// its backoff.
+// nextTransientDelay returns the shared transient backoff, advancing the
+// streak on the first transient failure of each poll cycle only.
 func (s *OutboxService) nextTransientDelay() time.Duration {
-	return s.backoff(int(s.transientStreak.Add(1)))
+	gen := s.pollGen.Load()
+	s.transientMu.Lock()
+	if s.transientGen != gen || s.transientCount == 0 {
+		s.transientGen = gen
+		s.transientCount++
+	}
+	n := s.transientCount
+	s.transientMu.Unlock()
+	return s.backoff(n)
 }
+
+func (s *OutboxService) resetTransient() {
+	s.transientMu.Lock()
+	s.transientCount = 0
+	s.transientMu.Unlock()
+}
+
+// beginPoll starts a poll cycle for the transient backoff.
+func (s *OutboxService) beginPoll() { s.pollGen.Add(1) }
 
 func (s *OutboxService) newBookkeepCtx(recordCount int) (context.Context, context.CancelFunc) {
 	var publishBudget time.Duration
@@ -507,7 +536,7 @@ func (s *OutboxService) publishRecord(ctx, bookkeepCtx context.Context, rec doma
 		return
 	}
 
-	s.transientStreak.Store(0)
+	s.resetTransient()
 	s.markPublished(bookkeepCtx, rec, env)
 }
 

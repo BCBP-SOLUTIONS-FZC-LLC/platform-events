@@ -130,6 +130,7 @@ func TestPublishRecord_TransientErrors_ReleaseWithoutAttempt(t *testing.T) {
 			svc.SetRetryBackoff(time.Second, time.Minute)
 			var delays []time.Duration
 			for range 4 {
+				svc.beginPoll() // one failure per poll cycle
 				rec := testRecord(t, "transient.event")
 				svc.publishRecord(context.Background(), context.Background(), rec)
 				assert.NotContains(t, store.failed, rec.ID)
@@ -153,11 +154,30 @@ func TestPublishRecord_SuccessResetsTransientStreak(t *testing.T) {
 	pub := &errPublisher{err: domain.ErrRetryable}
 	svc := NewOutboxService(store, pub, nil, nil, 5, 2, 0)
 	for range 5 {
+		svc.beginPoll()
 		svc.publishRecord(context.Background(), context.Background(), testRecord(t, "e"))
 	}
+	assert.Equal(t, 5, svc.transientCount)
 	pub.err = nil
 	svc.publishRecord(context.Background(), context.Background(), testRecord(t, "e"))
-	assert.Zero(t, svc.transientStreak.Load())
+	assert.Zero(t, svc.transientCount)
+}
+
+// TestTransientBackoff_OncePerPoll: many records failing in one poll cycle
+// (PublishConcurrency > 1) advance the shared backoff once, not once each —
+// a one-second SNS blip must not park the batch for minutes.
+func TestTransientBackoff_OncePerPoll(t *testing.T) {
+	store := newStubStore()
+	svc := NewOutboxService(store, &errPublisher{err: domain.ErrRetryable}, nil, nil, 5, 8, 0)
+	svc.SetRetryBackoff(time.Second, 5*time.Minute)
+	svc.beginPoll()
+	for range 50 {
+		svc.publishRecord(context.Background(), context.Background(), testRecord(t, "e"))
+	}
+	assert.Equal(t, 1, svc.transientCount)
+	for id, d := range store.releasedIn {
+		assert.LessOrEqual(t, d, time.Second, "record %s parked for %s", id, d)
+	}
 }
 
 // TestPublishRecord_PermanentError_CountsAttemptWithBackoff: an ordinary

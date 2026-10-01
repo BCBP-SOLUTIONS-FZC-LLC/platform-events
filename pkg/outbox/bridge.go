@@ -111,9 +111,10 @@ func toDomainBatchError(batchErr *events.BatchError) *domain.BatchError {
 	out := &domain.BatchError{Failures: make([]domain.BatchFailure, len(batchErr.Failures))}
 	for i, f := range batchErr.Failures {
 		out.Failures[i] = domain.BatchFailure{
-			ID:      f.ID,
-			Code:    f.Code,
-			Message: f.Message,
+			ID:        f.ID,
+			Code:      f.Code,
+			Message:   f.Message,
+			Retryable: f.Retryable,
 		}
 	}
 	return out

@@ -10,7 +10,7 @@ Core capabilities:
 - `Publisher` interface + AWS SNS implementation
 - `Consumer` interface + AWS SQS implementation (long-poll loop, parallel dispatch)
 - **Outbox runner** — transactional outbox pattern over a Postgres table; guarantees at-least-once delivery without 2PC
-- **Inbox** (`pkg/inbox`) — consumer-side dedup: `processed_events` ledger (`ApplySchema`, `Store`, `Handler` wrapper, `Prune`), metric `events_inbox_duplicates_total`
+- **Inbox** (`pkg/inbox`) — consumer-side dedup: `processed_events` ledger (`ApplySchema`, `Store`, `Handler` wrapper, `Prune`), metric `events_inbox_duplicates_total`. `Store.Process(ctx, env, fn(ctx, tx))` claims the ID inside the handler's transaction for exactly-once Postgres writes; `Handler` is best-effort (separate transactions). Neither records a message the handler dead-lettered, so DLQ redrives are processed
 - **`GlueDecodeCodec`** — decode-only codec stripping the Glue Schema Registry wire header
 - **`DLQPublisher`** — forwards failed messages to the source queue's `RedrivePolicy` DLQ (`SendToDLQ`, `ResolveDLQ`); the only sanctioned SQS path for consumer services (they must not import the SQS SDK). Typed `*DLQError` + `ErrRetryable`; `mock.DLQPublisher` (validates input like the real one); metrics `platform_dlq_messages_total` (counted once via `port.DLQAttribution`) + `platform_dependency_request_seconds{dependency="sqs"}` (legacy `events_dlq_forwarded_total`); span `sqs.dlq_forward`. Consumer option `WithDLQForwarding(dlq)` forwards malformed / over-`WithMaxReceiveCount` / decode-poison messages automatically (raw body + attributes); handlers get the raw message via `events.SourceMessageFromContext(ctx)` — never forward `env.JSON()`
 - **Event-envelope types** — versioned, typed `Envelope[T]` carrying metadata (event ID, type, source, tenant, trace ID, timestamp) plus JSON-serialised payload
@@ -130,7 +130,7 @@ External dependencies (private modules):
   - `MockConsumer` (in `pkg/events/mock`) — in-memory queue; `Inject(env)` delivers messages synchronously
 
 - **HMAC helpers**
-  - `Sign(key []byte, payload []byte) string` — returns hex-encoded HMAC-SHA256 signature
+  - `Sign(key []byte, payload []byte) (string, error)` — returns hex-encoded HMAC-SHA256 signature; `ErrKeyTooShort` for keys < 32 bytes
   - `Verify(key []byte, payload []byte, sig string) bool` — constant-time comparison; returns false on any parse/length error rather than panicking
   - `SignEnvelope(key []byte, env Envelope[json.RawMessage]) (string, error)` — signs canonical JSON of envelope
   - `VerifyEnvelope(key []byte, env Envelope[json.RawMessage], sig string) (bool, error)` — deserialises and verifies; safe for webhook receipt handlers
@@ -226,7 +226,8 @@ The JSON keys follow CloudEvents naming (`specversion`, `dataschema`, `time`, `d
 - **Message attributes** — `EventType`, `TenantID`, `Source`, `EventID`, and `Subject` (when non-empty) are set as SNS message attributes to enable SQS subscription filter policies without deserialising the body. `Actor` is not forwarded as an attribute — it is an audit-trail field, not a routing field.
 - **FIFO topics** — if `TopicARN` ends in `.fifo`, the publisher requires `MessageGroupID`; `MessageDeduplicationID` defaults to `Envelope.ID` (content-based deduplication must be disabled at the topic level).
 - **Batching** — `PublishBatch` uses `sns:PublishBatch` (max 10 per call); batches larger than 10 are automatically split.
-- **Retry** — caller is responsible for retry (the outbox runner handles this); the SNS adapter does not retry internally. `Publish` returns the raw AWS error for callers to inspect (`smithy.APIError`).
+- **Retry** — caller is responsible for retry (the outbox runner handles this); the SNS adapter does not retry internally. `Publish` returns the AWS error, wrapped in `RetryableError` (`errors.Is(err, events.ErrRetryable)`) when transient: SNS throttling / internal codes (`Throttled`, `InternalError`, `KMSThrottling`, …) and any failure without an AWS API error (network, DNS, TLS, timeouts, credentials). `errors.As(err, &smithy.APIError)` still reaches the underlying error. `PublishBatch` failures carry `BatchFailure.Retryable` (and Code `TransportError` for a transient whole-request failure; a permanent one keeps its AWS code). Chunks are split by count (10) **and** by SNS's 256 KiB request size.
+- **Outbox retry classification** — retryable failures release the record without counting an attempt (shared backoff); everything else counts toward `MaxAttempts` and dead-letters. A custom `events.Publisher` should set `BatchFailure.Retryable` (or wrap single-publish errors with `ErrRetryable`) only for failures that say nothing about the message.
 - **OTel** — each `Publish` call creates a child span `sns.publish` with attributes `messaging.system=aws_sns`, `messaging.destination`, `messaging.message_id`. OTel must be initialised by the consuming service before publishing; call `gincommon.InitTracingFromEnv()` (from `platform-gincommon`) at startup — `platform-events` calls `otel.Tracer(...)` and will produce no-op spans if the provider is not yet set.
 
 ### SQS Consumer

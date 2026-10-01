@@ -1428,3 +1428,39 @@ func TestOutboxService_Enqueue_InvalidPayload_StoreNotCalled(t *testing.T) {
 	defer store.mu.Unlock()
 	assert.Empty(t, store.records)
 }
+
+// A permanent batch failure counts an attempt (so it eventually dead-letters);
+// a Retryable one releases the lease without counting.
+func TestOutboxService_PublishBatch_Sequential_RetryableFlag(t *testing.T) {
+	mk := func() (domain.Envelope[json.RawMessage], domain.OutboxRecord) {
+		env := domain.NewEnvelope("flag.event", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		return env, domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload}
+	}
+	permEnv, permRec := mk()
+	retryEnv, retryRec := mk()
+	store := newMockStore()
+	store.records = []domain.OutboxRecord{permRec, retryRec}
+	pub := &domainBatchErrPublisher{err: &domain.BatchError{Failures: []domain.BatchFailure{
+		{ID: permEnv.ID, Code: "AuthorizationError", Message: "not authorized"},
+		{ID: retryEnv.ID, Code: "Throttled", Message: "slow down", Retryable: true},
+	}}}
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
+	require.NoError(t, svc.PublishBatch(context.Background(), 10))
+
+	assert.Equal(t, "not authorized", store.failed[permEnv.ID], "permanent failure counts an attempt")
+	assert.NotContains(t, store.released, permEnv.ID)
+	assert.Equal(t, "slow down", store.released[retryEnv.ID], "retryable failure releases the lease")
+	assert.NotContains(t, store.failed, retryEnv.ID)
+}
+
+func TestOutboxService_Enqueue_NonCanonicalID_Rejected(t *testing.T) {
+	store := newMockStore()
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, nil, nil, 5, 1, 0)
+	env := domain.NewEnvelope("id.check", "svc", json.RawMessage(`{}`))
+	env.ID = strings.ToUpper(env.ID)
+	err := svc.Enqueue(context.Background(), noopTx{}, env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "canonical lowercase UUID")
+	assert.Empty(t, store.records)
+}

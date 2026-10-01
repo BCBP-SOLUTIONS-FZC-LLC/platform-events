@@ -29,8 +29,8 @@
 # pre-creates every counter whose labels are known up front at 0 — per queue
 # when a consumer starts, label-less and outbox error/operation counters at
 # init. Counters keyed by event_type (platform_dlq_messages_total) cannot be,
-# so their rules add the value of series that did not exist 15m ago
-# (`x unless x offset 15m`).
+# so their rules add the value of series with no sample in the hour before
+# the window (`x unless last_over_time(x[1h] offset 15m)`).
 
 groups:
   - name: platform_events.recording
@@ -63,11 +63,12 @@ groups:
 
       # A series born in the window (the first dead-letter of an event_type /
       # reason since the pod started) counts its whole value; increase() alone
-      # would report 0 for it.
+      # would report 0 for it. "Born" means no sample in the hour before the
+      # window, so a scrape gap of a few minutes does not re-count old values.
       - record: platform_events:dlq_messages:increase15m
         expr: |
           sum by (domain, service, environment, operation, reason) (
-            (platform_dlq_messages_total unless platform_dlq_messages_total offset 15m)
+            (platform_dlq_messages_total unless last_over_time(platform_dlq_messages_total[1h] offset 15m))
               or
             increase(platform_dlq_messages_total[15m])
           )
@@ -115,7 +116,10 @@ groups:
 
       # Dead-lettering is progress too (a handler that SendToDLQs and returns
       # nil is not "processed"). platform_dlq_messages_total has no queue
-      # label, so it suppresses the alert per service.
+      # label, so a queue that processes nothing alerts unless the service's
+      # whole consume dead-letter rate covers at least 90% of what that queue
+      # receives — dead-lettering on one queue cannot hide a stall on another
+      # that receives more.
       - alert: PlatformEventsConsumerStalled
         expr: |
           (
@@ -123,8 +127,12 @@ groups:
               unless
             sum by (domain, service, environment, queue) (rate(platform_messages_processed_total[10m])) > 0
           )
-            unless on (domain, service, environment)
-          sum by (domain, service, environment) (rate(platform_dlq_messages_total{operation="consume"}[10m])) > 0
+            > on (domain, service, environment) group_left ()
+          (
+            1.1 * sum by (domain, service, environment) (rate(platform_dlq_messages_total{operation="consume"}[10m]))
+              or
+            0 * sum by (domain, service, environment) (rate(platform_messages_received_total[10m]))
+          )
         for: 15m
         labels:
           severity: critical

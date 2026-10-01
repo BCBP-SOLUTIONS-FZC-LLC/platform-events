@@ -194,3 +194,41 @@ tests:
               summary: "billing published outbox events it could not mark as published"
               description: "Those events will be delivered again; consumers must be idempotent (inbox dedup)."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxduplicatedeliveryrisk"
+
+  # Dead-lettering on one queue does not hide a stall on another.
+  - interval: 1m
+    input_series:
+      - series: 'platform_messages_received_total{domain="iam",service="event-consumer",environment="prod",queue="wedged"}'
+        values: '0+10x40'
+      - series: 'platform_messages_processed_total{domain="iam",service="event-consumer",environment="prod",queue="wedged",event_type="iam.user.created"}'
+        values: '0x40'
+      - series: 'platform_messages_received_total{domain="iam",service="event-consumer",environment="prod",queue="noisy"}'
+        values: '0+1x40'
+      - series: 'platform_messages_processed_total{domain="iam",service="event-consumer",environment="prod",queue="noisy",event_type="iam.user.created"}'
+        values: '0x40'
+      - series: 'platform_dlq_messages_total{domain="iam",service="event-consumer",environment="prod",operation="consume",event_type="unknown",reason="malformed"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PlatformEventsConsumerStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              domain: iam
+              service: event-consumer
+              environment: prod
+              queue: wedged
+            exp_annotations:
+              summary: "event-consumer receives messages on wedged but processes none"
+              description: "Messages have been delivered for 15 minutes without a single successful handler completion."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumerstalled"
+
+  # A scrape gap around the window's start does not re-count an old series.
+  - interval: 1m
+    input_series:
+      - series: 'platform_dlq_messages_total{domain="iam",service="event-consumer",environment="prod",operation="consume",event_type="iam.user.created",reason="max_receive_count"}'
+        values: '7x30 _x10 7x30'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: PlatformEventsMessagesDeadLettered
+        exp_alerts: []

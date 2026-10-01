@@ -1,6 +1,8 @@
 package outbox
 
 import (
+	"github.com/google/uuid"
+
 	"context"
 	"encoding/json"
 	"fmt"
@@ -44,12 +46,22 @@ func Enqueue(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMe
 	if strings.ContainsRune(env.ID, '\x00') || strings.ContainsRune(env.Type, '\x00') || strings.ContainsRune(env.Source, '\x00') {
 		return fmt.Errorf("outbox: envelope fields (ID, Type, Source) must not contain null bytes")
 	}
+	// The ID is stored in a uuid column and read back in canonical form, while
+	// publish failures are reported under the ID in the payload: anything but
+	// the canonical spelling would make a failed publish look delivered.
+	if id, err := uuid.Parse(env.ID); err != nil || id.String() != env.ID {
+		return fmt.Errorf("outbox: envelope ID %q must be a canonical lowercase UUID — use events.NewEnvelope to construct envelopes", env.ID)
+	}
 	b, err := json.Marshal(env)
 	if err != nil {
 		return err
 	}
 	// SNS message size limit is 256 KB. Reject early to avoid persisting records
 	// that will always fail at publish time and burn outbox attempt budget.
+	// A publisher codec (WithCodec) re-encodes the payload at publish time —
+	// base64 alone adds about a third — so with a codec keep payloads well
+	// below this; an envelope that grows past SNS's limit fails permanently
+	// and is dead-lettered after MaxAttempts.
 	const maxEnvelopeBytes = 240 * 1024
 	if len(b) > maxEnvelopeBytes {
 		return fmt.Errorf("outbox: serialised envelope is %d bytes — exceeds safe SNS limit (%d bytes); reduce payload size", len(b), maxEnvelopeBytes)

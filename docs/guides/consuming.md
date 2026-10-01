@@ -420,7 +420,22 @@ SQS delivers messages **at least once**. A handler may be called more than once 
 
 Without idempotency, duplicate delivery causes duplicate side effects: double charges, double emails, double DB rows. Use `Envelope.ID` as the idempotency key.
 
-#### Pattern 1 — Postgres unique constraint (recommended)
+#### Pattern 0 — `inbox.Store.Process` (recommended)
+
+`pkg/inbox` packages Pattern 1: apply its schema with `inbox.ApplySchema`, then run the handler's writes through `Store.Process`. It claims `Envelope.ID` in the handler's own transaction (`INSERT … ON CONFLICT DO NOTHING`), so the claim and the writes commit or roll back together, and concurrent copies of a message serialise on the claim:
+
+```go
+store, _ := inbox.NewStore(pool, "user_projection")
+handler := func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+    return store.Process(ctx, env, func(ctx context.Context, tx pgcommon.Tx) error {
+        return repo.ApplyUserCreated(ctx, tx, env) // writes through tx
+    })
+}
+```
+
+A failing `fn` rolls back the claim, so SQS retries; a duplicate returns nil without calling `fn` and is counted in `platform_duplicate_messages_total`. A handler that dead-letters the message (`SendToDLQ`, then nil) is not recorded, so redriving the DLQ processes it. `inbox.Handler(store, next)` is the wrapper for handlers whose effects are not Postgres writes; it uses separate transactions, so the handler must still be idempotent.
+
+#### Pattern 1 — Postgres unique constraint (hand-rolled)
 
 Create a `processed_events` table once per service:
 

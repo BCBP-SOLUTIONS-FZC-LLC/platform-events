@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,4 +235,27 @@ func TestEnqueue_InvalidPayload_NoInsert(t *testing.T) {
 	env := events.NewEnvelope("bad.payload", "svc", json.RawMessage(`{not json`))
 	require.Error(t, outbox.Enqueue(context.Background(), tx, env))
 	assert.Empty(t, tx.execSQL, "nothing is inserted")
+}
+
+// Only the canonical UUID spelling is accepted: Postgres reads the id back
+// canonicalised, and a mismatch with the payload's ID would make a failed
+// publish look delivered.
+func TestEnqueue_NonCanonicalID_Rejected(t *testing.T) {
+	base := events.NewEnvelope("id.check", "svc", json.RawMessage(`{}`))
+	for _, id := range []string{
+		strings.ToUpper(base.ID),
+		"{" + base.ID + "}",
+		strings.ReplaceAll(base.ID, "-", ""),
+		"not-a-uuid",
+	} {
+		tx := newStubTx(pgcommon.Tx.Exec)
+		env := base
+		env.ID = id
+		err := outbox.Enqueue(context.Background(), tx, env)
+		require.Error(t, err, id)
+		assert.Contains(t, err.Error(), "canonical lowercase UUID")
+		assert.Empty(t, tx.execSQL, "nothing is inserted for %q", id)
+	}
+	tx := newStubTx(pgcommon.Tx.Exec)
+	require.NoError(t, outbox.Enqueue(context.Background(), tx, base))
 }
