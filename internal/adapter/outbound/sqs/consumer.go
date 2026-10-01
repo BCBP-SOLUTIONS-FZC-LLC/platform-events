@@ -1281,6 +1281,12 @@ func missingEnvelopeFields(env domain.Envelope[json.RawMessage]) error {
 		missing = append(missing, "source")
 	}
 	if len(missing) == 0 {
+		// The tenant and trace ID become the handler's pgcommon GUC set,
+		// which rejects a NUL (pgcommon v1.5.1 ErrInvalidGUCValue): every
+		// database call of the handler would fail on every delivery.
+		if strings.ContainsRune(env.TenantID, '\x00') || strings.ContainsRune(env.TraceID, '\x00') {
+			return errors.New("invalid event envelope: tenant_id or trace_id contains a NUL character")
+		}
 		return nil
 	}
 	return fmt.Errorf("not an event envelope: missing %s (an SNS subscription without RawMessageDelivery delivers a notification wrapper)", strings.Join(missing, ", "))

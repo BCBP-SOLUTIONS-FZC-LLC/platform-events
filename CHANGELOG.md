@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- **platform-pgcommon v1.5.1 is inherited** (from v1.4.3) — read its upgrade notes. The ones that matter here:
+  - `RunInTx` / `WithTx` roll back and return `pgcommon.ErrTxEndedInCallback` when the callback ends its own transaction. That includes an `inbox.Store.Process` `fn` that calls `tx.Commit` / `tx.Rollback` or runs `COMMIT` / `ROLLBACK`: the message is now retried instead of committing `fn`'s writes without the claim.
+  - `GUCSet.Validate` rejects a NUL or invalid UTF-8 (`domain.ErrInvalidGUCValue`). The SQS consumer now treats an envelope whose `tenant_id` or `trace_id` contains NUL as malformed (DLQ forward or delete) instead of failing every database call of the handler on every delivery.
+  - `ConfigFromEnv` warns when `DATABASE_URL` sets no `sslmode` (pgx would use `prefer`); the warning reaches `config.LoadOutbox().Warnings`.
+  - A cancelled retry wait wraps both `ctx.Err()` and the last error; migrate `Up` fails on a source without top-level migrations (`outbox.ApplySchema` / `inbox.ApplySchema` are unaffected — they pass the `migrations` subdirectory).
 - **New outbox migration `011`** replaces the dead-letter index `idx_outbox_dead_letters_failed_at (failed_at DESC)` with `idx_outbox_dead_letters_failed_at_id (failed_at, id)` — the order list, replay and discard use. Rolling back past it needs `migrate down` first (see 1.6.0's `ErrVersionNotInSource` note).
 - **FIFO source queues are now processed per message group, in order.** A `.fifo` queue's batch is split by `MessageGroupId`; each group runs on one worker in receive order, and a message that is not settled (handler error, failed decode or DLQ forward, panic) hands the group's later messages of that batch back unprocessed. FIFO consumers lose cross-message parallelism within a group (at most one message per group in flight per replica; groups still run in parallel up to `WithConcurrency`) — set `WithVisibilityTimeout` so queued group messages are extended while they wait. Without a visibility timeout a FIFO consumer receives one message per call. A failed `DeleteMessage` also stops the group.
 - **`outbox.Enqueue` rejects a NUL character** (`\u0000`) anywhere in the envelope, and in `TenantID` / `TraceID`: Postgres `jsonb` cannot store it, so the INSERT failed — and rolled back the business transaction — on every retry. Strip NULs from user input before enqueueing.
@@ -45,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CI (parity with platform-pgcommon v1.5.1): `ci.yml` no longer uses `paths-ignore`. A `changes` job (`.github/scripts/detect-changes.sh`, regression-tested by the new `make ci-scripts-test`) decides docs-only, and the jobs behind required checks are skipped by `if:` (the reusable validate workflows take a `skip` input), so a docs-only PR's required checks report success instead of never reporting. Reusable workflows receive `CI_REPO_READ_TOKEN` / `GO_PRIVATE_TOKEN` explicitly instead of `secrets: inherit`; on `main` every push gets its own concurrency group, so a pending code commit's run is never cancelled by a later push.
 - `BatchError.Error()` names the first failure (`… (first: <id> <code>: <message>)`).
 - The reference CLI prints the effective `MaxMessages` / `WaitSeconds` and the drain timeout.
 - `make toolchain-check` recognises any `FROM … golang:<version>` form.

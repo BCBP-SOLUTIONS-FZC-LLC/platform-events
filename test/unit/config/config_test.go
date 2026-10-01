@@ -232,7 +232,8 @@ func TestLoadOutbox_CustomValues(t *testing.T) {
 	t.Setenv("OUTBOX_DRAIN_TIMEOUT", "45s")
 	t.Setenv("OUTBOX_RETRY_BACKOFF", "2s")
 	t.Setenv("OUTBOX_MAX_RETRY_BACKOFF", "10m")
-	t.Setenv("DATABASE_URL", "postgres://user:pass@host/db")
+	t.Setenv("DATABASE_URL", "postgres://user:pass@host/db?sslmode=verify-full")
+	t.Setenv("PGSSLMODE", "")
 
 	cfg := config.LoadOutbox()
 	assert.Equal(t, 2*time.Second, cfg.RetryBackoff)
@@ -245,7 +246,7 @@ func TestLoadOutbox_CustomValues(t *testing.T) {
 	assert.Equal(t, 4, cfg.PublishConcurrency)
 	assert.Equal(t, 5*time.Second, cfg.PublishTimeout)
 	assert.Equal(t, 45*time.Second, cfg.DrainTimeout)
-	assert.Equal(t, "postgres://user:pass@host/db", cfg.DatabaseURL)
+	assert.Equal(t, "postgres://user:pass@host/db?sslmode=verify-full", cfg.DatabaseURL)
 	assert.Empty(t, cfg.Warnings)
 }
 
@@ -646,4 +647,14 @@ func TestLoad_RegionFallsBackToAWSDefaultRegion(t *testing.T) {
 	t.Setenv("AWS_REGION", "")
 	t.Setenv("AWS_DEFAULT_REGION", "")
 	assert.Equal(t, "us-east-1", config.LoadSQS().Region)
+}
+
+// platform-pgcommon's configuration warnings (since v1.5.1: a DATABASE_URL
+// without sslmode, which pgx would run as "prefer") reach OutboxConfigEnv.
+func TestLoadOutbox_ForwardsPgcommonSSLModeWarning(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://user:pass@db.internal/app")
+	t.Setenv("PGSSLMODE", "")
+	cfg := config.LoadOutbox()
+	assert.Contains(t, strings.Join(cfg.Warnings, "\n"), "platform-pgcommon: DATABASE_URL")
+	assert.Contains(t, strings.Join(cfg.Warnings, "\n"), "sslmode")
 }

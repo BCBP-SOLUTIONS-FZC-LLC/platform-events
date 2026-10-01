@@ -185,6 +185,14 @@ mod-verify:
 	cd test && $(GO) mod verify
 	cd tools && $(GO) mod verify
 
+# ci-scripts-test: regression tests for the CI shell scripts (no bats; scratch
+# git repositories): detect-changes.sh's docs-only decision and log
+# sanitising — a wrong docs-only verdict would skip every required check.
+# Same script and tests as platform-pgcommon v1.5.1. No Docker.
+.PHONY: ci-scripts-test
+ci-scripts-test:
+	bash .github/scripts/detect-changes_test.sh
+
 # toolchain-check: the Go toolchain is identical in the three go.mod files and
 # the Dockerfile builder image (bump them together for a stdlib CVE fix).
 .PHONY: toolchain-check
@@ -330,7 +338,7 @@ docker-down:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy mod-verify toolchain-check fmt-check vet lint docs-check metrics-lint rules-check dashboards-check test-ci build
+ci: tidy mod-verify toolchain-check ci-scripts-test fmt-check vet lint docs-check metrics-lint rules-check dashboards-check test-ci build
 
 # -----------------------------
 # OBSERVABILITY STANDARD

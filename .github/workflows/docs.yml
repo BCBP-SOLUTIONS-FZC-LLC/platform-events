@@ -1,6 +1,6 @@
-# Docs-only changes skip ci.yml (paths-ignore: '*.md', 'docs/architecture/**', …),
+# ci.yml skips its expensive jobs for docs-only changes (its `changes` job),
 # so this lightweight workflow runs the architecture-diagram sync check on
-# exactly those changes: every docs/architecture/mermaid/*.mmd must be embedded
+# diagram changes: every docs/architecture/mermaid/*.mmd must be embedded
 # byte-identically in ARCHITECTURE.md (.github/scripts/docs-mermaid-sync.sh).
 # Mixed code + docs changes are also checked by validate-quality.yml. Same as
 # platform-pgcommon v1.4.2.

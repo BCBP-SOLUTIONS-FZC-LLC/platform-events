@@ -150,6 +150,8 @@ func TestConsumer_Inject_ValidatesAndDecodesLikeProduction(t *testing.T) {
 	bad.Source = ""
 	require.ErrorIs(t, c.Inject(bad), mock.ErrMalformedEnvelope)
 	assert.Empty(t, got, "the handler must not see a malformed envelope")
+	nul := events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`), events.WithTenantID("t\x00"))
+	require.ErrorIs(t, c.Inject(nul), mock.ErrMalformedEnvelope, "a NUL tenant is unusable as the RLS GUC")
 
 	encoded := events.NewEnvelope("x.y", "svc", json.RawMessage(`"aGVsbG8="`), events.WithSchemaID("schema-1")) // base64("hello")
 	require.Error(t, c.Inject(encoded), "no Codec configured: decode fails as in production")

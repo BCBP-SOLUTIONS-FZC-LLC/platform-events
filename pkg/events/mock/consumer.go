@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
@@ -83,8 +84,9 @@ func (m *Consumer) Inject(env events.Envelope[json.RawMessage]) error {
 	if queueURL == "" {
 		queueURL = MockQueueURL
 	}
-	if env.ID == "" || env.Type == "" || env.Source == "" {
-		return fmt.Errorf("%w: id, type and source are required — the SQS consumer deletes or dead-letters such a message without calling the handler", ErrMalformedEnvelope)
+	if env.ID == "" || env.Type == "" || env.Source == "" ||
+		strings.ContainsRune(env.TenantID, '\x00') || strings.ContainsRune(env.TraceID, '\x00') {
+		return fmt.Errorf("%w: id, type and source are required, and tenant_id / trace_id must not contain NUL — the SQS consumer deletes or dead-letters such a message without calling the handler", ErrMalformedEnvelope)
 	}
 	body, err := env.JSON()
 	if err != nil {

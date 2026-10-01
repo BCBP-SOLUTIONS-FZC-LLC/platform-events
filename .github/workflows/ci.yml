@@ -2,7 +2,7 @@
 # Pipeline mirrors iam-org-membership (the org's reference pipeline, whose job
 # names are the required status checks on main).
 #
-# Parallel flow:
+# Parallel flow (every job below needs `changes`, which decides docs-only):
 #
 #   validate-test ──────┬──► interop (cross-language wire format) ──┐
 #   build-image ────────┼──► trivy ─────────────────────────────────┤──► pr-summary (PR events only)
@@ -26,30 +26,39 @@
 # / test", "Validate / Quality / quality", "Build image (cache)", "Trivy CVE
 # scan", "Smoke tests", "PR summary". Renaming a job breaks merging.
 #
-# paths-ignore skips this entire (expensive) pipeline for commits that only
-# touch Markdown docs or the mermaid diagrams — those can't affect test/build
-# outcomes. docs/observability/** is deliberately NOT ignored: the runbook
-# anchors and the generated metrics inventory are checked by make metrics-lint. A commit that touches both docs and code still runs normally
-# (paths-ignore only skips when EVERY changed file matches).
+# Docs-only changes (any *.md, docs/architecture/*.mmd — but nothing under
+# docs/observability/, which metrics-lint checks) skip the expensive jobs, but
+# the workflow itself always runs: the `changes` job (detect-changes.sh, the
+# same script as platform-pgcommon v1.5.1) decides, and every job behind a
+# required check is skipped by `if:` instead of the whole workflow being
+# filtered out by `paths-ignore` — a workflow that never starts never reports
+# its required checks, which deadlocked docs-only PRs. A skipped job reports
+# success to branch protection. The reusable validate-* workflows get `skip`
+# as an input and skip their inner job themselves: skipping the CALLER job
+# would report only "Validate / Test", never the required
+# "Validate / Test / test". docs.yml checks docs changes.
 #
 name: CI
 
 "on":
   push:
     branches: [main, master]
-    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**', 'docs/lld/**']
   pull_request:
     branches: [main, master]
-    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**', 'docs/lld/**']
   workflow_dispatch:
 
 permissions:
   contents: read
   packages: read
 
+# On a PR, a newer push supersedes the older run (cancelled). On main every
+# push gets its own group (keyed by the commit): GitHub cancels a *pending*
+# run in a group when a newer one queues even with cancel-in-progress false,
+# and a cancelled code commit followed by a docs-only one would never have its
+# image built, pushed and signed.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
@@ -57,17 +66,52 @@ env:
   BUILDKIT_PROGRESS: plain
 
 jobs:
+  # ── docs-only detection ──────────────────────────────────────────────────
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
+
+      - name: Detect docs-only change
+        id: detect
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: bash .github/scripts/detect-changes.sh
+
   # ── runs in parallel with validate-quality + build-image ─────────────────
+  # Not skipped here (see the header): the reusable workflow skips its job.
+  # Secrets are passed explicitly (no `secrets: inherit`), so PR test code
+  # never runs with other secrets in scope.
   validate-test:
     name: Validate / Test
+    needs: changes
     uses: ./.github/workflows/validate-test.yml
-    secrets: inherit
+    with:
+      skip: ${{ needs.changes.outputs.code != 'true' }}
+    secrets:
+      CI_REPO_READ_TOKEN: ${{ secrets.CI_REPO_READ_TOKEN }}
+      GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
 
   # ── runs in parallel with validate-test + build-image ────────────────────
   validate-quality:
     name: Validate / Quality
+    needs: changes
     uses: ./.github/workflows/validate-quality.yml
-    secrets: inherit
+    with:
+      skip: ${{ needs.changes.outputs.code != 'true' }}
+    secrets:
+      CI_REPO_READ_TOKEN: ${{ secrets.CI_REPO_READ_TOKEN }}
+      GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
 
   # ── runs in parallel with validate-test + validate-quality ───────────────
   # Lints the Dockerfile as its first steps — a hadolint failure exits before
@@ -75,6 +119,8 @@ jobs:
   build-image:
     name: Build image (cache)
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 25
     permissions:
       contents: read
@@ -145,7 +191,8 @@ jobs:
   trivy:
     name: Trivy CVE scan
     runs-on: ubuntu-latest
-    needs: [validate-test, build-image]
+    needs: [changes, validate-test, build-image]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 15
     permissions:
       contents: read
@@ -241,7 +288,8 @@ jobs:
   smoke:
     name: Smoke tests
     runs-on: ubuntu-latest
-    needs: [validate-test, build-image]
+    needs: [changes, validate-test, build-image]
+    if: needs.changes.outputs.code == 'true'
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -275,7 +323,8 @@ jobs:
   # ── cross-language wire-format compatibility (Go ↔ Python) ────────────────
   interop:
     name: Cross-language compatibility
-    needs: validate-test
+    needs: [changes, validate-test]
+    if: needs.changes.outputs.code == 'true'
     uses: BCBP-SOLUTIONS-FZC-LLC/platform-interop-tests/.github/workflows/interop.yml@87107db3ca534faf15bd1d71d90baa498c3a7f0b # main @ 2026-08-18 — pinned: it receives a private token
     with:
       # This repo's own PR/branch ref; the other libraries default to their main
@@ -320,8 +369,8 @@ jobs:
     runs-on: ubuntu-latest
     # Same gate set as release.yml's push: nothing is published unless the
     # tests, quality, image scan, smoke tests and Go↔Python interop all passed.
-    needs: [validate-test, validate-quality, trivy, smoke, interop]
-    if: github.event_name == 'push'
+    needs: [changes, validate-test, validate-quality, trivy, smoke, interop]
+    if: github.event_name == 'push' && needs.changes.outputs.code == 'true'
     timeout-minutes: 25
     permissions:
       contents: read

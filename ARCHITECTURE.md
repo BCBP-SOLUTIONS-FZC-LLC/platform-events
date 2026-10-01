@@ -215,7 +215,7 @@ graph LR
 | `Handler(ledger, next)` | Wraps an `events.Handler`: rejects a non-UUID envelope ID, acknowledges an already-recorded ID without calling `next` (`events_inbox_duplicates_total{consumer}`), otherwise runs `next` and records the ID only if it returned `nil` — see [Idempotency](#idempotency) for the check-then-act caveat |
 | `Ledger` | Interface `Handler` needs: `IsProcessed`, `MarkProcessed`, `Consumer` — satisfied by `*Store`, fakeable in tests |
 | `NewStore(pool, consumer)` | `processed_events` ledger on a `*pgcommon.Pool`, scoped to one consumer name |
-| `Store.Process(ctx, env, fn)` | Claims the event ID inside one transaction and runs `fn(ctx, tx)` in it — exactly-once Postgres writes; duplicates return nil without calling `fn`; a dead-lettered message is not recorded |
+| `Store.Process(ctx, env, fn)` | Claims the event ID inside one transaction and runs `fn(ctx, tx)` in it — exactly-once Postgres writes; duplicates return nil without calling `fn`; a dead-lettered message is not recorded; `fn` must not end `tx` (`pgcommon.ErrTxEndedInCallback`) |
 | `Store.Prune(ctx, retention, batch)` | Batched delete of rows older than `retention` (`DefaultPruneBatch` = 5000); keep retention above the 7-day SQS message lifetime |
 | `ApplySchema(ctx, runner)` / `MigrationsTable` | Embedded migration `001`, tracked in `inbox_migrations` |
 
@@ -1060,7 +1060,8 @@ The CLI is also built into a digest-pinned distroless image (`Dockerfile`, ~6 MB
 | Stage | Where | What it proves |
 |---|---|---|
 | `Validate / Test` | `validate-test.yml` | unit + integration + e2e with `-race`; merged coverage ≥ 97% |
-| `Validate / Quality` | `validate-quality.yml` | fmt, tidy, vet + lint (incl. tagged tests), govulncheck, RLS-6 grep, Dockerfile digest pinning |
+| `Detect changes` | `ci.yml` (`detect-changes.sh`) | Decides docs-only; every other job is skipped by `if:` for docs-only changes, so required checks still report (success) — no `paths-ignore` |
+| `Validate / Quality` | `validate-quality.yml` | fmt, tidy, vet + lint (incl. tagged tests), govulncheck, RLS-6 grep, CI script tests (`make ci-scripts-test`), toolchain consistency, Dockerfile digest pinning |
 | `Build image (cache)` → `Trivy CVE scan` / `Smoke tests` | `ci.yml` | Hadolint; no fixable CRITICAL/HIGH/UNKNOWN CVE in the image; the binary starts, validates config, stamps its version |
 | `Cross-language compatibility` | `ci.yml` → `platform-interop-tests` | Go ↔ Python envelope JSON and HMAC byte-for-byte |
 | `Push image → GHCR` | `ci.yml`, push to `main` | Signed (Cosign keyless), SBOM + provenance attested |

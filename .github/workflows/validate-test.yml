@@ -15,6 +15,22 @@ name: Validate / Test
         type: string
         required: false
         default: ''
+      skip:
+        description: >-
+          Skip the job (ci.yml: documentation-only change). Skipped here, not
+          at the caller, so the required check "<workflow> / <job>" still
+          reports (a skipped job counts as success for branch protection).
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      # The only secrets this workflow reads. Callers pass them explicitly —
+      # no `secrets: inherit`, so PR test code never runs with other secrets
+      # in scope.
+      CI_REPO_READ_TOKEN:
+        required: false
+      GO_PRIVATE_TOKEN:
+        required: false
     outputs:
       pct:
         description: 'Total statement coverage percentage'
@@ -30,6 +46,7 @@ env:
 jobs:
   test:
     name: test
+    if: ${{ !inputs.skip }}
     runs-on: ubuntu-latest
     # make test-ci runs unit/integration/e2e in parallel; integration and e2e
     # each start their own floci + Postgres containers (testcontainers-go).

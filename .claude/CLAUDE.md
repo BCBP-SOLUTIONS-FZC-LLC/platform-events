@@ -45,6 +45,7 @@ make lint            # golangci-lint
 make metrics-lint    # Observability standard gate (metric conformance, rule files, inventory drift)
 make metrics-doc     # Regenerate docs/observability/metrics-registry.md from the registry
 make rules-check     # promtool check + alert unit tests for monitoring/prometheus (Docker)
+make ci-scripts-test # regression tests for detect-changes.sh (ci.yml docs-only decision)
 make toolchain-check # Go toolchain identical in the three go.mod files and the Dockerfile
 make docs-check      # every docs/architecture/mermaid/*.mmd embedded verbatim in ARCHITECTURE.md
 make test            # All tests (unit + integration), excludes smoke
@@ -56,7 +57,7 @@ make race            # All tests with -race flag
 make build           # Compile reference CLI to bin/platform-events
 make cover           # Coverage HTML report (measures ./internal/... ./pkg/...)
 make cover-func      # Coverage summary by function (terminal)
-make ci              # tidy + mod-verify + toolchain-check + fmt-check + vet + lint + docs-check + metrics-lint + rules-check + dashboards-check + test-ci + build (the same gates as CI)
+make ci              # tidy + mod-verify + toolchain-check + ci-scripts-test + fmt-check + vet + lint + docs-check + metrics-lint + rules-check + dashboards-check + test-ci + build (the same gates as CI)
 make docker-up       # Start floci (SNS/SQS, :4574) + floci-ui (http://localhost:4505) + Postgres (:5538); demo topology via scripts/init-floci.sh
 make docker-down     # Stop the local containers
 make clean           # Remove bin/ artefacts
@@ -114,7 +115,7 @@ test/                      ← separate Go module (replace … => ../)
 tools/                     ← separate Go module: golangci-lint via `go tool -modfile=tools/go.mod`
 
 External dependencies (private modules):
-  platform-pgcommon v1.4.3 → Pool, RunInTx, ConfigFromEnv, migrate.Runner, Tx/Conn/Rows aliases
+  platform-pgcommon v1.5.1 → Pool, RunInTx (ErrTxEndedInCallback), ConfigFromEnv (sslmode warnings), migrate.Runner, Tx/Conn/Rows aliases
   platform-gincommon       → not imported: port.Logger matches its ZapLogger; tracing initialised by the service
 ```
 
@@ -465,7 +466,7 @@ GitHub Actions mirrors `iam-org-membership`'s pipeline — the org ruleset on `m
 
 - **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → `.github/scripts/coverage-gate.sh` (≥ 97%).
 - **`validate-quality.yml`** (reusable) — `go mod verify`, HTML-entity check, RLS-6 grep, `gofmt`, tidy drift, `make vet` / `make lint` (each also with `-tags=integration,e2e`), `make metrics-lint` + `make rules-check` + `make dashboards-check` (Observability Standard), `make docs-check` (diagram sync), `make toolchain-check`, `make vuln-check`, Dockerfile digest-pinning check. Both validate jobs delete the private-module token right after `go mod download`; only push runs write the registry build cache. `golangci-lint` runs via `go tool` (the `tool` directive in `go.mod` is not propagated to consumers).
-- **`docs.yml`** — docs-only changes (`ARCHITECTURE.md`, `docs/architecture/**`, skipped by `ci.yml`): `make docs-check`. **Edit a diagram in both places** — the `.mmd` source and its embedded copy in `ARCHITECTURE.md` must stay byte-identical.
+- **`docs.yml`** — changes to `ARCHITECTURE.md` / `docs/architecture/**`: `make docs-check`. `ci.yml` itself always runs: its `changes` job (`.github/scripts/detect-changes.sh`, tested by `make ci-scripts-test`, same as platform-pgcommon v1.5.1) decides docs-only and skips the jobs behind required checks by `if:` (the reusable validate workflows take a `skip` input), so their checks report success — never reintroduce `paths-ignore`. Reusable workflows get `CI_REPO_READ_TOKEN` / `GO_PRIVATE_TOKEN` explicitly, never `secrets: inherit`. **Edit a diagram in both places** — the `.mmd` source and its embedded copy in `ARCHITECTURE.md` must stay byte-identical.
 - **`ci.yml`** (push/PR to main) — the two gates + `Build image (cache)` in parallel → `Trivy CVE scan` / `Smoke tests` → `Cross-language compatibility` → `PR summary`; on push, `Push image → GHCR` (Cosign-signed).
 - **`changelog-check.yml`** — PRs touching `internal/`, `pkg/`, `cmd/` must update `CHANGELOG.md`.
 - **`release.yml`** (`v*` tags) — **the same job graph as `ci.yml`** at the tag, behind a fail-fast `verify` job (tag on `main`, dispatch only from `main` or the tag, CHANGELOG section — a prerelease may use its base version's; floating image tags `X.Y`/`X`/`latest` only move forward, via `release-image-tags.sh`, same scripts as platform-pgcommon v1.4.1), plus 5-platform CLI binaries; the image is pushed (semver tags, signed, provenance) only after every gate passes, then the GitHub Release is published. Change a gate in `ci.yml` → change it in `release.yml` too. The Git tag is the **Go module release** consuming services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z`.

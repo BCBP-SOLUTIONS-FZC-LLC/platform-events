@@ -433,7 +433,7 @@ handler := func(ctx context.Context, env events.Envelope[json.RawMessage]) error
 }
 ```
 
-A failing `fn` rolls back the claim, so SQS retries; a duplicate returns nil without calling `fn` and is counted in `platform_duplicate_messages_total`. A handler that dead-letters the message (`SendToDLQ`, then nil) is not recorded, so redriving the DLQ processes it. `inbox.Handler(store, next)` is the wrapper for handlers whose effects are not Postgres writes; it uses separate transactions, so the handler must still be idempotent.
+A failing `fn` rolls back the claim, so SQS retries; a duplicate returns nil without calling `fn` and is counted in `platform_duplicate_messages_total`. A handler that dead-letters the message (`SendToDLQ`, then nil) is not recorded, so redriving the DLQ processes it. `fn` must not end `tx` itself (`tx.Commit`, `COMMIT`, …): platform-pgcommon (≥ v1.5.1) rolls back and returns `pgcommon.ErrTxEndedInCallback`, and the message is retried. `inbox.Handler(store, next)` is the wrapper for handlers whose effects are not Postgres writes; it uses separate transactions, so the handler must still be idempotent.
 
 #### Pattern 1 — Postgres unique constraint (hand-rolled)
 

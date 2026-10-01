@@ -9,7 +9,7 @@
 | Go module | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events` (`go 1.26.0`, `toolchain go1.26.8`) |
 | Status | v1.6.0 (released 2026-10-01) + `[Unreleased]` production-review fixes on branch `fix/production-review` |
 | Base documents | [`ARCHITECTURE.md`](../../ARCHITECTURE.md), [`README.md`](../../README.md), [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md), [`EVENT_SCHEMA_GOVERNANCE.md`](../../EVENT_SCHEMA_GOVERNANCE.md), [`docs/observability/`](../observability/README.md) |
-| Sibling libraries | `platform-pgcommon` v1.4.3 (database, transactions, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
+| Sibling libraries | `platform-pgcommon` v1.5.1 (database, transactions, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
 | Consumers | Platform services (e.g. `iam-org-membership`, whose LLD §7 / §9 / §20 rely on the outbox and consumer contracts defined here) |
 | Deployment stage | Library — consumed via `go get …@v1.6.0`; v1.6.1 (production-review fixes) on branch `fix/production-review`, not yet pushed (see §13.4) |
 
@@ -17,6 +17,7 @@
 
 | Rev | Date | Change |
 |---|---|---|
+| 2.8 | 2026-10-02 | platform-pgcommon v1.4.3 → v1.5.1 (§3.1, §13.4, §18.1): `Store.Process` callbacks must not end the transaction (`ErrTxEndedInCallback`); a NUL in `tenant_id` / `trace_id` makes an envelope malformed (§7.1, §10.3); `sslmode` warnings reach `OutboxConfigEnv.Warnings` (§12). CI: `changes` job replaces `paths-ignore` (OQ-11 closed), explicit reusable-workflow secrets, per-commit concurrency on `main`, `make ci-scripts-test` (§14). |
 | 2.7 | 2026-10-01 | Status alignment: §13.4 deployment stage (v1.6.1 pending on `fix/production-review`; `feat/observability-legacy-removal` waiting on it), OQ-7 closed, OQ-9…OQ-12 (v1.6.1 release, repository ruleset with stale required checks, docs-only PRs never reporting required checks, legacy-metric removal), §14 test inventory (`consumer_fifo_test.go`, `migrations_review_test.go`). No design change. |
 | 2.6 | 2026-10-01 | Second review round: FIFO group messages get the running message's handler-timeout budget (re-armed per dispatch), one message per receive without a visibility timeout, a failed delete stops the group (§7.1); SNS drops `baggage` / `tracestate` before failing on the 10-attribute limit (§7.2); `Enqueue` rejects NUL (§10.3); replay inserts first with `ON CONFLICT` and counts skipped rows after commit (§8.6); 003 also rebuilds an INVALID index; `AWS_DEFAULT_REGION` fallback and `SQS_DRAIN_TIMEOUT` (§12); `mock.Consumer` validates and decodes (M-2); `SystemTenantID` does not disable RLS (E-7). |
 | 2.5 | 2026-10-01 | Production review of v1.6.0: FIFO source queues processed per message group in order (§7.1); FIFO DLQ dedup ID unique per forward (§10.3); a `dataschema` on a non-string `data` is passed through (§7.3, EVT-5); migration 010 down releases waiting records, 003 rebuilds only when the shape differs, new 011 `(failed_at, id)` dead-letter index (§4, §19.5); replay skips IDs already in `outbox_events` (§8.6); shutdown mid-batch releases at once (§8.4); metrics rollback on legacy failure; extension calls bounded; DSN masking of `sslpassword`. |
@@ -61,7 +62,7 @@ This document is the low-level design for **`platform-events`**, the shared Go l
 
 Refined into an implementable specification, this document gives the exact tables and indexes the library creates in a service's database, the public signatures and their behavioural contracts, the state machines behind publish / consume / outbox / inbox, the invariants that hold across them, configuration, metrics, and the operational procedures a service owner needs. Where this LLD and the code disagree, **the code is authoritative**; the discrepancy is a documentation bug and this document is updated with the change.
 
-**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `fix/production-review` (v1.6.0 + `[Unreleased]`) at revision 2.7 (merged coverage 98.5%, `make ci` green).
+**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `fix/production-review` (v1.6.0 + `[Unreleased]`) at revision 2.8 (merged coverage 98.5%, `make ci` green).
 
 ### 1.1 Relationship to the architecture documents
 
@@ -185,7 +186,7 @@ pkg/
 
 | Library | Version | Imported | Role |
 |---|---|---|---|
-| `platform-pgcommon` | v1.4.3 | Yes | All database access, transactions, configuration, migrations, RLS GUC context |
+| `platform-pgcommon` | v1.5.1 | Yes | All database access, transactions, configuration, migrations, RLS GUC context |
 | `platform-gincommon` | — | **No** | Interface compatibility only (`port.Logger`, `RequestContext` fields) |
 | `aws-sdk-go-v2` | v1.47.1 (sns v1.47.2, sqs v1.52.1) | Yes | SNS / SQS clients, smithy error types |
 | OpenTelemetry Go | — | Yes | Global tracer and propagator (`otel.Tracer`, `otel.GetTextMapPropagator`) |
@@ -441,7 +442,7 @@ O-6 … O-9 apply a 30s internal DB timeout each and order by `failed_at, id`. `
 | I-1 | `Handler` | `(ledger Ledger, next events.Handler) events.Handler` — best-effort dedup (separate transactions) |
 | I-2 | `Ledger` | `IsProcessed(ctx, uuid.UUID)`, `MarkProcessed(ctx, uuid.UUID)`, `Consumer()` — implemented by `*Store` |
 | I-3 | `NewStore` | `(pool *pgcommon.Pool, consumer string) (*Store, error)` |
-| I-4 | `Store.Process` | `(ctx, env, fn func(ctx, tx pgcommon.Tx) error) error` — exactly-once Postgres writes |
+| I-4 | `Store.Process` | `(ctx, env, fn func(ctx, tx pgcommon.Tx) error) error` — exactly-once Postgres writes; `fn` must not end `tx` (`pgcommon.ErrTxEndedInCallback`, message retried) |
 | I-5 | `Store.Prune` | `(ctx, retention time.Duration, batch int) (int64, error)` — `DefaultPruneBatch` = 5000 |
 | I-6 | `ApplySchema` | `(ctx, runner *migrate.Runner) error` |
 
@@ -868,7 +869,7 @@ All AWS calls use the SDK's TLS endpoints; `EndpointURL` / `AWS_ENDPOINT_URL` is
 ### 10.3 Input validation
 
 - `Enqueue`: required fields, canonical UUID, no NUL bytes, ≤ 240 KiB; `EnqueueOrdered`: key ≤ 256 bytes, valid UTF-8, no NUL.
-- Consumer: a body must be JSON with `id`, `type` and `source` (`ParseEnvelope` additionally requires `time`); malformed bodies never reach handlers; the codec is gated on `dataschema`.
+- Consumer: a body must be JSON with `id`, `type` and `source`, and its `tenant_id` / `trace_id` must not contain NUL (they become the handler's pgcommon GUC set, which rejects it) (`ParseEnvelope` additionally requires `time`); malformed bodies never reach handlers; the codec is gated on `dataschema`.
 - `DLQPublisher`: rejects invalid input before any AWS call (`ErrDLQInvalidMessage`: empty body / reason, characters SQS disallows, invalid attribute names, body + attributes > 1 MiB); `DLQReason` truncated to 1024 bytes; empty-valued caller attributes dropped; diagnostic attributes always override caller values; more than SQS's 10 attributes → caller attributes kept in priority order `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical, the rest dropped and logged — or rejected under `StrictAttributes`. `EventType` comes from the body when it parses as an envelope, else `attrs["EventType"]`, else `unknown`. A FIFO DLQ gets `MessageGroupId` = the envelope ID (SHA-256 of the body when there is no valid ID) and a `MessageDeduplicationId` unique per `SendToDLQ` call — a content-derived one made SQS drop a second forward of the same event within 5 minutes (two source queues sharing a DLQ, a redrive that fails again) while reporting success, so the source message was deleted and the dead-letter lost.
 - HMAC: keys ≥ 32 bytes (`ErrKeyTooShort`), constant-time `hmac.Equal`, `Verify` returns false on any decode error, canonical JSON for envelopes.
 
@@ -1054,14 +1055,14 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | Source | PR #12 (`feat/observability-standard`) and release PR #13 merged to `main`; tag `v1.6.0` on `e11be6b`, GitHub Release published |
 | Next release | `v1.6.1` — CHANGELOG `[Unreleased]` (two production-review rounds: FIFO per-group consumer, DLQ dedup, migrations 003 / 010-down / 011, replay hardening, SNS trace attributes, CI hardening) on branch `fix/production-review`, committed locally, not yet pushed |
 | Pending branch | `feat/observability-legacy-removal` (`d33cf9b`, "emit only Tier 1 platform_* metrics") — a breaking change; rebase on `fix/production-review` once merged |
-| Dependencies | platform-pgcommon v1.4.3, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
+| Dependencies | platform-pgcommon v1.5.1, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
 | Consumers | Platform services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z` (`GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*`) |
 
 ---
 
 ## 14. Testing Strategy
 
-`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **98.5%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, toolchain-check, fmt-check, vet, lint (incl. tagged files), docs-check, metrics-lint, rules-check, dashboards-check, test-ci, build. `Validate / Quality` additionally runs an HTML-entity check, the RLS-6 grep, `make toolchain-check` (the Go toolchain identical in the three `go.mod` files and the Dockerfile), `make vuln-check` and the Dockerfile digest-pinning check. Both validate jobs delete the private-module token right after `go mod download`, before any PR code runs; only push runs write the registry build cache the signed images are built from; `changelog-check.yml` requires a `CHANGELOG.md` entry for PRs touching `internal/`, `pkg/` or `cmd/`; `release.yml` also builds CLI binaries for 5 platforms. Developer targets: `setup`, `install-hooks`, `test-unit` / `test-int` / `test-e2e` / `test-smoke`, `cover` / `cover-func`, `docker-up` / `docker-down`, `pin-base-images`.
+`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **98.5%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, toolchain-check, ci-scripts-test, fmt-check, vet, lint (incl. tagged files), docs-check, metrics-lint, rules-check, dashboards-check, test-ci, build. `ci.yml` always runs: its `changes` job (`.github/scripts/detect-changes.sh`, regression-tested by `make ci-scripts-test`) decides docs-only, and the jobs behind required checks are skipped by `if:` (reusable validate workflows take a `skip` input), so a docs-only PR's required checks report success; secrets are passed to reusable workflows explicitly. `Validate / Quality` additionally runs an HTML-entity check, the RLS-6 grep, `make ci-scripts-test`, `make toolchain-check` (the Go toolchain identical in the three `go.mod` files and the Dockerfile), `make vuln-check` and the Dockerfile digest-pinning check. Both validate jobs delete the private-module token right after `go mod download`, before any PR code runs; only push runs write the registry build cache the signed images are built from; `changelog-check.yml` requires a `CHANGELOG.md` entry for PRs touching `internal/`, `pkg/` or `cmd/`; `release.yml` also builds CLI binaries for 5 platforms. Developer targets: `setup`, `install-hooks`, `test-unit` / `test-int` / `test-e2e` / `test-smoke`, `cover` / `cover-func`, `docker-up` / `docker-down`, `pin-base-images`.
 
 ### 14.1 Unit tests
 
@@ -1138,12 +1139,12 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | OQ-3 | A separate `timeout` reason on Canonical `platform_messages_failed_total` — rejected for now; timeouts are counted in the new Proposed `platform_message_timeouts_total{operation}` and failures keep `decode_error` / `dead_letter_error` / `handler_error` | Observability standard owners | Decided (new metric) |
 | OQ-4 | Strict-ordering mode (blocking a key across dead-letters) — not supported; the `StrictOrdering` flag was removed; a dead-lettered head releases its key | Library owners | Decided |
 | OQ-5 | `PlatformEventsConsumerStalled` suppression uses the service-wide dead-letter rate (`platform_dlq_messages_total` has no `queue` label) | Observability standard owners | Accepted |
-| OQ-6 | platform-pgcommon's `release.yml` uses `docker/metadata-action` `latest=auto` (fixed here with `latest=false`) | pgcommon owners | Upstream fix pending (still open in v1.4.3) |
+| OQ-6 | platform-pgcommon's `release.yml` uses `docker/metadata-action` `latest=auto` (fixed here with `latest=false`) | pgcommon owners | Upstream fix pending (still no `flavor: latest=false` in v1.5.1) |
 | OQ-7 | Migration `010` changed during development; a dev database that applied an earlier draft needs `migrate down 1` and re-migrating | Release owner | Closed — noted in PR #12, shipped in v1.6.0 |
 | OQ-8 | Release `v1.6.0`: push the branch, open the PR, tag after merge; update §13.4 | Release owner | Closed — tagged `v1.6.0` |
 | OQ-9 | Release `v1.6.1` from `fix/production-review` (push, PR, tag after merge; update §13.4) | Release owner | Pending |
 | OQ-10 | Repository ruleset `17023503` ("protect-main-branch") still requires the old check names `Test` / `Build` / `lint` / `vet` / `coverage`, which no workflow emits — every PR needs a bypass merge; the org ruleset already requires the current jobs | Repository admins | Open — drop the stale required checks |
-| OQ-11 | `ci.yml` `paths-ignore` skips the whole pipeline for docs-only PRs, so the org-required checks never report and such PRs cannot merge without a bypass | Library owners | Open — run the pipeline on all pull requests (keep the skip for pushes) |
+| OQ-11 | `ci.yml` `paths-ignore` skipped the whole pipeline for docs-only PRs, so the org-required checks never reported and such PRs could not merge without a bypass | Library owners | Closed — `changes` job + `detect-changes.sh` (from platform-pgcommon v1.5.1) skip jobs by `if:`, so skipped required checks report success |
 | OQ-12 | Remove the legacy `events_*` / `outbox_*` / `sqs_*` metrics (branch `feat/observability-legacy-removal`) — breaking; needs the Proposed successors ratified (OQ-1) and consumers migrated (sunset ≥ 2027-04-01) | Observability standard owners | Blocked on OQ-1 |
 
 **Known limitations (accepted by design):**
@@ -1188,7 +1189,7 @@ Consumer failure reasons and DLQ reasons are listed in §11.2; outbox error oper
 
 ### 18.1 Integration with `platform-pgcommon`
 
-Every database call goes through `*pgcommon.Pool` (`RunInTx`, `WithConn`); `ApplySchema` passes the embedded migration FS to `migrate.Runner` with the library's own migrations table. Upgrades of pgcommon are adopted per release (v1.4.1: `ErrVersionNotInSource` / `ErrMigrationDirty`; v1.4.2: docs only, diagram-sync script reused; v1.4.3: docs only — its LLD `docs/lld/platform-lld-pgcommon.md`).
+Every database call goes through `*pgcommon.Pool` (`RunInTx`, `WithConn`); `ApplySchema` passes the embedded migration FS to `migrate.Runner` with the library's own migrations table. Upgrades of pgcommon are adopted per release (v1.4.1: `ErrVersionNotInSource` / `ErrMigrationDirty`; v1.4.2: docs only, diagram-sync script reused; v1.4.3: docs only — its LLD `docs/lld/platform-lld-pgcommon.md`; v1.5.1: `RunInTx` returns `ErrTxEndedInCallback` when the callback ends its own transaction — relevant to `inbox.Store.Process` callbacks; `GUCSet.Validate` rejects NUL / invalid UTF-8 (`ErrInvalidGUCValue`) — the consumer now treats an envelope whose `tenant_id` / `trace_id` contains NUL as malformed; `ConfigFromEnv` warns on a `DATABASE_URL` without `sslmode`, forwarded into `OutboxConfigEnv.Warnings`; CI parity: the `changes` job, explicit reusable-workflow secrets, per-commit concurrency on `main`).
 
 ### 18.2 Integration with `platform-gincommon`
 
@@ -1338,5 +1339,5 @@ Summary of the v1.6.0 changes (and the `[Unreleased]` production-review fixes, r
 | 6 | `WithDLQForwarding`, `DLQAttribution` (dead-letters counted once), `SourceMessageFromContext` (`DLQPublisher` itself shipped in v1.5.0) | §5.5, §8.7 |
 | 7 | Inbox `Store.Process` (exactly-once) and dead-letter awareness | §7.4 |
 | 8 | New Proposed metrics: `platform_messages_in_flight`, `platform_outbox_oldest_pending_age`, `platform_outbox_ordering_blocked_events`, `platform_message_timeouts_total` | §11.2 |
-| 9 | platform-pgcommon v1.4.3; release scripts parity; `latest=false`; `make docs-check` | §14, §16 |
+| 9 | platform-pgcommon v1.5.1; release scripts parity; `latest=false`; `make docs-check` | §14, §16 |
 | 10 | `[Unreleased]`: FIFO per-group consumer ordering (handler-timeout budget per group, receive 1 without VT, failed delete stops the group); SNS trace-attribute shedding; `Enqueue` NUL rejection; replay `ON CONFLICT`; `AWS_DEFAULT_REGION`; `SQS_DRAIN_TIMEOUT`; production-faithful `mock.Consumer`; FIFO DLQ dedup; `dataschema` pass-through; migrations 003 / 010-down / 011; replay collision skip; shutdown batch release; CI cache and token hardening; `make toolchain-check` | §4, §7.1, §8.6, §10.3, §14, §19.5 |

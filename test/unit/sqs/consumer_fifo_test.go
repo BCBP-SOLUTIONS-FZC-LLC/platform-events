@@ -395,3 +395,23 @@ func TestFIFO_NoVisibilityTimeout_ReceivesOne(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, int32(1), maxMsgs[0])
 }
+
+// A tenant_id with a NUL can never be used as the handler's RLS GUC
+// (pgcommon rejects it), so the message is malformed: deleted, never handled.
+func TestNULTenant_TreatedAsMalformed(t *testing.T) {
+	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{}`))
+	env.TenantID = "acme\x00"
+	msg := makeSQSMessage(env)
+	client := newFIFOClient([]sqstypes.Message{msg})
+	called := make(chan struct{}, 1)
+	c, err := internalsqs.NewWithClient(internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1}, client,
+		func(context.Context, domain.Envelope[json.RawMessage]) error { called <- struct{}{}; return nil })
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Start(ctx) }()
+	require.Eventually(t, func() bool { return client.wasDeleted(msg) }, 5*time.Second, 10*time.Millisecond)
+	cancel()
+	require.NoError(t, c.Stop())
+	assert.Empty(t, called, "the handler must not run")
+}
