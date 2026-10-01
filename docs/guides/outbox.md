@@ -95,7 +95,7 @@ defer func() {
 //   }
 ```
 
-**Config defaults:** `PollInterval` 5s · `BatchSize` 50 · `MaxAttempts` 5 · `PublishConcurrency` 1 · `PublishTimeout` 10s · `DrainTimeout` 30s · `ClaimLeaseDuration` 10m · `StartupJitter` 0. When `PublishConcurrency` is `1` (default), the runner publishes via SNS `PublishBatch` (10 messages per API call). Values `> 1` publish records in parallel goroutines with per-record `Publish` calls. When a poll cycle fails (e.g. the DB is unreachable), the runner applies exponential backoff (1s → 30s) before retrying instead of hammering the pool every `PollInterval`.
+**Config defaults:** `PollInterval` 5s · `BatchSize` 50 · `MaxAttempts` 5 · `PublishConcurrency` 1 · `PublishTimeout` 10s · `DrainTimeout` 30s · `ClaimLeaseDuration` 10m · `StartupJitter` 0 · `RetryBackoff` 1s · `MaxRetryBackoff` 5m. When `PublishConcurrency` is `1` (default), the runner publishes via SNS `PublishBatch` (10 messages per API call). Values `> 1` publish records in parallel goroutines with per-record `Publish` calls. When a poll cycle fails (e.g. the DB is unreachable), the runner applies exponential backoff (1s → 30s) before retrying instead of hammering the pool every `PollInterval`.
 
 ### Enqueueing inside a transaction
 
@@ -114,7 +114,7 @@ err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context
 })
 ```
 
-`Enqueue` validates the envelope (non-nil tx; non-empty `ID`/`Type`/`Source`; non-zero `Timestamp`; no null bytes in `ID`/`Type`/`Source`) and rejects payloads whose serialised size exceeds **240 KB** — staying under the SNS 256 KB hard limit so an outbox record that could never publish is never persisted.
+`Enqueue` validates the envelope (non-nil tx; non-empty `ID`/`Type`/`Source`; non-zero `Timestamp`; no null bytes in `ID`/`Type`/`Source`; `ID` a **canonical lowercase UUID**, as `events.NewEnvelope` produces — services that set their own IDs must use `uuid.UUID.String()`) and rejects payloads whose serialised size exceeds **240 KB** — staying under the SNS 256 KB hard limit so an outbox record that could never publish is never persisted.
 
 ### Payload size guidelines
 
@@ -226,7 +226,7 @@ log.Printf("discarded %d irrecoverable dead letters", n)
 | `TenantID` | `string` | Exact tenant match (`""` = all tenants) |
 | `FailedBefore` | `time.Time` | Only records where `failed_at < FailedBefore` (zero = no bound) |
 
-**Retryable failures** (SNS throttling: `ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`) and publish timeouts do not count toward `MaxAttempts`: the lease is released and the record retried after a backoff shared by all records (`RetryBackoff`, doubling up to `MaxRetryBackoff`), which resets on the next successful publish. A period of SNS unavailability builds a backlog (watch `PlatformEventsOutboxBacklog`) but never dead-letters healthy records.
+**Retryable failures** do not count toward `MaxAttempts`: SNS throttling and service-side errors (`Throttled`, `InternalError`, `KMSThrottling`, `ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`), any HTTP 5xx or 429 response (including body-less ones the SDK reports as `UnknownError`), per-entry batch failures with `SenderFault=false`, publish timeouts, and failures that never got an answer from SNS (network, DNS, TLS, credential resolution). The lease is released and the record retried after a backoff shared by all records (`RetryBackoff`, doubling once per poll cycle up to `MaxRetryBackoff`) that resets on the next successful publish. A period of SNS unavailability builds a backlog (watch `PlatformEventsOutboxBacklog`) but never dead-letters healthy records. Everything else — authorization, a missing topic, invalid parameters, an oversized request — counts an attempt, backs off per record, and dead-letters at `MaxAttempts`.
 
 ### Idempotency
 

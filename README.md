@@ -88,9 +88,9 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 
 | Symbol | Purpose |
 |---|---|
-| `mock.Publisher` | `Published()`, `SetError()`, `Reset()` |
-| `mock.Consumer` | `Inject(env)` delivers synchronously to the registered handler |
-| `mock.DLQPublisher` | `Sent()`, `SetError()`, `Reset()`; `ResolveDLQ` returns `DLQURL` |
+| `mock.Publisher` | `Published()`, `SetError()`, `SetBatchError()` (partial / `Retryable` batch failures), `Reset()`; rejects envelopes without ID, Type or Source like the SNS publisher |
+| `mock.Consumer` | `Inject(env)` delivers synchronously with the real consumer's handler context: tenant GUC (RLS), trace ID, source message, dead-letter attribution |
+| `mock.DLQPublisher` | `Sent()`, `SetError()`, `Reset()`; `ResolveDLQ` returns `DLQURL`; counts the forward and marks the attribution like the SQS publisher (so inbox skips dead-lettered messages in tests too) |
 
 ### `pkg/outbox` — transactional outbox
 
@@ -497,7 +497,6 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 | `MIGRATION_DATABASE_URL` | `DATABASE_URL` | DDL-role DSN for `ApplySchema`, connecting directly (not via PgBouncer) — `config.LoadOutbox().MigrationDatabaseURL` |
 | `APP_ENV` → `ENVIRONMENT` / `APP_NAME` | `dev` / — | Metrics `environment` / `service` labels when not set on `MetricsIdentity` (same as platform-pgcommon) |
 | `OTEL_*` | — | Not read by platform-events — platform-gincommon's `InitTracingFromEnv` in the service reads them (`config.LoadOTel` is deprecated) |
-| `APP_ENV` | — | Environment gate for OTel insecure mode |
 | `SMOKE_SNS_TOPIC_ARN` / `SMOKE_SQS_QUEUE_URL` | — | `make test-smoke` only |
 
 `DLQConfig` (`Region`, `EndpointURL`, `ConsumerName`) has no env loader — wire it from the service's own config. Copy `.env-example` to `.env` via `make setup`.

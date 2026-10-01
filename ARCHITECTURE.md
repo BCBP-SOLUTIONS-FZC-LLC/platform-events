@@ -183,15 +183,15 @@ graph LR
 | `VerifyEnvelope(key, env, sig)` | Deserialises and verifies; safe for webhook receipt handlers |
 | `Init(service, version)` | Registers Prometheus metrics once (`sync.Once`) |
 | `InitWithRegisterer(service, version, reg)` | Registers against a custom `prometheus.Registerer` (use in tests) |
-| `mock.Publisher` | In-memory, thread-safe; `Published()`, `SetError()`, `Reset()` |
-| `mock.Consumer` | In-memory queue; `Inject(env)` delivers synchronously |
+| `mock.Publisher` | In-memory, thread-safe; `Published()`, `SetError()`, `SetBatchError()`, `Reset()`; validates ID/Type/Source like the SNS publisher |
+| `mock.Consumer` | In-memory queue; `Inject(env)` delivers synchronously with the real consumer's handler context (`sqs.HandlerContext` + dead-letter attribution) |
 | `mock.DLQPublisher` | In-memory, thread-safe; `Sent() []DLQMessage`, `SetError()`, `Reset()`; `ResolveDLQ` returns `DLQURL` (default `mock://dlq`) |
 
 ### pkg/outbox
 
 | Symbol | Description |
 |--------|-------------|
-| `Config` | `Pool *pgcommon.Pool`, `Publisher`, `Logger`, `PollInterval` (5s), `BatchSize` (50), `MaxAttempts` (5), `ClaimLeaseDuration` (10 min), `PublishConcurrency` (1 — SNS `PublishBatch` path; `> 1` parallel per-record `Publish`), `PublishTimeout` (10s), `DrainTimeout` (30s), `StartupJitter` (0) |
+| `Config` | `Pool *pgcommon.Pool`, `Publisher`, `Logger`, `PollInterval` (5s), `BatchSize` (50), `MaxAttempts` (5), `ClaimLeaseDuration` (10 min), `PublishConcurrency` (1 — SNS `PublishBatch` path; `> 1` parallel per-record `Publish`), `PublishTimeout` (10s), `DrainTimeout` (30s), `StartupJitter` (0), `RetryBackoff` (1s), `MaxRetryBackoff` (5m) |
 | `NewRunner(cfg) (*Runner, error)` | Constructs the outbox runner; applies defaults; returns an error if `ClaimLeaseDuration` is too short for the configured `BatchSize × PublishTimeout`; panics if `Publisher` nil or both `Pool` and `Store` nil (programming errors) |
 | `Runner.Start(ctx)` | Starts the poll loop (immediate first poll, then per `PollInterval`); exponential backoff (1s→30s) on poll-cycle failure; blocks until `ctx` is cancelled |
 | `Runner.Stop()` | Graceful drain; waits up to `DrainTimeout` for the in-flight batch, then returns a non-nil error if it did not finish |
@@ -548,9 +548,9 @@ The platform has **two independent retry systems** — one for publish failures 
 |-----------|------------------------|---------------------|
 | **What fails** | SNS publish call | Handler logic (`return err`) |
 | **Where tracked** | `outbox_events.attempts` column | SQS `ApproximateReceiveCount` attribute |
-| **Retry trigger** | Next outbox runner poll cycle | SQS visibility timeout expiry |
-| **Retry interval** | `PollInterval` (default 5 s) | `VisibilityTimeout` (default 30 s, library-managed) |
-| **Retry limit** | `MaxAttempts` (default 5) | `MaxReceiveCount` (SQS queue setting, **not** a library config) |
+| **Retry trigger** | First poll after the record's backoff | SQS visibility timeout expiry |
+| **Retry interval** | `RetryBackoff`·2^(n−1), capped at `MaxRetryBackoff` (1 s → 5 m, jittered); transient failures share one backoff and never count | `VisibilityTimeout` (default 30 s, library-managed) |
+| **Retry limit** | `MaxAttempts` (default 5) | The queue's RedrivePolicy `maxReceiveCount`; optionally a lower consumer-side `WithMaxReceiveCount` that triggers `WithDeadLetterHandler` / `WithDLQForwarding` |
 | **Terminal state** | Postgres `outbox_dead_letters` table | SQS Dead-Letter Queue (separate SQS queue) |
 | **Recovery action** | `runner.ReprocessDeadLetters(ctx, n)` or SQL `UPDATE` | SQS redrive policy or manual `ChangeMessageVisibility` |
 | **Explicit dead-lettering** | n/a — the runner dead-letters automatically after `MaxAttempts` | `events.DLQPublisher.SendToDLQ` — forward a poison message to the queue's configured DLQ immediately, without waiting for `MaxReceiveCount` |
@@ -975,12 +975,12 @@ When goroutine 1 finishes:
 
 ### Idempotency
 
-The inbox is **check-then-act, not transactional with the handler**: `inbox.Handler` calls `IsProcessed`, then `next`, then `MarkProcessed` only if `next` returned `nil`. Two consequences follow, and handlers must tolerate both:
+`inbox.Handler` is **check-then-act, not transactional with the handler**: it calls `IsProcessed`, then `next`, then `MarkProcessed` only if `next` returned `nil` (and did not dead-letter the message). Two consequences follow, and handlers must tolerate both:
 
 - A crash (or a `MarkProcessed` failure) after `next` succeeds leaves the ID unrecorded — SQS redelivers and `next` runs again.
 - Two concurrent deliveries of the same message (visibility timeout expiry while the first is still running) can both pass `IsProcessed` before either records.
 
-The inbox therefore reduces duplicate work; it does not make side effects exactly-once. For side effects that must not repeat, record the event ID in the **same transaction** as the side effect (`INSERT INTO processed_events … ON CONFLICT DO NOTHING`, then check `RowsAffected`) — see [Implementing idempotency](docs/guides/consuming.md#implementing-idempotency).
+`inbox.Handler` therefore reduces duplicate work; it does not make side effects exactly-once. For Postgres writes, use **`inbox.Store.Process(ctx, env, fn)`**: it claims the event ID in the handler's own transaction (`INSERT INTO processed_events … ON CONFLICT DO NOTHING`), so the claim and `fn`'s writes commit or roll back together and concurrent copies serialise on the claim — exactly-once writes. Neither records a message the handler dead-lettered (`SendToDLQ`, then nil), so a DLQ redrive is processed. Side effects outside Postgres (emails, payments) still need their own idempotency key — see [Implementing idempotency](docs/guides/consuming.md#implementing-idempotency).
 
 ---
 
@@ -1326,7 +1326,7 @@ Judgment calls where the requirements left an internals-only detail open. Each i
 5. **FIFO DLQ identity is the envelope ID.** `MessageGroupId` and `MessageDeduplicationId` are both set to `Envelope.ID` (SHA-256 of the body when the body isn't an envelope). Per-message groups maximise DLQ consumer parallelism; ordering inside a DLQ has no value.
 6. **`WithMaxReceiveCount(n) < maxReceiveCount` is documented, not enforced.** The consumer could read the queue's `RedrivePolicy` at startup and reject a misconfigured `n`, but that adds an IAM permission and a startup AWS call to every consumer. It is called out in the README, the guides, `.env-example` and this document instead; enforcing it is a candidate follow-up.
 7. **Codec decode failures are retried, malformed JSON is not.** Unparseable JSON will never parse, so it is deleted; a decode failure may be a registry outage, so the message is left visible for SQS's own redrive to handle.
-8. **The inbox is check-then-act.** The ledger cannot join the handler's transaction because the library does not own it. The trade-off and the stronger same-transaction pattern are documented under [Idempotency](#idempotency).
+8. **`inbox.Handler` is check-then-act.** A wrapper cannot join a transaction the handler opens itself; `inbox.Store.Process` inverts that — it opens the transaction and hands it to the handler — for exactly-once Postgres writes. See [Idempotency](#idempotency).
 9. **Tagged test files are vetted and linted.** `make vet` / `make lint` run a second pass with `-tags=integration,e2e`; the first run found one latent `staticcheck` issue in `test/e2e/outbox_test.go`.
 
 ---

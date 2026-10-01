@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -325,4 +326,55 @@ func TestPublishRecord_FailsDuringShutdown(t *testing.T) {
 	require.Contains(t, store.released, rec.ID)
 	assert.Contains(t, store.released[rec.ID], "publish interrupted by shutdown")
 	assert.Zero(t, store.releasedIn[rec.ID])
+}
+
+// batchFailPublisher fails every envelope of a batch under a given ID spelling.
+type batchFailPublisher struct{ spell func(string) string }
+
+func (batchFailPublisher) Publish(context.Context, domain.Envelope[json.RawMessage]) error {
+	return nil
+}
+func (p batchFailPublisher) PublishBatch(_ context.Context, envs []domain.Envelope[json.RawMessage]) error {
+	be := &domain.BatchError{}
+	for _, e := range envs {
+		be.Failures = append(be.Failures, domain.BatchFailure{ID: p.spell(e.ID), Code: "InvalidParameter", Message: "bad"})
+	}
+	return be
+}
+
+type claimStore struct {
+	*stubStore
+	recs      []domain.OutboxRecord
+	published []string
+}
+
+func (s *claimStore) ClaimBatch(context.Context, int) ([]domain.OutboxRecord, error) {
+	return s.recs, nil
+}
+func (s *claimStore) MarkPublished(_ context.Context, id string) error {
+	s.published = append(s.published, id)
+	return nil
+}
+
+// TestPublishBatch_LegacyNonCanonicalID_FailureMatched: a row whose payload ID
+// is uppercase (written before Enqueue required canonical IDs) is read back
+// canonicalised; its failure must still match, never be marked published.
+func TestPublishBatch_LegacyNonCanonicalID_FailureMatched(t *testing.T) {
+	env := domain.NewEnvelope("legacy.event", "svc", json.RawMessage(`{}`))
+	env.ID = strings.ToUpper(env.ID)
+	payload, err := json.Marshal(env)
+	require.NoError(t, err)
+	store := &claimStore{stubStore: newStubStore(), recs: []domain.OutboxRecord{{ID: strings.ToLower(env.ID), EventType: env.Type, Payload: payload}}}
+	svc := NewOutboxService(store, batchFailPublisher{spell: func(id string) string { return id }}, nil, nil, 5, 1, 0)
+
+	require.NoError(t, svc.PublishBatch(context.Background(), 10))
+	assert.Empty(t, store.published, "a failed publish must not be marked published")
+	assert.Contains(t, store.failed, strings.ToLower(env.ID))
+}
+
+func TestCanonicalID(t *testing.T) {
+	id := uuid.NewString()
+	assert.Equal(t, id, canonicalID(strings.ToUpper(id)))
+	assert.Equal(t, id, canonicalID("{"+id+"}"))
+	assert.Equal(t, "not-a-uuid", canonicalID("not-a-uuid"), "non-UUIDs are compared as-is")
 }

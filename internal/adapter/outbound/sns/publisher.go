@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -580,6 +581,9 @@ var retryableErrorCodes = map[string]struct{}{
 	"Throttled":     {},
 	"InternalError": {},
 	"KMSThrottling": {},
+	// The SDK's code for an error response with no body: SNS always sends one,
+	// so this came from infrastructure in between (load balancer, endpoint).
+	"UnknownError": {},
 	// Generic AWS / smithy transient codes.
 	"Throttling":                    {},
 	"ThrottlingException":           {},
@@ -602,6 +606,14 @@ var retryableErrorCodes = map[string]struct{}{
 func wrapIfRetryable(err error) error {
 	if err == nil || errors.Is(err, domain.ErrRetryable) {
 		return err
+	}
+	// A 5xx or 429 is transient whatever its code — including "UnknownError",
+	// the SDK's code for an error response without a body (typically from a
+	// load balancer or VPC endpoint in front of SNS).
+	if respErr, ok := errors.AsType[*smithyhttp.ResponseError](err); ok {
+		if status := respErr.HTTPStatusCode(); status >= 500 || status == 429 {
+			return &domain.RetryableError{Cause: err}
+		}
 	}
 	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
 		if _, ok := retryableErrorCodes[apiErr.ErrorCode()]; ok {

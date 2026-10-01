@@ -125,19 +125,67 @@ func maskQueryParams(query string) string {
 	return strings.Join(parts, "&")
 }
 
+// maskKeyValueDSN masks password/passwd in a libpq keyword/value string
+// ("host=h password='a b' dbname=d"). Values follow libpq's rules: spaces are
+// allowed around "=", and a value may be single-quoted with backslash escapes,
+// so a quoted password containing spaces or quotes is masked whole.
 func maskKeyValueDSN(dsn string) string {
-	parts := strings.Fields(dsn)
-	for i, part := range parts {
-		eqIdx := strings.Index(part, "=")
-		if eqIdx < 0 {
+	var out strings.Builder
+	i, n := 0, len(dsn)
+	isSpace := func(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+	for i < n {
+		// Copy whitespace between pairs.
+		for i < n && isSpace(dsn[i]) {
+			out.WriteByte(dsn[i])
+			i++
+		}
+		if i >= n {
+			break
+		}
+		keyStart := i
+		for i < n && dsn[i] != '=' && !isSpace(dsn[i]) {
+			i++
+		}
+		key := dsn[keyStart:i]
+		j := i
+		for j < n && isSpace(dsn[j]) {
+			j++
+		}
+		if j >= n || dsn[j] != '=' {
+			// Not a keyword=value pair: copy the token through.
+			out.WriteString(dsn[keyStart:i])
 			continue
 		}
-		switch strings.ToLower(part[:eqIdx]) {
-		case "password", "passwd":
-			parts[i] = part[:eqIdx+1] + "***"
+		j++ // past '='
+		for j < n && isSpace(dsn[j]) {
+			j++
 		}
+		valStart := j
+		if j < n && dsn[j] == '\'' {
+			j++
+			for j < n && dsn[j] != '\'' {
+				if dsn[j] == '\\' && j+1 < n {
+					j++
+				}
+				j++
+			}
+			if j < n {
+				j++ // closing quote
+			}
+		} else {
+			for j < n && !isSpace(dsn[j]) {
+				j++
+			}
+		}
+		switch strings.ToLower(key) {
+		case "password", "passwd":
+			out.WriteString(key + "=***")
+		default:
+			out.WriteString(key + "=" + dsn[valStart:j])
+		}
+		i = j
 	}
-	return strings.Join(parts, " ")
+	return out.String()
 }
 
 // OTelConfigEnv holds environment-derived OpenTelemetry configuration.

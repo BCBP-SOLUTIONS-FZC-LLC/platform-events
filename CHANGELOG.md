@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Upgrade notes
 
 - **`outbox.Enqueue` requires the canonical lowercase UUID form for the envelope ID** (what `events.NewEnvelope` produces). Uppercase, braced or unhyphenated IDs are rejected: Postgres stores the ID canonicalised, and the mismatch with the payload's ID made a failed batch publish look delivered.
+- **`mock` package behaves like production** (tests may need updating):
+  - `mock.Consumer.Inject` passes the real consumer's handler context.
+  - `mock.DLQPublisher.SendToDLQ` counts the forward and marks the dead-letter attribution, so `inbox.Handler` / `Store.Process` skip a dead-lettered message, as in production.
+  - `mock.Publisher` rejects envelopes without ID, Type or Source.
+- **`events.NewSQSConsumer` / `NewSQSConsumerWithClient` return an error for a nil handler** (previously every message panicked); `WithDeadLetterHandler(nil)` is ignored.
 - **Custom `events.Publisher` implementations:** a `BatchFailure` is now treated as transient only when `Retryable` is set (or its Code is `TransportError`). A whole-batch failure from the SNS publisher is `TransportError` only when transient; a permanent one keeps its AWS code and counts toward `MaxAttempts`.
 
 - **Outbox retries back off, and transient failures no longer count toward `MaxAttempts`.** A permanent publish failure now retries after `RetryBackoff·2^(attempt-1)` (default 1s, capped at `MaxRetryBackoff` = 5m, jittered) instead of on the next poll. With the defaults the first retries still land on the next poll (the backoff is shorter than the 5s `PollInterval`), so a poison record reaches `outbox_dead_letters` in about the same ~25s; larger `MaxAttempts` values now spread out up to 5m apart. Transport errors, throttling and timeouts release the lease without counting an attempt, so an SNS outage builds a backlog (watch `PlatformEventsOutboxBacklog`) instead of dead-lettering it. Tune with `outbox.Config.RetryBackoff` / `MaxRetryBackoff` or `OUTBOX_RETRY_BACKOFF` / `OUTBOX_MAX_RETRY_BACKOFF`.
@@ -20,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Outbox / SNS publisher (regression in the unreleased retry change):**
   - Every whole-batch SNS failure was labelled `TransportError`, so permanent ones (`BatchRequestTooLong`, `AuthorizationError`, `NotFound`, `KMSAccessDenied`, …) were retried forever without counting attempts, holding the healthy records of the same chunk with them. Failures now carry `BatchFailure.Retryable`. Only throttling, SNS-side errors, timeouts and failures without an AWS API error (network, DNS, TLS, credentials) are transient.
   - SNS's own throttle and internal codes (`Throttled`, `InternalError`, `KMSThrottling`) were not recognised as transient, so throttling used up attempts. Per-entry failures with `SenderFault=false` are transient too.
+  - An HTTP 5xx or 429 with no body (from a load balancer or VPC endpoint), which the SDK reports as `UnknownError`, was treated as permanent. Any 5xx / 429 and `UnknownError` are now transient, for the SQS DLQ publisher too.
+  - Rows written before `Enqueue` required canonical IDs, or replayed from `outbox_dead_letters`, could have a payload ID that differed in case from the stored `rec.ID`. A failed batch publish of such a row was marked published. Failure IDs are now matched in canonical form.
   - `PublishBatch` splits each 10-message chunk by SNS's 256 KiB request limit as well, so one large event no longer fails its neighbours with `BatchRequestTooLong`.
   - With `PublishConcurrency > 1`, the shared transient backoff advanced once per failed record, so a one-second SNS blip parked a 50-record batch for 5 minutes. It now advances once per poll cycle.
 - **Inbox:**
@@ -50,11 +57,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Every third-party action and the interop reusable workflow (which receives a private token) are pinned by commit SHA.
   - The lint exclusion for `test/smoke` used v1 syntax and was ignored. It now uses v2 `linters.exclusions.paths`.
 
+- **Mocks:** `mock.Consumer.Inject` now gives handlers the real consumer's context (tenant GUC for RLS, trace ID, source message, dead-letter attribution). `mock.DLQPublisher` counts and marks dead-letters like the SQS publisher. `mock.Publisher` validates envelopes and gains `SetBatchError`. Service tests previously passed on behaviour production does not have.
+- **Config:** `OutboxConfigEnv.String()` masks a quoted keyword/value password containing spaces (`password='a b'`) whole; previously part of it was printed.
+
 ### Changed
 
 - AWS SDK for Go v2 upgraded: core v1.47.1, `service/sns` v1.47.2, `service/sqs` v1.52.1, `smithy-go` v1.28.2.
 
 ### Docs
+
+- `VERSIONING.md`, the envelope, consuming and outbox guides, `EVENT_SCHEMA_GOVERNANCE.md` and `CONTRIBUTING.md` now use the envelope's real wire keys (`time`, `specversion`, `dataschema`, `data`).
+- The `SQSConsumerOptions` godoc and ARCHITECTURE / consuming guide describe `WithMaxReceiveCount` routing correctly.
+- ARCHITECTURE now covers `Store.Process`; the outbox guide covers the canonical-ID rule, `RetryBackoff` and the full transient classification.
+- Removed the stale `APP_ENV` README row.
 
 - CLAUDE.md:
   - The envelope JSON now uses the real keys (`specversion`, `dataschema`, `time`, `data`).

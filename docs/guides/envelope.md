@@ -104,7 +104,7 @@ env := events.NewEnvelope("iam.user.created.v2", "platform-iam", payload,
 )
 ```
 
-Consumers that receive an unrecognised `schema_version` should log a warning and delete the message rather than silently misparsing it. If `schema_version` is absent, treat it as `"1"` for backward compatibility.
+Consumers that receive an unrecognised schema version (`SchemaVersion`, wire key `specversion`) should log a warning and delete the message rather than silently misparsing it. If it is absent, treat it as `"1"` for backward compatibility.
 
 ### Serialisation
 
@@ -185,5 +185,5 @@ func route(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 
 ### Envelope compatibility guarantees
 
-The `id`, `type`, `source`, and `timestamp` fields are **stable** — always present, never removed or renamed, format frozen within `v1.x`. The remaining fields (`tenant_id`, `trace_id`, `correlation_id`, `schema_version`, `subject`, `actor`, `schema_id`) are **contextual** — present when set, never removed. The library may add new optional fields in MINOR releases; existing consumers are unaffected. See [ARCHITECTURE.md § Envelope compatibility guarantees](../../ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field stability class table and the `v1.x` never-break list.
+The `id`, `type`, `source`, and `time` wire fields are **stable** — always present, never removed or renamed, format frozen within `v1.x`. The remaining fields (`tenant_id`, `trace_id`, `correlation_id`, `specversion`, `subject`, `actor`, `dataschema`, `ip_address`, `user_agent`) are **contextual** — present when set, never removed. The library may add new optional fields in MINOR releases; existing consumers are unaffected. See [ARCHITECTURE.md § Envelope compatibility guarantees](../../ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field stability class table and the `v1.x` never-break list.
 

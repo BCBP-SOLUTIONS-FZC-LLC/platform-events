@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -61,7 +62,11 @@ func WithVisibilityTimeout(d time.Duration) ConsumerOption {
 }
 
 // WithDeadLetterHandler sets a handler for messages that have exhausted retries.
+// A nil fn is ignored.
 func WithDeadLetterHandler(fn Handler) ConsumerOption {
+	if fn == nil {
+		return internalsqs.WithDeadLetterHandler(nil)
+	}
 	return internalsqs.WithDeadLetterHandler(func(ctx context.Context, env domain.Envelope[json.RawMessage]) error {
 		return fn(ctx, domainToPublic(env))
 	})
@@ -133,6 +138,9 @@ type SQSClientLike interface {
 
 // NewSQSConsumer constructs an SQS-backed Consumer.
 func NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Consumer, error) {
+	if handler == nil {
+		return nil, errors.New("events: handler is required")
+	}
 	wrappedHandler := func(ctx context.Context, env domain.Envelope[json.RawMessage]) error {
 		return handler(ctx, domainToPublic(env))
 	}
@@ -149,6 +157,9 @@ func NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Con
 // NewSQSConsumerWithClient constructs an SQS-backed Consumer using an injected
 // SQS client. Useful in unit tests to avoid real AWS credentials.
 func NewSQSConsumerWithClient(cfg SQSConfig, client SQSClientLike, handler Handler, opts ...ConsumerOption) (Consumer, error) {
+	if handler == nil {
+		return nil, errors.New("events: handler is required")
+	}
 	wrappedHandler := func(ctx context.Context, env domain.Envelope[json.RawMessage]) error {
 		return handler(ctx, domainToPublic(env))
 	}

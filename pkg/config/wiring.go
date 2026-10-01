@@ -71,18 +71,17 @@ func SQSConfigFromEnv(env SQSConfigEnv, logger port.Logger) events.SQSConfig {
 // SQSConsumerOptions returns ConsumerOption values derived from SQSConfigEnv.
 // Pass alongside SQSConfigFromEnv when constructing NewSQSConsumer.
 //
-// IMPORTANT: this helper does NOT wire WithDeadLetterHandler — that function
-// cannot be configured from env vars alone. If SQS_MAX_RECEIVE_COUNT is set
-// (and MaxReceiveCount > 0), you MUST also call events.WithDeadLetterHandler
-// explicitly when constructing the consumer:
+// IMPORTANT: this helper does NOT wire WithDeadLetterHandler or
+// WithDLQForwarding — neither can be configured from env vars alone. The
+// SQS_MAX_RECEIVE_COUNT threshold only takes effect with at least one of them:
 //
 //	opts := config.SQSConsumerOptions(sqsEnv)
-//	if sqsEnv.MaxReceiveCount > 0 {
-//	    opts = append(opts, events.WithDeadLetterHandler(myDLHFunc))
-//	}
+//	opts = append(opts, events.WithDLQForwarding(dlq))           // forward to the queue's DLQ
+//	opts = append(opts, events.WithDeadLetterHandler(myDLHFunc)) // and/or run a callback first
 //
-// Omitting WithDeadLetterHandler means messages that exceed MaxReceiveCount are
-// logged at ERROR level and deleted rather than routed to your handler.
+// With neither, there is no consumer-side threshold: a message that keeps
+// failing goes to your normal handler on every delivery until the queue's own
+// RedrivePolicy moves it to the DLQ.
 func SQSConsumerOptions(env SQSConfigEnv) []events.ConsumerOption {
 	opts := []events.ConsumerOption{
 		events.WithConcurrency(env.Concurrency),

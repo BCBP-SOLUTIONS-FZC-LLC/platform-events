@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 	smithy "github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -20,6 +22,14 @@ import (
 )
 
 const classifyTopic = "arn:aws:sns:us-east-1:123:test"
+
+// httpErr builds the error chain the SDK returns for an HTTP error response.
+func httpErr(status int, code string) error {
+	return &smithy.OperationError{ServiceID: "SNS", OperationName: "PublishBatch", Err: &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+		Err:      &smithy.GenericAPIError{Code: code, Message: "status " + http.StatusText(status)},
+	}}
+}
 
 func batchFailures(t *testing.T, err error) []internalsns.BatchFailure {
 	t.Helper()
@@ -50,6 +60,10 @@ func TestPublishBatch_RequestErrorClassification(t *testing.T) {
 		{"client validation (pointer)", &smithy.InvalidParamsError{Context: "PublishBatchInput"}, "PublishError", false},
 		{"serialization", &smithy.SerializationError{Err: errors.New("bad")}, "PublishError", false},
 		{"already retryable", &domain.RetryableError{Cause: errors.New("upstream")}, "TransportError", true},
+		{"empty-body 502", httpErr(502, "UnknownError"), "TransportError", true},
+		{"429 with a permanent-looking code", httpErr(429, "SomethingNew"), "TransportError", true},
+		{"UnknownError without status", &mockAPIError{code: "UnknownError"}, "TransportError", true},
+		{"400 InvalidParameter", httpErr(400, "InvalidParameter"), "InvalidParameter", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := &mockSNSClient{publishBatchFn: func(context.Context, *sns.PublishBatchInput, ...func(*sns.Options)) (*sns.PublishBatchOutput, error) {

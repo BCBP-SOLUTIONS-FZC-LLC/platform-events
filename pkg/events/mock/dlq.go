@@ -5,7 +5,9 @@ import (
 	"maps"
 	"sync"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
@@ -33,8 +35,12 @@ type DLQPublisher struct {
 	err  error
 }
 
-// SendToDLQ records the message and returns any configured error.
-func (m *DLQPublisher) SendToDLQ(_ context.Context, sourceQueueURL string, body []byte, attrs map[string]string, reason string) error {
+// SendToDLQ records the message and returns any configured error. Like the
+// SQS publisher, a recorded message is counted in platform_dlq_messages_total
+// (when platform metrics are initialised) and marks the handler context's
+// dead-letter attribution, so the consumer does not count it again and inbox
+// does not record it as processed.
+func (m *DLQPublisher) SendToDLQ(ctx context.Context, sourceQueueURL string, body []byte, attrs map[string]string, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.err != nil {
@@ -49,6 +55,9 @@ func (m *DLQPublisher) SendToDLQ(_ context.Context, sourceQueueURL string, body 
 		Attrs:          maps.Clone(attrs),
 		Reason:         reason,
 	})
+	attribution := port.DLQAttributionFromContext(ctx)
+	metrics.IncDLQ("consume", internalsqs.DLQEventType(body, attrs), attribution.Reason())
+	attribution.MarkRecorded()
 	return nil
 }
 

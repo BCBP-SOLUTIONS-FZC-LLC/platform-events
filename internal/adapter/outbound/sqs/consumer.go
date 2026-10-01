@@ -69,7 +69,11 @@ func WithVisibilityTimeout(d time.Duration) ConsumerOption {
 // The message is deleted from SQS only if the handler returns nil; on error the
 // message is left visible for retry, matching the semantics of the normal handler.
 func WithDeadLetterHandler(fn port.Handler) ConsumerOption {
-	return func(c *sqsConsumer) { c.deadLetterHandler = fn }
+	return func(c *sqsConsumer) {
+		if fn != nil {
+			c.deadLetterHandler = fn
+		}
+	}
 }
 
 // WithDLQPublisher forwards poison messages to the source queue's configured
@@ -582,9 +586,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	// Inject TenantID for downstream pgcommon pool RLS enforcement.
 	// Inject TraceID via the port context key so handler code can retrieve it
 	// with events.TraceIDFromContext — GUCSet does not carry TraceID.
-	handlerBase := pgcommon.WithGUCSet(context.WithoutCancel(loopCtx), pgdomain.GUCSet{TenantID: env.TenantID})
-	handlerBase = port.WithEnvelopeTraceID(handlerBase, env.TraceID)
-	handlerBase = port.WithSourceMessage(handlerBase, func() port.SourceMessage { return sourceMessage(c.queueURL, msg) })
+	handlerBase := HandlerContext(context.WithoutCancel(loopCtx), env.TenantID, env.TraceID, func() port.SourceMessage { return sourceMessage(c.queueURL, msg) })
 	receiveCount := approxReceiveCount(msg.Attributes)
 	overThreshold := c.maxReceiveCount > 0 && receiveCount > c.maxReceiveCount
 
@@ -912,6 +914,17 @@ func (c *sqsConsumer) runDeadLetterHandler(ctx context.Context, env domain.Envel
 		}
 	}()
 	return c.deadLetterHandler(ctx, env)
+}
+
+// HandlerContext returns parent carrying what every consumer handler gets:
+// the tenant as platform-pgcommon's GUC set (so pool queries are RLS-scoped
+// to the event's tenant), the envelope's trace ID (events.TraceIDFromContext)
+// and the source message (events.SourceMessageFromContext). Shared with
+// mock.Consumer so service tests see the same context as production.
+func HandlerContext(parent context.Context, tenantID, traceID string, source func() port.SourceMessage) context.Context {
+	ctx := pgcommon.WithGUCSet(parent, pgdomain.GUCSet{TenantID: tenantID})
+	ctx = port.WithEnvelopeTraceID(ctx, traceID)
+	return port.WithSourceMessage(ctx, source)
 }
 
 // errDLQForwardFailed marks a dead-letter routing attempt whose DLQ forward

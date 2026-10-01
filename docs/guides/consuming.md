@@ -147,7 +147,7 @@ Common causes:
 | Invalid business state | `user_id` references a user that was deleted before the event arrived |
 | Illegal state transition | An `order.shipped` event arrives for an order already in `cancelled` state |
 | Missing precondition | A `payment.settled` event arrives but no corresponding `payment.created` exists |
-| Schema version too new | `schema_version: "5"` but this consumer only understands up to `"3"` |
+| Schema version too new | `specversion: "5"` (`env.SchemaVersion`) but this consumer only understands up to `"3"` |
 
 **Handling pattern:**
 
@@ -324,7 +324,7 @@ func myHandler(ctx context.Context, env events.Envelope[json.RawMessage]) error 
 }
 ```
 
-Retries are driven by SQS visibility timeouts — not by the library — and follow the queue's redrive policy. The retry limit (`MaxReceiveCount`) is a **queue configuration**, not a library setting. See [ARCHITECTURE.md § Failure lifecycle](../../ARCHITECTURE.md#failure-lifecycle) for the full consumer-side retry timeline and how it differs from outbox (producer-side) retries.
+Retries are driven by SQS visibility timeouts — not by the library — and follow the queue's redrive policy. The retry limit is the queue's RedrivePolicy `maxReceiveCount`. `WithMaxReceiveCount` adds an optional, lower consumer-side threshold that routes a message to `WithDeadLetterHandler` and/or `WithDLQForwarding` before SQS's redrive would; without either option it has no effect. See [ARCHITECTURE.md § Failure lifecycle](../../ARCHITECTURE.md#failure-lifecycle) for the full consumer-side retry timeline and how it differs from outbox (producer-side) retries.
 
 ### Concurrency and graceful shutdown
 

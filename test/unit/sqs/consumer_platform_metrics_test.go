@@ -104,7 +104,7 @@ func TestConsumerPlatformMetrics_MalformedForwardCountedOnce(t *testing.T) {
 
 	t.Run("non-counting publisher", func(t *testing.T) {
 		reg := initPlatformMetrics(t)
-		dlq := newSignallingDLQ()
+		dlq := &nonCountingDLQ{}
 		deletes, _ := consumeOnce(t, malformed, nil, internalsqs.WithDLQPublisher(dlq))
 		eventually(t, func() bool { return deletes() == 1 }, "deleted after forward")
 		assert.InDelta(t, 1, dlqCount(t, reg, "unknown", "malformed"), 0)
@@ -192,4 +192,25 @@ func TestConsumerPlatformMetrics_PropagationFirstReceiptOnly(t *testing.T) {
 	deletes, _ := consumeOnce(t, withReceiveCount(makeSQSMessage(env), "2"), nil)
 	eventually(t, func() bool { return deletes() == 1 }, "processed")
 	assert.Zero(t, histogramCount(t, reg, "platform_event_propagation_seconds", map[string]string{"queue": testQueue}))
+}
+
+// nonCountingDLQ is a custom DLQ publisher that neither counts nor marks the
+// attribution, so the consumer must count the dead-letter itself.
+type nonCountingDLQ struct{}
+
+func (*nonCountingDLQ) SendToDLQ(context.Context, string, []byte, map[string]string, string) error {
+	return nil
+}
+func (*nonCountingDLQ) ResolveDLQ(context.Context, string) (string, error) { return "mock://dlq", nil }
+
+var _ port.DLQPublisher = (*nonCountingDLQ)(nil)
+
+// The mock DLQ publisher behaves like the SQS one: it counts the forward and
+// marks the attribution, so the consumer does not count it again.
+func TestConsumerPlatformMetrics_MockDLQCountsOnce(t *testing.T) {
+	reg := initPlatformMetrics(t)
+	malformed := sqstypes.Message{MessageId: aws.String("bad"), Body: aws.String("not json"), ReceiptHandle: aws.String("rh")}
+	deletes, _ := consumeOnce(t, malformed, nil, internalsqs.WithDLQPublisher(newSignallingDLQ()))
+	eventually(t, func() bool { return deletes() == 1 }, "deleted after forward")
+	assert.InDelta(t, 1, dlqCount(t, reg, "unknown", "malformed"), 0)
 }

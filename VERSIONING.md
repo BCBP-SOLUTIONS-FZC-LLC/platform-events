@@ -34,9 +34,11 @@ The `Envelope` JSON wire format has its own stability contract, independent of G
 
 | Class | Fields | Guarantee |
 |-------|--------|-----------|
-| **Stable** | `id`, `type`, `source`, `timestamp` | Always present on the wire; never removed, renamed, or changed in type/format |
-| **Contextual** | `tenant_id`, `trace_id`, `correlation_id`, `schema_version` | Never removed; present when set; semantics of absent value frozen |
-| **Externally governed** | `payload` | Shape owned by the publishing service; library only validates well-formed JSON |
+| **Stable** | `id`, `type`, `source`, `time` | Always present on the wire; never removed, renamed, or changed in type/format |
+| **Contextual** | `tenant_id`, `trace_id`, `correlation_id`, `specversion`, `subject`, `actor`, `dataschema`, `ip_address`, `user_agent` | Never removed; present when set; semantics of absent value frozen |
+| **Externally governed** | `data` | Shape owned by the publishing service; library only validates well-formed JSON |
+
+Wire keys follow CloudEvents naming; the Go fields are `Timestamp` (`time`), `SchemaVersion` (`specversion`), `SchemaID` (`dataschema`) and `Payload` (`data`). The full per-field table is in [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees).
 | **Reserved** | Future optional fields | Added only in MINOR releases; always `omitempty`; never break existing consumers |
 
 Any violation of these wire format guarantees — removing a stable field or changing `id` format — constitutes a MAJOR bump even if the Go API is unchanged.

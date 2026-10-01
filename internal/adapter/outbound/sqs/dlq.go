@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -454,6 +455,12 @@ func parseEnvelopeHeader(body []byte) (envelopeHeader, bool) {
 // "unknown". Only a real envelope's type is used, so a non-envelope body
 // cannot mint arbitrary event_type metric label values.
 func (p *DLQPublisher) eventTypeFor(body []byte, attrs map[string]string) string {
+	return DLQEventType(body, attrs)
+}
+
+// DLQEventType is the event_type a dead-lettered message is counted under:
+// the envelope's type, else the EventType attribute, else "unknown".
+func DLQEventType(body []byte, attrs map[string]string) string {
 	if h, ok := parseEnvelopeHeader(body); ok {
 		return h.Type
 	}
@@ -576,6 +583,9 @@ var retryableSQSErrorCodes = map[string]struct{}{
 	"ServiceUnavailable":  {},
 	"InternalFailure":     {},
 	"InternalError":       {},
+	// The SDK's code for an error response without a body — from a load
+	// balancer or endpoint in front of SQS, not SQS itself.
+	"UnknownError": {},
 }
 
 // apiErrorCode returns err's AWS API error code, or "" when it is not an API error.
@@ -607,6 +617,11 @@ func isNonExistentQueueCode(code string) bool {
 func classifySQSError(err error) error {
 	if _, ok := retryableSQSErrorCodes[apiErrorCode(err)]; ok {
 		return &domain.RetryableError{Cause: err}
+	}
+	if respErr, ok := errors.AsType[*smithyhttp.ResponseError](err); ok {
+		if status := respErr.HTTPStatusCode(); status >= 500 || status == 429 {
+			return &domain.RetryableError{Cause: err}
+		}
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {

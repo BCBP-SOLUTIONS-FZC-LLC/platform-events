@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -308,6 +310,14 @@ func TestResolveDLQ_GetQueueAttributesError(t *testing.T) {
 		"access denied": {&smithy.GenericAPIError{Code: "AccessDenied"}, false},
 		"no such queue": {&smithy.GenericAPIError{Code: "AWS.SimpleQueueService.NonExistentQueue"}, false},
 		"plain error":   {errors.New("boom"), false},
+		"empty-body 503": {&smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 503}},
+			Err:      &smithy.GenericAPIError{Code: "UnknownError"},
+		}, true},
+		"429": {&smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 429}},
+			Err:      &smithy.GenericAPIError{Code: "Whatever"},
+		}, true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

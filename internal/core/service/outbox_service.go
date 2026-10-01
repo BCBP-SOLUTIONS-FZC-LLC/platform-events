@@ -354,7 +354,7 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 			// retried without consuming an attempt; anything else counts.
 			transient := f.Retryable || f.Code == "TransportError"
 			anyTransient = anyTransient || transient
-			failed[f.ID] = failInfo{msg: truncateError(f.Message), transient: transient}
+			failed[canonicalID(f.ID)] = failInfo{msg: truncateError(f.Message), transient: transient}
 		}
 		if len(failed) < len(items) {
 			s.resetTransient() // something got through
@@ -364,7 +364,7 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 			transientDelay = s.nextTransientDelay()
 		}
 		for _, it := range items {
-			fi, ok := failed[it.rec.ID]
+			fi, ok := failed[canonicalID(it.rec.ID)]
 			switch {
 			case !ok:
 				s.markPublished(bookkeepCtx, it.rec, it.env)
@@ -379,6 +379,18 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 
 	s.handlePublishError(ctx, bookkeepCtx, err, recordsOf(items, func(it item) domain.OutboxRecord { return it.rec }))
 	return ctx.Err()
+}
+
+// canonicalID returns id in canonical UUID form when it parses, else id.
+// Failures are reported under the payload's envelope ID while rec.ID comes
+// back canonicalised from the uuid column; rows written before Enqueue
+// required canonical IDs (or replayed from the dead-letter table) can differ
+// in case or punctuation, and an unmatched failure would be marked published.
+func canonicalID(id string) string {
+	if u, err := uuid.Parse(id); err == nil {
+		return u.String()
+	}
+	return id
 }
 
 func recordsOf[T any](items []T, rec func(T) domain.OutboxRecord) []domain.OutboxRecord {

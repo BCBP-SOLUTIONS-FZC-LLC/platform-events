@@ -566,3 +566,27 @@ func TestLoadOutbox_InvalidRetryBackoff_WarnsAndDefaults(t *testing.T) {
 	assert.Contains(t, joined, "OUTBOX_RETRY_BACKOFF")
 	assert.Contains(t, joined, "OUTBOX_MAX_RETRY_BACKOFF")
 }
+
+// Quoted libpq values (spaces, escaped quotes) and spaces around "=" are
+// masked whole; other keys are kept verbatim.
+func TestMaskDSN_KeyValueQuotedPassword(t *testing.T) {
+	for _, dsn := range []string{
+		`host=db password='s3cr et' dbname=app`,
+		`host=db password = 'it\'s secret' dbname=app`,
+		`host=db PASSWD='a b c'`,
+		`host=db password='unterminated secret`,
+	} {
+		s := config.OutboxConfigEnv{DatabaseURL: dsn}.String() //nolint:gosec
+		assert.NotContains(t, s, "secret", dsn)
+		assert.NotContains(t, s, "s3cr", dsn)
+		assert.NotContains(t, s, " b c", dsn)
+		assert.Contains(t, s, "host=db", dsn)
+	}
+	s := config.OutboxConfigEnv{DatabaseURL: `host=db password='x y' dbname=app`}.String() //nolint:gosec
+	assert.Contains(t, s, "dbname=app", "keys after a quoted value are kept")
+}
+
+func TestMaskDSN_KeyValueTrailingSpace(t *testing.T) {
+	s := config.OutboxConfigEnv{DatabaseURL: "host=db password=secret   "}.String() //nolint:gosec
+	assert.NotContains(t, s, "secret")
+}

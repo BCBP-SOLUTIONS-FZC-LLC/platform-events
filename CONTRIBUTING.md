@@ -65,7 +65,7 @@ Register the new event type in [EVENT_SCHEMA_GOVERNANCE.md](EVENT_SCHEMA_GOVERNA
 - **Event types are immutable once published** — treat a published `event_type` string as a permanent contract
 - All optional fields must be tagged `json:",omitempty"`; consumers must never use `json.Decoder.DisallowUnknownFields()` on event payloads
 - No field removals, renames, type changes, or semantic changes without minting a new versioned event type
-- Adding a new optional field is non-breaking — increment `schema_version` so consumers can distinguish payload generations
+- Adding a new optional field is non-breaking — increment the schema version (`WithSchemaVersion`, wire key `specversion`) so consumers can distinguish payload generations
 
 See [EVENT_SCHEMA_GOVERNANCE.md](EVENT_SCHEMA_GOVERNANCE.md) for the full ruleset, migration window pattern, and consumer compatibility contract.
 
