@@ -7,6 +7,11 @@ type BatchFailure struct {
 	ID      string
 	Code    string
 	Message string
+	// Retryable reports a transient failure (throttling, service-side error,
+	// timeout) that says nothing about the message itself: the outbox retries
+	// it without counting an attempt. Code "TransportError" is also treated as
+	// retryable, for publishers that predate this field.
+	Retryable bool
 }
 
 // BatchError collects per-message errors from a PublishBatch call.

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"sync"
@@ -19,13 +20,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
@@ -302,6 +310,14 @@ func TestResolveDLQ_GetQueueAttributesError(t *testing.T) {
 		"access denied": {&smithy.GenericAPIError{Code: "AccessDenied"}, false},
 		"no such queue": {&smithy.GenericAPIError{Code: "AWS.SimpleQueueService.NonExistentQueue"}, false},
 		"plain error":   {errors.New("boom"), false},
+		"empty-body 503": {&smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 503}},
+			Err:      &smithy.GenericAPIError{Code: "UnknownError"},
+		}, true},
+		"429": {&smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 429}},
+			Err:      &smithy.GenericAPIError{Code: "Whatever"},
+		}, true},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -448,11 +464,10 @@ func TestSendToDLQ_SendMessageFailure(t *testing.T) {
 		err       error
 		retryable bool
 	}{
-		"throttled":       {&smithy.GenericAPIError{Code: "ThrottlingException"}, true},
-		"internal":        {&smithy.GenericAPIError{Code: "InternalError"}, true},
-		"kms throttled":   {&smithy.GenericAPIError{Code: "KmsThrottled"}, true},
-		"invalid message": {&smithy.GenericAPIError{Code: "InvalidMessageContents"}, false},
-		"kms disabled":    {&smithy.GenericAPIError{Code: "KmsDisabled"}, false},
+		"throttled":     {&smithy.GenericAPIError{Code: "ThrottlingException"}, true},
+		"internal":      {&smithy.GenericAPIError{Code: "InternalError"}, true},
+		"kms throttled": {&smithy.GenericAPIError{Code: "KmsThrottled"}, true},
+		"kms disabled":  {&smithy.GenericAPIError{Code: "KmsDisabled"}, false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -490,21 +505,29 @@ func TestSendToDLQ_ResolutionErrorPropagates(t *testing.T) {
 }
 
 func TestSendToDLQ_InvalidInput(t *testing.T) {
-	tooMany := map[string]string{}
-	for i := range 7 {
-		tooMany[string(rune('a'+i))] = "v"
-	}
 	cases := map[string]struct {
 		source string
 		body   []byte
 		attrs  map[string]string
 		reason string
 	}{
-		"empty source":        {"", []byte("x"), nil, "r"},
-		"empty body":          {dlqSourceURL, nil, nil, "r"},
-		"invalid utf8":        {dlqSourceURL, []byte{0xff, 0xfe}, nil, "r"},
-		"empty reason":        {dlqSourceURL, []byte("x"), nil, "  "},
-		"too many attrs (11)": {dlqSourceURL, []byte("x"), tooMany, "r"},
+		"empty source":       {"", []byte("x"), nil, "r"},
+		"empty body":         {dlqSourceURL, nil, nil, "r"},
+		"invalid utf8":       {dlqSourceURL, []byte{0xff, 0xfe}, nil, "r"},
+		"empty reason":       {dlqSourceURL, []byte("x"), nil, "  "},
+		"NUL in body":        {dlqSourceURL, []byte("a\x00b"), nil, "r"},
+		"control char body":  {dlqSourceURL, []byte("a\x1fb"), nil, "r"},
+		"reserved AWS. name": {dlqSourceURL, []byte("x"), map[string]string{"AWS.Trace": "v"}, "r"},
+		"reserved amazon.":   {dlqSourceURL, []byte("x"), map[string]string{"amazon.x": "v"}, "r"},
+		"leading period":     {dlqSourceURL, []byte("x"), map[string]string{".a": "v"}, "r"},
+		"trailing period":    {dlqSourceURL, []byte("x"), map[string]string{"a.": "v"}, "r"},
+		"double period":      {dlqSourceURL, []byte("x"), map[string]string{"a..b": "v"}, "r"},
+		"space in name":      {dlqSourceURL, []byte("x"), map[string]string{"a b": "v"}, "r"},
+		"name too long":      {dlqSourceURL, []byte("x"), map[string]string{strings.Repeat("a", 257): "v"}, "r"},
+		"control char value": {dlqSourceURL, []byte("x"), map[string]string{"a": "v\x01"}, "r"},
+		"invalid utf8 value": {dlqSourceURL, []byte("x"), map[string]string{"a": "\xff"}, "r"},
+		"body over 1 MiB":    {dlqSourceURL, []byte(strings.Repeat("x", 1<<20+1)), nil, "r"},
+		"body+attrs > 1 MiB": {dlqSourceURL, []byte(strings.Repeat("x", 1<<20-10)), map[string]string{"k": "vvvvv"}, "r"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -528,9 +551,277 @@ func TestSendToDLQ_AttributeLimitBoundary(t *testing.T) {
 	require.NoError(t, newTestDLQPublisher(t, client, "").SendToDLQ(context.Background(), dlqSourceURL, []byte("x"), attrs, "r"))
 	assert.Len(t, client.lastSent(t).MessageAttributes, 10)
 
-	// With ConsumerName configured the same set is one over.
-	err := newTestDLQPublisher(t, &mockDLQClient{}, "c").SendToDLQ(context.Background(), dlqSourceURL, []byte("x"), attrs, "r")
+	// With ConsumerName configured the same set is one over: rejected in
+	// strict mode, before any API call.
+	strictClient := &mockDLQClient{}
+	strict, err := internalsqs.NewDLQPublisherWithClient(internalsqs.DLQConfig{ConsumerName: "c", StrictAttributes: true}, strictClient)
+	require.NoError(t, err)
+	err = strict.SendToDLQ(context.Background(), dlqSourceURL, []byte("x"), attrs, "r")
 	require.ErrorIs(t, err, events.ErrDLQInvalidMessage)
+	assert.Contains(t, err.Error(), "11 message attributes exceeds the SQS limit of 10 (5 are reserved")
+	assert.Equal(t, int32(0), strictClient.getAttrCalls.Load())
+
+	// By default the lowest-priority caller attribute ("f") is dropped instead.
+	trimClient := &mockDLQClient{}
+	require.NoError(t, newTestDLQPublisher(t, trimClient, "c").SendToDLQ(context.Background(), dlqSourceURL, []byte("x"), attrs, "r"))
+	in := trimClient.lastSent(t)
+	assert.Len(t, in.MessageAttributes, 10)
+	assert.NotContains(t, in.MessageAttributes, "f")
+	assert.Contains(t, in.MessageAttributes, "e")
+}
+
+func TestSendToDLQ_TrimsExcessAttributesByPriority(t *testing.T) {
+	// SNS routing attributes + trace context + custom attributes: 11 caller
+	// attributes, room for 5 alongside the 5 reserved ones.
+	attrs := map[string]string{
+		"zzz": "v", "aaa": "v", "baggage": "b", "tracestate": "ts", "traceparent": "tp",
+		"Subject": "users/1", "Source": "svc", "EventID": "e-1", "TenantID": "t-1",
+		"EventType": "caller.type", // reserved name — never counts, overridden
+		"empty":     "",            // dropped, never counts
+	}
+	client := &mockDLQClient{}
+	logger := &fixtures.MockLogger{}
+	p, err := internalsqs.NewDLQPublisherWithClient(internalsqs.DLQConfig{ConsumerName: "c", Logger: logger}, client)
+	require.NoError(t, err)
+	require.NoError(t, p.SendToDLQ(context.Background(), dlqSourceURL, envelopeBody(t), attrs, "r"))
+
+	in := client.lastSent(t)
+	require.Len(t, in.MessageAttributes, 10)
+	for _, k := range []string{"TenantID", "EventID", "Source", "Subject", "traceparent"} {
+		assert.Contains(t, in.MessageAttributes, k)
+	}
+	for _, k := range []string{"tracestate", "baggage", "aaa", "zzz", "empty"} {
+		assert.NotContains(t, in.MessageAttributes, k)
+	}
+	assert.Equal(t, "order.created", attr(in, events.DLQAttrEventType))
+
+	entries := logger.Entries()
+	require.NotEmpty(t, entries)
+	assert.Equal(t, "WARN", entries[0].Level)
+	assert.Equal(t, []string{"tracestate", "baggage", "aaa", "zzz"}, entries[0].Fields["dropped_attributes"])
+}
+
+func TestSendToDLQ_ReservedNameCallerAttrsDoNotCount(t *testing.T) {
+	// 6 custom + 4 caller values under reserved names: the reserved ones are
+	// overridden, so everything fits in strict mode.
+	attrs := map[string]string{
+		events.DLQAttrReason: "x", events.DLQAttrOriginalQueue: "x", events.DLQAttrFailedAt: "x", events.DLQAttrEventType: "x",
+	}
+	for i := range 6 {
+		attrs[string(rune('a'+i))] = "v"
+	}
+	client := &mockDLQClient{}
+	p, err := internalsqs.NewDLQPublisherWithClient(internalsqs.DLQConfig{StrictAttributes: true}, client)
+	require.NoError(t, err)
+	require.NoError(t, p.SendToDLQ(context.Background(), dlqSourceURL, []byte("x"), attrs, "r"))
+	assert.Len(t, client.lastSent(t).MessageAttributes, 10)
+}
+
+func TestSendToDLQ_SanitizesReason(t *testing.T) {
+	client := &mockDLQClient{}
+	require.NoError(t, newTestDLQPublisher(t, client, "").SendToDLQ(context.Background(), dlqSourceURL, []byte("x"), nil, "bad\x00byte \xff here\nnext"))
+	assert.Equal(t, "bad\uFFFDbyte \uFFFD here\nnext", attr(client.lastSent(t), events.DLQAttrReason))
+}
+
+func TestSendToDLQ_OverSizeAfterReservedAttributes(t *testing.T) {
+	// Body alone fits; the reserved attributes push it over the limit.
+	client := &mockDLQClient{}
+	err := newTestDLQPublisher(t, client, "").SendToDLQ(context.Background(), dlqSourceURL, []byte(strings.Repeat("x", 1<<20-8)), nil, "r")
+	require.ErrorIs(t, err, events.ErrDLQInvalidMessage)
+	assert.Equal(t, int32(0), client.getAttrCalls.Load())
+}
+
+func TestSendToDLQ_SendMessageRejectsMessage(t *testing.T) {
+	for _, code := range []string{"InvalidParameterValue", "InvalidMessageContents", "InvalidAttributeName", "InvalidAttributeValue"} {
+		t.Run(code, func(t *testing.T) {
+			apiErr := &smithy.GenericAPIError{Code: code}
+			client := &mockDLQClient{sendMessageFn: func(context.Context, *sqs.SendMessageInput) (*sqs.SendMessageOutput, error) {
+				return nil, apiErr
+			}}
+			err := newTestDLQPublisher(t, client, "").SendToDLQ(context.Background(), dlqSourceURL, envelopeBody(t), nil, "r")
+			require.ErrorIs(t, err, events.ErrDLQInvalidMessage)
+			require.ErrorIs(t, err, apiErr)
+			assert.NotErrorIs(t, err, events.ErrDLQSendFailed)
+			assert.NotErrorIs(t, err, events.ErrRetryable)
+		})
+	}
+}
+
+func TestSendToDLQ_NonExistentDLQEvictsCache(t *testing.T) {
+	for _, code := range []string{"AWS.SimpleQueueService.NonExistentQueue", "QueueDoesNotExist"} {
+		t.Run(code, func(t *testing.T) {
+			var fail atomic.Bool
+			fail.Store(true)
+			client := &mockDLQClient{}
+			client.sendMessageFn = func(context.Context, *sqs.SendMessageInput) (*sqs.SendMessageOutput, error) {
+				if fail.Load() {
+					return nil, &smithy.GenericAPIError{Code: code}
+				}
+				return &sqs.SendMessageOutput{MessageId: aws.String("m")}, nil
+			}
+			p := newTestDLQPublisher(t, client, "")
+
+			err := p.SendToDLQ(context.Background(), dlqSourceURL, envelopeBody(t), nil, "r")
+			require.ErrorIs(t, err, events.ErrDLQUnresolved)
+			assert.Equal(t, int32(1), client.getAttrCalls.Load())
+
+			fail.Store(false)
+			require.NoError(t, p.SendToDLQ(context.Background(), dlqSourceURL, envelopeBody(t), nil, "r"))
+			assert.Equal(t, int32(2), client.getAttrCalls.Load(), "evicted entry must be re-resolved")
+		})
+	}
+}
+
+func TestResolveDLQ_CacheTTL(t *testing.T) {
+	clock := fixtures.NewFakeClock(time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC))
+	client := &mockDLQClient{}
+	p, err := internalsqs.NewDLQPublisherWithClient(internalsqs.DLQConfig{Clock: clock}, client)
+	require.NoError(t, err)
+
+	_, err = p.ResolveDLQ(context.Background(), dlqSourceURL)
+	require.NoError(t, err)
+	clock.Advance(15*time.Minute - time.Second)
+	_, err = p.ResolveDLQ(context.Background(), dlqSourceURL)
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), client.getAttrCalls.Load(), "within the default 15m TTL")
+
+	clock.Advance(time.Second)
+	_, err = p.ResolveDLQ(context.Background(), dlqSourceURL)
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), client.getAttrCalls.Load(), "expired entry must be re-resolved")
+}
+
+func TestResolveDLQ_CustomAndDisabledCacheTTL(t *testing.T) {
+	cases := map[string]struct {
+		ttl       time.Duration
+		wantCalls int32
+	}{
+		"custom 1m": {time.Minute, 2},
+		"disabled":  {-1, 1},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			clock := fixtures.NewFakeClock(time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC))
+			client := &mockDLQClient{}
+			p, err := internalsqs.NewDLQPublisherWithClient(internalsqs.DLQConfig{Clock: clock, CacheTTL: tc.ttl}, client)
+			require.NoError(t, err)
+			_, err = p.ResolveDLQ(context.Background(), dlqSourceURL)
+			require.NoError(t, err)
+			clock.Advance(24 * time.Hour)
+			_, err = p.ResolveDLQ(context.Background(), dlqSourceURL)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantCalls, client.getAttrCalls.Load())
+		})
+	}
+}
+
+func TestSendToDLQ_FIFO_InvalidIDCharsFallBackToHash(t *testing.T) {
+	client := &mockDLQClient{getQueueAttributesFn: func(context.Context, *sqs.GetQueueAttributesInput) (*sqs.GetQueueAttributesOutput, error) {
+		return redrivePolicyOutput(`{"deadLetterTargetArn":"` + dlqARN + `.fifo"}`), nil
+	}}
+	body := []byte(`{"id":"has space","type":"order.created","source":"svc","time":"2026-09-30T12:00:00Z"}`)
+	require.NoError(t, newTestDLQPublisher(t, client, "").SendToDLQ(context.Background(), dlqSourceURL+".fifo", body, nil, "r"))
+	sum := sha256.Sum256(body)
+	assert.Equal(t, hex.EncodeToString(sum[:]), aws.ToString(client.lastSent(t).MessageGroupId))
+}
+
+func TestSendToDLQ_CreatesSpan(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	failing := &mockDLQClient{sendMessageFn: func(context.Context, *sqs.SendMessageInput) (*sqs.SendMessageOutput, error) {
+		return nil, errors.New("boom")
+	}}
+	require.NoError(t, newTestDLQPublisher(t, &mockDLQClient{}, "").SendToDLQ(context.Background(), dlqSourceURL, envelopeBody(t), nil, "r"))
+	require.Error(t, newTestDLQPublisher(t, failing, "").SendToDLQ(context.Background(), dlqSourceURL, envelopeBody(t), nil, "r"))
+
+	spans := rec.Ended()
+	require.Len(t, spans, 2)
+	attrsOf := func(s sdktrace.ReadOnlySpan) map[string]string {
+		m := map[string]string{}
+		for _, kv := range s.Attributes() {
+			m[string(kv.Key)] = kv.Value.String()
+		}
+		return m
+	}
+	ok, bad := spans[0], spans[1]
+	assert.Equal(t, "sqs.dlq_forward", ok.Name())
+	assert.Equal(t, oteltrace.SpanKindProducer, ok.SpanKind())
+	assert.Equal(t, otelcodes.Ok, ok.Status().Code)
+	a := attrsOf(ok)
+	assert.Equal(t, "aws_sqs", a["messaging.system"])
+	assert.Equal(t, dlqURL, a["messaging.destination"])
+	assert.Equal(t, "dlq-msg-1", a["messaging.message_id"])
+	assert.Equal(t, "order.created", a["events.event_type"])
+	assert.Equal(t, dlqSourceURL, a["events.dlq.source_queue"])
+	assert.Equal(t, otelcodes.Error, bad.Status().Code)
+	assert.NotEmpty(t, bad.Events(), "error must be recorded on the span")
+}
+
+func TestSendToDLQ_PlatformMetrics(t *testing.T) {
+	reg := initPlatformMetrics(t)
+	ctx, attribution := port.WithDLQAttribution(context.Background(), "malformed")
+
+	p := newTestDLQPublisher(t, &mockDLQClient{}, "")
+	require.NoError(t, p.SendToDLQ(ctx, dlqSourceURL, envelopeBody(t), nil, "r"))
+	assert.True(t, attribution.Recorded(), "the publisher marks the message counted")
+	require.NoError(t, p.SendToDLQ(context.Background(), dlqSourceURL, envelopeBody(t), nil, "r"))
+
+	failing := &mockDLQClient{sendMessageFn: func(context.Context, *sqs.SendMessageInput) (*sqs.SendMessageOutput, error) {
+		return nil, errors.New("boom")
+	}}
+	failCtx, failAttribution := port.WithDLQAttribution(context.Background(), "malformed")
+	require.Error(t, newTestDLQPublisher(t, failing, "").SendToDLQ(failCtx, dlqSourceURL, envelopeBody(t), nil, "r"))
+	assert.False(t, failAttribution.Recorded(), "a failed forward is not counted")
+
+	assert.InDelta(t, 1, counterValue(t, reg, "platform_dlq_messages_total", map[string]string{"operation": "consume", "event_type": "order.created", "reason": "malformed"}), 0)
+	assert.InDelta(t, 1, counterValue(t, reg, "platform_dlq_messages_total", map[string]string{"operation": "consume", "event_type": "order.created", "reason": "explicit"}), 0)
+	assert.Equal(t, uint64(2), histogramCount(t, reg, "platform_dependency_request_seconds", map[string]string{"dependency": "sqs", "operation": "get_queue_attributes", "outcome": "success"}))
+	assert.Equal(t, uint64(2), histogramCount(t, reg, "platform_dependency_request_seconds", map[string]string{"dependency": "sqs", "operation": "send_message", "outcome": "success"}))
+	assert.Equal(t, uint64(1), histogramCount(t, reg, "platform_dependency_request_seconds", map[string]string{"dependency": "sqs", "operation": "send_message", "outcome": "error"}))
+}
+
+func TestSendToDLQ_TrimmedAttributesAreNotValidated(t *testing.T) {
+	// 6 valid caller attributes fill the room; "~bad name" sorts last, is
+	// dropped by trimming and therefore cannot fail the send.
+	attrs := map[string]string{"~bad name": "v"}
+	for i := range 6 {
+		attrs[string(rune('a'+i))] = "v"
+	}
+	client := &mockDLQClient{}
+	require.NoError(t, newTestDLQPublisher(t, client, "").SendToDLQ(context.Background(), dlqSourceURL, []byte("x"), attrs, "r"))
+	assert.NotContains(t, client.lastSent(t).MessageAttributes, "~bad name")
+
+	// A kept invalid attribute is still rejected.
+	err := newTestDLQPublisher(t, &mockDLQClient{}, "").SendToDLQ(context.Background(), dlqSourceURL, []byte("x"), map[string]string{"bad name": "v"}, "r")
+	require.ErrorIs(t, err, events.ErrDLQInvalidMessage)
+}
+
+func TestSendToDLQ_NonEnvelopeJSONDoesNotSetEventType(t *testing.T) {
+	// JSON with a "type"/"id" but not a full envelope (no source/time) must not
+	// mint an event_type label or a FIFO identity from arbitrary content.
+	client := &mockDLQClient{}
+	require.NoError(t, newTestDLQPublisher(t, client, "").SendToDLQ(context.Background(), dlqSourceURL, []byte(`{"id":"x","type":"attacker-controlled-123"}`), nil, "r"))
+	assert.Equal(t, "unknown", attr(client.lastSent(t), events.DLQAttrEventType))
+
+	// An SNS notification wrapper (non-raw delivery) is not an envelope either.
+	sns := []byte(`{"Type":"Notification","MessageId":"m-1","Message":"{}","Timestamp":"2026-09-30T12:00:00Z"}`)
+	require.NoError(t, newTestDLQPublisher(t, client, "").SendToDLQ(context.Background(), dlqSourceURL, sns, nil, "r"))
+	assert.Equal(t, "unknown", attr(client.lastSent(t), events.DLQAttrEventType))
+}
+
+func TestValidateDLQMessage(t *testing.T) {
+	require.NoError(t, internalsqs.ValidateDLQMessage(dlqSourceURL, []byte("ok \t\n\r \uFFFD 😀"), map[string]string{"Tenant-ID_1.x": "v", "empty": ""}, "r"))
+	err := internalsqs.ValidateDLQMessage(dlqSourceURL, []byte("x"), map[string]string{"AWS.x": "v"}, "r")
+	var dlqErr *events.DLQError
+	require.ErrorAs(t, err, &dlqErr)
+	assert.Equal(t, events.ErrDLQInvalidMessage, dlqErr.Kind)
+	assert.Equal(t, dlqSourceURL, dlqErr.SourceQueue)
+	assert.Contains(t, err.Error(), `message attribute "AWS.x"`)
 }
 
 func TestSendToDLQ_PublicConstructor(t *testing.T) {
@@ -624,7 +915,7 @@ func TestSendToDLQ_FIFO_OversizedEnvelopeIDFallsBackToHash(t *testing.T) {
 	client := &mockDLQClient{getQueueAttributesFn: func(context.Context, *sqs.GetQueueAttributesInput) (*sqs.GetQueueAttributesOutput, error) {
 		return redrivePolicyOutput(`{"deadLetterTargetArn":"arn:aws:sqs:us-east-1:123456789012:orders-dlq.fifo"}`), nil
 	}}
-	body := []byte(`{"id":"` + strings.Repeat("x", 129) + `","type":"t"}`)
+	body := []byte(`{"id":"` + strings.Repeat("x", 129) + `","type":"t","source":"svc","time":"2026-09-30T12:00:00Z"}`)
 	require.NoError(t, newTestDLQPublisher(t, client, "").SendToDLQ(context.Background(), dlqSourceURL, body, nil, "r"))
 	in := client.lastSent(t)
 	sum := sha256.Sum256(body)

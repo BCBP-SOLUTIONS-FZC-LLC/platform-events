@@ -22,6 +22,15 @@ const MigrationsTable = "inbox_migrations"
 // Logger of runner. runner is not mutated, so it can be reused for domain
 // migrations before or after this call. The DSN must point at Postgres
 // directly (not PgBouncer): the migration lock is session-scoped.
+//
+// The schema version recorded in the tracking table must exist in this
+// library's embedded migrations: since platform-pgcommon v1.4.1, a database
+// migrated by a newer platform-events (e.g. after rolling a service back to
+// an older image) makes ApplySchema fail with migrate.ErrVersionNotInSource,
+// and an interrupted migration with migrate.ErrMigrationDirty
+// (errors.Is works on the returned error). Roll back by migrating the inbox
+// schema down first, or run ApplySchema as a separate migration job rather
+// than at service startup.
 func ApplySchema(ctx context.Context, runner *migrate.Runner) error {
 	if runner == nil {
 		return fmt.Errorf("inbox: ApplySchema requires a non-nil migrate.Runner")

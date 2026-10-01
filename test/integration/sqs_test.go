@@ -29,8 +29,8 @@ func TestSQSConsumeLoop(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
-	queueURL := ls.CreateQueue(ctx, t, "consumer-test-queue")
+	emu := fixtures.StartFloci(ctx, t)
+	queueURL := emu.CreateQueue(ctx, t, "consumer-test-queue")
 
 	// Pre-load a message into the queue.
 	env := events.NewEnvelope("test.consume", "svc", json.RawMessage(`{"x":42}`),
@@ -39,7 +39,7 @@ func TestSQSConsumeLoop(t *testing.T) {
 	body, err := json.Marshal(env)
 	require.NoError(t, err)
 
-	_, err = ls.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{
+	_, err = emu.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:    aws.String(queueURL),
 		MessageBody: aws.String(string(body)),
 	})
@@ -54,7 +54,7 @@ func TestSQSConsumeLoop(t *testing.T) {
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    queueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		MaxMessages: 1,
 		WaitSeconds: 1,
 	}, handler)

@@ -22,6 +22,9 @@ type OutboxRecord struct {
 	CreatedAt   time.Time
 	ScheduledAt time.Time
 	PublishedAt *time.Time
+	// OrderingKey groups records that are published one at a time, in
+	// enqueue order ("" = unordered). Set by outbox.EnqueueOrdered.
+	OrderingKey string
 }
 
 // DeadLetterRecord is a row from outbox_dead_letters — an event that exhausted

@@ -147,9 +147,13 @@ func TestLoadOutbox_Defaults(t *testing.T) {
 	t.Setenv("OUTBOX_PUBLISH_CONCURRENCY", "")
 	t.Setenv("OUTBOX_PUBLISH_TIMEOUT", "")
 	t.Setenv("OUTBOX_DRAIN_TIMEOUT", "")
+	t.Setenv("OUTBOX_RETRY_BACKOFF", "")
+	t.Setenv("OUTBOX_MAX_RETRY_BACKOFF", "")
 	t.Setenv("DATABASE_URL", "")
 
 	cfg := config.LoadOutbox()
+	assert.Equal(t, time.Second, cfg.RetryBackoff)
+	assert.Equal(t, 5*time.Minute, cfg.MaxRetryBackoff)
 	assert.Equal(t, 5*time.Second, cfg.PollInterval)
 	assert.Equal(t, 50, cfg.BatchSize)
 	assert.Equal(t, 5, cfg.MaxAttempts)
@@ -158,7 +162,60 @@ func TestLoadOutbox_Defaults(t *testing.T) {
 	assert.Equal(t, 1, cfg.PublishConcurrency)
 	assert.Equal(t, 10*time.Second, cfg.PublishTimeout)
 	assert.Equal(t, 30*time.Second, cfg.DrainTimeout)
+	// No database env at all: pgcommon's ConfigFromEnv reports it.
+	require.Len(t, cfg.Warnings, 1)
+	assert.Contains(t, cfg.Warnings[0], "platform-pgcommon: PG_USER/PG_DBNAME")
+	assert.Empty(t, cfg.DatabaseURL)
+	require.Error(t, cfg.Validate())
+}
+
+func TestLoadOutbox_DatabaseConfigFromPgcommon(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("MIGRATION_DATABASE_URL", "")
+	t.Setenv("PG_HOST", "db.internal")
+	t.Setenv("PG_PORT", "6432")
+	t.Setenv("PG_USER", "events")
+	t.Setenv("PG_PASSWORD", "s3cret")
+	t.Setenv("PG_DBNAME", "platform")
+	t.Setenv("PG_SSLMODE", "verify-full")
+	t.Setenv("PG_MAX_CONNS", "25")
+	t.Setenv("PG_STATEMENT_TIMEOUT", "15s")
+	t.Setenv("PG_BOUNCER_MODE", "true")
+
+	cfg := config.LoadOutbox()
+	require.NotEmpty(t, cfg.DatabaseURL, "DSN built from PG_* parts by pgcommon")
+	assert.Equal(t, cfg.DB.DSN, cfg.DatabaseURL)
+	assert.Contains(t, cfg.DatabaseURL, "db.internal")
+	assert.Equal(t, int32(25), cfg.DB.MaxConns)
+	assert.Equal(t, 15*time.Second, cfg.DB.StatementTimeout)
+	assert.True(t, cfg.DB.PGBouncerMode)
+	assert.Equal(t, cfg.DatabaseURL, cfg.MigrationDatabaseURL, "falls back to the app DSN")
+	assert.NoError(t, cfg.Validate())
 	assert.Empty(t, cfg.Warnings)
+	assert.NotContains(t, cfg.String(), "s3cret")
+}
+
+func TestLoadOutbox_MigrationDatabaseURL(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://app:apppw@pgbouncer:6432/db?sslmode=require")
+	t.Setenv("MIGRATION_DATABASE_URL", "postgres://ddl:ddlpw@postgres:5432/db?sslmode=require")
+
+	cfg := config.LoadOutbox()
+	assert.Equal(t, "postgres://app:apppw@pgbouncer:6432/db?sslmode=require", cfg.DatabaseURL)
+	assert.Equal(t, "postgres://ddl:ddlpw@postgres:5432/db?sslmode=require", cfg.MigrationDatabaseURL)
+	s := cfg.String()
+	assert.NotContains(t, s, "apppw")
+	assert.NotContains(t, s, "ddlpw")
+	assert.Contains(t, s, "MigrationDatabaseURL:postgres://***@postgres:5432")
+}
+
+func TestLoadOutbox_PgcommonWarningsForwarded(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://u:p@h/db?sslmode=disable")
+	t.Setenv("PG_MAX_CONNS", "lots")
+
+	cfg := config.LoadOutbox()
+	joined := strings.Join(cfg.Warnings, "\n")
+	assert.Contains(t, joined, "platform-pgcommon: DATABASE_URL: sslmode=disable")
+	assert.Contains(t, joined, "platform-pgcommon: PG_MAX_CONNS")
 }
 
 func TestLoadOutbox_CustomValues(t *testing.T) {
@@ -170,9 +227,13 @@ func TestLoadOutbox_CustomValues(t *testing.T) {
 	t.Setenv("OUTBOX_PUBLISH_CONCURRENCY", "4")
 	t.Setenv("OUTBOX_PUBLISH_TIMEOUT", "5s")
 	t.Setenv("OUTBOX_DRAIN_TIMEOUT", "45s")
+	t.Setenv("OUTBOX_RETRY_BACKOFF", "2s")
+	t.Setenv("OUTBOX_MAX_RETRY_BACKOFF", "10m")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@host/db")
 
 	cfg := config.LoadOutbox()
+	assert.Equal(t, 2*time.Second, cfg.RetryBackoff)
+	assert.Equal(t, 10*time.Minute, cfg.MaxRetryBackoff)
 	assert.Equal(t, 2*time.Second, cfg.PollInterval)
 	assert.Equal(t, 25, cfg.BatchSize)
 	assert.Equal(t, 3, cfg.MaxAttempts)
@@ -268,7 +329,7 @@ func TestOutboxConfigEnv_String_KeyValueNonPassword(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// LoadOTel
+// LoadOTel (deprecated — kept until the next major version)
 // ---------------------------------------------------------------------------
 
 func TestLoadOTel_Defaults(t *testing.T) {
@@ -277,7 +338,7 @@ func TestLoadOTel_Defaults(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "")
 
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.Equal(t, "localhost:4317", cfg.ExporterEndpoint)
 	assert.False(t, cfg.Insecure)
 	assert.Empty(t, cfg.Warnings)
@@ -288,7 +349,7 @@ func TestLoadOTel_DevEnvSetsInsecure(t *testing.T) {
 		t.Run(env, func(t *testing.T) {
 			t.Setenv("APP_ENV", env)
 			t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "")
-			cfg := config.LoadOTel()
+			cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 			assert.True(t, cfg.Insecure)
 		})
 	}
@@ -297,7 +358,7 @@ func TestLoadOTel_DevEnvSetsInsecure(t *testing.T) {
 func TestLoadOTel_InsecureEnvTrue(t *testing.T) {
 	t.Setenv("APP_ENV", "production")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "true")
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.True(t, cfg.Insecure)
 	assert.Empty(t, cfg.Warnings)
 }
@@ -305,7 +366,7 @@ func TestLoadOTel_InsecureEnvTrue(t *testing.T) {
 func TestLoadOTel_InsecureEnvFalse(t *testing.T) {
 	t.Setenv("APP_ENV", "dev")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "false")
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.False(t, cfg.Insecure)
 	assert.Empty(t, cfg.Warnings)
 }
@@ -313,18 +374,18 @@ func TestLoadOTel_InsecureEnvFalse(t *testing.T) {
 func TestLoadOTel_InsecureEnvNumeric(t *testing.T) {
 	t.Setenv("APP_ENV", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "1")
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.True(t, cfg.Insecure)
 
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "0")
-	cfg = config.LoadOTel()
+	cfg = config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.False(t, cfg.Insecure)
 }
 
 func TestLoadOTel_InvalidInsecureEnvProducesWarning(t *testing.T) {
 	t.Setenv("APP_ENV", "")
 	t.Setenv("OTEL_EXPORTER_OTLP_INSECURE", "maybe")
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	require.NotEmpty(t, cfg.Warnings)
 	assert.Contains(t, cfg.Warnings[0], "OTEL_EXPORTER_OTLP_INSECURE")
 }
@@ -335,7 +396,7 @@ func TestLoadOTel_CustomEndpoint(t *testing.T) {
 	t.Setenv("OTEL_SERVICE_NAME", "my-service")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "collector:4317")
 
-	cfg := config.LoadOTel()
+	cfg := config.LoadOTel() //nolint:staticcheck // exercises the deprecated API
 	assert.Equal(t, "my-service", cfg.ServiceName)
 	assert.Equal(t, "collector:4317", cfg.ExporterEndpoint)
 }
@@ -493,4 +554,62 @@ func TestLoadOutbox_InvalidMaxAttempts_ProducesWarning(t *testing.T) {
 	}
 	assert.True(t, found, "expected a warning for invalid OUTBOX_MAX_ATTEMPTS")
 	assert.Equal(t, 5, cfg.MaxAttempts, "should fall back to default of 5")
+}
+
+func TestLoadOutbox_InvalidRetryBackoff_WarnsAndDefaults(t *testing.T) {
+	t.Setenv("OUTBOX_RETRY_BACKOFF", "soon")
+	t.Setenv("OUTBOX_MAX_RETRY_BACKOFF", "later")
+	cfg := config.LoadOutbox()
+	assert.Equal(t, time.Second, cfg.RetryBackoff)
+	assert.Equal(t, 5*time.Minute, cfg.MaxRetryBackoff)
+	joined := strings.Join(cfg.Warnings, "\n")
+	assert.Contains(t, joined, "OUTBOX_RETRY_BACKOFF")
+	assert.Contains(t, joined, "OUTBOX_MAX_RETRY_BACKOFF")
+}
+
+// Quoted libpq values (spaces, escaped quotes) and spaces around "=" are
+// masked whole; other keys are kept verbatim.
+func TestMaskDSN_KeyValueQuotedPassword(t *testing.T) {
+	for _, dsn := range []string{
+		`host=db password='s3cr et' dbname=app`,
+		`host=db password = 'it\'s secret' dbname=app`,
+		`host=db PASSWD='a b c'`,
+		`host=db password='unterminated secret`,
+	} {
+		s := config.OutboxConfigEnv{DatabaseURL: dsn}.String() //nolint:gosec
+		assert.NotContains(t, s, "secret", dsn)
+		assert.NotContains(t, s, "s3cr", dsn)
+		assert.NotContains(t, s, " b c", dsn)
+		assert.Contains(t, s, "host=db", dsn)
+	}
+	s := config.OutboxConfigEnv{DatabaseURL: `host=db password='x y' dbname=app`}.String() //nolint:gosec
+	assert.Contains(t, s, "dbname=app", "keys after a quoted value are kept")
+}
+
+func TestMaskDSN_KeyValueTrailingSpace(t *testing.T) {
+	s := config.OutboxConfigEnv{DatabaseURL: "host=db password=secret   "}.String() //nolint:gosec
+	assert.NotContains(t, s, "secret")
+}
+
+func TestMaskDSN_KeyValueEscapedSpaceUnquoted(t *testing.T) {
+	s := config.OutboxConfigEnv{DatabaseURL: `host=db password=top\ secret dbname=app`}.String() //nolint:gosec
+	assert.NotContains(t, s, "secret")
+	assert.Contains(t, s, "dbname=app")
+}
+
+func TestLoad_NewDurationVars(t *testing.T) {
+	t.Setenv("SQS_HANDLER_TIMEOUT", "5m")
+	t.Setenv("OUTBOX_GAUGE_INTERVAL", "30s")
+	assert.Equal(t, 5*time.Minute, config.LoadSQS().HandlerTimeout)
+	assert.Equal(t, 30*time.Second, config.LoadOutbox().GaugeInterval)
+	opts := config.SQSConsumerOptions(config.LoadSQS())
+	assert.NotEmpty(t, opts)
+
+	t.Setenv("SQS_HANDLER_TIMEOUT", "forever")
+	t.Setenv("OUTBOX_GAUGE_INTERVAL", "often")
+	sqsCfg, outboxCfg := config.LoadSQS(), config.LoadOutbox()
+	assert.Zero(t, sqsCfg.HandlerTimeout)
+	assert.Equal(t, 15*time.Second, outboxCfg.GaugeInterval)
+	assert.Contains(t, strings.Join(sqsCfg.Warnings, "\n"), "SQS_HANDLER_TIMEOUT")
+	assert.Contains(t, strings.Join(outboxCfg.Warnings, "\n"), "OUTBOX_GAUGE_INTERVAL")
 }

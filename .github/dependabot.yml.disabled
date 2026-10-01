@@ -1,7 +1,8 @@
 version: 2
 updates:
+  # Three Go modules (library, test/, tools/) — see the Makefile's module layout.
   - package-ecosystem: gomod
-    directory: /
+    directories: [/, /test, /tools]
     schedule:
       interval: weekly
     open-pull-requests-limit: 5

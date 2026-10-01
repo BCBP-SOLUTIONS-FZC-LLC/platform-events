@@ -3,8 +3,8 @@
 The platform's shared **event-driven messaging library** — the single sanctioned path for every service that publishes or consumes domain events. It owns the canonical event envelope, the SNS publisher, the SQS consumer loop, the transactional outbox, consumer-side deduplication (inbox), dead-letter forwarding, HMAC signing, and the messaging-layer observability every service would otherwise re-implement. It is consumed as a private Go module and is **never deployed on its own**.
 
 **Repository:** `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events`
-**Module:** Go 1.26.6 · private module · library only (`cmd/platform-events` is a reference CLI that validates config and prints version info, not a server — CI builds, scans and smoke-tests it as a container image)
-**Design:** Clean Architecture — public API in `pkg/`, AWS/Postgres adapters in `internal/adapter/`, SDK-free core in `internal/core/`. Design narrative, sequence diagrams and invariants: [ARCHITECTURE.md](ARCHITECTURE.md). The wire format is byte-compatible with the Python sibling [`platform-eventcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-eventcommon); the `interop` CI job enforces it.
+**Module:** Go 1.26 (`go 1.26.0`, `toolchain go1.26.8`) · private module · library only (`cmd/platform-events` is a reference CLI that validates config and prints version info, not a server — CI builds, scans and smoke-tests it as a container image)
+**Design:** Clean Architecture — public API in `pkg/`, AWS/Postgres adapters in `internal/adapter/`, SDK-free core in `internal/core/`. Design narrative, sequence diagrams and invariants: [ARCHITECTURE.md](ARCHITECTURE.md); low-level design (data model, API contract, flows, failure handling): [docs/lld/platform-events-lld.md](docs/lld/platform-events-lld.md). The wire format is byte-compatible with the Python sibling [`platform-eventcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-eventcommon); the `interop` CI job enforces it.
 
 ---
 
@@ -20,7 +20,7 @@ The platform's shared **event-driven messaging library** — the single sanction
 | `DLQPublisher` — forwarding a failed message to the queue's already-configured SQS DLQ | Reading, replaying or redriving the SQS DLQ; creating DLQs |
 | `Codec` hook + decode-only `GlueDecodeCodec` | A schema-registry client or SDK (services implement `Codec` against their own registry) |
 | HMAC-SHA256 `Sign` / `Verify` helpers | Key storage and rotation (Secrets Manager / SSM) |
-| `events_*`, `outbox_*`, `sqs_*` Prometheus metrics and OTel spans | Metric/trace exporters and providers (initialised by the consuming service) |
+| Tier 1 `platform_*` Prometheus metrics (Enterprise Platform Observability Standard; legacy `events_*` / `outbox_*` / `sqs_*` in parallel) and OTel spans | Metric/trace exporters and providers (initialised by the consuming service) |
 
 Consuming services never import `github.com/aws/aws-sdk-go-v2/service/sns` or `.../sqs` — depguard rules in service repos forbid it. Every transport operation a service needs is a `platform-events` API; if one is missing, it is added here rather than worked around in the service.
 
@@ -31,7 +31,7 @@ These hold everywhere, always. If a design requires violating one, the design ch
 | Invariant | What it means for you |
 |---|---|
 | **Delivery is at-least-once** | Every handler may be called more than once for the same `Envelope.ID`. Idempotency is not a nice-to-have. |
-| **Ordering is best-effort unless FIFO per group** | Standard SNS/SQS make no ordering promise. FIFO guarantees order only within a single `MessageGroupID`. Cross-group and cross-service ordering is never guaranteed. |
+| **Outbox ordering is opt-in** | By default the outbox does not preserve publish order (a failed record is published after later ones; replicas publish concurrently), so even FIFO does not give per-aggregate order. For per-aggregate order, enqueue with `outbox.EnqueueOrdered(…, key)`: each key's records are published one at a time, in enqueue order — see [Outbox § Ordering](docs/guides/outbox.md#ordering). |
 | **Idempotency is required for all consumers** | No configuration, queue type, or delivery mode removes this requirement. |
 | **Events are immutable once published** | An `event_type` and its payload contract are frozen on first production publish. Breaking changes require a new versioned type (`.v2`). |
 | **The producer has no knowledge of consumers** | Never check "who is listening" before publishing. Consumers come and go; the event type remains. |
@@ -53,7 +53,7 @@ Every service in the platform needs the same messaging guarantees — no lost ev
 
 **Design principles:** events are facts, not commands (producers never direct consumers) · fail fast on misconfiguration (`NewSNSPublisher` rejects an empty/invalid `TopicARN`, `NewSQSConsumer` an empty `QueueURL`, `ResolveDLQ` a missing `RedrivePolicy` — at startup, not first use) · make safe usage the default · keep business logic free from messaging plumbing · centralise cross-cutting concerns.
 
-This is enforced structurally: `internal/core/domain` and `internal/core/port` import no AWS SDK, and `pkg/*` is the only surface services can import — Go's `internal/` rule blocks the rest.
+`internal/core/domain` and `internal/core/port` import no AWS SDK (a convention checked in review), and `pkg/*` is the only surface services can import — Go's `internal/` rule blocks the rest.
 
 ---
 
@@ -68,12 +68,13 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | `Envelope[T]`, `NewEnvelope(type, source, payload, opts...)` | Typed event; UUID v7 `ID`, UTC `Timestamp`. Opts: `WithTenantID`, `WithTraceID`, `WithCorrelationID`, `WithSystemTenant`, `WithSchemaVersion`, `WithSubject`, `WithActor`, `WithIPAddress`, `WithUserAgent`, `WithSchemaID` |
 | `ParseEnvelope[T](data)`, `Envelope.JSON()` | Validate-and-decode / canonical JSON |
 | `Publisher`, `NewSNSPublisher(SNSConfig, opts...)` | `Publish` / `PublishBatch`. Opts: `WithMessageGroupID`, `WithMessageDeduplicationID`, `WithAttributes`, `WithCodec` |
-| `Consumer`, `Handler`, `NewSQSConsumer(SQSConfig, handler, opts...)` | Long-poll loop. Opts: `WithConcurrency`, `WithVisibilityTimeout`, `WithDeadLetterHandler`, `WithMaxReceiveCount`, `WithDrainTimeout`, `WithConsumerCodec` |
+| `Consumer`, `Handler`, `NewSQSConsumer(SQSConfig, handler, opts...)` | Long-poll loop (nil handler → error). Opts: `WithConcurrency`, `WithVisibilityTimeout`, `WithDeadLetterHandler`, `WithMaxReceiveCount`, `WithDrainTimeout`, `WithConsumerCodec`, `WithDLQForwarding`, `WithHandlerTimeout`, `WithQueueDepthMetrics`, `WithMalformedBodyLogging` |
+| `SourceMessageFromContext(ctx)` | The raw received message (body + attributes) inside a handler — forward this to the DLQ, never `env.JSON()` |
 | `NewSQSConsumerWithClient`, `SQSClientLike` | Inject a fake SQS client to test the consumer loop itself |
 | `TraceIDFromContext(ctx)` | Envelope `TraceID` inside a handler |
 | `Codec`, `NoopCodec`, `GlueDecodeCodec` | Schema-registry hook; decode-only Glue header stripper |
 | `Sign`, `Verify`, `SignEnvelope`, `VerifyEnvelope` | HMAC-SHA256, constant-time verify |
-| `Init`, `InitWithRegisterer` | Register Prometheus metrics |
+| `InitMetrics(MetricsIdentity, registerer, ...MetricsOption)` | Register the Tier 1 `platform_*` metrics (required `domain`/`service`/`environment` labels injected centrally) plus the legacy metrics during the compatibility period; options `WithoutLegacyMetrics()`, `WithEventTypeLimit(n)`, `WithEventTypes(...)`; `MetricsRegistry()`. `Init` / `InitWithRegisterer` are deprecated (legacy only) |
 
 ### `pkg/events` — dead-letter forwarding
 
@@ -82,37 +83,39 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | `DLQPublisher`, `NewSQSDLQPublisher(DLQConfig)` | `SendToDLQ(ctx, sourceQueueURL, body, attrs, reason)` forwards to the source queue's `RedrivePolicy` DLQ; `ResolveDLQ` fails fast at startup |
 | `NewSQSDLQPublisherWithClient`, `DLQClientLike` | Test injection (`GetQueueAttributes`, `GetQueueUrl`, `SendMessage`) |
 | `DLQAttrEventType` · `DLQAttrReason` · `DLQAttrOriginalQueue` · `DLQAttrConsumerName` · `DLQAttrFailedAt` | Standard attributes added to every forwarded message |
-| `DLQError`, `ErrDLQ*`, `ErrRetryable` | Typed errors — see [Validation and errors](#validation-and-errors) |
+| `DLQError`, `ErrDLQ*`, `ErrRetryable` | Typed errors — see [Validation and errors](#validation-and-errors). `ErrRetryable` also marks transient publish / codec failures (`BatchFailure.Retryable` in batch errors) that the outbox retries without counting attempts |
 
 ### `pkg/events/mock` — test doubles
 
 | Symbol | Purpose |
 |---|---|
-| `mock.Publisher` | `Published()`, `SetError()`, `Reset()` |
-| `mock.Consumer` | `Inject(env)` delivers synchronously to the registered handler |
-| `mock.DLQPublisher` | `Sent()`, `SetError()`, `Reset()`; `ResolveDLQ` returns `DLQURL` |
+| `mock.Publisher` | `Published()`, `SetError()`, `SetBatchError()` (partial / `Retryable` batch failures), `Reset()`; rejects envelopes without ID, Type or Source like the SNS publisher |
+| `mock.Consumer` | `Inject(env)` delivers synchronously with the real consumer's handler context: tenant GUC (RLS), trace ID, source message, dead-letter attribution |
+| `mock.DLQPublisher` | `Sent()`, `SetError()`, `Reset()`; `ResolveDLQ` returns `DLQURL`; counts the forward and marks the attribution like the SQS publisher (so inbox skips dead-lettered messages in tests too) |
 
 ### `pkg/outbox` — transactional outbox
 
 | Symbol | Purpose |
 |---|---|
-| `Enqueue(ctx, tx, env)` | Insert inside the caller's `pgx.Tx` — no SNS call; rejects payloads > 240 KB |
-| `NewRunner(Config)`, `Runner.Start` / `Stop` / `Ready` | Poll → claim (`SKIP LOCKED` + lease) → publish → mark |
+| `Enqueue(ctx, tx, env)` | Insert inside the caller's `pgcommon.Tx` — no SNS call; requires a canonical lowercase UUID `ID`; rejects payloads > 240 KB |
+| `EnqueueOrdered(ctx, tx, env, key)` | Same, with an ordering key: a key's records are published one at a time, in enqueue order — [Outbox § Ordering](docs/guides/outbox.md#ordering) |
+| `NewRunner(Config)`, `Runner.Start` / `Stop` / `Ready` | Poll → claim (`SKIP LOCKED` + lease) → publish → mark; per-record retry backoff (`RetryBackoff` / `MaxRetryBackoff`), transient failures never count toward `MaxAttempts`; re-polls while batches publish |
 | `Runner.ListDeadLetters` / `ReprocessDeadLetters` / `ReprocessDeadLettersWith` / `DiscardDeadLetters` | Inspect / replay / discard `outbox_dead_letters` (`DLQFilter`, `DeadLetterRecord`) |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Batched delete of old published rows |
-| `ApplySchema(ctx, migrateRunner)`, `MigrationsTable` | Embedded migrations `001`–`008`, isolated `outbox_migrations` tracking table |
+| `ApplySchema(ctx, migrateRunner)`, `MigrationsTable` | Embedded migrations `001`–`010`, isolated `outbox_migrations` tracking table |
 
 ### `pkg/inbox` — consumer-side deduplication
 
 | Symbol | Purpose |
 |---|---|
-| `Handler(ledger, next)` | Skips already-recorded envelope IDs; records an ID only after `next` succeeds |
-| `NewStore(pool, consumer)`, `Store.IsProcessed` / `MarkProcessed` / `Prune` | `processed_events` ledger on a `pgcommon.Pool` |
+| `Handler(ledger, next)` | Best-effort dedup: skips already-recorded envelope IDs; records an ID only after `next` succeeds (and did not dead-letter it) |
+| `NewStore(pool, consumer)`, `Store.Process(ctx, env, fn)` | `processed_events` ledger on a `pgcommon.Pool`; `Process` claims the ID inside one transaction with `fn`'s writes — exactly-once Postgres writes |
+| `Store.IsProcessed` / `MarkProcessed` / `Prune` | Ledger primitives and batched retention delete |
 | `ApplySchema`, `MigrationsTable` | Embedded schema, own `inbox_migrations` table |
 
 ### `pkg/config` — environment wiring
 
-`LoadSNS` / `LoadSQS` / `LoadOutbox` / `LoadOTel` · `SNSConfigFromEnv` · `SQSConfigFromEnv` · `SQSConsumerOptions` · `RunnerConfigFromEnv` · `LogWarnings` / `LogWarningsTo` — see [Environment variables](#environment-variables).
+`LoadSNS` / `LoadSQS` / `LoadOutbox` · `SNSConfigFromEnv` · `SQSConfigFromEnv` · `SQSConsumerOptions` · `RunnerConfigFromEnv` · `LogWarnings` / `LogWarningsTo` — see [Environment variables](#environment-variables).
 
 ---
 
@@ -125,7 +128,6 @@ Invalid configuration is rejected at construction; invalid envelopes and DLQ inp
 | `events.ErrEnvelopeIDRequired` / `ErrEnvelopeTypeRequired` / `ErrEnvelopeSourceRequired` | `ParseEnvelope` or `outbox.Enqueue` — missing `id` / `type` / `source` |
 | `events.ErrKeyTooShort` | `Sign` / `SignEnvelope` with a key < 32 bytes |
 | `events.ErrInvalidSignature` | Exported for forward-compatibility; `Verify` / `VerifyEnvelope` return `bool` |
-| `events.ErrBatchTooLarge` | Internal sentinel; `PublishBatch` splits at 10 automatically — never returned |
 | `*events.BatchError` | `PublishBatch` partial failure — one `BatchFailure{ID, Code, Message}` per failed message |
 | `events.ErrDLQInvalidMessage` | `DLQPublisher` — empty source URL / body / reason, invalid UTF-8, > 10 attributes |
 | `events.ErrDLQNotConfigured` | `DLQPublisher` — source queue has no `RedrivePolicy` |
@@ -153,7 +155,7 @@ if err := dlq.SendToDLQ(ctx, queueURL, body, nil, reason); err != nil {
 | `TopicARN` must be an SNS ARN | `NewSNSPublisher` rejects empty values and anything without an `arn:aws:sns:` / `arn:aws-cn:sns:` / `arn:aws-us-gov:sns:` prefix |
 | `VisibilityTimeout` ≤ 12 h | `NewSQSConsumer` rejects larger values (SQS hard limit) |
 | Outbox payload ≤ 240 KB | `outbox.Enqueue` rejects larger envelopes (the SNS limit is 256 KB) and null bytes in string fields |
-| Malformed message bodies are not retried | Deleted immediately, counted as `events_consumed_total{status="malformed"}` |
+| Malformed message bodies are not retried | Counted as `platform_messages_failed_total{reason="malformed"}` (legacy `events_consumed_total{status="malformed"}`); forwarded verbatim to the queue's DLQ with `WithDLQForwarding`, otherwise deleted immediately |
 | `WithMaxReceiveCount(n)` must be **lower** than the queue's `RedrivePolicy` `maxReceiveCount` | Otherwise SQS moves the message before the dead-letter handler runs — see [Forwarding to the SQS DLQ](docs/guides/consuming.md#forwarding-to-the-sqs-dlq) |
 | DLQ forwards carry authoritative metadata | `DLQReason`, `OriginalQueue`, `FailedAt`, `ConsumerName` override caller values; `DLQReason` capped at 1 KiB |
 | `last_error` is bounded | Truncated to 512 chars in `outbox_events` / `outbox_dead_letters` |
@@ -166,32 +168,35 @@ Clean Architecture — dependencies point inward; the core never imports an adap
 
 ```
 platform-events/
-├── cmd/platform-events/               # Reference CLI — prints version info (make build → bin/platform-events)
+├── cmd/platform-events/               # Reference CLI — prints version + resolved config, -strict validates (make build → bin/platform-events)
 ├── pkg/                               # Public API — the only packages services may import
-│   ├── events/                        # Envelope, Publisher, Consumer, DLQPublisher, Codec, GlueDecodeCodec, HMAC, metrics Init
+│   ├── events/                        # Envelope, Publisher, Consumer, DLQPublisher, Codec, GlueDecodeCodec, HMAC, InitMetrics / MetricsRegistry
 │   │   └── mock/                      # mock.Publisher, mock.Consumer, mock.DLQPublisher
-│   ├── outbox/                        # Enqueue, Runner, dead-letter API, ApplySchema + embedded migrations/
-│   ├── inbox/                         # processed_events ledger, Handler wrapper, ApplySchema + migrations/
+│   ├── outbox/                        # Enqueue, EnqueueOrdered, Runner, dead-letter API, ApplySchema + embedded migrations/ (001–010)
+│   ├── inbox/                         # processed_events ledger (Store.Process, Handler), ApplySchema + migrations/
 │   └── config/                        # Env loaders + wiring helpers
 ├── internal/
 │   ├── core/
 │   │   ├── domain/                    # Envelope, OutboxRecord, DLQFilter, DLQError, sentinel errors — no external deps
-│   │   ├── port/                      # Publisher, Consumer, Codec, Logger, Clock, OutboxStore interfaces
-│   │   └── service/                   # OutboxService, HMACService
+│   │   ├── port/                      # Publisher, Consumer, Codec, Logger, Clock, OutboxStore, DLQPublisher, DLQAttribution, SourceMessage
+│   │   └── service/                   # OutboxService (publish cycle, retry/backoff classification), HMACService
 │   └── adapter/outbound/
-│       ├── sns/                       # SNS publisher, batch split, retryable-error classification
-│       ├── sqs/                       # SQS consumer loop + DLQ publisher (RedrivePolicy resolution + cache)
-│       ├── outboxstore/               # Postgres outbox store (pgx via platform-pgcommon)
-│       ├── metrics/                   # Prometheus counters / histograms / gauges
-│       └── logger/                    # Zap → port.Logger adapter
+│       ├── sns/                       # SNS publisher, batch split (10 entries / 256 KiB), failure classification
+│       ├── sqs/                       # SQS consumer loop, DLQ publisher (RedrivePolicy resolution + cache), queue-depth sampler
+│       ├── outboxstore/               # Postgres outbox store (platform-pgcommon only)
+│       └── metrics/                   # Tier 1 platform_* + legacy metrics; registry.go = Platform Observability Registry entry
 ├── docs/
 │   ├── architecture/mermaid/          # 13 × .mmd diagram sources (embedded in ARCHITECTURE.md)
-│   └── guides/                        # Detailed how-to guides (linked throughout this README)
+│   ├── guides/                        # Detailed how-to guides (linked throughout this README)
+│   ├── lld/                           # Low-level design (platform-events-lld.md)
+│   └── observability/                 # Observability standard: model, generated metrics registry, runbook
+├── monitoring/                        # Reference bundle: prometheus/ (rules, SLO, alerts, promtool tests), grafana/ (dashboard), kubernetes/ (KEDA)
 ├── scripts/merge_coverage.py          # Merges per-suite coverage profiles (max-count)
 ├── .github/workflows/ + scripts/      # CI: ci, validate-test, validate-quality, changelog-check, release
 ├── Dockerfile · .docker-digests       # Reference-CLI image (digest-pinned) for CI build / Trivy / smoke
 ├── .githooks/pre-commit               # tidy (+ drift check) + fmt-check + lint; installed via `make setup`
-└── test/                              # unit/ (no Docker), integration/ + e2e/ (testcontainers), smoke/ (live AWS), fixtures/
+├── test/                              # own module: unit/ (no Docker), integration/ + e2e/ (testcontainers: one shared floci per package), smoke/ (live AWS), fixtures/
+└── tools/                             # own module: golangci-lint (go tool -modfile=tools/go.mod)
 ```
 
 ### Dependency rules
@@ -201,26 +206,28 @@ platform-events/
 | `internal/core/domain` | Nothing internal; no AWS SDK |
 | `internal/core/port` | `domain` only |
 | `internal/core/service` | `domain`, `port` |
-| `internal/adapter/outbound/*` | `domain`, `port`, `metrics`; the AWS SDK and pgx are confined here |
+| `internal/adapter/outbound/*` | `domain`, `port`, `metrics`; the AWS SDK is confined here (pgx is never imported — platform-pgcommon only) |
 | `pkg/*` | Adapters and core; re-exports the public surface via type aliases |
 | `cmd/`, `test/` | Everything above |
+
+The layer rules are a convention checked in review; CI enforces the depguard rule `pgcommon-only` (no `pgx`, `database/sql` or `golang-migrate` imports anywhere but `test/smoke`), and Go's `internal/` rule keeps services on `pkg/`.
 
 ### Storage and messaging
 
 | Concern | Technology | Notes |
 |---|---|---|
-| **Outbound events** | AWS SNS (standard or FIFO) | Attributes `EventType` · `TenantID` · `Source` · `EventID` · `Subject` for filter policies; `PublishBatch` splits at 10 |
-| **Inbound events** | AWS SQS | Long poll (≤ 20 s), `ApproximateReceiveCount`-based dead-letter routing; `RawMessageDelivery=true` required on SNS subscriptions |
+| **Outbound events** | AWS SNS (standard or FIFO) | Attributes `EventType` · `TenantID` · `Source` · `EventID` · `Subject` for filter policies; `PublishBatch` splits at 10 entries and 256 KiB per request |
+| **Inbound events** | AWS SQS | Long poll (≤ 20 s), visibility extended from receipt, `ApproximateReceiveCount`-based dead-letter routing; `RawMessageDelivery=true` required on SNS subscriptions |
 | **Dead letters (producer)** | Postgres `outbox_dead_letters` | Records that exhausted `MaxAttempts`; managed via the `Runner` DLQ API |
 | **Dead letters (consumer)** | The queue's SQS DLQ | Via `RedrivePolicy`, or forwarded explicitly with `DLQPublisher` |
-| **Outbox / inbox** | PostgreSQL via `platform-pgcommon` | `outbox_events`, `outbox_dead_letters`, `processed_events`; own migration tracking tables |
+| **Outbox / inbox** | PostgreSQL via `platform-pgcommon` | `outbox_events` (with optional per-key ordering), `outbox_dead_letters`, `processed_events`; own migration tracking tables |
 | **Schema registry** | Pluggable `Codec` | No SDK dependency; `GlueDecodeCodec` strips the AWS Glue header on consume |
 
 ### Shared library dependencies
 
 | Library | Version | Purpose |
 |---|---|---|
-| `platform-pgcommon` | v1.1.0 | `pgcommon.Pool`, `RunInTx`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas |
+| `platform-pgcommon` | v1.4.3 | `pgcommon.Pool`, `RunInTx`, `ConfigFromEnv`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas, `Tx`/`Conn`/`Rows` aliases (pgx is never imported directly) |
 | `platform-gincommon` | — (not a dependency) | Interface-compatible only: its `ZapLogger` satisfies `port.Logger`, and its `RequestContext` supplies `TenantID` / `TraceID` for envelopes |
 
 ---
@@ -261,7 +268,7 @@ Every domain event tied to a DB write goes through `outbox.Enqueue` inside `pgco
 
 ### 4. Idempotency
 
-Wrap handlers with `inbox.Handler(store, next)`, or use the `processed_events ... ON CONFLICT DO NOTHING` pattern inside the handler's transaction — [Implementing idempotency](docs/guides/consuming.md#implementing-idempotency).
+Wrap handlers with `inbox.Handler(store, next)` (best-effort: the check, the handler and the record are separate transactions), or — for Postgres writes — run them through `store.Process(ctx, env, func(ctx, tx) error {…})`, which claims the ID inside the handler's transaction so the writes happen exactly once. Neither records a message the handler dead-lettered, so a DLQ redrive is processed — [Implementing idempotency](docs/guides/consuming.md#implementing-idempotency).
 
 ### 5. Dead-letter forwarding
 
@@ -273,7 +280,7 @@ Producers pass `WithCodec`; consumers of Glue-encoded events pass `WithConsumerC
 
 ### 7. Wire format
 
-SNS→SQS subscriptions **must** use `RawMessageDelivery=true` — without it the consumer deletes every message as malformed. The body is the envelope JSON; with a codec, `data` is a base64 string and `dataschema` holds the schema version ID. Envelope compatibility classes: [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees).
+SNS→SQS subscriptions **must** use `RawMessageDelivery=true` — without it every message is an SNS notification wrapper, which the consumer treats as malformed (forwarded to the DLQ with `WithDLQForwarding`, otherwise deleted) and never passes to the handler. The body is the envelope JSON; with a codec, `data` is a base64 string and `dataschema` holds the schema version ID. Envelope compatibility classes: [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees).
 
 ### 8. Handling errors
 
@@ -281,7 +288,7 @@ See [Validation and errors](#validation-and-errors). For what a handler should r
 
 ### 9. Testing in your service
 
-Use `pkg/events/mock` — no LocalStack needed: [Testing in consuming services](docs/guides/testing-in-services.md). To test consumer-loop behaviour itself, inject a fake client with `NewSQSConsumerWithClient` — [Testing with an injected client](docs/guides/consuming.md#testing-with-an-injected-client).
+Use `pkg/events/mock` — no AWS emulator needed: [Testing in consuming services](docs/guides/testing-in-services.md). To test consumer-loop behaviour itself, inject a fake client with `NewSQSConsumerWithClient` — [Testing with an injected client](docs/guides/consuming.md#testing-with-an-injected-client).
 
 ### 10. Background work you should schedule
 
@@ -300,8 +307,8 @@ Production defaults, backpressure tuning and the service adoption checklist: [Op
 
 ### Prerequisites
 
-- Go 1.26.6+
-- Docker — testcontainers-go starts LocalStack + Postgres for the integration and e2e suites; `make docker-up` for manual runs
+- Go 1.26+ (the `toolchain go1.26.8` line makes the go command fetch 1.26.8 automatically for this repository's own builds; consumers are not pinned to a patch release)
+- Docker — testcontainers-go starts floci (`floci/floci:2.1.0`) + Postgres for the integration and e2e suites; `make docker-up` for manual runs
 - `GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*` (`GONOSUMDB` too) and an SSH key registered with the BCBP org — the Makefile exports both
 
 ### Setup
@@ -312,8 +319,12 @@ cd platform-events
 make setup       # copies .env-example → .env and installs .githooks/pre-commit (run once)
 make tidy        # go mod tidy
 make test-unit   # no Docker needed
-make docker-up   # optional: LocalStack (SNS + SQS) on :4566 + Postgres on :5432
+make docker-up   # optional: floci (SNS + SQS) on :4574, floci-ui on :4505, Postgres on :5538
 ```
+
+### Module layout
+
+Three Go modules, the same layout as platform-pgcommon, so consuming services inherit only what the library itself imports: `.` (the library), `test/` (every suite and fixture; `replace …platform-events => ../`) and `tools/` (golangci-lint, run through `go tool -modfile=tools/go.mod`). The library's `go.mod` went from 289 to 55 lines, and testcontainers and the linter's dependency tree are gone from it. White-box tests beside the sources (`internal/core/service/*_test.go`) stay in the root module. `make tidy`, `vet`, `lint`, `mod-verify` and every `test-*` target cover all three modules.
 
 ### Common commands
 
@@ -324,19 +335,25 @@ make docker-up   # optional: LocalStack (SNS + SQS) on :4566 + Postgres on :5432
 | `make tidy` / `make fmt` / `make fmt-check` | Go basics; `fmt-check` mirrors CI and does not modify files |
 | `make vet` | `go vet` — default build plus every test build tag (`integration`, `e2e`) |
 | `make lint` | `golangci-lint` via `go tool` — default build plus every test build tag |
+| `make metrics-lint` | Observability Standard gate: registered-collector conformance (tiers, naming, required labels, vocabulary, registry parity), governance of rule files, dashboards and autoscaling manifests, inventory drift |
+| `make metrics-doc` | Regenerate `docs/observability/metrics-registry.md` from the metrics registry |
+| `make rules-check` | `promtool check rules` + alert unit tests for `monitoring/prometheus/` (Docker) |
+| `make dashboards-check` | PromQL syntax gate for `monitoring/grafana/*.json`: every panel and variable query checked with promtool (Docker, jq) |
+| `make docs-check` | Diagram drift gate: every `docs/architecture/mermaid/*.mmd` embedded byte-identically in `ARCHITECTURE.md` |
+| `make pin-base-images` | Re-pin every image this repository runs by digest: Dockerfile, promtool, docker-compose, testcontainers fixtures (recorded in `.docker-digests`) |
 | `make mod-verify` | `go mod verify` |
 | `make vuln-check` | `govulncheck` (pinned version) on `./internal/...` + `./pkg/...` |
 | `make test` | Unit + integration in parallel (Docker required; e2e is separate) |
 | `make test-ci` | Unit + integration + e2e in parallel with `-race`; per-suite profiles in `.coverage/`, merged into `coverage.out` (used in CI) |
 | `make test-unit` | Unit tests only, no Docker |
-| `make test-integration` (alias `test-int`) | Integration tests — LocalStack + Postgres via testcontainers |
+| `make test-integration` (alias `test-int`) | Integration tests — floci + Postgres via testcontainers |
 | `make test-e2e` | Full outbox pipeline: Postgres → runner → SNS → SQS → consumer |
 | `make test-smoke` | Live AWS (`SMOKE_SNS_TOPIC_ARN` / `SMOKE_SQS_QUEUE_URL`) — manual, never in CI |
 | `make race` | All three suites with `-race`, no coverage merge |
 | `make build` | Compile `bin/platform-events` and verify library packages compile |
 | `make cover` / `make cover-func` | Coverage HTML report / per-function summary (runs `test-ci`) |
-| `make ci` | `tidy` + `fmt-check` + `vet` + `lint` + `test-ci` + `build` |
-| `make docker-up` / `make docker-down` | Start/stop LocalStack + Postgres |
+| `make ci` | `tidy` + `mod-verify` + `fmt-check` + `vet` + `lint` + `docs-check` + `metrics-lint` + `rules-check` + `dashboards-check` + `test-ci` + `build` — the same gates as CI |
+| `make docker-up` / `make docker-down` | Start/stop floci + floci-ui + Postgres (demo topology provisioned) |
 | `make docker-build` | Build the reference-CLI image the way CI does (needs `GO_PRIVATE_TOKEN`) |
 | `make pin-base-images` | Re-pin the Dockerfile base-image digests (updates `Dockerfile` + `.docker-digests`) |
 | `make godoc` | Serve package docs via pkgsite at http://localhost:8080 |
@@ -347,9 +364,10 @@ When suites run in parallel their logs interleave; a failing suite re-prints its
 ### Running a single test
 
 ```bash
-go test ./test/unit/sqs/...    -run TestSendToDLQ_Success_PopulatesAttributes -v
-go test ./test/integration/... -tags=integration -run TestDLQPublisher_ForwardsToRedriveTarget -v
-go test -short ./test/integration/...   # -short skips every test that needs Docker
+cd test   # the suites are their own module
+go test ./unit/sqs/...    -run TestSendToDLQ_Success_PopulatesAttributes -v
+go test ./integration/... -tags=integration -run TestDLQPublisher_ForwardsToRedriveTarget -v
+go test -short -tags=integration ./integration/...   # -short skips every test that needs Docker
 ```
 
 ### Developer tools
@@ -363,7 +381,7 @@ go test -short ./test/integration/...   # -short skips every test that needs Doc
 ### How the pipeline works
 
 ```
-service write ──(same pgx.Tx)──▶ outbox_events (Postgres)
+service write ──(same pgcommon.Tx)──▶ outbox_events (Postgres)
                                         │
                               outbox.Runner (PollInterval, default 5 s)
                                         │
@@ -378,38 +396,51 @@ service write ──(same pgx.Tx)──▶ outbox_events (Postgres)
 ### Step 1 — Start infrastructure
 
 ```bash
-make docker-up    # LocalStack (SNS + SQS) on :4566, Postgres (platform_events_dev) on :5432
+make docker-up    # floci (SNS + SQS) on :4574, floci-ui on http://localhost:4505, Postgres (platform_events_dev) on :5538
 ```
 
-### Step 2 — Create a topic, queue and subscription
+[floci](https://floci.io) is the open-source (MIT), always-free AWS emulator the platform uses instead of LocalStack, the same as iam-org-membership. Its ready hook, `scripts/init-floci.sh`, provisions a demo topology that `.env-example` already points at:
+
+| Resource | Name |
+|---|---|
+| SNS topic | `platform-events-demo` (`SNS_TOPIC_ARN`) |
+| SQS queue | `platform-events-demo-q` (`SQS_QUEUE_URL`), subscribed with `RawMessageDelivery=true` |
+| DLQ | `platform-events-demo-q-dlq`, the demo queue's `RedrivePolicy` target (`maxReceiveCount=5`), for exercising `DLQPublisher` / `WithDLQForwarding` |
+
+The host ports are unique across the org's local stacks, so platform-events runs alongside any IAM service. Override them with `FLOCI_PORT`, `FLOCI_UI_PORT` and `POSTGRES_PORT`.
+
+### Step 2 — Verify the topology
 
 ```bash
-export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 AWS_ENDPOINT_URL=http://localhost:4566
-TOPIC=$(aws sns create-topic --name demo-events --query TopicArn --output text)
-QUEUE=$(aws sqs create-queue --queue-name demo-q --query QueueUrl --output text)
-QARN=$(aws sqs get-queue-attributes --queue-url "$QUEUE" --attribute-names QueueArn --query Attributes.QueueArn --output text)
-aws sns subscribe --topic-arn "$TOPIC" --protocol sqs --notification-endpoint "$QARN" \
-  --attributes RawMessageDelivery=true
+docker compose exec floci aws --region us-east-1 sns list-topics
+docker compose exec floci aws --region us-east-1 sqs list-queues
 ```
 
-### Step 3 — Give the queue a DLQ (to exercise `DLQPublisher`)
+`--region` is required: the CLI in the floci image defaults to `us-east-1`, and floci treats region as an isolation boundary. From the host, use `AWS_ENDPOINT_URL=http://localhost:4574` with credentials `test` / `test`.
+
+### Step 3 — Watch delivery in the browser (floci-ui)
+
+Open **http://localhost:4505** → **Integration → SQS**. The **Messages** column shows live counts per queue. Publish a test event and refresh to see it land on `platform-events-demo-q`:
 
 ```bash
-DLQ=$(aws sqs create-queue --queue-name demo-q-dlq --query QueueUrl --output text)
-DLQARN=$(aws sqs get-queue-attributes --queue-url "$DLQ" --attribute-names QueueArn --query Attributes.QueueArn --output text)
-aws sqs set-queue-attributes --queue-url "$QUEUE" \
-  --attributes "{\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"$DLQARN\\\",\\\"maxReceiveCount\\\":\\\"5\\\"}\"}"
+docker compose exec floci aws --region us-east-1 sns publish \
+  --topic-arn arn:aws:sns:us-east-1:000000000000:platform-events-demo \
+  --message '{"id":"demo-1","type":"demo.thing.happened"}' \
+  --message-attributes 'EventType={DataType=String,StringValue=demo.thing.happened}'
 ```
+
+floci-ui shows queue and topic metadata, not message bodies. Use the CLI in Step 4 for those.
 
 ### Step 4 — Inspect messages
 
 ```bash
+Q=http://floci:4566/000000000000/platform-events-demo-q
 # Peek without deleting — the message becomes visible again after the visibility timeout.
-aws sqs receive-message --queue-url "$QUEUE" --max-number-of-messages 10 --message-attribute-names All \
-  | jq -r '.Messages[] | .Body | fromjson'
+docker compose exec floci aws --region us-east-1 sqs receive-message --queue-url "$Q" \
+  --max-number-of-messages 10 --message-attribute-names All
 
 # Forwarded poison messages carry DLQReason / OriginalQueue / FailedAt / ConsumerName.
-aws sqs receive-message --queue-url "$DLQ" --message-attribute-names All
+docker compose exec floci aws --region us-east-1 sqs receive-message --queue-url "$Q-dlq" --message-attribute-names All
 ```
 
 ### Step 5 — Inspect the outbox
@@ -439,36 +470,41 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 - **`test/e2e/outbox_test.go`** — the full outbox pipeline end to end, including `TestOutbox_RollbackDoesNotPublish`: a rolled-back transaction's event must never be published.
 - **`test/integration/outboxstore_test.go`** — claiming, attempt counting and dead-lettering against real Postgres.
 - **`test/unit/sqs/consumer_test.go`** — consumer-loop semantics: retry-vs-delete, visibility extension, drain, and dead-letter routing on `ApproximateReceiveCount > n`.
-- **`test/unit/sqs/dlq_test.go`** + **`test/integration/dlq_test.go`** — `RedrivePolicy` parsing, ARN resolution, caching, error classification, and a real LocalStack forward.
+- **`test/unit/sqs/dlq_test.go`** + **`test/integration/dlq_test.go`** — `RedrivePolicy` parsing, ARN resolution, caching, error classification, and a real forward against floci.
 - **Interop** — `platform-interop-tests` checks `Envelope` JSON and HMAC canonicalisation byte-for-byte against the Python library.
 
 ### Coverage
 
-CI (`ci.yml` → `make cover-func`) fails below **95%** total, measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live under `test/`, a separate package tree, so every run uses `-coverpkg`; `make test-ci` merges the unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.0%** (verified 2026-09-30).
+CI (`Validate / Test`: `make test-ci`, then `.github/scripts/coverage-gate.sh`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **99.0%** (verified 2026-10-01).
 
 ---
 
 ## Environment variables
 
-Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox` / `LoadOTel`). The library reads nothing implicitly — services opt in by calling the loaders.
+Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings via platform-pgcommon's `ConfigFromEnv`). The library reads nothing implicitly — services opt in by calling the loaders. The two exceptions follow platform-pgcommon exactly: `InitMetrics` fills an empty metrics `environment` from `APP_ENV` → `ENVIRONMENT` → `dev`, and `MetricsIdentityFromEnv` takes `service` from `APP_NAME`. **Tracing and logging are configured by the service, not this library:** the `OTEL_*` variables are read by platform-gincommon's `InitTracingFromEnv` (platform-events only uses the global tracer provider it installs), and every component logs through the `port.Logger` the service injects (e.g. gincommon's `ZapLogger`). `config.LoadOTel` is deprecated.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `AWS_REGION` | `us-east-1` | SNS and SQS clients |
-| `AWS_ENDPOINT_URL` | — | `http://localhost:4566` for LocalStack |
+| `AWS_ENDPOINT_URL` | — | `http://localhost:4574` for the local floci stack |
 | `SNS_TOPIC_ARN` | — | Required for the SNS publisher |
 | `SQS_QUEUE_URL` | — | Required for the SQS consumer |
 | `SQS_MAX_MESSAGES` / `SQS_WAIT_SECONDS` | `10` / `20` | Batch size (1–10) / long-poll duration |
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | ≥ 2× p99 handler duration; ≤ 12 h |
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
-| `SQS_MAX_RECEIVE_COUNT` | `0` (unset) | `WithMaxReceiveCount`; must be **below** the queue's `RedrivePolicy` `maxReceiveCount`, and only takes effect with `WithDeadLetterHandler` |
+| `SQS_MAX_RECEIVE_COUNT` | `0` (unset) | `WithMaxReceiveCount`; must be **below** the queue's `RedrivePolicy` `maxReceiveCount`. Takes effect with `WithDeadLetterHandler` and/or `WithDLQForwarding`, either of which defaults it to 5 when unset |
+| `SQS_HANDLER_TIMEOUT` | — (off) | `WithHandlerTimeout`: cancels a handler's context after this long and stops extending its message's visibility, so a hung handler's message is redelivered instead of held forever |
+| `OUTBOX_GAUGE_INTERVAL` | `15s` | How often the runner refreshes the backlog gauges (two `COUNT` queries capped at 100k rows), independent of `OUTBOX_POLL_INTERVAL` |
+| `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | `WithQueueDepthMetrics`: samples `platform_queue_depth` / `platform_dlq_depth` every interval (min 10s). Needs `sqs:GetQueueAttributes` on the queue and its DLQ; skipped when `InitMetrics` hasn't run |
 | `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` | `5s` / `50` / `5` | Runner cadence, batch size, attempts before dead-letter |
 | `OUTBOX_CLAIM_LEASE_DURATION` | `10m` (store default when unset) | How long a claimed record is hidden from other runners |
 | `OUTBOX_STARTUP_JITTER` | `0` | Use `5s`–`10s` with multiple replicas |
 | `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_DRAIN_TIMEOUT` | `1` / `10s` / `30s` | `1` uses SNS `PublishBatch`; per-record timeout; `Stop()` wait bound |
-| `DATABASE_URL` | — | Postgres DSN for the outbox runner |
-| `OTEL_SERVICE_NAME` / `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_INSECURE` | — / `localhost:4317` / `false` | Insecure is forced `true` when `APP_ENV` is `dev` / `development` / `local` |
-| `APP_ENV` | — | Environment gate for OTel insecure mode |
+| `OUTBOX_RETRY_BACKOFF` / `OUTBOX_MAX_RETRY_BACKOFF` | `1s` / `5m` | Delay before a failed record's next attempt: base·2^(attempt−1), capped, with jitter. Transport errors, throttling and timeouts never count toward `MAX_ATTEMPTS`; they back off together and reset on the next successful publish |
+| `DATABASE_URL` | — | Postgres DSN for the outbox runner. Read by platform-pgcommon's `ConfigFromEnv` (exposed as `config.LoadOutbox().DB`); alternatively `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE`. Pool tuning (`PG_MAX_CONNS`, `PG_STATEMENT_TIMEOUT`, `PG_LOCK_TIMEOUT`, `PG_BOUNCER_MODE`, …) per platform-pgcommon |
+| `MIGRATION_DATABASE_URL` | `DATABASE_URL` | DDL-role DSN for `ApplySchema`, connecting directly (not via PgBouncer) — `config.LoadOutbox().MigrationDatabaseURL` |
+| `APP_ENV` → `ENVIRONMENT` / `APP_NAME` | `dev` / — | Metrics `environment` / `service` labels when not set on `MetricsIdentity` (same as platform-pgcommon) |
+| `OTEL_*` | — | Not read by platform-events — platform-gincommon's `InitTracingFromEnv` in the service reads them (`config.LoadOTel` is deprecated) |
 | `SMOKE_SNS_TOPIC_ARN` / `SMOKE_SQS_QUEUE_URL` | — | `make test-smoke` only |
 
 `DLQConfig` (`Region`, `EndpointURL`, `ConsumerName`) has no env loader — wire it from the service's own config. Copy `.env-example` to `.env` via `make setup`.
@@ -492,15 +528,20 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox` / `LoadOTel`). The li
 
 ### Metrics
 
-Call `events.Init(serviceName, buildVersion)` once at startup (`InitWithRegisterer` in tests). Every metric carries a `service` label.
+platform-events implements the **Enterprise Platform Observability Standard**. As a cross-domain platform library, all of its metrics are Tier 1 `platform_*`. Call `events.InitMetrics` once at startup, with the same registerer and identity you pass to platform-pgcommon's `pgmetrics.InitWithIdentity`:
 
-- **Publish:** `events_published_total{topic,event_type,status}`, `events_publish_duration_seconds`, `events_codec_encode_total` / `events_codec_encode_duration_seconds`.
-- **Consume:** `events_consumed_total{queue,event_type,status}` (`success` / `error` / `malformed` / `dlq_success` / `dlq_error`), `events_consume_duration_seconds`, `events_codec_decode_total` / `events_codec_decode_duration_seconds`, `events_inbox_duplicates_total{consumer}`, `events_dlq_forwarded_total{queue,event_type,status}`.
-- **Outbox:** `outbox_pending_total`, `outbox_leased_total`, `outbox_published_total`, `outbox_attempts_total`, `outbox_dead_letters_total`, `outbox_dead_letters_reprocessed_total`, `outbox_dead_letters_discarded_total`, `outbox_poll_errors_total`, `outbox_unmarshal_errors_total`, `outbox_mark_published_errors_total`.
-- **SQS infrastructure:** `sqs_receive_errors_total`, `sqs_delete_errors_total`, `sqs_visibility_extension_errors_total`.
-- **Hygiene:** `events_oversized_event_type_label_total` (event types > 128 bytes are replaced with `__oversized__`).
+```go
+warnings, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "event-consumer", Version: buildVersion}, registry)
+// err: invalid identity / legacy registration failure. warnings: a platform_* metric the
+// registry refused (e.g. an existing platform_retry_total with other labels) — disabled, not fatal.
+```
 
-Full table with alert guidance: [Observability](docs/guides/observability.md#prometheus-metrics). Day-one alerts: [Operations](docs/guides/operations.md#recommended-production-defaults).
+- **Consume (Canonical):** `platform_messages_received_total{queue}`, `platform_messages_processed_total{queue,event_type}`, `platform_messages_failed_total{queue,event_type,reason}`, `platform_retry_total{operation,event_type}`, `platform_dlq_messages_total{operation,event_type,reason}`. Each delivery is received once and ends processed, failed or dead-lettered, and a dead-lettered message is counted once whoever forwarded it.
+- **Proposed** (shadow-emitted until ratified): `platform_queue_depth` / `platform_dlq_depth` (opt-in: `WithQueueDepthMetrics`, the only way services can get SQS depth into Prometheus), `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}` (SNS, SQS and codec calls), `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
+- **Legacy** (Deprecated, emitted in parallel until `WithoutLegacyMetrics()`): `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info`.
+- **Required labels** `domain`, `service`, `environment` on every Tier 1 metric; `queue` / `topic` are names, never URLs or ARNs; `tenant_id`, `event_id` and other unbounded labels are prohibited.
+
+Registry, label vocabulary and ratification packets: [docs/observability/metrics-registry.md](docs/observability/metrics-registry.md) (generated). Model, wiring and migration: [docs/observability/README.md](docs/observability/README.md). Reference rules, SLO and alerts: [`monitoring/prometheus/`](monitoring/prometheus/), with [runbook](docs/observability/runbook.md). Reference dashboard: [`monitoring/grafana/`](monitoring/grafana/). Reference autoscaling: [`monitoring/kubernetes/`](monitoring/kubernetes/). CI enforces all of it (`make metrics-lint`, `make rules-check`).
 
 ### Tracing and logs
 
@@ -531,9 +572,10 @@ git push origin v1.5.0     # triggers release.yml
 
 Five workflow files, mirroring `iam-org-membership` — the org's reference pipeline, whose job names are the required status checks on `main`:
 
+- **`docs.yml`** — on docs-only changes to `ARCHITECTURE.md` / `docs/architecture/**` (which `ci.yml` skips): the diagram sync check.
 - **`ci.yml`** — orchestrator on push / PR to `main`. `Validate / Test`, `Validate / Quality` and `Build image (cache)` run in parallel; `Trivy CVE scan` and `Smoke tests` gate on the test job and the image; `Cross-language compatibility` (`platform-interop-tests`) gates on the test job; `PR summary` posts one status comment per PR; on push to `main`, `Push image → GHCR` publishes and Cosign-signs the reference-CLI image. Docs-only commits (`**.md`, `docs/architecture/**`, `docs/guides/**`) skip the pipeline.
-- **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 95%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
-- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make vuln-check` → Dockerfile digest-pinning check.
+- **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 97%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
+- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make dashboards-check` (dashboard PromQL) → `make docs-check` (diagram sync) → `make vuln-check` → digest-pinning check (Dockerfile, docker-compose and the testcontainers images).
 - **`changelog-check.yml`** — fails a PR touching `internal/`, `pkg/` or `cmd/` without a `CHANGELOG.md` update.
 - **`release.yml`** — on `v*.*.*` tags: the same job graph as `ci.yml` plus verify / binaries / publish — see [Releasing](#releasing).
 
@@ -557,10 +599,11 @@ Five workflow files, mirroring `iam-org-membership` — the org's reference pipe
 
 | Container | Image | Host port | Purpose |
 |---|---|---|---|
-| `localstack` | `localstack/localstack:4` | `4566` | SNS + SQS (`us-east-1`, credentials `test` / `test`) |
-| `postgres` | `postgres:16-alpine` | `5432` | Outbox / inbox store (`postgres` / `postgres`, DB `platform_events_dev`) |
+| `floci` | `floci/floci:2.1.0-compat` | `4574` (`FLOCI_PORT`) | SNS + SQS (`us-east-1`, account `000000000000`, credentials `test` / `test`); `scripts/init-floci.sh` provisions the demo topic, queue and DLQ |
+| `floci-ui` | `floci/floci-ui:0.5.0` | `4505` (`FLOCI_UI_PORT`) | Web console for floci: queues, topics, live message counts |
+| `postgres` | `postgres:16-alpine` | `5538` (`POSTGRES_PORT`) | Outbox / inbox store (`postgres` / `postgres`, DB `platform_events_dev`) |
 
-`make docker-up` / `make docker-down` start and stop both. The integration and e2e suites do **not** need them — testcontainers-go starts its own isolated containers per run (the Makefile exports `DOCKER_HOST` for Docker Desktop's user socket).
+`make docker-up` / `make docker-down` start and stop them. Host ports are unique across the org's local stacks, so this runs alongside pgcommon's and every IAM service's. The integration and e2e suites do **not** need them — testcontainers-go starts its own isolated containers per run (the Makefile exports `DOCKER_HOST` for Docker Desktop's user socket).
 
 ### The reference-CLI image
 
@@ -620,12 +663,14 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, adding adapters, t
 |---|---|
 | [`.claude/CLAUDE.md`](.claude/CLAUDE.md) | Guidance for Claude Code working in this repo |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Layer model, sequence diagrams, failure lifecycle, invariants, performance |
+| [`docs/lld/platform-events-lld.md`](docs/lld/platform-events-lld.md) | Low-level design: data model, public API contract, flows, retry classification, configuration, observability |
+| [`docs/observability/`](docs/observability/README.md) | Observability standard: tier model, generated metrics registry, runbook |
 | [`docs/README.md`](docs/README.md) | Mermaid diagram index and how to keep diagrams in sync |
 | [`docs/guides/quick-start.md`](docs/guides/quick-start.md) | End-to-end service wiring |
 | [`docs/guides/envelope.md`](docs/guides/envelope.md) | Envelope construction, serialisation, payload typing |
 | [`docs/guides/publishing.md`](docs/guides/publishing.md) | Publishing rules, anti-patterns, SNS publisher |
 | [`docs/guides/consuming.md`](docs/guides/consuming.md) | Handler contract, errors, poison messages, DLQ forwarding, idempotency |
-| [`docs/guides/outbox.md`](docs/guides/outbox.md) | Outbox wiring, dead letters, pruning, replay |
+| [`docs/guides/outbox.md`](docs/guides/outbox.md) | Outbox wiring, retries, ordering, dead letters, pruning, replay |
 | [`docs/guides/codec.md`](docs/guides/codec.md) | Schema-registry `Codec` hook |
 | [`docs/guides/hmac.md`](docs/guides/hmac.md) | HMAC helpers |
 | [`docs/guides/observability.md`](docs/guides/observability.md) | Metrics, tracing, logging correlation |

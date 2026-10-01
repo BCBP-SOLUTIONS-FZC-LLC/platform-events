@@ -1,38 +1,37 @@
 graph TD
     subgraph pub["Public API  —  pkg/"]
-        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nCodec · NoopCodec · GlueDecodeCodec · WithCodec · WithConsumerCodec\nSQSClientLike\nDLQPublisher · NewSQSDLQPublisher · DLQConfig · DLQClientLike · DLQAttr*\nDLQError · ErrDLQ* · ErrRetryable\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.Publisher · mock.Consumer · mock.DLQPublisher"]
-        inbox_pkg["pkg/inbox\nHandler(ledger, next) · Ledger\nStore · NewStore · IsProcessed · MarkProcessed · Prune · DefaultPruneBatch\nApplySchema · MigrationsTable (inbox_migrations)"]
-        outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
+        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nCodec · NoopCodec · GlueDecodeCodec · WithCodec · WithConsumerCodec\nSQSClientLike\nDLQPublisher · NewSQSDLQPublisher · DLQConfig · DLQClientLike · DLQAttr*\nDLQError · ErrDLQ* · ErrRetryable\nSign · Verify · SignEnvelope · VerifyEnvelope\nInitMetrics · MetricsIdentity · WithEventTypes · WithEventTypeLimit\nInit · InitWithRegisterer (deprecated)\nmock.Publisher · mock.Consumer · mock.DLQPublisher"]
+        inbox_pkg["pkg/inbox\nHandler(ledger, next) · Ledger\nStore · NewStore · Process · IsProcessed · MarkProcessed · Prune · DefaultPruneBatch\nApplySchema · MigrationsTable (inbox_migrations)"]
+        outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · EnqueueOrdered · ApplySchema · MigrationsTable · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 
     subgraph cli["CLI  —  cmd/"]
-        cmd["cmd/platform-events\nversion info"]
+        cmd["cmd/platform-events\nversion + resolved config · -strict"]
     end
 
     subgraph adapters["Adapters  —  internal/adapter/outbound/"]
-        sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · PublisherOption · WithCodec\nencodeEnvelopePayload · wrapIfRetryable"]
-        sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch\nConsumerOption · WithCodec · decodeCodecPayload\nvisibility extension · drain\nper-call receive timeout\nDLQPublisher · ResolveDLQ · SendToDLQ\nRedrivePolicy lookup + cache · classifySQSError"]
-        outboxstore_adp["outboxstore\nStore · Enqueue · ClaimBatch\nMarkPublished · MarkFailed · PrunePublished\nLeasedCount · ListDeadLetters · ReprocessDeadLetters\nReprocessDeadLettersWith · DiscardDeadLetters"]
-        metrics_adp["metrics\nPrometheus counters & histograms\nEventsPublishedTotal · EventsPublishDuration\nEventsConsumedTotal · EventsConsumeDuration\nCodecEncodeTotal · CodecEncodeDuration · CodecDecodeTotal · CodecDecodeDuration\nOutboxPendingTotal · OutboxPublishedTotal\nOutboxAttemptsTotal · OutboxDeadLettersTotal\nOutboxLeasedTotal · OutboxDeadLettersReprocessedTotal · OutboxDeadLettersDiscardedTotal\nSQSReceiveErrorsTotal · SQSDeleteErrorsTotal · SQSVisibilityErrorsTotal\nDLQForwardedTotal · InboxDuplicatesTotal\nOutboxPollErrorsTotal · OutboxUnmarshalErrorsTotal · OutboxMarkPublishedErrorsTotal\nOversizedEventTypeLabelTotal"]
-        logger_adp["logger\nZapLogger → port.Logger\n(map-based fields; gincommon-compatible)"]
+        sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · BatchFailure.Retryable · PublisherOption · WithCodec\nbatch split (10 entries / 256 KiB) · sendBatch\nencodeEnvelopePayload · wrapIfRetryable · requestFailure"]
+        sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch · HandlerContext\nConsumerOption · WithHandlerTimeout · WithDLQPublisher\nvisibilityExtender (from receipt) · drain · hand-back\nenvelope validation · handleMalformed\nDLQPublisher · ResolveDLQ · SendToDLQ\nRedrivePolicy lookup + cache · classifySQSError\nqueue-depth sampler"]
+        outboxstore_adp["outboxstore\nStore · InsertRecord · ClaimBatch\nMarkPublished · MarkFailed · ReleaseLease\nPendingCount · LeasedCount · BlockedCount · OldestPendingAge\nPromoteWaiting (per-key ordering) · PrunePublished\nListDeadLetters · ReprocessDeadLetters(With) · DiscardDeadLetters"]
+        metrics_adp["metrics\nregistry.go — Platform Observability Registry entry\nInitWithIdentity · Identity · SanitizeEventType (cap, UTF-8)\nTier 1 platform_* collectors (Canonical + Proposed)\nlegacy events_* / outbox_* / sqs_* collectors (Deprecated)"]
     end
 
     subgraph core["Core  —  internal/core/"]
-        port_pkg["port\nPublisher · Consumer · Handler\nCodec · NoopCodec\nLogger · Clock\nOutboxStore · LeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
-        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord · DLQFilter · DeadLetterRecord\nWrapCodecPayload · UnwrapCodecPayload\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge\nErrRetryable · RetryableError\nDLQError · ErrDLQNotConfigured · ErrDLQInvalidRedrivePolicy\nErrDLQUnresolved · ErrDLQSendFailed · ErrDLQInvalidMessage"]
-        service_pkg["service\nOutboxService · HMACService\nSign · Verify\nLeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
+        port_pkg["port\nPublisher · Consumer · Handler\nCodec · NoopCodec · DLQPublisher\nLogger · Clock\nOutboxStore (MarkFailed · ReleaseLease · counts · PromoteWaiting · DLQ ops)\nDLQAttribution · SourceMessage\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
+        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord · DLQFilter · DeadLetterRecord\nWrapCodecPayload · UnwrapCodecPayload\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature\nErrRetryable · RetryableError\nDLQError · ErrDLQNotConfigured · ErrDLQInvalidRedrivePolicy\nErrDLQUnresolved · ErrDLQSendFailed · ErrDLQInvalidMessage"]
+        service_pkg["service\nOutboxService · PublishBatch · retry classification\nper-record backoff · shared transient backoff\nHMACService · Sign · Verify"]
     end
 
     subgraph infra["Infrastructure"]
-        config_pkg["pkg/config\nLoadSNS · LoadSQS · LoadOutbox · LoadOTel\nRunnerConfigFromEnv · SQSConsumerOptions"]
-        migs_pkg["pkg/outbox/migrations\nembed.FS  (*.sql)"]
+        config_pkg["pkg/config\nLoadSNS · LoadSQS · LoadOutbox\nRunnerConfigFromEnv · SQSConsumerOptions"]
+        migs_pkg["pkg/outbox/migrations · pkg/inbox/migrations\nembed.FS (outbox 001–010, inbox 001)"]
     end
 
     subgraph tests["Tests  —  test/"]
         test_unit["unit/\nno Docker · pure Go"]
         test_int["integration/\ntestcontainers-go · tag: integration"]
-        test_e2e["e2e/\nLocalStack + Postgres · tag: e2e\nfull outbox + SNS/SQS pipeline"]
-        fixtures["fixtures/\nMockLogger · MockPublisher · MockConsumer\nFakeClock · LocalStack bootstrap · NewTestDB"]
+        test_e2e["e2e/\nfloci + Postgres · tag: e2e\nfull outbox + SNS/SQS pipeline"]
+        fixtures["fixtures/\nMockLogger · MockPublisher · MockConsumer\nFakeClock · floci bootstrap · NewTestDB"]
     end
 
     events_pkg    --> port_pkg
@@ -55,7 +54,6 @@ graph TD
     sqs_adp       --> metrics_adp
     outboxstore_adp --> port_pkg
     outboxstore_adp --> domain_pkg
-    logger_adp    --> port_pkg
     service_pkg   --> port_pkg
     service_pkg   --> domain_pkg
     cmd           --> config_pkg

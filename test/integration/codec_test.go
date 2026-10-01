@@ -50,23 +50,23 @@ func TestCodecRoundTrip_SNSPublish_SQSConsume(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
+	emu := fixtures.StartFloci(ctx, t)
 
 	// Two queues subscribed to the same topic: inspectQueueURL is read directly
 	// with the raw SQS client to assert the wire format; consumeQueueURL is
 	// driven by a real events.Consumer to assert decoded handler behaviour.
 	// Using separate queues avoids a manual ReceiveMessage and the Consumer's
 	// own poll loop racing for the same single message.
-	topicARN := ls.CreateTopic(ctx, t, "codec-test-topic")
-	inspectQueueURL := ls.CreateQueue(ctx, t, "codec-test-inspect-queue")
-	consumeQueueURL := ls.CreateQueue(ctx, t, "codec-test-consume-queue")
-	ls.SubscribeQueueToTopic(ctx, t, topicARN, inspectQueueURL)
-	ls.SubscribeQueueToTopic(ctx, t, topicARN, consumeQueueURL)
+	topicARN := emu.CreateTopic(ctx, t, "codec-test-topic")
+	inspectQueueURL := emu.CreateQueue(ctx, t, "codec-test-inspect-queue")
+	consumeQueueURL := emu.CreateQueue(ctx, t, "codec-test-consume-queue")
+	emu.SubscribeQueueToTopic(ctx, t, topicARN, inspectQueueURL)
+	emu.SubscribeQueueToTopic(ctx, t, topicARN, consumeQueueURL)
 
 	pub, err := events.NewSNSPublisher(events.SNSConfig{
 		TopicARN:    topicARN,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 	}, events.WithCodec(fakeReversingCodec{}))
 	require.NoError(t, err)
 
@@ -80,7 +80,7 @@ func TestCodecRoundTrip_SNSPublish_SQSConsume(t *testing.T) {
 
 	// Inspect the raw SQS message: the wire format must reflect the codec —
 	// dataschema set, data a base64 JSON string.
-	out, err := ls.SQSClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+	out, err := emu.SQSClient.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(inspectQueueURL),
 		MaxNumberOfMessages: 1,
 		WaitTimeSeconds:     5,
@@ -113,7 +113,7 @@ func TestCodecRoundTrip_SNSPublish_SQSConsume(t *testing.T) {
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    consumeQueueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		MaxMessages: 1,
 		WaitSeconds: 1,
 	}, handler, events.WithConsumerCodec(fakeReversingCodec{}))

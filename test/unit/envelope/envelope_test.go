@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
@@ -320,4 +321,22 @@ func TestEnvelope_JSON_UsesDataKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(b), `"data":`)
 	assert.NotContains(t, string(b), `"payload":`)
+}
+
+// Decoding rejects a field of the wrong type (well-formed JSON, so it reaches
+// UnmarshalJSON — malformed syntax is rejected by encoding/json before it) and
+// accepts an envelope with no data field (payload left at its zero value), for
+// both the public and domain types.
+func TestEnvelopeUnmarshal_InvalidJSONAndMissingData(t *testing.T) {
+	var pub events.Envelope[json.RawMessage]
+	require.Error(t, json.Unmarshal([]byte(`{"id": 1}`), &pub))
+	require.NoError(t, json.Unmarshal([]byte(`{"id":"e-1","type":"a.b.c","source":"svc","time":"2026-10-01T00:00:00Z"}`), &pub))
+	assert.Equal(t, "e-1", pub.ID)
+	assert.Nil(t, pub.Payload)
+
+	var dom domain.Envelope[json.RawMessage]
+	require.Error(t, json.Unmarshal([]byte(`{"id": 1}`), &dom))
+	require.NoError(t, json.Unmarshal([]byte(`{"id":"e-2","type":"a.b.c","source":"svc"}`), &dom))
+	assert.Equal(t, "e-2", dom.ID)
+	assert.Nil(t, dom.Payload)
 }

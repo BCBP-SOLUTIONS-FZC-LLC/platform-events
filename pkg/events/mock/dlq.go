@@ -5,6 +5,9 @@ import (
 	"maps"
 	"sync"
 
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
+	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
@@ -18,6 +21,12 @@ type DLQMessage struct {
 
 // DLQPublisher is a thread-safe in-memory DLQPublisher for use in unit tests.
 // ResolveDLQ returns DLQURL (default "mock://dlq").
+//
+// SendToDLQ validates its input exactly as the SQS publisher does before any
+// AWS call — empty source queue URL, body or reason; characters SQS does not
+// allow; invalid attribute names; over 1 MiB of body plus attributes — and
+// returns the same *events.DLQError (ErrDLQInvalidMessage) without recording
+// the message, so a call that would fail in production fails in tests too.
 type DLQPublisher struct {
 	DLQURL string
 
@@ -26,12 +35,19 @@ type DLQPublisher struct {
 	err  error
 }
 
-// SendToDLQ records the message and returns any configured error.
-func (m *DLQPublisher) SendToDLQ(_ context.Context, sourceQueueURL string, body []byte, attrs map[string]string, reason string) error {
+// SendToDLQ records the message and returns any configured error. Like the
+// SQS publisher, a recorded message is counted in platform_dlq_messages_total
+// (when platform metrics are initialised) and marks the handler context's
+// dead-letter attribution, so the consumer does not count it again and inbox
+// does not record it as processed.
+func (m *DLQPublisher) SendToDLQ(ctx context.Context, sourceQueueURL string, body []byte, attrs map[string]string, reason string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.err != nil {
 		return m.err
+	}
+	if err := internalsqs.ValidateDLQMessage(sourceQueueURL, body, attrs, reason); err != nil {
+		return err
 	}
 	m.sent = append(m.sent, DLQMessage{
 		SourceQueueURL: sourceQueueURL,
@@ -39,6 +55,9 @@ func (m *DLQPublisher) SendToDLQ(_ context.Context, sourceQueueURL string, body 
 		Attrs:          maps.Clone(attrs),
 		Reason:         reason,
 	})
+	attribution := port.DLQAttributionFromContext(ctx)
+	metrics.IncDLQ("consume", internalsqs.DLQEventType(body, attrs), attribution.Reason())
+	attribution.MarkRecorded()
 	return nil
 }
 

@@ -7,7 +7,6 @@ graph LR
     sqs(["adapter/outbound/sqs"])
     outboxstore(["adapter/outbound/outboxstore"])
     metrics(["adapter/outbound/metrics"])
-    logger(["adapter/outbound/logger"])
     service(["core/service"])
     port(["core/port"])
     domain(["core/domain  (internal)"])
@@ -35,6 +34,5 @@ graph LR
     sqs          --> metrics
     outboxstore  --> port
     outboxstore  --> domain
-    logger       --> port
     service      --> port
     service      --> domain

@@ -6,7 +6,6 @@ import (
 	"context"
 	"testing"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -31,7 +30,7 @@ func closedPoolStore(t *testing.T) (*outboxstore.Store, context.Context) {
 func enqueueRecord(t *testing.T, store *outboxstore.Store, pool *pgcommon.Pool) domain.OutboxRecord {
 	t.Helper()
 	rec := makeRecord("closed.pool.event")
-	err := pgcommon.RunInTx(context.Background(), pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(context.Background(), pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
@@ -96,7 +95,7 @@ func TestOutboxStore_MarkFailed_ClosedPool_Error(t *testing.T) {
 	}
 	store, ctx := closedPoolStore(t)
 
-	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000002"}, "error", 5)
+	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000002"}, "error", 5, 0)
 	require.Error(t, err)
 }
 
@@ -111,7 +110,7 @@ func TestOutboxStore_MarkFailed_ClosedPool_AfterEnqueue_Error(t *testing.T) {
 	rec := enqueueRecord(t, store, pool)
 	pool.Close()
 
-	err := store.MarkFailed(ctx, rec, "publish failed", 5)
+	err := store.MarkFailed(ctx, rec, "publish failed", 5, 0)
 	require.Error(t, err)
 }
 

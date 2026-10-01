@@ -8,10 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
@@ -29,13 +30,24 @@ type mockOutboxStore struct {
 	records   []domain.OutboxRecord
 	published map[string]bool
 	failed    map[string]string
-	claimErr  error
+	released  map[string]string
+	// pendingCalls counts PendingCount queries (gauge refreshes).
+	pendingCalls int
+	oldestAge    time.Duration
+	oldestErr    error
+	blocked      int64
+	blockedErr   error
+	promoted     int64
+	promoteErr   error
+	claimErr     error
+	claims       int // ClaimBatch calls, for tests that watch the poll loop
 }
 
 func newMockOutboxStore() *mockOutboxStore {
 	return &mockOutboxStore{
 		published: make(map[string]bool),
 		failed:    make(map[string]string),
+		released:  make(map[string]string),
 	}
 }
 
@@ -45,7 +57,7 @@ func (s *mockOutboxStore) setClaimErr(err error) {
 	s.claimErr = err
 }
 
-func (s *mockOutboxStore) Enqueue(_ context.Context, _ pgx.Tx, rec domain.OutboxRecord) error {
+func (s *mockOutboxStore) Enqueue(_ context.Context, _ pgcommon.Tx, rec domain.OutboxRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = append(s.records, rec)
@@ -55,6 +67,7 @@ func (s *mockOutboxStore) Enqueue(_ context.Context, _ pgx.Tx, rec domain.Outbox
 func (s *mockOutboxStore) ClaimBatch(_ context.Context, n int) ([]domain.OutboxRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.claims++
 	if s.claimErr != nil {
 		return nil, s.claimErr
 	}
@@ -77,13 +90,35 @@ func (s *mockOutboxStore) MarkPublished(_ context.Context, id string) error {
 	return nil
 }
 
-func (s *mockOutboxStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, _ int) error {
+func (s *mockOutboxStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, _ int, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failed[rec.ID] = lastError
 	return nil
 }
 
+func (s *mockOutboxStore) ReleaseLease(_ context.Context, id, lastError string, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.released[id] = lastError
+	return nil
+}
+
+func (s *mockOutboxStore) OldestPendingAge(context.Context) (time.Duration, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.oldestAge, s.oldestErr
+}
+func (s *mockOutboxStore) PromoteWaiting(context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.promoted, s.promoteErr
+}
+func (s *mockOutboxStore) BlockedCount(context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.blocked, s.blockedErr
+}
 func (s *mockOutboxStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *mockOutboxStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
 func (s *mockOutboxStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
@@ -102,6 +137,7 @@ func (s *mockOutboxStore) DiscardDeadLetters(_ context.Context, _ domain.DLQFilt
 func (s *mockOutboxStore) PendingCount(_ context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pendingCalls++
 	return int64(len(s.records)), nil
 }
 
@@ -606,8 +642,8 @@ func TestApplySchema_ValidDSN_CoversDSNManipulation(t *testing.T) {
 }
 
 func TestApplySchema_ValidDSN_AlreadyHasMigrationsTable(t *testing.T) {
-	// When the DSN already contains x-migrations-table, dsnWithMigrationsTable
-	// must not override the existing value (the !q.Has() == false branch).
+	// An explicit x-migrations-table in the DSN is replaced with
+	// outbox_migrations (sharing the service's table would collide versions).
 	runner := &migrate.Runner{DSN: "postgres://localhost:5432/testdb?x-migrations-table=custom_migrations"}
 	err := outbox.ApplySchema(context.Background(), runner)
 	require.Error(t, err) // DB connection fails — expected
@@ -1539,3 +1575,317 @@ func TestRunner_DiscardDeadLetters_FilteredByFailedBefore(t *testing.T) {
 // ----------------------------
 // drainTicker: exercises the <-ticker.C drain branch after backoff
 // ----------------------------
+
+// After a ticker-path poll failure the runner backs off (1s) and then resumes
+// regular polling: the ticker is reset and claims continue.
+func TestRunner_TickerPollFails_BackoffThenResumes(t *testing.T) {
+	store := newMockOutboxStore()
+	pub := &mockPublicPublisher{inner: &fixtures.MockPublisher{}}
+	logger := &fixtures.MockLogger{}
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: pub, Logger: logger, PollInterval: 20 * time.Millisecond})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() { startDone <- r.Start(ctx) }()
+	defer func() { cancel(); require.NoError(t, <-startDone) }()
+
+	time.Sleep(10 * time.Millisecond)
+	store.setClaimErr(errors.New("transient db error"))
+	require.Eventually(t, func() bool {
+		for _, e := range logger.Entries() {
+			if e.Level == "ERROR" {
+				return true
+			}
+		}
+		return false
+	}, 3*time.Second, 5*time.Millisecond, "ticker-path poll failure")
+
+	store.setClaimErr(nil)
+	store.mu.Lock()
+	before := store.claims
+	store.mu.Unlock()
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.claims >= before+3
+	}, 4*time.Second, 10*time.Millisecond, "polling resumes at the regular interval after the backoff")
+}
+
+// TestRunner_ReadyBeforeStart: the documented `go runner.Start(ctx);
+// <-runner.Ready()` pattern can call Ready before Start runs; that channel must
+// still be closed by the first poll.
+func TestRunner_ReadyBeforeStart(t *testing.T) {
+	r, err := outbox.NewRunner(outbox.Config{
+		Store:        newMockOutboxStore(),
+		Publisher:    &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+		PollInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	ready := r.Ready() // before Start
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ready channel obtained before Start was never closed")
+	}
+	cancel()
+	<-done
+
+	// A restart replaces the closed channel; the new cycle closes it too.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan struct{})
+	go func() { defer close(done2); _ = r.Start(ctx2) }()
+	require.Eventually(t, func() bool {
+		select {
+		case <-r.Ready():
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+	cancel2()
+	<-done2
+}
+
+// The backlog gauges refresh on GaugeInterval, not every poll: a fast poll
+// must not multiply the COUNT queries on the database.
+func TestRunner_GaugesRefreshOnTheirOwnInterval(t *testing.T) {
+	metrics.InitWithRegisterer("gauge-interval", "v0", prometheus.NewRegistry())
+	store := newMockOutboxStore()
+	r, err := outbox.NewRunner(outbox.Config{
+		Store:         store,
+		Publisher:     &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+		PollInterval:  10 * time.Millisecond,
+		GaugeInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	require.Eventually(t, func() bool { store.mu.Lock(); defer store.mu.Unlock(); return store.claims >= 10 }, 5*time.Second, 5*time.Millisecond)
+	cancel()
+	<-done
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Equal(t, 1, store.pendingCalls, "one refresh on the first poll, none after within GaugeInterval")
+}
+
+// The oldest-pending-age gauge is refreshed with the backlog gauges; a failed
+// query leaves it unchanged and is counted.
+func TestRunner_OldestPendingAgeGauge(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "runner-test", Environment: "dev"}, reg)
+	require.NoError(t, err)
+	t.Cleanup(func() { metrics.InitWithRegisterer("runner-reset", "v0", prometheus.NewRegistry()) })
+
+	run := func(store *mockOutboxStore) {
+		r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}}, PollInterval: time.Hour})
+		require.NoError(t, err)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { defer close(done); _ = r.Start(ctx) }()
+		<-r.Ready()
+		cancel()
+		<-done
+	}
+	gauge := func() float64 {
+		mfs, err := reg.Gather()
+		require.NoError(t, err)
+		for _, mf := range mfs {
+			if mf.GetName() == "platform_outbox_oldest_pending_age" {
+				return mf.GetMetric()[0].GetGauge().GetValue()
+			}
+		}
+		return -1
+	}
+	store := newMockOutboxStore()
+	store.oldestAge = 90 * time.Second
+	run(store)
+	assert.InDelta(t, 90, gauge(), 0)
+
+	failing := newMockOutboxStore()
+	failing.oldestErr = errors.New("db down")
+	run(failing)
+	assert.InDelta(t, 90, gauge(), 0, "a failed query leaves the last value")
+}
+
+// The runner keeps polling while batches publish, so a
+// key's backlog drains in one tick instead of one record per PollInterval;
+// and it samples the ordering-blocked gauge.
+func TestRunner_RepollsWhilePublishingAndGauges(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "strict-test", Environment: "dev"}, reg)
+	require.NoError(t, err)
+	t.Cleanup(func() { metrics.InitWithRegisterer("runner-reset", "v0", prometheus.NewRegistry()) })
+
+	store := newMockOutboxStore()
+	store.blocked = 2
+	for range 3 {
+		env := domain.NewEnvelope("user.updated", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		store.records = append(store.records, domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload, OrderingKey: "user/a"})
+	}
+	r, err := outbox.NewRunner(outbox.Config{
+		Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+		BatchSize: 1, PollInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return len(store.published) == 3
+	}, 5*time.Second, 5*time.Millisecond, "all three drained in the first tick (PollInterval is 1h)")
+	cancel()
+	<-done
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "platform_outbox_ordering_blocked_events" {
+			found = true
+			assert.InDelta(t, 2, mf.GetMetric()[0].GetGauge().GetValue(), 0)
+		}
+	}
+	assert.True(t, found)
+}
+
+// Failed gauge queries are logged and leave the gauges unchanged.
+func TestRunner_GaugeQueryErrorsLogged(t *testing.T) {
+	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "gauge-err", Environment: "dev"}, prometheus.NewRegistry())
+	require.NoError(t, err)
+	t.Cleanup(func() { metrics.InitWithRegisterer("runner-reset", "v0", prometheus.NewRegistry()) })
+	store := newMockOutboxStore()
+	store.blockedErr = errors.New("db down")
+	store.oldestErr = errors.New("db down")
+	logger := &fixtures.MockLogger{}
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+		Logger: logger, PollInterval: time.Hour})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	<-r.Ready()
+	cancel()
+	<-done
+	var msgs []string
+	for _, e := range logger.Entries() {
+		msgs = append(msgs, e.Message)
+	}
+	assert.Contains(t, msgs, "outbox: failed to query ordering-blocked count")
+	assert.Contains(t, msgs, "outbox: failed to query oldest pending age")
+}
+
+// transientBatchPublisher fails every record with a retryable error.
+type transientBatchPublisher struct{}
+
+func (transientBatchPublisher) Publish(context.Context, events.Envelope[json.RawMessage]) error {
+	return events.ErrRetryable
+}
+func (transientBatchPublisher) PublishBatch(_ context.Context, envs []events.Envelope[json.RawMessage]) error {
+	be := &events.BatchError{}
+	for _, e := range envs {
+		be.Failures = append(be.Failures, events.BatchFailure{ID: e.ID, Code: "Throttled", Retryable: true})
+	}
+	return be
+}
+
+// During an outage the immediate re-poll must not become a claim-and-fail
+// loop: a batch that published nothing (or failed transiently) ends the tick.
+func TestRunner_NoRepollOnTransientFailure(t *testing.T) {
+	store := newMockOutboxStore()
+	for range 20 {
+		env := domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		store.records = append(store.records, domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload})
+	}
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: transientBatchPublisher{}, BatchSize: 2, PollInterval: time.Hour})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	<-r.Ready()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	<-done
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Equal(t, 1, store.claims, "one claim this tick — no re-poll after a transient failure")
+}
+
+// The waiting-record sweep runs with the gauges; promotions and failures are logged.
+func TestRunner_PromoteWaitingSweepLogged(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		promoted int64
+		err      error
+		want     string
+	}{
+		{"promoted", 2, nil, "outbox: promoted ordered records left waiting"},
+		{"error", 0, errors.New("db down"), "outbox: failed to promote waiting ordered records"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMockOutboxStore()
+			store.promoted, store.promoteErr = tc.promoted, tc.err
+			logger := &fixtures.MockLogger{}
+			r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+				Logger: logger, PollInterval: time.Hour})
+			require.NoError(t, err)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() { defer close(done); _ = r.Start(ctx) }()
+			<-r.Ready()
+			cancel()
+			<-done
+			var msgs []string
+			for _, e := range logger.Entries() {
+				msgs = append(msgs, e.Message)
+			}
+			assert.Contains(t, msgs, tc.want)
+		})
+	}
+}
+
+// slowPublisher takes a while per batch, so a re-poll loop is observable.
+type slowPublisher struct{ delay time.Duration }
+
+func (p slowPublisher) Publish(context.Context, events.Envelope[json.RawMessage]) error {
+	time.Sleep(p.delay)
+	return nil
+}
+func (p slowPublisher) PublishBatch(context.Context, []events.Envelope[json.RawMessage]) error {
+	time.Sleep(p.delay)
+	return nil
+}
+
+// Stop ends the re-poll loop promptly even with a long PollInterval and a
+// steady backlog: it drains the batch in flight, then returns.
+func TestRunner_StopEndsRepollLoop(t *testing.T) {
+	store := newMockOutboxStore()
+	for range 500 {
+		env := domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		store.records = append(store.records, domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload})
+	}
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: slowPublisher{delay: 20 * time.Millisecond},
+		BatchSize: 1, PollInterval: time.Minute, DrainTimeout: 2 * time.Second})
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(context.Background()) }()
+	<-r.Ready()
+	time.Sleep(100 * time.Millisecond) // the re-poll loop is draining the backlog
+	start := time.Now()
+	require.NoError(t, r.Stop())
+	<-done
+	assert.Less(t, time.Since(start), time.Second, "Stop returns after the batch in flight, not after PollInterval")
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Less(t, len(store.published), 500, "the loop stopped before draining everything")
+}

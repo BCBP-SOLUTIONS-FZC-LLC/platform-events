@@ -34,7 +34,7 @@ defer consumer.Stop()    // graceful drain — waits up to 30s for in-flight han
 
 ### Testing with an injected client
 
-`NewSQSConsumerWithClient` builds the same consumer as `NewSQSConsumer` but takes an `events.SQSClientLike` instead of constructing a real `*sqs.Client` — use it to unit-test consumer-loop behaviour (retry, visibility extension, dead-letter routing, concurrency) against a hand-rolled fake, without LocalStack or AWS credentials. This is different from `mock.Consumer` (see [Testing in consuming services](testing-in-services.md#testing-in-consuming-services)), which stubs out the whole `Consumer` interface and skips the SQS loop entirely — reach for `NewSQSConsumerWithClient` when the behaviour under test is the loop itself, and `mock.Consumer` when it's your handler's side effects.
+`NewSQSConsumerWithClient` builds the same consumer as `NewSQSConsumer` but takes an `events.SQSClientLike` instead of constructing a real `*sqs.Client` — use it to unit-test consumer-loop behaviour (retry, visibility extension, dead-letter routing, concurrency) against a hand-rolled fake, without an AWS emulator (floci) or AWS credentials. This is different from `mock.Consumer` (see [Testing in consuming services](testing-in-services.md#testing-in-consuming-services)), which stubs out the whole `Consumer` interface and skips the SQS loop entirely — reach for `NewSQSConsumerWithClient` when the behaviour under test is the loop itself, and `mock.Consumer` when it's your handler's side effects.
 
 ```go
 type fakeSQSClient struct {
@@ -86,7 +86,7 @@ func TestConsumer_DeletesOnSuccess(t *testing.T) {
 | `nil` | SQS message deleted from queue |
 | `non-nil error` | SQS message left visible; retried after visibility timeout |
 | Panic | Recovered; stack trace logged; SQS message left visible for retry |
-| Unmarshal failure | Message deleted immediately; counted as `events_consumed_total{status=malformed}` |
+| Unmarshal failure | Counted as `platform_messages_failed_total{reason="malformed"}`; forwarded to the DLQ then deleted with `WithDLQForwarding` (left visible if the forward fails), otherwise deleted immediately |
 
 **VisibilityTimeout limit:** SQS enforces a hard maximum of 12 hours. `NewSQSConsumer` returns an error if `VisibilityTimeout > 12h`.
 
@@ -147,7 +147,7 @@ Common causes:
 | Invalid business state | `user_id` references a user that was deleted before the event arrived |
 | Illegal state transition | An `order.shipped` event arrives for an order already in `cancelled` state |
 | Missing precondition | A `payment.settled` event arrives but no corresponding `payment.created` exists |
-| Schema version too new | `schema_version: "5"` but this consumer only understands up to `"3"` |
+| Schema version too new | `specversion: "5"` (`env.SchemaVersion`) but this consumer only understands up to `"3"` |
 
 **Handling pattern:**
 
@@ -214,17 +214,19 @@ Consumer → events.DLQPublisher → SQS GetQueueAttributes(RedrivePolicy)
          → deadLetterTargetArn → GetQueueUrl → SendMessage(DLQ)
 ```
 
-The lookup is cached per source queue. The body is forwarded verbatim; caller attributes are kept and these are added:
+The lookup is cached per source queue for `DLQConfig.CacheTTL` (default 15 min; negative = never expires) and evicted as soon as `SendMessage` reports the DLQ no longer exists. The body is forwarded verbatim; caller attributes are kept and these are added:
 
 | Attribute | Value |
 |---|---|
-| `EventType` | Envelope `type` from the body; else `attrs["EventType"]`; else `unknown` |
-| `DLQReason` | The `reason` argument (required; truncated to 1 KiB) |
+| `EventType` | Envelope `type` when the body is a full envelope (`id`, `type`, `source`, `time`); else `attrs["EventType"]`; else `unknown` |
+| `DLQReason` | The `reason` argument (required; truncated to 1 KiB; characters SQS rejects replaced with U+FFFD) |
 | `OriginalQueue` | `sourceQueueURL` |
 | `FailedAt` | RFC 3339 UTC timestamp |
 | `ConsumerName` | `DLQConfig.ConsumerName`, when set |
 
-Standard attributes override caller values of the same name. SQS allows 10 attributes per message, so callers get at most 6 (5 when `ConsumerName` is set). A FIFO DLQ (`.fifo`) gets `MessageGroupId` and `MessageDeduplicationId` set to the envelope ID.
+Standard attributes override caller values of the same name. SQS allows 10 attributes per message, so callers get at most 6 (5 when `ConsumerName` is set). Excess caller attributes are **dropped** before validation (so a dropped attribute cannot fail the send), lowest priority first (kept first: `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical order) and logged at WARN; set `DLQConfig.StrictAttributes` to reject with `ErrDLQInvalidMessage` instead. A FIFO DLQ (`.fifo`) gets `MessageGroupId` and `MessageDeduplicationId` set to the envelope ID (a SHA-256 of the body when it is not an envelope or the ID is not a valid FIFO identifier).
+
+Each forward emits an `sqs.dlq_forward` span (`SpanKindProducer`), counts the message once in `platform_dlq_messages_total{operation="consume",reason}` (legacy `events_dlq_forwarded_total`), and times its SQS calls in `platform_dependency_request_seconds`.
 
 **Wiring:**
 
@@ -243,41 +245,43 @@ if _, err := dlq.ResolveDLQ(ctx, queueURL); err != nil {
 }
 ```
 
-**From a handler — poison message:**
+**Automatic — `WithDLQForwarding` (recommended):**
+
+```go
+consumer, err := events.NewSQSConsumer(sqsCfg, handle,
+    events.WithDLQForwarding(dlq),
+    // MUST be lower than the queue's RedrivePolicy maxReceiveCount (5 here):
+    // SQS moves the message itself once the count exceeds maxReceiveCount,
+    // so with n >= maxReceiveCount the consumer never gets to forward it.
+    events.WithMaxReceiveCount(4), // default 5 when omitted
+)
+```
+
+With `WithDLQForwarding` the consumer forwards the **original raw body and attributes** (never a re-serialised envelope) and deletes the source message only after the forward succeeds — on failure it stays visible and SQS's own redrive remains the backstop. It forwards:
+
+| Case | `DLQReason` |
+|---|---|
+| Body is not a valid envelope (previously deleted and only logged) | `malformed message body: <json error>` |
+| `ApproximateReceiveCount` > `WithMaxReceiveCount` — after `WithDeadLetterHandler`, when set, returns `nil` | `receive count N exceeded consumer max receive count M` |
+| Past that threshold **and** `Codec.Decode` fails | `codec decode failed: <error>` |
+
+`Start` resolves the DLQ before polling and **returns an error** (wrapping `ErrDLQNotConfigured` / `ErrDLQInvalidRedrivePolicy`) when the queue has no usable `RedrivePolicy` — otherwise every forward would fail and, with no `RedrivePolicy`, SQS would never move the message either, leaving it redelivered until retention expires. A transient resolution failure is logged at WARN and the consumer starts. Each forward is bounded by 30 s, capped at half of `WithVisibilityTimeout` (minimum 1 s), so the message cannot become visible and be forwarded twice mid-flight.
+
+**Forward in one place only.** With `WithDLQForwarding` on, the consumer already forwards messages that pass the threshold. A dead-letter handler that also calls `SendToDLQ` puts the message in the DLQ **twice**, and it is counted twice. Use the handler for side effects (alerting, compensation), or drop `WithDLQForwarding` and forward from the handler, but don't do both.
+
+When both a dead-letter handler and forwarding are set, the handler runs first; if it fails nothing is forwarded, and if the forward then fails the handler runs again on the next delivery — keep it idempotent.
+
+**From a handler — poison message:** forward the original transport message from `events.SourceMessageFromContext`, not `env.JSON()` — a re-serialised envelope has lost the message attributes and, with `WithConsumerCodec`, holds the *decoded* payload under a still-set `SchemaID`, so a redrive would fail to decode it.
 
 ```go
 if order == nil {
-    body, err := env.JSON()
-    if err != nil {
-        return err
-    }
-    if err := dlq.SendToDLQ(ctx, queueURL, body, map[string]string{"TenantID": env.TenantID}, "order not found"); err != nil {
+    src, _ := events.SourceMessageFromContext(ctx) // raw body, String/Number attributes, queue URL, receive count
+    if err := dlq.SendToDLQ(ctx, src.QueueURL, src.Body, src.Attributes, "order not found"); err != nil {
         return err // forward failed — keep the original on the queue so it is retried
     }
     return nil // forwarded — let the consumer delete the original
 }
 ```
-
-**From a dead-letter handler — retries exhausted:**
-
-```go
-consumer, err := events.NewSQSConsumer(sqsCfg, handle,
-    // MUST be lower than the queue's RedrivePolicy maxReceiveCount (5 here):
-    // SQS stops delivering the message once the count exceeds maxReceiveCount,
-    // so with n >= maxReceiveCount this handler never runs.
-    events.WithMaxReceiveCount(4),
-    events.WithDeadLetterHandler(func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
-        env.SchemaID = "" // payload was already decoded by WithConsumerCodec — see note below
-        body, err := env.JSON()
-        if err != nil {
-            return err
-        }
-        return dlq.SendToDLQ(ctx, queueURL, body, nil, "retries exhausted")
-    }),
-)
-```
-
-> **Codec note:** handlers receive the envelope *after* `WithConsumerCodec` decoded the payload, but `SchemaID` is still set. If you forward a re-serialised envelope, clear `SchemaID` first — otherwise a message later redriven to the source queue is decoded a second time and fails.
 
 **Error handling** — every error is a `*events.DLQError`:
 
@@ -297,11 +301,13 @@ default:
 
 | Sentinel | Cause | Retryable |
 |---|---|---|
-| `ErrDLQInvalidMessage` | Empty source URL / body / reason, invalid UTF-8, too many attributes — rejected before any AWS call | No |
+| `ErrDLQInvalidMessage` | Empty source URL / body / reason; invalid UTF-8 or characters SQS does not allow; invalid attribute name (`AWS.`/`Amazon.` prefix, bad characters, > 256 chars); body + attributes > 1 MiB; too many attributes with `StrictAttributes` — all rejected before any AWS call. Also returned when `SendMessage` rejects the message (`InvalidParameterValue` — e.g. over the queue's `MaximumMessageSize` — `InvalidMessageContents`, `InvalidAttributeName`, `InvalidAttributeValue`) | No |
 | `ErrDLQNotConfigured` | Source queue has no `RedrivePolicy` | No |
 | `ErrDLQInvalidRedrivePolicy` | Policy not JSON, no `deadLetterTargetArn`, or not an SQS ARN | No |
-| `ErrDLQUnresolved` | `GetQueueAttributes` / `GetQueueUrl` failed | Also matches `ErrRetryable` if transient |
+| `ErrDLQUnresolved` | `GetQueueAttributes` / `GetQueueUrl` failed, or `SendMessage` found the DLQ deleted (cache entry evicted; the next call re-resolves) | Also matches `ErrRetryable` if transient |
 | `ErrDLQSendFailed` | `SendMessage` failed | Also matches `ErrRetryable` if transient |
+
+**Queue depth (optional):** `events.WithQueueDepthMetrics(time.Minute)` samples the queue's backlog and its DLQ's into `platform_queue_depth` / `platform_dlq_depth`. It needs `sqs:GetQueueAttributes` on both queues. See [docs/observability](../observability/README.md#tier-classification).
 
 **IAM:** `sqs:GetQueueAttributes` on the source queue; `sqs:GetQueueUrl` and `sqs:SendMessage` on the DLQ; `kms:GenerateDataKey` + `kms:Decrypt` if the DLQ uses a customer-managed KMS key.
 
@@ -318,7 +324,7 @@ func myHandler(ctx context.Context, env events.Envelope[json.RawMessage]) error 
 }
 ```
 
-Retries are driven by SQS visibility timeouts — not by the library — and follow the queue's redrive policy. The retry limit (`MaxReceiveCount`) is a **queue configuration**, not a library setting. See [ARCHITECTURE.md § Failure lifecycle](../../ARCHITECTURE.md#failure-lifecycle) for the full consumer-side retry timeline and how it differs from outbox (producer-side) retries.
+Retries are driven by SQS visibility timeouts — not by the library — and follow the queue's redrive policy. The retry limit is the queue's RedrivePolicy `maxReceiveCount`. `WithMaxReceiveCount` adds an optional, lower consumer-side threshold that routes a message to `WithDeadLetterHandler` and/or `WithDLQForwarding` before SQS's redrive would; without either option it has no effect. See [ARCHITECTURE.md § Failure lifecycle](../../ARCHITECTURE.md#failure-lifecycle) for the full consumer-side retry timeline and how it differs from outbox (producer-side) retries.
 
 ### Concurrency and graceful shutdown
 
@@ -373,7 +379,7 @@ func handlePaymentSettled(ctx context.Context, env events.Envelope[json.RawMessa
         return nil // permanent failure — discard
     }
 
-    return pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+    return pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
         // ① DB write — guarded by processed_events (atomically)
         tag, err := tx.Exec(ctx,
             `INSERT INTO processed_events (event_id, processed_at) VALUES ($1, NOW()) ON CONFLICT DO NOTHING`,
@@ -414,7 +420,22 @@ SQS delivers messages **at least once**. A handler may be called more than once 
 
 Without idempotency, duplicate delivery causes duplicate side effects: double charges, double emails, double DB rows. Use `Envelope.ID` as the idempotency key.
 
-#### Pattern 1 — Postgres unique constraint (recommended)
+#### Pattern 0 — `inbox.Store.Process` (recommended)
+
+`pkg/inbox` packages Pattern 1: apply its schema with `inbox.ApplySchema`, then run the handler's writes through `Store.Process`. It claims `Envelope.ID` in the handler's own transaction (`INSERT … ON CONFLICT DO NOTHING`), so the claim and the writes commit or roll back together, and concurrent copies of a message serialise on the claim:
+
+```go
+store, _ := inbox.NewStore(pool, "user_projection")
+handler := func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
+    return store.Process(ctx, env, func(ctx context.Context, tx pgcommon.Tx) error {
+        return repo.ApplyUserCreated(ctx, tx, env) // writes through tx
+    })
+}
+```
+
+A failing `fn` rolls back the claim, so SQS retries; a duplicate returns nil without calling `fn` and is counted in `platform_duplicate_messages_total`. A handler that dead-letters the message (`SendToDLQ`, then nil) is not recorded, so redriving the DLQ processes it. `inbox.Handler(store, next)` is the wrapper for handlers whose effects are not Postgres writes; it uses separate transactions, so the handler must still be idempotent.
+
+#### Pattern 1 — Postgres unique constraint (hand-rolled)
 
 Create a `processed_events` table once per service:
 
@@ -434,7 +455,7 @@ Then guard every handler inside the same transaction as the side-effect write:
 
 ```go
 func handleUserCreated(ctx context.Context, env events.Envelope[json.RawMessage]) error {
-    return pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+    return pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
         // 1. Claim the event ID — ON CONFLICT DO NOTHING is atomic.
         tag, err := tx.Exec(ctx, `
             INSERT INTO processed_events (event_id)

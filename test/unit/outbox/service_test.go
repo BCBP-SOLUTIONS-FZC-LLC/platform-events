@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
@@ -21,31 +21,13 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
-// noopTx is a minimal pgx.Tx stub used to avoid nil-tx panics when testing
-// OutboxService.Enqueue with a store that returns an error immediately.
-type noopTx struct{}
+// noopTx is a non-nil pgcommon.Tx for OutboxService.Enqueue tests whose
+// store ignores the transaction. Embedding the interface (left nil) provides
+// every method without naming a pgx type; calling one would panic, flagging an
+// unexpected use of the transaction.
+type noopTx struct{ pgcommon.Tx }
 
-func (noopTx) Begin(_ context.Context) (pgx.Tx, error) { return nil, errors.New("noop") }
-func (noopTx) Commit(_ context.Context) error          { return nil }
-func (noopTx) Rollback(_ context.Context) error        { return nil }
-func (noopTx) CopyFrom(_ context.Context, _ pgx.Identifier, _ []string, _ pgx.CopyFromSource) (int64, error) {
-	return 0, errors.New("noop")
-}
-func (noopTx) SendBatch(_ context.Context, _ *pgx.Batch) pgx.BatchResults { return nil }
-func (noopTx) LargeObjects() pgx.LargeObjects                             { return pgx.LargeObjects{} }
-func (noopTx) Prepare(_ context.Context, _, _ string) (*pgconn.StatementDescription, error) {
-	return nil, errors.New("noop")
-}
-func (noopTx) Exec(_ context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
-	return pgconn.CommandTag{}, nil
-}
-func (noopTx) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-	return nil, errors.New("noop")
-}
-func (noopTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row { return nil }
-func (noopTx) Conn() *pgx.Conn                                        { return nil }
-
-var _ pgx.Tx = noopTx{}
+var _ pgcommon.Tx = noopTx{}
 
 // mockStore is a thread-safe in-memory OutboxStore for testing.
 // The mutex protects published and failed maps which are written by parallel
@@ -55,6 +37,7 @@ type mockStore struct {
 	records   []domain.OutboxRecord
 	published map[string]bool
 	failed    map[string]string
+	released  map[string]string
 	err       error
 }
 
@@ -62,10 +45,11 @@ func newMockStore() *mockStore {
 	return &mockStore{
 		published: make(map[string]bool),
 		failed:    make(map[string]string),
+		released:  make(map[string]string),
 	}
 }
 
-func (s *mockStore) Enqueue(_ context.Context, _ pgx.Tx, rec domain.OutboxRecord) error {
+func (s *mockStore) Enqueue(_ context.Context, _ pgcommon.Tx, rec domain.OutboxRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.records = append(s.records, rec)
@@ -97,13 +81,25 @@ func (s *mockStore) MarkPublished(_ context.Context, id string) error {
 	return nil
 }
 
-func (s *mockStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, _ int) error {
+func (s *mockStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, _ int, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failed[rec.ID] = lastError
 	return nil
 }
 
+// ReleaseLease records lease releases (shutdown, transient failures) — no
+// attempt counted, so they are kept apart from failed.
+func (s *mockStore) ReleaseLease(_ context.Context, id, lastError string, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.released[id] = lastError
+	return nil
+}
+
+func (s *mockStore) OldestPendingAge(context.Context) (time.Duration, error)    { return 0, nil }
+func (s *mockStore) PromoteWaiting(context.Context) (int64, error)              { return 0, nil }
+func (s *mockStore) BlockedCount(context.Context) (int64, error)                { return 0, nil }
 func (s *mockStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *mockStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
 func (s *mockStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
@@ -202,11 +198,11 @@ func TestOutboxService_PublishBatch_Sequential_PartialBatchError(t *testing.T) {
 	assert.Contains(t, store.failed, envFail.ID)
 }
 
-// TestOutboxService_PublishBatch_Sequential_TransportError_UsesMaxAttemptsPlus1 verifies
-// that a BatchError failure with Code="TransportError" (e.g. SNS throttle wrapped by
-// publishChunk) uses maxAttempts+1 as the MarkFailed threshold so transient transport
-// failures do not consume a retry slot and prematurely dead-letter healthy records.
-func TestOutboxService_PublishBatch_Sequential_TransportError_UsesMaxAttemptsPlus1(t *testing.T) {
+// TestOutboxService_PublishBatch_Sequential_TransportError_ReleasesWithoutAttempt
+// verifies that a BatchError failure with Code="TransportError" (e.g. SNS throttle
+// wrapped by publishChunk) releases the lease without counting an attempt, so an
+// SNS outage can never dead-letter healthy records.
+func TestOutboxService_PublishBatch_Sequential_TransportError_ReleasesWithoutAttempt(t *testing.T) {
 	const maxAttempts = 5
 	var capturedThresholds []int
 	capture := &captureMaxAttemptsStore{
@@ -233,9 +229,8 @@ func TestOutboxService_PublishBatch_Sequential_TransportError_UsesMaxAttemptsPlu
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err)
 
-	require.Len(t, capturedThresholds, 1, "MarkFailed must be called exactly once")
-	assert.Equal(t, maxAttempts+1, capturedThresholds[0],
-		"TransportError must use maxAttempts+1 to avoid consuming a retry slot")
+	assert.Empty(t, capturedThresholds, "TransportError must not count an attempt")
+	assert.Equal(t, "ThrottlingException", capture.released[env.ID], "lease released with the error recorded")
 }
 
 func TestOutboxService_PublishBatch_Success(t *testing.T) {
@@ -496,8 +491,13 @@ type markFailedErrorStore struct {
 	mfErr error
 }
 
-func (s *markFailedErrorStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int) error {
-	_ = s.mockStore.MarkFailed(context.Background(), rec, lastError, maxAttempts)
+func (s *markFailedErrorStore) ReleaseLease(_ context.Context, id, lastError string, retryAfter time.Duration) error {
+	_ = s.mockStore.ReleaseLease(context.Background(), id, lastError, retryAfter)
+	return s.mfErr
+}
+
+func (s *markFailedErrorStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int, retryAfter time.Duration) error {
+	_ = s.mockStore.MarkFailed(context.Background(), rec, lastError, maxAttempts, retryAfter)
 	return s.mfErr
 }
 
@@ -634,8 +634,9 @@ func TestOutboxService_PublishBatch_CtxCancel_StrandedRecordsMarkedFailed(t *tes
 
 	// All 3 claimed records should have been released via MarkFailed so no
 	// runner needs to wait for the claim lease to expire.
-	assert.Len(t, store.failed, 3, "all stranded records should have MarkFailed called")
-	for id, reason := range store.failed {
+	assert.Len(t, store.released, 3, "all stranded records should have their lease released")
+	assert.Empty(t, store.failed, "shutdown must not count an attempt")
+	for id, reason := range store.released {
 		assert.Contains(t, reason, "context", "MarkFailed reason should mention context cancellation for %s", id)
 	}
 }
@@ -684,7 +685,8 @@ func TestOutboxService_PublishBatch_Parallel_CtxCancel_StrandedMarkedFailed(t *t
 
 	err := svc.PublishBatch(ctx, 10)
 	require.Error(t, err)
-	assert.Len(t, store.failed, 4, "all records should have MarkFailed called")
+	assert.Len(t, store.released, 4, "all records should have their lease released")
+	assert.Empty(t, store.failed, "shutdown must not count an attempt")
 }
 
 // ----------------------------
@@ -728,12 +730,14 @@ func TestOutboxService_PublishTimeout_Fires_MarksFailed(t *testing.T) {
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err)
 
-	// Record should be marked failed because the publish timed out.
-	assert.Contains(t, store.failed, env.ID, "timed-out record should be marked failed")
+	// A publish timeout is transient: the lease is released (retried after the
+	// shared backoff) without counting an attempt.
+	assert.Contains(t, store.released, env.ID, "timed-out record should have its lease released")
+	assert.NotContains(t, store.failed, env.ID, "a timeout must not count an attempt")
 }
 
 // ----------------------------
-// Shutdown does not dead-letter at-maxAttempts-1 records (maxAttempts+1 fix)
+// Shutdown never counts an attempt
 // ----------------------------
 
 func TestOutboxService_CtxCancel_DoesNotDeadLetterAtMaxAttemptsMinusOne(t *testing.T) {
@@ -759,9 +763,8 @@ func TestOutboxService_CtxCancel_DoesNotDeadLetterAtMaxAttemptsMinusOne(t *testi
 
 	_ = svc.PublishBatch(ctx, 10)
 
-	require.Len(t, calls, 1)
-	// Cancellation must pass maxAttempts+1 (=6) so attempts=4 is never dead-lettered by shutdown alone.
-	assert.Equal(t, 6, calls[0].maxAttempts, "cancellation path must use maxAttempts+1")
+	assert.Empty(t, calls, "shutdown must release the lease, not count an attempt")
+	assert.Contains(t, store.released, env.ID)
 }
 
 type captureMaxAttemptsStore struct {
@@ -769,7 +772,7 @@ type captureMaxAttemptsStore struct {
 	onFail func(id string, maxAttempts int)
 }
 
-func (s *captureMaxAttemptsStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, _ string, maxAttempts int) error {
+func (s *captureMaxAttemptsStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, _ string, maxAttempts int, _ time.Duration) error {
 	s.onFail(rec.ID, maxAttempts)
 	s.failed[rec.ID] = "captured"
 	return nil
@@ -920,10 +923,10 @@ func TestOutboxService_PublishBatch_NormalFailure_PassesMaxAttempts(t *testing.T
 	require.NoError(t, err)
 
 	require.Len(t, calls, 1)
-	// Normal (non-retryable) failure must pass maxAttempts (not +1) so the record
-	// is eventually dead-lettered after exactly maxAttempts failures.
+	// Normal (non-retryable) failure counts an attempt against maxAttempts so
+	// the record is dead-lettered after exactly maxAttempts failures.
 	assert.Equal(t, maxAttempts, calls[0].maxAttempts,
-		"non-retryable publish failure must use maxAttempts (not maxAttempts+1)")
+		"non-retryable publish failure must use maxAttempts")
 }
 
 func TestOutboxService_ReprocessDeadLetters_Error(t *testing.T) {
@@ -1046,7 +1049,7 @@ func TestOutboxService_PublishBatch_CtxAlreadyCancelled(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled, "cancelled context must propagate to return value")
 
 	assert.Empty(t, pub.Published(), "no records should be published with already-cancelled context")
-	assert.Len(t, store.failed, 3, "all records must be marked failed at loop top")
+	assert.Len(t, store.released, 3, "all records must have their lease released at loop top")
 }
 
 // ----------------------------
@@ -1395,7 +1398,7 @@ func TestOutboxService_PublishBatch_Parallel_Panic_MarkFailedError_WithLogger(t 
 
 	found := false
 	for _, e := range logger.Entries() {
-		if e.Level == "ERROR" && strings.Contains(e.Message, "failed to mark record failed after panic") {
+		if e.Level == "ERROR" && strings.Contains(e.Message, "failed to mark record failed") {
 			found = true
 			break
 		}
@@ -1415,4 +1418,52 @@ func TestNewOutboxService_ZeroPublishConcurrency_DefaultsToOne(t *testing.T) {
 	// Just verify the service was constructed and can be used without panic.
 	tx := noopTx{}
 	_ = svc.Enqueue(context.Background(), tx, env) // error expected (tx is noop), no panic
+}
+
+// A payload that is not valid JSON fails OutboxService.Enqueue before the
+// store is called.
+func TestOutboxService_Enqueue_InvalidPayload_StoreNotCalled(t *testing.T) {
+	store := newMockStore()
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, nil, nil, 5, 1, 0)
+	env := domain.NewEnvelope("bad.payload", "svc", json.RawMessage(`{not json`))
+	require.Error(t, svc.Enqueue(context.Background(), noopTx{}, env))
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Empty(t, store.records)
+}
+
+// A permanent batch failure counts an attempt (so it eventually dead-letters);
+// a Retryable one releases the lease without counting.
+func TestOutboxService_PublishBatch_Sequential_RetryableFlag(t *testing.T) {
+	mk := func() (domain.Envelope[json.RawMessage], domain.OutboxRecord) {
+		env := domain.NewEnvelope("flag.event", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		return env, domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload}
+	}
+	permEnv, permRec := mk()
+	retryEnv, retryRec := mk()
+	store := newMockStore()
+	store.records = []domain.OutboxRecord{permRec, retryRec}
+	pub := &domainBatchErrPublisher{err: &domain.BatchError{Failures: []domain.BatchFailure{
+		{ID: permEnv.ID, Code: "AuthorizationError", Message: "not authorized"},
+		{ID: retryEnv.ID, Code: "Throttled", Message: "slow down", Retryable: true},
+	}}}
+	svc := service.NewOutboxService(store, pub, nil, nil, 5, 1, 0)
+	require.NoError(t, svc.PublishBatch(context.Background(), 10))
+
+	assert.Equal(t, "not authorized", store.failed[permEnv.ID], "permanent failure counts an attempt")
+	assert.NotContains(t, store.released, permEnv.ID)
+	assert.Equal(t, "slow down", store.released[retryEnv.ID], "retryable failure releases the lease")
+	assert.NotContains(t, store.failed, retryEnv.ID)
+}
+
+func TestOutboxService_Enqueue_NonCanonicalID_Rejected(t *testing.T) {
+	store := newMockStore()
+	svc := service.NewOutboxService(store, &fixtures.MockPublisher{}, nil, nil, 5, 1, 0)
+	env := domain.NewEnvelope("id.check", "svc", json.RawMessage(`{}`))
+	env.ID = strings.ToUpper(env.ID)
+	err := svc.Enqueue(context.Background(), noopTx{}, env)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "canonical lowercase UUID")
+	assert.Empty(t, store.records)
 }

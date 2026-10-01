@@ -24,6 +24,8 @@ const (
 	defaultMaxAttempts    = 5
 	defaultDrainTimeout   = 30 * time.Second
 	defaultPublishTimeout = 10 * time.Second
+	defaultGaugeInterval  = 15 * time.Second
+	gaugeQueryTimeout     = 5 * time.Second
 
 	// Poll backoff: doubles on each consecutive failure, capped at maxPollBackoff.
 	initPollBackoff = 1 * time.Second
@@ -76,10 +78,25 @@ type Config struct {
 	// Set a negative value (e.g. -1) to disable the per-record timeout.
 	PublishTimeout time.Duration
 
+	// GaugeInterval is how often the runner refreshes the outbox_pending /
+	// outbox_leased gauges (two capped COUNT queries). Defaults to 15s,
+	// independent of PollInterval so a fast poll does not multiply database
+	// load; readings are capped at outboxstore.MaxCountedRows (100k).
+	GaugeInterval time.Duration
+
 	// StartupJitter adds a random delay in [0, StartupJitter) before the first
 	// poll. Use when running multiple runner instances to desynchronise their
 	// initial polls and avoid a thundering-herd burst on the DB.
 	StartupJitter time.Duration
+
+	// RetryBackoff is the delay before a record's first retry; each further
+	// failure doubles it (with jitter) up to MaxRetryBackoff. Defaults: 1s, 5m.
+	// Failures that describe the publisher rather than the record (transport
+	// errors, throttling, timeouts) never count toward MaxAttempts; they back
+	// off on one shared schedule that resets on the next successful publish,
+	// so an SNS outage builds a backlog instead of dead-lettering it.
+	RetryBackoff    time.Duration
+	MaxRetryBackoff time.Duration
 }
 
 // Runner polls the outbox_events table and publishes pending records.
@@ -92,10 +109,14 @@ type Runner struct {
 	doneCh  chan struct{}      // closed when the active Start() goroutine has exited
 	started atomic.Bool        // guards against concurrent Start() calls
 
+	// lastGauge is when the backlog gauges were last refreshed (poll loop only).
+	lastGauge time.Time
+
 	// readyCh is closed after the first successful poll cycle (or empty poll),
 	// signalling that the DB connection and schema are healthy. Expose via Ready().
-	readyCh   chan struct{}
-	readyOnce sync.Once
+	// readyClosed records whether readyCh has been closed; guarded by mu.
+	readyCh     chan struct{}
+	readyClosed bool
 }
 
 // outboxMetricsAdapter routes OutboxService metric callbacks to the adapter
@@ -132,6 +153,9 @@ func NewRunner(cfg Config) (*Runner, error) {
 	}
 	if cfg.PublishTimeout == 0 {
 		cfg.PublishTimeout = defaultPublishTimeout
+	}
+	if cfg.GaugeInterval <= 0 {
+		cfg.GaugeInterval = defaultGaugeInterval
 	}
 	// PublishConcurrency defaults to 1 (sequential); service constructor handles <= 0.
 
@@ -178,6 +202,7 @@ func NewRunner(cfg Config) (*Runner, error) {
 		cfg.PublishTimeout,
 	)
 	svc.SetOutboxMetrics(outboxMetricsAdapter{})
+	svc.SetRetryBackoff(cfg.RetryBackoff, cfg.MaxRetryBackoff)
 
 	// Pre-closed initial doneCh so Stop() before Start() returns immediately.
 	initialDone := make(chan struct{})
@@ -209,8 +234,13 @@ func (r *Runner) Start(ctx context.Context) error {
 	thisDone := make(chan struct{})
 	r.cancel = stopCancel
 	r.doneCh = thisDone
-	r.readyCh = make(chan struct{})
-	r.readyOnce = sync.Once{}
+	// Replace readyCh only once the previous cycle has closed it: a caller
+	// doing `go runner.Start(ctx); <-runner.Ready()` may already hold the
+	// current channel, and it must be the one this cycle closes.
+	if r.readyClosed {
+		r.readyCh = make(chan struct{})
+		r.readyClosed = false
+	}
 	r.mu.Unlock()
 	defer stopCancel() // always release stopCtx resources when Start() exits
 
@@ -241,7 +271,7 @@ func (r *Runner) Start(ctx context.Context) error {
 
 	// Run one poll immediately on startup so events that arrived while the runner
 	// was stopped are not delayed by a full PollInterval.
-	if r.pollOnce(ctx) {
+	if r.pollOnce(ctx, stopCtx) {
 		if !r.sleepBackoff(ctx, stopCtx, &pollBackoff) {
 			return nil
 		}
@@ -256,7 +286,7 @@ func (r *Runner) Start(ctx context.Context) error {
 		case <-stopCtx.Done():
 			return nil
 		case <-ticker.C:
-			if r.pollOnce(ctx) {
+			if r.pollOnce(ctx, stopCtx) {
 				if !r.sleepBackoff(ctx, stopCtx, &pollBackoff) {
 					return nil
 				}
@@ -290,9 +320,36 @@ func (r *Runner) sleepBackoff(ctx, stopCtx context.Context, backoff *time.Durati
 // pollOnce runs a single gauge-update + publish-batch cycle.
 // Returns true when the cycle encountered an infrastructure error (triggers
 // backoff in Start); returns false on success or context cancellation.
-func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
+// stopCtx is cancelled by Stop: it does not interrupt the batch in flight
+// (Stop drains it), but ends the re-poll loop so Stop returns promptly.
+func (r *Runner) pollOnce(ctx, stopCtx context.Context) (hadError bool) {
+	if time.Since(r.lastGauge) >= r.cfg.GaugeInterval {
+		r.lastGauge = time.Now()
+		r.refreshGauges(ctx)
+	}
+	if r.publishOnce(ctx) {
+		return true
+	}
+	// While batches keep publishing, poll again straight away (bounded by
+	// PollInterval) so a backlog — and an ordered key, whose next record
+	// becomes due only once its head is published — drains at publish speed
+	// rather than one batch per tick. Stop as soon as a batch publishes
+	// nothing or hits a transient failure: during an outage this must not
+	// turn into a tight claim-and-fail loop.
+	start := time.Now()
+	for r.svc.LastPublished() > 0 && !r.svc.LastHadTransientFailure() &&
+		ctx.Err() == nil && stopCtx.Err() == nil && time.Since(start) < r.cfg.PollInterval {
+		if r.publishOnce(ctx) {
+			return true
+		}
+	}
+	return false
+}
+
+// refreshGauges updates the backlog gauges from two capped counts.
+func (r *Runner) refreshGauges(ctx context.Context) {
 	if metrics.HasOutboxPendingMetric() {
-		gcCtx, gcCancel := context.WithTimeout(ctx, 2*time.Second)
+		gcCtx, gcCancel := context.WithTimeout(ctx, gaugeQueryTimeout)
 		n, pendErr := r.svc.PendingCount(gcCtx)
 		gcCancel()
 		if pendErr != nil {
@@ -309,10 +366,11 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 		}
 	}
 	if metrics.HasOutboxLeasedMetric() {
-		lcCtx, lcCancel := context.WithTimeout(ctx, 2*time.Second)
+		lcCtx, lcCancel := context.WithTimeout(ctx, gaugeQueryTimeout)
 		n, leasedErr := r.svc.LeasedCount(lcCtx)
 		lcCancel()
 		if leasedErr != nil {
+			metrics.RecordOutboxLeasedCountError()
 			if r.cfg.Logger != nil {
 				r.cfg.Logger.Warn("outbox: failed to query leased count", map[string]any{
 					"error": leasedErr.Error(),
@@ -322,6 +380,47 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 			metrics.SetOutboxLeased(float64(n))
 		}
 	}
+	// Promote ordered records whose head was published while they were being
+	// enqueued, or whose promotion failed (normally their head's publish
+	// promotes them directly). Runs with the gauges: every GaugeInterval, or
+	// PollInterval if that is longer.
+	if n, err := r.svc.PromoteWaiting(ctx); err != nil {
+		if r.cfg.Logger != nil {
+			r.cfg.Logger.Warn("outbox: failed to promote waiting ordered records", map[string]any{"error": err.Error()})
+		}
+	} else if n > 0 && r.cfg.Logger != nil {
+		r.cfg.Logger.Info("outbox: promoted ordered records left waiting", map[string]any{"count": n})
+	}
+	if metrics.HasOutboxBlockedMetric() {
+		bcCtx, bcCancel := context.WithTimeout(ctx, gaugeQueryTimeout)
+		n, blockedErr := r.svc.BlockedCount(bcCtx)
+		bcCancel()
+		if blockedErr != nil {
+			metrics.SetOutboxBlocked(-1)
+			if r.cfg.Logger != nil {
+				r.cfg.Logger.Warn("outbox: failed to query ordering-blocked count", map[string]any{"error": blockedErr.Error()})
+			}
+		} else {
+			metrics.SetOutboxBlocked(float64(n))
+		}
+	}
+	if metrics.HasOutboxOldestAgeMetric() {
+		oaCtx, oaCancel := context.WithTimeout(ctx, gaugeQueryTimeout)
+		age, ageErr := r.svc.OldestPendingAge(oaCtx)
+		oaCancel()
+		if ageErr != nil {
+			metrics.SetOutboxOldestPendingAge(-1)
+			if r.cfg.Logger != nil {
+				r.cfg.Logger.Warn("outbox: failed to query oldest pending age", map[string]any{"error": ageErr.Error()})
+			}
+		} else {
+			metrics.SetOutboxOldestPendingAge(age)
+		}
+	}
+}
+
+// publishOnce runs one publish-batch cycle; see pollOnce for the result.
+func (r *Runner) publishOnce(ctx context.Context) (hadError bool) {
 	if err := r.svc.PublishBatch(ctx, r.cfg.BatchSize); err != nil {
 		// Context cancellation is not an infrastructure error — no backoff.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -339,7 +438,12 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 		return true
 	}
 	// First successful (or empty) poll: signal readiness for health probes.
-	r.readyOnce.Do(func() { close(r.readyCh) })
+	r.mu.Lock()
+	if !r.readyClosed {
+		close(r.readyCh)
+		r.readyClosed = true
+	}
+	r.mu.Unlock()
 	return false
 }
 
@@ -440,7 +544,10 @@ func (r *Runner) PrunePublished(ctx context.Context, olderThan time.Duration, li
 
 // Stop signals the runner to stop and waits up to DrainTimeout for the current
 // poll cycle to finish. Returns an error if the drain timeout is exceeded.
-// Safe to call multiple times and safe to call before Start.
+// Safe to call multiple times and safe to call before Start. Stop affects only
+// a Start that is already running — a Stop that races ahead of a Start in
+// another goroutine is a no-op — so shut down by cancelling the ctx passed to
+// Start and then calling Stop to wait for the drain.
 func (r *Runner) Stop() error {
 	r.mu.Lock()
 	r.cancel()

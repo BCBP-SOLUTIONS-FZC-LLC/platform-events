@@ -14,7 +14,26 @@ linters:
     - gosec
     - errorlint
     - exhaustive
+    - depguard
   settings:
+    depguard:
+      rules:
+        # Every database connection, configuration and operation goes
+        # through platform-pgcommon (Pool, RunInTx, ConfigFromEnv, migrate and
+        # its Tx/TxOptions/Conn/Rows/Row/ErrNoRows aliases) — library, CLI,
+        # fixtures and tests alike. A test fake needing a pgx-only type (e.g.
+        # Exec's CommandTag) infers it from pgcommon.Tx instead; see
+        # test/unit/enqueue/enqueue_test.go.
+        pgcommon-only:
+          files:
+            - "$all"
+          deny:
+            - pkg: github.com/jackc/pgx
+              desc: use platform-pgcommon (pgcommon.Tx, pgcommon.RunInTx, pgcommon.Conn, pgcommon.ErrNoRows, …) instead of pgx directly
+            - pkg: database/sql
+              desc: use platform-pgcommon's Pool instead of database/sql
+            - pkg: github.com/golang-migrate/migrate
+              desc: use platform-pgcommon's migrate.Runner (outbox.ApplySchema / inbox.ApplySchema) instead of golang-migrate directly
     errcheck:
       exclude-functions:
         - fmt.Fprintf
@@ -28,6 +47,11 @@ linters:
         - G404 # weak random — acceptable for jitter, not security-sensitive
     exhaustive:
       default-signifies-exhaustive: true
+  # Smoke tests (build tag "smoke") run against live AWS and are not linted.
+  # Paths are relative to this file, also when linting from test/.
+  exclusions:
+    paths:
+      - ^test/smoke/
 
 formatters:
   enable:
@@ -37,7 +61,3 @@ formatters:
     goimports:
       local-prefixes:
         - github.com/BCBP-SOLUTIONS-FZC-LLC
-
-issues:
-  exclude-dirs:
-    - test/smoke

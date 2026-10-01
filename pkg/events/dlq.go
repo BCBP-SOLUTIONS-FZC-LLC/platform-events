@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"time"
 
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
 
@@ -32,21 +33,43 @@ const (
 //	    // queue configuration problem — alert, do not retry
 //	}
 //
-// Typical use is from a WithDeadLetterHandler callback, or from a handler that
-// detects a message it can never process: forward it, then return nil so the
-// consumer deletes the original. Return the error instead when SendToDLQ
-// fails, so the original stays on the source queue.
-type DLQPublisher interface {
-	// SendToDLQ publishes body to sourceQueueURL's DLQ. attrs are forwarded
-	// as String message attributes; DLQReason (reason, required), OriginalQueue,
-	// FailedAt (RFC 3339, UTC), ConsumerName (when configured) and EventType
-	// (from the envelope body, else attrs["EventType"], else "unknown") are
-	// added. SQS allows 10 attributes per message, 4–5 of which are reserved.
-	SendToDLQ(ctx context.Context, sourceQueueURL string, body []byte, attrs map[string]string, reason string) error
+// Most consumers need no direct calls: pass the publisher to the consumer via
+// WithDLQForwarding and malformed or over-threshold messages are forwarded
+// automatically. To dead-letter explicitly from a handler that detects a
+// message it can never process, forward the original transport message from
+// SourceMessageFromContext — not a re-serialised Envelope, which has lost the
+// message attributes and, for codec-encoded events, holds a decoded payload
+// under a still-set SchemaID — then return nil so the consumer deletes the
+// original. Return the error instead when SendToDLQ fails, so the original
+// stays on the source queue.
+//
+// SendToDLQ(ctx, sourceQueueURL, body, attrs, reason) publishes body to
+// sourceQueueURL's DLQ. attrs are forwarded as String message attributes;
+// DLQReason (reason, required), OriginalQueue, FailedAt (RFC 3339, UTC),
+// ConsumerName (when configured) and EventType (from the envelope body, else
+// attrs["EventType"], else "unknown") are added. SQS allows 10 attributes per
+// message, 4–5 of which are reserved; excess caller attributes are dropped
+// lowest-priority first unless DLQConfig.StrictAttributes is set.
+//
+// ResolveDLQ(ctx, sourceQueueURL) returns the URL of sourceQueueURL's DLQ. The
+// lookup is cached (DLQConfig.CacheTTL). Call it at startup to fail fast on a
+// missing or malformed RedrivePolicy.
+type DLQPublisher = port.DLQPublisher
 
-	// ResolveDLQ returns the URL of sourceQueueURL's DLQ. The lookup is cached.
-	// Call it at startup to fail fast on a missing or malformed RedrivePolicy.
-	ResolveDLQ(ctx context.Context, sourceQueueURL string) (string, error)
+// SourceMessage is the transport message a handler's envelope was parsed
+// from, before codec decoding. See SourceMessageFromContext.
+type SourceMessage = port.SourceMessage
+
+// SourceMessageFromContext returns the original SQS message (raw body, String
+// and Number attributes, queue URL, receive count) for the envelope being
+// handled. It is set on the ctx passed to Handler and WithDeadLetterHandler
+// callbacks by the SQS consumer; ok is false elsewhere.
+//
+//	if src, ok := events.SourceMessageFromContext(ctx); ok {
+//	    err := dlq.SendToDLQ(ctx, src.QueueURL, src.Body, src.Attributes, "unsupported tenant")
+//	}
+func SourceMessageFromContext(ctx context.Context) (SourceMessage, bool) {
+	return port.SourceMessageFromContext(ctx)
 }
 
 // DLQConfig configures a DLQPublisher.
@@ -56,10 +79,18 @@ type DLQPublisher interface {
 // kms:Decrypt when the DLQ uses a customer-managed KMS key).
 type DLQConfig struct {
 	Region      string
-	EndpointURL string // optional — LocalStack endpoint for testing
+	EndpointURL string // optional — AWS emulator (floci) endpoint for local runs and tests
 	// ConsumerName is attached to every forwarded message as ConsumerName.
 	ConsumerName string
 	Logger       port.Logger
+	// CacheTTL bounds how long a resolved DLQ is reused before the source
+	// queue's RedrivePolicy is read again. Zero means 15 minutes; negative
+	// disables expiry.
+	CacheTTL time.Duration
+	// StrictAttributes rejects (ErrDLQInvalidMessage) a message whose
+	// attributes exceed the SQS limit of 10, instead of dropping the
+	// lowest-priority caller attributes.
+	StrictAttributes bool
 }
 
 // DLQClientLike is the subset of the AWS SQS client API used by the DLQ
@@ -97,9 +128,11 @@ func NewSQSDLQPublisherWithClient(cfg DLQConfig, client DLQClientLike) (DLQPubli
 
 func toInternalDLQConfig(cfg DLQConfig) internalsqs.DLQConfig {
 	return internalsqs.DLQConfig{
-		Region:       cfg.Region,
-		EndpointURL:  cfg.EndpointURL,
-		ConsumerName: cfg.ConsumerName,
-		Logger:       cfg.Logger,
+		Region:           cfg.Region,
+		EndpointURL:      cfg.EndpointURL,
+		ConsumerName:     cfg.ConsumerName,
+		Logger:           cfg.Logger,
+		CacheTTL:         cfg.CacheTTL,
+		StrictAttributes: cfg.StrictAttributes,
 	}
 }

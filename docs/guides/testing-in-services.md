@@ -6,7 +6,7 @@ Mocks for `Publisher`, `Consumer` and `DLQPublisher`, and wiring them in tests. 
 
 ## Testing in consuming services
 
-`pkg/events/mock` ships ready-made, thread-safe test doubles so consuming services never need to stand up LocalStack or SNS just to run a unit test.
+`pkg/events/mock` ships ready-made, thread-safe test doubles so consuming services never need to stand up an AWS emulator (floci) or SNS just to run a unit test.
 
 ```go
 import "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events/mock"
@@ -45,10 +45,11 @@ The `mock.Publisher` API:
 
 | Method | What it does |
 |--------|-------------|
-| `Publish(ctx, env)` | Records the envelope; returns any error set via `SetError` |
+| `Publish(ctx, env)` | Records the envelope; returns any error set via `SetError`, or an error for an envelope without ID, Type or Source (as the SNS publisher does) |
 | `PublishBatch(ctx, envs)` | Calls `Publish` for each envelope |
 | `Published()` | Returns a copy of all recorded envelopes (thread-safe) |
-| `SetError(err)` | Makes all subsequent `Publish` calls return `err` |
+| `SetError(err)` | Makes all subsequent `Publish` / `PublishBatch` calls return `err` |
+| `SetBatchError(be)` | Makes `PublishBatch` fail the envelopes listed in `be.Failures` (returned as given — set `Retryable` to exercise the outbox's transient path) and publish the rest |
 | `Reset()` | Clears recorded envelopes and any configured error |
 
 ### Mock Consumer
@@ -82,7 +83,7 @@ The `mock.Consumer` API:
 | `Start(ctx)` | No-op; marks consumer as running |
 | `Stop()` | No-op; marks consumer as stopped |
 | `SetHandler(fn)` | Registers the handler called by `Inject` |
-| `Inject(env)` | Delivers the envelope synchronously to the registered handler |
+| `Inject(env)` | Delivers the envelope synchronously to the registered handler, with the context the SQS consumer gives: the tenant as pgcommon's GUC set (RLS), `events.TraceIDFromContext`, `events.SourceMessageFromContext` (body = the envelope JSON, queue = `QueueURL` or `mock.MockQueueURL`) and the dead-letter attribution |
 | `IsRunning()` | Reports whether `Start` has been called without a matching `Stop` |
 
 ### Mock DLQPublisher
@@ -114,7 +115,7 @@ The `mock.DLQPublisher` API:
 
 | Method | What it does |
 |--------|-------------|
-| `SendToDLQ(ctx, sourceQueueURL, body, attrs, reason)` | Records a copy of the message as a `DLQMessage`; returns any error set via `SetError` |
+| `SendToDLQ(ctx, sourceQueueURL, body, attrs, reason)` | Records a copy of the message as a `DLQMessage`; returns any error set via `SetError`. Like the SQS publisher it counts `platform_dlq_messages_total` and marks the handler's dead-letter attribution, so `inbox.Handler` / `Store.Process` do not record a dead-lettered message in tests either |
 | `ResolveDLQ(ctx, sourceQueueURL)` | Returns the `DLQURL` field (default `mock://dlq`), or the configured error |
 | `Sent()` | Returns a copy of all recorded `DLQMessage` values (`SourceQueueURL`, `Body`, `Attrs`, `Reason`) |
 | `SetError(err)` | Makes subsequent calls return `err` |

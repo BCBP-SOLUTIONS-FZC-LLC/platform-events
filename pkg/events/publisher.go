@@ -26,6 +26,11 @@ type BatchFailure struct {
 	ID      string
 	Code    string
 	Message string
+	// Retryable reports a transient failure (throttling, service-side error,
+	// timeout) that says nothing about the message itself: the outbox retries
+	// it without counting an attempt. Code "TransportError" is also treated as
+	// retryable, for publishers that predate this field.
+	Retryable bool
 }
 
 // Publisher publishes event envelopes to a message broker.
@@ -39,7 +44,7 @@ type SNSConfig struct {
 	// TopicARN is required. NewSNSPublisher returns an error if empty.
 	TopicARN    string
 	Region      string
-	EndpointURL string // optional — LocalStack endpoint for testing
+	EndpointURL string // optional — AWS emulator (floci) endpoint for local runs and tests
 	Logger      port.Logger
 }
 
@@ -68,6 +73,9 @@ func WithAttributes(attrs map[string]string) PublisherOption {
 // WithCodec sets the Codec used to encode outgoing envelope payloads before
 // publish. Unset (nil), Publish/PublishBatch behave exactly as before this
 // option existed: Payload stays plain JSON and SchemaID stays empty.
+// The encoded payload is base64-wrapped (about a third larger), so leave
+// headroom below SNS's 256 KiB message limit — outbox.Enqueue's 240 KiB
+// check runs before encoding.
 func WithCodec(codec Codec) PublisherOption {
 	return sns.WithCodec(codec)
 }
@@ -118,7 +126,7 @@ func (a *publisherAdapter) PublishBatch(ctx context.Context, envs []Envelope[jso
 	if errors.As(err, &snsBatchErr) {
 		pubErr := &BatchError{Failures: make([]BatchFailure, len(snsBatchErr.Failures))}
 		for i, f := range snsBatchErr.Failures {
-			pubErr.Failures[i] = BatchFailure{ID: f.ID, Code: f.Code, Message: f.Message}
+			pubErr.Failures[i] = BatchFailure{ID: f.ID, Code: f.Code, Message: f.Message, Retryable: f.Retryable}
 		}
 		return pubErr
 	}

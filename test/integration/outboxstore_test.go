@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
@@ -21,6 +19,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
 
@@ -61,7 +60,7 @@ func TestOutboxStore_EnqueueAndClaimBatch(t *testing.T) {
 	rec := makeRecord("order.created")
 
 	// Enqueue within a transaction.
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
@@ -89,7 +88,7 @@ func TestOutboxStore_MarkPublished(t *testing.T) {
 	defer cleanup()
 
 	rec := makeRecord("payment.processed")
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
@@ -117,19 +116,19 @@ func TestOutboxStore_MarkFailed_IncrementsAttempts(t *testing.T) {
 	defer cleanup()
 
 	rec := makeRecord("user.registered")
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
 
 	// Mark as failed (maxAttempts = 5, so we won't move to dead letter yet).
-	err = store.MarkFailed(ctx, rec, "publish error", 5)
+	err = store.MarkFailed(ctx, rec, "publish error", 5, 0)
 	require.NoError(t, err)
 
 	// Record should still be in outbox_events with attempts=1.
 	var attempts int
 	var lastError string
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT attempts, last_error FROM outbox_events WHERE id = $1", rec.ID,
 		).Scan(&attempts, &lastError)
@@ -160,13 +159,13 @@ func TestOutboxStore_MarkFailed_MovesToDeadLetter(t *testing.T) {
 	before := testutil.ToFloat64(dlCounter)
 
 	rec := makeRecord("invoice.settled")
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
 
 	// Fail it maxAttempts times (maxAttempts=1 so it moves immediately).
-	err = store.MarkFailed(ctx, rec, "fatal error", 1)
+	err = store.MarkFailed(ctx, rec, "fatal error", 1, 0)
 	require.NoError(t, err)
 
 	// The dead-letter counter must have incremented by exactly one.
@@ -175,7 +174,7 @@ func TestOutboxStore_MarkFailed_MovesToDeadLetter(t *testing.T) {
 
 	// Record should NOT be in outbox_events.
 	var count int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT COUNT(*) FROM outbox_events WHERE id = $1", rec.ID,
 		).Scan(&count)
@@ -185,7 +184,7 @@ func TestOutboxStore_MarkFailed_MovesToDeadLetter(t *testing.T) {
 
 	// Record should be in outbox_dead_letters.
 	var dlCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec.ID,
 		).Scan(&dlCount)
@@ -209,7 +208,7 @@ func TestOutboxStore_ClaimBatch_RespectsLimit(t *testing.T) {
 	// Enqueue 5 records.
 	for i := 0; i < 5; i++ {
 		rec := makeRecord("batch.event")
-		err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 			return store.Enqueue(ctx, tx, rec)
 		})
 		require.NoError(t, err)
@@ -234,27 +233,27 @@ func TestOutboxStore_MarkFailed_DeadLetter_Idempotent(t *testing.T) {
 	defer cleanup()
 
 	rec := makeRecord("idempotent.test")
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
 
 	// Move to dead letter.
-	err = store.MarkFailed(ctx, rec, "error1", 1)
+	err = store.MarkFailed(ctx, rec, "error1", 1, 0)
 	require.NoError(t, err)
 
 	// Re-enqueue to test re-insertion to dead letter (ON CONFLICT DO NOTHING should not error).
 	rec2 := makeRecord("idempotent.test2")
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec2)
 	})
 	require.NoError(t, err)
-	err = store.MarkFailed(ctx, rec2, "error2", 1)
+	err = store.MarkFailed(ctx, rec2, "error2", 1, 0)
 	require.NoError(t, err)
 
 	// Both records should be in dead letters.
 	var count int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT COUNT(*) FROM outbox_dead_letters",
 		).Scan(&count)
@@ -278,7 +277,7 @@ func TestOutboxStore_MarkFailed_RecordNotFound(t *testing.T) {
 	// A valid UUID that does not exist in the table. MarkFailed now returns nil
 	// when the record is absent (it was already published or removed by a
 	// concurrent runner) — this is logged at WARN, not propagated as an error.
-	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000001"}, "error", 5)
+	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000001"}, "error", 5, 0)
 	require.NoError(t, err, "non-existent record should return nil — treated as already-handled")
 }
 
@@ -297,7 +296,7 @@ func TestOutboxStore_PendingCount(t *testing.T) {
 
 	// Enqueue one record.
 	rec := makeRecord("pending.count")
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
@@ -346,7 +345,7 @@ func TestOutboxStore_MarkFailed_NonExistentRecord_WithLogger(t *testing.T) {
 	store := outboxstore.New(pool, logger, 0)
 
 	// Call MarkFailed on a non-existent record — should log a warning, not error.
-	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000002"}, "test error", 5)
+	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000002"}, "test error", 5, 0)
 	require.NoError(t, err, "MarkFailed on a missing record must not error")
 
 	entries := logger.Entries()
@@ -404,7 +403,7 @@ func TestApplySchema_CreatesOutboxTables(t *testing.T) {
 	defer cleanup()
 
 	var outboxTableExists bool
-	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, `
 			SELECT EXISTS(
 				SELECT FROM information_schema.tables
@@ -415,7 +414,7 @@ func TestApplySchema_CreatesOutboxTables(t *testing.T) {
 	assert.True(t, outboxTableExists, "outbox_events table should exist")
 
 	var dlTableExists bool
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, `
 			SELECT EXISTS(
 				SELECT FROM information_schema.tables
@@ -429,7 +428,7 @@ func TestApplySchema_CreatesOutboxTables(t *testing.T) {
 	// shared "schema_migrations" table, so multiple runners can coexist in the
 	// same database without version-number collisions.
 	var trackingTableExists bool
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, `
 			SELECT EXISTS(
 				SELECT FROM information_schema.tables
@@ -438,6 +437,116 @@ func TestApplySchema_CreatesOutboxTables(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.True(t, trackingTableExists, "outbox_migrations tracking table should exist (not schema_migrations)")
+}
+
+// An explicit x-migrations-table in the DSN (typically the service's own
+// tracking table) is replaced: outbox versions must never share it.
+func TestApplySchema_IgnoresCallerMigrationsTable(t *testing.T) {
+	ctx := context.Background()
+	dsn, drop := fixtures.NewEmptyTestDB(ctx, t)
+	defer drop()
+
+	require.NoError(t, outbox.ApplySchema(ctx, &migrate.Runner{DSN: dsn + "&x-migrations-table=svc_migrations"}))
+
+	pool, err := pgcommon.NewPool(ctx, pgcommon.Config{DSN: dsn})
+	require.NoError(t, err)
+	defer pool.Close()
+	exists := func(table string) bool {
+		var ok bool
+		require.NoError(t, pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+			return conn.QueryRow(ctx, `SELECT EXISTS(SELECT FROM information_schema.tables WHERE table_name = $1)`, table).Scan(&ok)
+		}))
+		return ok
+	}
+	assert.True(t, exists(outbox.MigrationsTable), "outbox tracked in its own table")
+	assert.False(t, exists("svc_migrations"), "the service's tracking table is untouched")
+}
+
+// ReleaseLease hands a record back without counting an attempt; retryAfter
+// controls when it is claimable again. MarkFailed's retryAfter does the same
+// for a counted failure.
+func TestOutboxStore_ReleaseLeaseAndRetryBackoff(t *testing.T) {
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+	enqueue := func(et string) domain.OutboxRecord {
+		rec := makeRecord(et)
+		require.NoError(t, pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+			return store.Enqueue(ctx, tx, rec)
+		}))
+		claimed, err := store.ClaimBatch(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+		return rec
+	}
+	row := func(id string) (attempts int, lastError string) {
+		require.NoError(t, pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+			return conn.QueryRow(ctx, "SELECT attempts, last_error FROM outbox_events WHERE id = $1", id).Scan(&attempts, &lastError)
+		}))
+		return attempts, lastError
+	}
+	claimable := func() int {
+		recs, err := store.ClaimBatch(ctx, 10)
+		require.NoError(t, err)
+		return len(recs)
+	}
+
+	// Released immediately: claimable again, no attempt counted.
+	rec := enqueue("lease.release")
+	require.NoError(t, store.ReleaseLease(ctx, rec.ID, "shutdown", 0))
+	attempts, lastErr := row(rec.ID)
+	assert.Equal(t, 0, attempts)
+	assert.Equal(t, "shutdown", lastErr)
+	assert.Equal(t, 1, claimable(), "claimable again at once")
+
+	// Released with a delay: not claimable until it passes.
+	require.NoError(t, store.ReleaseLease(ctx, rec.ID, "throttled", time.Hour))
+	assert.Equal(t, 0, claimable(), "hidden for retryAfter")
+	attempts, _ = row(rec.ID)
+	assert.Equal(t, 0, attempts, "a transient failure never counts")
+
+	// A counted failure with backoff: attempts++ and hidden for retryAfter.
+	rec2 := enqueue("lease.markfailed")
+	require.NoError(t, store.MarkFailed(ctx, rec2, "bad request", 5, time.Hour))
+	attempts, _ = row(rec2.ID)
+	assert.Equal(t, 1, attempts)
+	assert.Equal(t, 0, claimable(), "hidden for the retry backoff")
+
+	// Releasing a record that is already published is a no-op.
+	require.NoError(t, pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+		_, err := conn.Exec(ctx, "UPDATE outbox_events SET published_at = NOW(), last_error = '' WHERE id = $1", rec2.ID)
+		return err
+	}))
+	require.NoError(t, store.ReleaseLease(ctx, rec2.ID, "late", 0))
+	_, lastErr = row(rec2.ID)
+	assert.Empty(t, lastErr, "published row untouched")
+}
+
+func TestOutboxStore_OldestPendingAge(t *testing.T) {
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+
+	age, err := store.OldestPendingAge(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, age, "empty outbox")
+
+	rec := makeRecord("age.event")
+	require.NoError(t, pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+		if err := store.Enqueue(ctx, tx, rec); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE outbox_events SET created_at = NOW() - interval '10 minutes' WHERE id = $1`, rec.ID)
+		return err
+	}))
+	age, err = store.OldestPendingAge(ctx)
+	require.NoError(t, err)
+	assert.InDelta(t, (10 * time.Minute).Seconds(), age.Seconds(), 5)
+
+	require.NoError(t, store.MarkPublished(ctx, rec.ID))
+	age, err = store.OldestPendingAge(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, age, "published records do not count")
 }
 
 // ----------------------------
@@ -459,7 +568,7 @@ func TestOutboxStore_LeasedCount(t *testing.T) {
 
 	// Enqueue a record and claim it (ClaimBatch sets scheduled_at to a future time = leased).
 	rec := makeRecord("leased.event")
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
@@ -498,15 +607,15 @@ func TestOutboxStore_ReprocessDeadLetters(t *testing.T) {
 
 	// Enqueue a record and move it to the dead-letter table via MarkFailed.
 	rec := makeRecord("dl.reprocess")
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.MarkFailed(ctx, rec, "permanent failure", 1 /* maxAttempts=1 */))
+	require.NoError(t, store.MarkFailed(ctx, rec, "permanent failure", 1 /* maxAttempts=1 */, 0))
 
 	// Verify record is now in dead_letters.
 	var dlCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec.ID,
 		).Scan(&dlCount)
@@ -521,7 +630,7 @@ func TestOutboxStore_ReprocessDeadLetters(t *testing.T) {
 
 	// Verify it's back in outbox_events and no longer in dead_letters.
 	var outboxCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT COUNT(*) FROM outbox_events WHERE id = $1", rec.ID,
 		).Scan(&outboxCount)
@@ -530,7 +639,7 @@ func TestOutboxStore_ReprocessDeadLetters(t *testing.T) {
 	assert.Equal(t, 1, outboxCount, "reprocessed record should be back in outbox_events")
 
 	var newDlCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec.ID,
 		).Scan(&newDlCount)
@@ -550,11 +659,11 @@ func TestOutboxStore_ReprocessDeadLetters_Limit(t *testing.T) {
 	// Create 3 dead-letter records.
 	for i := 0; i < 3; i++ {
 		rec := makeRecord("dl.limit")
-		err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 			return store.Enqueue(ctx, tx, rec)
 		})
 		require.NoError(t, err)
-		require.NoError(t, store.MarkFailed(ctx, rec, "fatal", 1))
+		require.NoError(t, store.MarkFailed(ctx, rec, "fatal", 1, 0))
 	}
 
 	// Reprocess only 2.
@@ -600,7 +709,7 @@ func TestOutboxStore_MarkPublished_AlreadyPublished(t *testing.T) {
 	storeWithLogger := outboxstore.New(pool, logger, 0)
 
 	rec := makeRecord("double.publish")
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return storeWithLogger.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
@@ -636,16 +745,16 @@ func TestOutboxStore_MarkFailed_DeadLetterOnFirstAttempt(t *testing.T) {
 	defer cleanup()
 
 	rec := makeRecord("dead.letter.immediate")
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
 
 	// With maxAttempts=1, attempts(0)+1=1 >= 1 → record moves to dead_letters immediately.
-	require.NoError(t, store.MarkFailed(ctx, rec, "permanent error", 1))
+	require.NoError(t, store.MarkFailed(ctx, rec, "permanent error", 1, 0))
 
 	var outboxCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT COUNT(*) FROM outbox_events WHERE id = $1", rec.ID,
 		).Scan(&outboxCount)
@@ -654,7 +763,7 @@ func TestOutboxStore_MarkFailed_DeadLetterOnFirstAttempt(t *testing.T) {
 	assert.Equal(t, 0, outboxCount, "record must be removed from outbox_events after dead-lettering")
 
 	var dlCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec.ID,
 		).Scan(&dlCount)
@@ -689,7 +798,7 @@ func TestOutboxStore_InsertRecord_NegativeDelay(t *testing.T) {
 		ScheduledAt: now.Add(-5 * time.Second), // 5 s in the past → delaySecs < 0
 	}
 
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
@@ -764,7 +873,7 @@ func TestOutboxStore_PrunePublished_DeletesOldPublishedRecords(t *testing.T) {
 	rec1 := makeRecord("prune.event.one")
 	rec2 := makeRecord("prune.event.two")
 	for _, rec := range []domain.OutboxRecord{rec1, rec2} {
-		err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 			return store.Enqueue(ctx, tx, rec)
 		})
 		require.NoError(t, err)
@@ -773,7 +882,7 @@ func TestOutboxStore_PrunePublished_DeletesOldPublishedRecords(t *testing.T) {
 	require.NoError(t, store.MarkPublished(ctx, rec2.ID))
 
 	// Backdate published_at to simulate old records so olderThan=1ms is satisfied.
-	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		_, err := conn.Exec(ctx,
 			`UPDATE outbox_events SET published_at = NOW() - INTERVAL '1 hour' WHERE id = ANY($1)`,
 			[]string{rec1.ID, rec2.ID},
@@ -800,13 +909,13 @@ func TestOutboxStore_PrunePublished_LimitBoundsDelete(t *testing.T) {
 	const total = 3
 	for i := range total {
 		rec := makeRecord(fmt.Sprintf("prune.limit.%d", i))
-		err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 			return store.Enqueue(ctx, tx, rec)
 		})
 		require.NoError(t, err)
 		require.NoError(t, store.MarkPublished(ctx, rec.ID))
 	}
-	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		_, err := conn.Exec(ctx, `UPDATE outbox_events SET published_at = NOW() - INTERVAL '1 hour' WHERE published_at IS NOT NULL`)
 		return err
 	})
@@ -843,11 +952,11 @@ func makeRecordWithTenant(eventType, tenantID string) domain.OutboxRecord {
 // moves it to outbox_dead_letters via MarkFailed with maxAttempts=1.
 func enqueueAndDeadLetter(ctx context.Context, t *testing.T, store *outboxstore.Store, pool *pgcommon.Pool, rec domain.OutboxRecord) {
 	t.Helper()
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.MarkFailed(ctx, rec, "forced to dead letter", 1))
+	require.NoError(t, store.MarkFailed(ctx, rec, "forced to dead letter", 1, 0))
 }
 
 // ----------------------------
@@ -950,7 +1059,7 @@ func TestOutboxStore_ListDeadLetters_FilterByFailedBefore(t *testing.T) {
 
 	// Backdate one record's failed_at to a known time in the past.
 	past := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err := pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		_, err := conn.Exec(ctx,
 			`UPDATE outbox_dead_letters SET failed_at = $1 WHERE event_type = 'iam.user.created'`, past)
 		return err
@@ -1044,7 +1153,7 @@ func TestOutboxStore_ReprocessDeadLettersWith_AllRecords(t *testing.T) {
 
 	// Both records should be back in outbox_events.
 	var count int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_events WHERE published_at IS NULL").Scan(&count)
 	})
 	require.NoError(t, err)
@@ -1052,7 +1161,7 @@ func TestOutboxStore_ReprocessDeadLettersWith_AllRecords(t *testing.T) {
 
 	// Dead letters table must be empty.
 	var dlCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters").Scan(&dlCount)
 	})
 	require.NoError(t, err)
@@ -1078,14 +1187,14 @@ func TestOutboxStore_ReprocessDeadLettersWith_FilterByEventType(t *testing.T) {
 
 	// Only rec1 should be back; rec2 stays dead-lettered.
 	var outboxCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_events WHERE id = $1", rec1.ID).Scan(&outboxCount)
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, outboxCount)
 
 	var dlCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec2.ID).Scan(&dlCount)
 	})
 	require.NoError(t, err)
@@ -1110,14 +1219,14 @@ func TestOutboxStore_ReprocessDeadLettersWith_FilterByTenantID(t *testing.T) {
 	assert.Equal(t, 1, n)
 
 	var acmeBack int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_events WHERE id = $1", recAcme.ID).Scan(&acmeBack)
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 1, acmeBack, "acme record must be back in outbox_events")
 
 	var betaStill int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", recBeta.ID).Scan(&betaStill)
 	})
 	require.NoError(t, err)
@@ -1140,7 +1249,7 @@ func TestOutboxStore_ReprocessDeadLettersWith_ResetsAttempts(t *testing.T) {
 	assert.Equal(t, 1, n)
 
 	var attempts int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT attempts FROM outbox_events WHERE id = $1", rec.ID).Scan(&attempts)
 	})
 	require.NoError(t, err)
@@ -1183,7 +1292,7 @@ func TestOutboxStore_DiscardDeadLetters_DeletesAll(t *testing.T) {
 	assert.Equal(t, int64(2), n)
 
 	var count int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters").Scan(&count)
 	})
 	require.NoError(t, err)
@@ -1209,14 +1318,14 @@ func TestOutboxStore_DiscardDeadLetters_FilterByEventType(t *testing.T) {
 
 	// rec1 must be gone; rec2 must remain.
 	var rec1Count int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec1.ID).Scan(&rec1Count)
 	})
 	require.NoError(t, err)
 	assert.Equal(t, 0, rec1Count, "discarded record must be gone")
 
 	var rec2Count int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", rec2.ID).Scan(&rec2Count)
 	})
 	require.NoError(t, err)
@@ -1241,7 +1350,7 @@ func TestOutboxStore_DiscardDeadLetters_FilterByTenantID(t *testing.T) {
 	assert.Equal(t, int64(1), n)
 
 	var betaCount int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters WHERE id = $1", recBeta.ID).Scan(&betaCount)
 	})
 	require.NoError(t, err)
@@ -1265,7 +1374,7 @@ func TestOutboxStore_DiscardDeadLetters_RespectsLimit(t *testing.T) {
 	assert.Equal(t, int64(2), n)
 
 	var remaining int
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, "SELECT COUNT(*) FROM outbox_dead_letters").Scan(&remaining)
 	})
 	require.NoError(t, err)
@@ -1325,7 +1434,7 @@ func TestOutboxStore_PGBouncerMode_EnqueueAndClaimBatch(t *testing.T) {
 
 	rec := makeRecord("pgbouncer.order.created")
 
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err, "Enqueue must not fail under SimpleProtocol exec mode")
@@ -1350,7 +1459,7 @@ func TestOutboxStore_PGBouncerMode_MarkFailed_MovesToDeadLetter(t *testing.T) {
 	store := outboxstore.New(pool, nil, 0)
 
 	rec := makeRecord("pgbouncer.invoice.settled")
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
@@ -1358,11 +1467,11 @@ func TestOutboxStore_PGBouncerMode_MarkFailed_MovesToDeadLetter(t *testing.T) {
 	// maxAttempts=1 moves the record straight to outbox_dead_letters, exercising
 	// the INSERT INTO outbox_dead_letters(..., payload, ...) path under
 	// SimpleProtocol as well.
-	err = store.MarkFailed(ctx, rec, "fatal error", 1)
+	err = store.MarkFailed(ctx, rec, "fatal error", 1, 0)
 	require.NoError(t, err, "MarkFailed dead-letter insert must not fail under SimpleProtocol exec mode")
 
 	var dlPayload []byte
-	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgxpool.Conn) error {
+	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx,
 			"SELECT payload FROM outbox_dead_letters WHERE id = $1", rec.ID,
 		).Scan(&dlPayload)
@@ -1381,7 +1490,7 @@ func TestOutboxStore_PrunePublished_RecentRecordsNotDeleted(t *testing.T) {
 
 	// Insert and mark published right now (no backdating).
 	rec := makeRecord("prune.recent")
-	err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
@@ -1391,4 +1500,24 @@ func TestOutboxStore_PrunePublished_RecentRecordsNotDeleted(t *testing.T) {
 	deleted, err := store.PrunePublished(ctx, 7*24*time.Hour, 1000)
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), deleted, "recently published record must not be pruned")
+}
+
+// A replayed dead letter is a fresh outbox entry: created_at resets, so the
+// oldest-pending-age gauge does not jump to the dead letter's age.
+func TestOutboxStore_Reprocess_ResetsCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+	rec := makeRecord("replay.age")
+	enqueueAndDeadLetter(ctx, t, store, pool, rec)
+	require.NoError(t, pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+		_, err := conn.Exec(ctx, `UPDATE outbox_dead_letters SET created_at = NOW() - interval '3 days' WHERE id = $1`, rec.ID)
+		return err
+	}))
+	n, err := store.ReprocessDeadLetters(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	age, err := store.OldestPendingAge(ctx)
+	require.NoError(t, err)
+	assert.Less(t, age, time.Minute)
 }

@@ -6,7 +6,7 @@ This is an internal shared library for BCBP Solutions platform services. This gu
 
 - Go 1.26+ (matches `go.mod`)
 - Docker (required for integration tests via `testcontainers-go`)
-- `golangci-lint` is managed as a Go tool — no separate install needed (`go tool golangci-lint run`)
+- `golangci-lint` is managed as a Go tool in its own `tools/` module — no separate install needed (`make lint`, or `go tool -modfile=tools/go.mod golangci-lint run`)
 
 ## Development setup
 
@@ -65,7 +65,7 @@ Register the new event type in [EVENT_SCHEMA_GOVERNANCE.md](EVENT_SCHEMA_GOVERNA
 - **Event types are immutable once published** — treat a published `event_type` string as a permanent contract
 - All optional fields must be tagged `json:",omitempty"`; consumers must never use `json.Decoder.DisallowUnknownFields()` on event payloads
 - No field removals, renames, type changes, or semantic changes without minting a new versioned event type
-- Adding a new optional field is non-breaking — increment `schema_version` so consumers can distinguish payload generations
+- Adding a new optional field is non-breaking — increment the schema version (`WithSchemaVersion`, wire key `specversion`) so consumers can distinguish payload generations
 
 See [EVENT_SCHEMA_GOVERNANCE.md](EVENT_SCHEMA_GOVERNANCE.md) for the full ruleset, migration window pattern, and consumer compatibility contract.
 
@@ -108,10 +108,10 @@ See [EVENT_SCHEMA_GOVERNANCE.md](EVENT_SCHEMA_GOVERNANCE.md) for the full rulese
 | Layer | Location | Build tag | Docker | Notes |
 |-------|----------|-----------|--------|-------|
 | Unit | `test/unit/` | *(none)* | No | Fully isolated; mock deps only |
-| Integration | `test/integration/` | `integration` | Yes | LocalStack + Postgres via testcontainers |
+| Integration | `test/integration/` | `integration` | Yes | floci + Postgres via testcontainers |
 | Smoke | `test/smoke/` | `smoke` | — | Targets live AWS resources; optional |
 
-All unit tests must pass without Docker (`make test-unit`). Integration tests spin up LocalStack (SNS + SQS) and Postgres containers automatically.
+All unit tests must pass without Docker (`make test-unit`). Integration tests spin up floci (open-source AWS emulator: SNS + SQS) and Postgres containers automatically.
 
 ## PR checklist
 

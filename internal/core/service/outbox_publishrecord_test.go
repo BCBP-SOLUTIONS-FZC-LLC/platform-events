@@ -1,8 +1,8 @@
 package service
 
 // White-box tests for outbox service internals that cannot be exercised reliably
-// from black-box tests: publishRecord's ctx.Err() fast-path, failureThreshold
-// retryable-vs-non-retryable branching, and releaseStranded behaviour.
+// from black-box tests: publishRecord's ctx.Err() fast-path, transient vs
+// permanent failure handling, the retry backoff, and releaseStranded.
 
 import (
 	"context"
@@ -14,31 +14,54 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 )
 
-// stubStore is an in-memory port.OutboxStore for the white-box test.
+// stubStore is an in-memory port.OutboxStore for the white-box test. failed
+// records MarkFailed calls (attempt counted); released records ReleaseLease
+// calls (no attempt) with their retry delays.
 type stubStore struct {
-	failed map[string]string
+	failed     map[string]string
+	retryAfter map[string]time.Duration
+	released   map[string]string
+	releasedIn map[string]time.Duration
 }
 
-func newStubStore() *stubStore { return &stubStore{failed: make(map[string]string)} }
+func newStubStore() *stubStore {
+	return &stubStore{
+		failed: map[string]string{}, retryAfter: map[string]time.Duration{},
+		released: map[string]string{}, releasedIn: map[string]time.Duration{},
+	}
+}
 
-func (s *stubStore) Enqueue(_ context.Context, _ pgx.Tx, _ domain.OutboxRecord) error { return nil }
+func (s *stubStore) Enqueue(_ context.Context, _ pgcommon.Tx, _ domain.OutboxRecord) error {
+	return nil
+}
 func (s *stubStore) ClaimBatch(_ context.Context, _ int) ([]domain.OutboxRecord, error) {
 	return nil, nil
 }
 func (s *stubStore) MarkPublished(_ context.Context, _ string) error { return nil }
-func (s *stubStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, reason string, _ int) error {
+func (s *stubStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, reason string, _ int, retryAfter time.Duration) error {
 	s.failed[rec.ID] = reason
+	s.retryAfter[rec.ID] = retryAfter
+	return nil
+}
+func (s *stubStore) ReleaseLease(_ context.Context, id, reason string, retryAfter time.Duration) error {
+	s.released[id] = reason
+	s.releasedIn[id] = retryAfter
 	return nil
 }
 func (s *stubStore) PendingCount(_ context.Context) (int64, error)              { return 0, nil }
+func (s *stubStore) OldestPendingAge(context.Context) (time.Duration, error)    { return 0, nil }
+func (s *stubStore) PromoteWaiting(context.Context) (int64, error)              { return 0, nil }
+func (s *stubStore) BlockedCount(context.Context) (int64, error)                { return 0, nil }
 func (s *stubStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *stubStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
 func (s *stubStore) PrunePublished(_ context.Context, _ time.Duration, _ int) (int64, error) {
@@ -68,116 +91,138 @@ func (stubPublisher) PublishBatch(_ context.Context, _ []domain.Envelope[json.Ra
 
 var _ port.Publisher = stubPublisher{}
 
-// TestPublishRecord_CtxCancelledBeforeRun covers the ctx.Err() != nil fast-path
-// at the start of publishRecord (lines 154-162 in outbox_service.go).
+func testRecord(t *testing.T, eventType string) domain.OutboxRecord {
+	t.Helper()
+	env := domain.NewEnvelope(eventType, "svc", json.RawMessage(`{}`))
+	payload, err := json.Marshal(env)
+	require.NoError(t, err)
+	return domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload}
+}
+
+// TestPublishRecord_CtxCancelledBeforeRun: a record claimed just before
+// shutdown is released immediately without counting an attempt.
 func TestPublishRecord_CtxCancelledBeforeRun(t *testing.T) {
 	store := newStubStore()
 	svc := NewOutboxService(store, stubPublisher{}, nil, nil, 5, 1, 0)
+	rec := testRecord(t, "cancel.event")
 
-	env := domain.NewEnvelope("cancel.event", "svc", json.RawMessage(`{}`))
-	payload, _ := json.Marshal(env)
-	rec := domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload}
-
-	// Pre-cancel the context so publishRecord immediately takes the fast-path.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
+	svc.publishRecord(ctx, context.Background(), rec)
 
-	bookkeepCtx := context.Background()
-	svc.publishRecord(ctx, bookkeepCtx, rec)
-
-	assert.Contains(t, store.failed, rec.ID,
-		"publishRecord should call MarkFailed when ctx is already cancelled")
-	assert.Contains(t, store.failed[rec.ID], "context",
-		"failure reason should mention context cancellation")
+	assert.NotContains(t, store.failed, rec.ID, "shutdown must not count an attempt")
+	require.Contains(t, store.released, rec.ID)
+	assert.Contains(t, store.released[rec.ID], "context")
+	assert.Zero(t, store.releasedIn[rec.ID], "a stranded record is claimable immediately")
 }
 
-// TestFailureThreshold_RetryableError verifies that context.Canceled,
-// context.DeadlineExceeded, and domain.ErrRetryable use maxAttempts+1 as the
-// failure threshold so a graceful-shutdown or transient-SNS failure does not
-// dead-letter a record that still has retry budget remaining.
-func TestFailureThreshold_RetryableErrors(t *testing.T) {
-	svc := NewOutboxService(newStubStore(), stubPublisher{}, nil, nil, 5, 1, 0)
-
-	cases := []struct {
+// TestPublishRecord_TransientErrors_ReleaseWithoutAttempt: timeouts and
+// ErrRetryable describe the publisher, so they release the lease (no attempt)
+// with a growing shared backoff.
+func TestPublishRecord_TransientErrors_ReleaseWithoutAttempt(t *testing.T) {
+	for _, tc := range []struct {
 		name string
 		err  error
 	}{
-		{"context.Canceled", context.Canceled},
 		{"context.DeadlineExceeded", context.DeadlineExceeded},
 		{"domain.ErrRetryable", domain.ErrRetryable},
 		{"wrapped ErrRetryable", fmt.Errorf("sns throttle: %w", domain.ErrRetryable)},
-	}
-	for _, tc := range cases {
+	} {
 		t.Run(tc.name, func(t *testing.T) {
-			threshold := svc.failureThreshold(tc.err)
-			assert.Equal(t, svc.maxAttempts+1, threshold,
-				"retryable error must use maxAttempts+1 to avoid premature dead-lettering")
+			store := newStubStore()
+			svc := NewOutboxService(store, &errPublisher{err: tc.err}, nil, nil, 5, 2, 0)
+			svc.SetRetryBackoff(time.Second, time.Minute)
+			var delays []time.Duration
+			for range 4 {
+				svc.beginPoll() // one failure per poll cycle
+				rec := testRecord(t, "transient.event")
+				svc.publishRecord(context.Background(), context.Background(), rec)
+				assert.NotContains(t, store.failed, rec.ID)
+				require.Contains(t, store.released, rec.ID)
+				delays = append(delays, store.releasedIn[rec.ID])
+			}
+			// Equal jitter: the n-th delay lies in [d/2, d] with d = 1s·2^(n-1).
+			for i, d := range delays {
+				hi := time.Second << i
+				assert.GreaterOrEqual(t, d, hi/2, "delay %d", i)
+				assert.LessOrEqual(t, d, hi, "delay %d", i)
+			}
 		})
 	}
 }
 
-// TestFailureThreshold_NonRetryableError verifies that ordinary SNS errors use
-// maxAttempts as the threshold so records exhaust retries and reach dead-letter.
-func TestFailureThreshold_NonRetryableError(t *testing.T) {
-	svc := NewOutboxService(newStubStore(), stubPublisher{}, nil, nil, 5, 1, 0)
-	threshold := svc.failureThreshold(errors.New("sns: InvalidParameter"))
-	assert.Equal(t, svc.maxAttempts, threshold,
-		"non-retryable error must use maxAttempts so record eventually dead-letters")
-}
-
-// TestReleaseStranded verifies that releaseStranded marks the record failed
-// with threshold maxAttempts+1 (not maxAttempts) so a single graceful-shutdown
-// event does not consume a retry slot or trigger dead-lettering.
-func TestReleaseStranded_UsesMaxAttemptsPlus1(t *testing.T) {
+// TestPublishRecord_SuccessResetsTransientStreak: one successful publish ends
+// the outage backoff.
+func TestPublishRecord_SuccessResetsTransientStreak(t *testing.T) {
 	store := newStubStore()
-	svc := NewOutboxService(store, stubPublisher{}, nil, nil, 5, 1, 0)
-
-	env := domain.NewEnvelope("stranded.event", "svc", json.RawMessage(`{}`))
-	payload, _ := json.Marshal(env)
-	rec := domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload}
-
-	svc.releaseStranded(context.Background(), rec, "shutdown")
-
-	require.Contains(t, store.failed, rec.ID)
-	assert.Equal(t, "shutdown", store.failed[rec.ID],
-		"releaseStranded should record the shutdown reason")
+	pub := &errPublisher{err: domain.ErrRetryable}
+	svc := NewOutboxService(store, pub, nil, nil, 5, 2, 0)
+	for range 5 {
+		svc.beginPoll()
+		svc.publishRecord(context.Background(), context.Background(), testRecord(t, "e"))
+	}
+	assert.Equal(t, 5, svc.transientCount)
+	pub.err = nil
+	svc.publishRecord(context.Background(), context.Background(), testRecord(t, "e"))
+	assert.Zero(t, svc.transientCount)
 }
 
-// stubStoreWithThreshold captures the threshold argument passed to MarkFailed
-// so tests can verify it without inspecting internal logic.
-type stubStoreWithThreshold struct {
-	stubStore
-	thresholds map[string]int
-}
-
-func newStubStoreWithThreshold() *stubStoreWithThreshold {
-	return &stubStoreWithThreshold{
-		stubStore:  stubStore{failed: make(map[string]string)},
-		thresholds: make(map[string]int),
+// TestTransientBackoff_OncePerPoll: many records failing in one poll cycle
+// (PublishConcurrency > 1) advance the shared backoff once, not once each —
+// a one-second SNS blip must not park the batch for minutes.
+func TestTransientBackoff_OncePerPoll(t *testing.T) {
+	store := newStubStore()
+	svc := NewOutboxService(store, &errPublisher{err: domain.ErrRetryable}, nil, nil, 5, 8, 0)
+	svc.SetRetryBackoff(time.Second, 5*time.Minute)
+	svc.beginPoll()
+	for range 50 {
+		svc.publishRecord(context.Background(), context.Background(), testRecord(t, "e"))
+	}
+	assert.Equal(t, 1, svc.transientCount)
+	for id, d := range store.releasedIn {
+		assert.LessOrEqual(t, d, time.Second, "record %s parked for %s", id, d)
 	}
 }
 
-func (s *stubStoreWithThreshold) MarkFailed(_ context.Context, rec domain.OutboxRecord, reason string, threshold int) error {
-	s.failed[rec.ID] = reason
-	s.thresholds[rec.ID] = threshold
-	return nil
+// TestPublishRecord_PermanentError_CountsAttemptWithBackoff: an ordinary
+// error counts an attempt and delays the retry by the per-record backoff.
+func TestPublishRecord_PermanentError_CountsAttemptWithBackoff(t *testing.T) {
+	store := newStubStore()
+	svc := NewOutboxService(store, &errPublisher{err: errors.New("sns: InvalidParameter")}, nil, nil, 5, 2, 0)
+	svc.SetRetryBackoff(2*time.Second, time.Hour)
+	rec := testRecord(t, "perm.event")
+	rec.Attempts = 3 // this failure is the 4th: 2s·2^3 = 16s
+	svc.publishRecord(context.Background(), context.Background(), rec)
+
+	require.Contains(t, store.failed, rec.ID)
+	assert.NotContains(t, store.released, rec.ID)
+	assert.GreaterOrEqual(t, store.retryAfter[rec.ID], 8*time.Second)
+	assert.LessOrEqual(t, store.retryAfter[rec.ID], 16*time.Second)
 }
 
-// TestReleaseStranded_ThresholdIsMaxAttemptsPlus1 uses stubStoreWithThreshold
-// to directly assert that the threshold passed to MarkFailed is maxAttempts+1.
-func TestReleaseStranded_ThresholdIsMaxAttemptsPlus1(t *testing.T) {
-	store := newStubStoreWithThreshold()
-	const maxAttempts = 3
-	svc := NewOutboxService(store, stubPublisher{}, nil, nil, maxAttempts, 1, 0)
+func TestBackoff_CapsAndDefaults(t *testing.T) {
+	svc := NewOutboxService(newStubStore(), stubPublisher{}, nil, nil, 5, 1, 0)
+	assert.LessOrEqual(t, svc.backoff(1), DefaultRetryBackoff)
+	assert.LessOrEqual(t, svc.backoff(1000), DefaultMaxRetryBackoff, "no overflow, capped")
+	assert.GreaterOrEqual(t, svc.backoff(1000), DefaultMaxRetryBackoff/2)
 
-	env := domain.NewEnvelope("stranded.event", "svc", json.RawMessage(`{}`))
-	payload, _ := json.Marshal(env)
-	rec := domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload}
+	svc.SetRetryBackoff(time.Minute, time.Second) // max < base → max raised to base
+	assert.Equal(t, time.Minute, svc.maxRetryBackoff)
+	svc.SetRetryBackoff(0, 0) // non-positive keeps current values
+	assert.Equal(t, time.Minute, svc.retryBackoff)
+}
 
-	svc.releaseStranded(context.Background(), rec, "ctx cancelled")
+// TestReleaseStranded_NoAttempt: shutdown never counts toward MaxAttempts.
+func TestReleaseStranded_NoAttempt(t *testing.T) {
+	store := newStubStore()
+	svc := NewOutboxService(store, stubPublisher{}, nil, nil, 3, 1, 0)
+	rec := testRecord(t, "stranded.event")
 
-	assert.Equal(t, maxAttempts+1, store.thresholds[rec.ID],
-		"releaseStranded must use maxAttempts+1 so a shutdown never counts as a retry")
+	svc.releaseStranded(context.Background(), rec, "shutdown")
+
+	assert.NotContains(t, store.failed, rec.ID)
+	assert.Equal(t, "shutdown", store.released[rec.ID])
+	assert.Zero(t, store.releasedIn[rec.ID])
 }
 
 // TestPanicErr_Error verifies the internal panicErr type formats correctly.
@@ -255,4 +300,84 @@ func TestPublishRecord_PublishError_WithLogger(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "publishRecord must log a WARN when publish fails and logger is set")
+}
+
+// cancelOnPublish cancels the batch context mid-publish (a shutdown) and fails.
+type cancelOnPublish struct{ cancel context.CancelFunc }
+
+func (p cancelOnPublish) Publish(context.Context, domain.Envelope[json.RawMessage]) error {
+	p.cancel()
+	return errors.New("connection reset")
+}
+func (p cancelOnPublish) PublishBatch(context.Context, []domain.Envelope[json.RawMessage]) error {
+	p.cancel()
+	return errors.New("connection reset")
+}
+
+// TestPublishRecord_FailsDuringShutdown: a publish that fails because the
+// runner is stopping releases the lease immediately without counting an
+// attempt, whatever the error.
+func TestPublishRecord_FailsDuringShutdown(t *testing.T) {
+	store := newStubStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	svc := NewOutboxService(store, cancelOnPublish{cancel}, nil, nil, 5, 2, 0)
+	rec := testRecord(t, "shutdown.event")
+
+	svc.publishRecord(ctx, context.Background(), rec)
+
+	assert.NotContains(t, store.failed, rec.ID)
+	require.Contains(t, store.released, rec.ID)
+	assert.Contains(t, store.released[rec.ID], "publish interrupted by shutdown")
+	assert.Zero(t, store.releasedIn[rec.ID])
+}
+
+// batchFailPublisher fails every envelope of a batch under a given ID spelling.
+type batchFailPublisher struct{ spell func(string) string }
+
+func (batchFailPublisher) Publish(context.Context, domain.Envelope[json.RawMessage]) error {
+	return nil
+}
+func (p batchFailPublisher) PublishBatch(_ context.Context, envs []domain.Envelope[json.RawMessage]) error {
+	be := &domain.BatchError{}
+	for _, e := range envs {
+		be.Failures = append(be.Failures, domain.BatchFailure{ID: p.spell(e.ID), Code: "InvalidParameter", Message: "bad"})
+	}
+	return be
+}
+
+type claimStore struct {
+	*stubStore
+	recs      []domain.OutboxRecord
+	published []string
+}
+
+func (s *claimStore) ClaimBatch(context.Context, int) ([]domain.OutboxRecord, error) {
+	return s.recs, nil
+}
+func (s *claimStore) MarkPublished(_ context.Context, id string) error {
+	s.published = append(s.published, id)
+	return nil
+}
+
+// TestPublishBatch_LegacyNonCanonicalID_FailureMatched: a row whose payload ID
+// is uppercase (written before Enqueue required canonical IDs) is read back
+// canonicalised; its failure must still match, never be marked published.
+func TestPublishBatch_LegacyNonCanonicalID_FailureMatched(t *testing.T) {
+	env := domain.NewEnvelope("legacy.event", "svc", json.RawMessage(`{}`))
+	env.ID = strings.ToUpper(env.ID)
+	payload, err := json.Marshal(env)
+	require.NoError(t, err)
+	store := &claimStore{stubStore: newStubStore(), recs: []domain.OutboxRecord{{ID: strings.ToLower(env.ID), EventType: env.Type, Payload: payload}}}
+	svc := NewOutboxService(store, batchFailPublisher{spell: func(id string) string { return id }}, nil, nil, 5, 1, 0)
+
+	require.NoError(t, svc.PublishBatch(context.Background(), 10))
+	assert.Empty(t, store.published, "a failed publish must not be marked published")
+	assert.Contains(t, store.failed, strings.ToLower(env.ID))
+}
+
+func TestCanonicalID(t *testing.T) {
+	id := uuid.NewString()
+	assert.Equal(t, id, canonicalID(strings.ToUpper(id)))
+	assert.Equal(t, id, canonicalID("{"+id+"}"))
+	assert.Equal(t, "not-a-uuid", canonicalID("not-a-uuid"), "non-UUIDs are compared as-is")
 }

@@ -1,0 +1,732 @@
+{
+  "title": "platform-events \u2014 messaging (Observability Standard)",
+  "uid": "platform-events-messaging",
+  "tags": [
+    "platform-events",
+    "observability-standard",
+    "tier1"
+  ],
+  "description": "Reference dashboard for services using platform-events. Canonical Tier 1 panels first, Proposed metrics as shadow panels, legacy panels only where still authoritative. Metric contract: docs/observability/metrics-registry.md. CI-linted (make metrics-lint).",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "domain",
+        "label": "Domain",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(platform_messages_received_total, domain)",
+          "refId": "domain"
+        },
+        "definition": "label_values(platform_messages_received_total, domain)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(platform_messages_received_total{domain=~\"$domain\"}, service)",
+          "refId": "service"
+        },
+        "definition": "label_values(platform_messages_received_total{domain=~\"$domain\"}, service)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1
+      },
+      {
+        "name": "environment",
+        "label": "Environment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(platform_messages_received_total{domain=~\"$domain\",service=~\"$service\"}, environment)",
+          "refId": "environment"
+        },
+        "definition": "label_values(platform_messages_received_total{domain=~\"$domain\",service=~\"$service\"}, environment)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1
+      },
+      {
+        "name": "queue",
+        "label": "Queue",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(platform_messages_received_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"}, queue)",
+          "refId": "queue"
+        },
+        "definition": "label_values(platform_messages_received_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"}, queue)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "sort": 1
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Consumer \u2014 Canonical Tier 1",
+      "collapsed": false,
+      "id": 1,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Messages received / processed / failed",
+      "id": 2,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (queue) (rate(platform_messages_received_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "received {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (queue) (rate(platform_messages_processed_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "processed {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (queue) (rate(platform_messages_failed_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "failed {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Every delivery is received once and ends processed, failed (and retried) or dead-lettered."
+    },
+    {
+      "type": "timeseries",
+      "title": "Failures by reason",
+      "id": 3,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(platform_messages_failed_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Consumer SLO \u2014 failure ratio vs 0.1% budget",
+      "id": 4,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "platform_events:messages_failure_ratio:rate1h{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"}",
+          "legendFormat": "1h {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "platform_events:messages_failure_ratio:rate5m{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"}",
+          "legendFormat": "5m {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "SLO: 99.9% of received messages processed without failure. The fast-burn alert fires above 1.44% on both windows (with \u22651 msg/min)."
+    },
+    {
+      "type": "timeseries",
+      "title": "Dead-lettered (15m)",
+      "id": 5,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 9
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (operation, reason) (increase(platform_dlq_messages_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"}[15m]))",
+          "legendFormat": "{{operation}} / {{reason}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Retries",
+      "id": 6,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 17
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (operation) (rate(platform_retry_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"}[$__rate_interval]))",
+          "legendFormat": "{{operation}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Disabled (RegistrationWarning) in services whose registry already holds platform_retry_total with another label set."
+    },
+    {
+      "type": "row",
+      "title": "Shadow \u2014 Proposed Tier 1 (graph only; not for alerts, SLOs or HPA until ratified)",
+      "collapsed": false,
+      "id": 7,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Handler duration p99 (Proposed)",
+      "id": 8,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, queue) (rate(platform_message_processing_duration_seconds_bucket{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p99 {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Event propagation p95 (Proposed)",
+      "id": 9,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, queue) (rate(platform_event_propagation_seconds_bucket{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"}[$__rate_interval])))",
+          "legendFormat": "p95 {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Envelope time \u2192 first receipt. Includes producer clock skew."
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue and DLQ depth (Proposed)",
+      "id": 10,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 34
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (queue) (platform_queue_depth{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"})",
+          "legendFormat": "queue {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (queue) (platform_dlq_depth{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"})",
+          "legendFormat": "DLQ of {{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Sampled by consumers started with WithQueueDepthMetrics; max across replicas."
+    },
+    {
+      "type": "timeseries",
+      "title": "Duplicates acknowledged by the inbox (Proposed)",
+      "id": 11,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 34
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (queue) (rate(platform_duplicate_messages_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "{{queue}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dependency error ratio (Proposed)",
+      "id": 12,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (dependency, operation) (rate(platform_dependency_request_seconds_count{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",outcome=\"error\"}[$__rate_interval])) / sum by (dependency, operation) (rate(platform_dependency_request_seconds_count{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"}[$__rate_interval]))",
+          "legendFormat": "{{dependency}} {{operation}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Dependency latency p99, long-poll excluded (Proposed)",
+      "id": 13,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, dependency, operation) (rate(platform_dependency_request_seconds_bucket{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",operation!=\"receive_message\"}[$__rate_interval])))",
+          "legendFormat": "{{dependency}} {{operation}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Publish error ratio (Proposed)",
+      "id": 14,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (topic) (rate(platform_messages_published_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\",outcome=\"error\"}[$__rate_interval])) / sum by (topic) (rate(platform_messages_published_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"}[$__rate_interval]))",
+          "legendFormat": "{{topic}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox backlog and in flight (Proposed)",
+      "id": 15,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 50
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(platform_outbox_pending_events{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"})",
+          "legendFormat": "pending",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max(platform_outbox_leased_events{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"})",
+          "legendFormat": "leased",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Event-type label overflow (Proposed)",
+      "id": 16,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 58
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (label) (increase(platform_telemetry_label_overflow_total{domain=~\"$domain\",service=~\"$service\",environment=~\"$environment\"}[1h]))",
+          "legendFormat": "{{label}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Non-zero: a producer sends event types over 128 bytes or beyond the per-process limit (WithEventTypeLimit)."
+    },
+    {
+      "type": "row",
+      "title": "Legacy \u2014 authoritative until the Proposed successors are ratified",
+      "collapsed": false,
+      "id": 17,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 66
+      },
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox backlog (legacy)",
+      "id": 18,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 67
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (service) (outbox_pending_total{service=~\"$service\"})",
+          "legendFormat": "{{service}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "-1 = the pending-count query failed. Successor: platform_outbox_pending_events."
+    },
+    {
+      "type": "timeseries",
+      "title": "Outbox publish errors (legacy)",
+      "id": 19,
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 67
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service) (rate(outbox_published_total{service=~\"$service\",status=\"error\"}[$__rate_interval]))",
+          "legendFormat": "{{service}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ],
+      "description": "Successor: platform_outbox_publish_attempts_total{outcome=\"error\"}."
+    }
+  ]
+}

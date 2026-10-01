@@ -7,9 +7,11 @@ erDiagram
         text trace_id "copied from Envelope, default empty"
         int attempts "incremented by MarkFailed"
         text last_error "truncated to 512 chars"
-        timestamptz created_at
-        timestamptz scheduled_at "next eligible poll time — doubles as the claim lease"
+        timestamptz created_at "enqueue time (reset on replay) — oldest-pending-age gauge"
+        timestamptz scheduled_at "next eligible time: claim lease, retry backoff, or 'infinity' while an ordered record waits"
         timestamptz published_at "NULL until MarkPublished"
+        text ordering_key "EnqueueOrdered key, NULL when unordered (migration 010)"
+        bigint ordering_seq "INSERT-time sequence for keyed records — order within a key"
     }
     outbox_dead_letters {
         uuid id PK "same id as the outbox_events row it replaced"
@@ -19,8 +21,9 @@ erDiagram
         text trace_id
         int attempts "value when dead-lettered"
         text last_error
-        timestamptz created_at "original enqueue time"
+        timestamptz created_at "enqueue time of the dead-lettered row"
         timestamptz failed_at "dead-letter time"
+        text ordering_key "kept through dead-lettering and replay (migration 010)"
     }
     processed_events {
         uuid event_id PK "Envelope.ID"
@@ -28,7 +31,7 @@ erDiagram
         timestamptz processed_at "Prune cut-off"
     }
     outbox_migrations {
-        bigint version PK "golang-migrate tracking for pkg/outbox (001–008)"
+        bigint version PK "golang-migrate tracking for pkg/outbox (001–010)"
         boolean dirty
     }
     inbox_migrations {
@@ -36,4 +39,4 @@ erDiagram
         boolean dirty
     }
     outbox_events ||--o| outbox_dead_letters : "moved after MaxAttempts (INSERT + DELETE, one tx)"
-    outbox_dead_letters ||--o| outbox_events : "ReprocessDeadLetters* moves back, attempts reset to 0"
+    outbox_dead_letters ||--o| outbox_events : "ReprocessDeadLetters* moves back: attempts 0, created_at reset, keyed rows join the back of their key"

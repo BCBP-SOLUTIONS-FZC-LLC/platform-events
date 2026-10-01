@@ -20,8 +20,12 @@ func TestRunnerConfigFromEnv_MapsFields(t *testing.T) {
 		PublishConcurrency: 1,
 		PublishTimeout:     15 * time.Second,
 		DrainTimeout:       45 * time.Second,
+		RetryBackoff:       2 * time.Second,
+		MaxRetryBackoff:    10 * time.Minute,
 	}
 	cfg := config.RunnerConfigFromEnv(env, nil, nil, nil)
+	assert.Equal(t, 2*time.Second, cfg.RetryBackoff)
+	assert.Equal(t, 10*time.Minute, cfg.MaxRetryBackoff)
 	assert.Equal(t, 2*time.Second, cfg.PollInterval)
 	assert.Equal(t, 25, cfg.BatchSize)
 	assert.Equal(t, 3, cfg.MaxAttempts)
@@ -42,6 +46,22 @@ func TestSQSConsumerOptions_OmitsMaxReceiveWhenZero(t *testing.T) {
 	env := config.SQSConfigEnv{Concurrency: 1, VisibilityTimeout: 30 * time.Second}
 	opts := config.SQSConsumerOptions(env)
 	require.Len(t, opts, 2)
+}
+
+func TestSQSConsumerOptions_QueueDepthInterval(t *testing.T) {
+	env := config.SQSConfigEnv{Concurrency: 1, VisibilityTimeout: 30 * time.Second, QueueDepthInterval: time.Minute}
+	require.Len(t, config.SQSConsumerOptions(env), 3)
+}
+
+func TestLoadSQS_QueueDepthInterval(t *testing.T) {
+	t.Setenv("SQS_QUEUE_DEPTH_INTERVAL", "")
+	assert.Zero(t, config.LoadSQS().QueueDepthInterval, "off by default")
+	t.Setenv("SQS_QUEUE_DEPTH_INTERVAL", "45s")
+	assert.Equal(t, 45*time.Second, config.LoadSQS().QueueDepthInterval)
+	t.Setenv("SQS_QUEUE_DEPTH_INTERVAL", "often")
+	cfg := config.LoadSQS()
+	assert.Zero(t, cfg.QueueDepthInterval)
+	assert.NotEmpty(t, cfg.Warnings)
 }
 
 func TestSNSConfigFromEnv(t *testing.T) {

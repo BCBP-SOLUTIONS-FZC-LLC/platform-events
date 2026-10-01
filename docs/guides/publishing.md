@@ -53,7 +53,7 @@ Flag any call to `publisher.Publish` or `publisher.PublishBatch` that appears in
 
 ```go
 // ✅ Correct — both writes in one transaction
-pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
     if err := repo.SaveUser(ctx, tx, user); err != nil {
         return err
     }
@@ -61,7 +61,7 @@ pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx
 })
 
 // ❌ Wrong — SNS call outside the transaction; event lost on crash
-pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
     return repo.SaveUser(ctx, tx, user)
 })
 publisher.Publish(ctx, envelope) // ← data inconsistency risk
@@ -93,7 +93,7 @@ Common mistakes that cause silent failures, data loss, or broken tenant isolatio
 publisher, err := events.NewSNSPublisher(events.SNSConfig{
     TopicARN:    os.Getenv("SNS_TOPIC_ARN"), // required — returns error if empty or invalid ARN format
     Region:      os.Getenv("AWS_REGION"),
-    EndpointURL: os.Getenv("AWS_ENDPOINT_URL"), // set to http://localhost:4566 for LocalStack
+    EndpointURL: os.Getenv("AWS_ENDPOINT_URL"), // e.g. http://localhost:4574 for the local floci stack (make docker-up)
     Logger:      logger,
 })
 ```
@@ -185,7 +185,7 @@ When `TopicARN` ends in `.fifo`, `MessageGroupID` is required; `MessageDeduplica
 > | SQS | Ordered delivery within a `MessageGroupID`; no duplicate delivery **within a single consumer session** | Protection against redelivery after a visibility timeout expires or a consumer crashes mid-handler |
 > | End-to-end | Ordered, deduplicated fan-out from SNS to SQS | That the consumer handler runs exactly once — it will not if the handler crashes after processing but before `DeleteMessage` |
 >
-> **FIFO gives you ordering. Idempotency still gives you safety.** Use `WithMessageGroupID` to enforce processing order within a group (e.g. per-tenant, per-aggregate). Use `Envelope.ID` + `INSERT ... ON CONFLICT DO NOTHING` to make the handler safe to run twice. The two properties are independent and both are required for correct behaviour. See [Implementing idempotency](consuming.md#implementing-idempotency) for the concrete pattern.
+> **FIFO serialises a group; it does not restore order the outbox lost.** `WithMessageGroupID` keeps SNS's received order within a group and serialises its processing — but the outbox may hand SNS a group's events out of order (a failed record is published after later ones; see [Outbox § Ordering](outbox.md#ordering)), so enqueue with `outbox.EnqueueOrdered` (keyed by the same value as the group ID) or carry a per-aggregate sequence number when order matters. Idempotency still gives you safety. Use `Envelope.ID` + `INSERT ... ON CONFLICT DO NOTHING` to make the handler safe to run twice. The two properties are independent and both are required for correct behaviour. See [Implementing idempotency](consuming.md#implementing-idempotency) for the concrete pattern.
 
 ### Message attributes
 

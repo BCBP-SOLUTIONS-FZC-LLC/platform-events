@@ -1,0 +1,35 @@
+# Docs-only changes skip ci.yml (paths-ignore: '*.md', 'docs/architecture/**', …),
+# so this lightweight workflow runs the architecture-diagram sync check on
+# exactly those changes: every docs/architecture/mermaid/*.mmd must be embedded
+# byte-identically in ARCHITECTURE.md (.github/scripts/docs-mermaid-sync.sh).
+# Mixed code + docs changes are also checked by validate-quality.yml. Same as
+# platform-pgcommon v1.4.2.
+name: Docs
+
+"on":
+  push:
+    branches: [main, master]
+    paths: ['ARCHITECTURE.md', 'docs/architecture/**', '.github/scripts/docs-mermaid-sync.sh']
+  pull_request:
+    branches: [main, master]
+    paths: ['ARCHITECTURE.md', 'docs/architecture/**', '.github/scripts/docs-mermaid-sync.sh']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  diagram-sync:
+    name: Architecture diagram sync
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Diagrams embedded verbatim in ARCHITECTURE.md
+        run: bash .github/scripts/docs-mermaid-sync.sh

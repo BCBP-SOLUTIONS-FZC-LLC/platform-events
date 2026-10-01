@@ -27,11 +27,20 @@ const MigrationsTable = "outbox_migrations"
 // table ([MigrationsTable]) so the caller can safely reuse their runner for
 // domain migrations before or after this call.
 //
-//	migrateRunner := &migrate.Runner{DSN: cfg.DatabaseURL, Logger: logger}
+//	migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv()} // Logger: a pgcommon domain.Logger (optional)
 //	if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
 //	    log.Fatal(err)
 //	}
 //	// migrateRunner.FS is unchanged — safe to reuse for domain migrations.
+//
+// The schema version recorded in the tracking table must exist in this
+// library's embedded migrations: since platform-pgcommon v1.4.1, a database
+// migrated by a newer platform-events (e.g. after rolling a service back to
+// an older image) makes ApplySchema fail with migrate.ErrVersionNotInSource,
+// and an interrupted migration with migrate.ErrMigrationDirty
+// (errors.Is works on the returned error). Roll back by migrating the outbox
+// schema down first, or run ApplySchema as a separate migration job rather
+// than at service startup.
 func ApplySchema(ctx context.Context, runner *migrate.Runner) error {
 	if runner == nil {
 		return fmt.Errorf("outbox: ApplySchema requires a non-nil migrate.Runner")
@@ -55,19 +64,18 @@ func ApplySchema(ctx context.Context, runner *migrate.Runner) error {
 	return outboxRunner.Up(ctx)
 }
 
-// dsnWithMigrationsTable injects x-migrations-table=table into the DSN query
-// string so that golang-migrate's pgx/v5 driver uses an isolated tracking table
-// instead of the default "schema_migrations". Does not override a value already
-// present in the DSN.
+// dsnWithMigrationsTable sets x-migrations-table=table on the DSN so that
+// golang-migrate's pgx/v5 driver tracks the outbox schema in its own table. An
+// explicit value already in the DSN (typically the service's own tracking
+// table) is replaced: sharing it would make outbox versions 1–10 collide with
+// the service's migration versions. Same rule as inbox.ApplySchema.
 func dsnWithMigrationsTable(dsn, table string) (string, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
 		return "", err
 	}
 	q := u.Query()
-	if !q.Has("x-migrations-table") {
-		q.Set("x-migrations-table", table)
-		u.RawQuery = q.Encode()
-	}
+	q.Set("x-migrations-table", table)
+	u.RawQuery = q.Encode()
 	return u.String(), nil
 }

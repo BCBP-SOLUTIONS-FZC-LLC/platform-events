@@ -768,6 +768,7 @@ func TestNewWithClient_MaxMessages_OutOfRange(t *testing.T) {
 		client,
 		handler,
 		internalsqs.WithDrainTimeout(500*time.Millisecond),
+		internalsqs.WithConcurrency(20), // enough free workers that MaxMessages is the limit
 	)
 	require.NoError(t, err)
 
@@ -1805,6 +1806,7 @@ func TestDispatch_MalformedBody_LongBodyTruncated(t *testing.T) {
 		client,
 		func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil },
 		internalsqs.WithDrainTimeout(2*time.Second),
+		internalsqs.WithMalformedBodyLogging(),
 	)
 	require.NoError(t, err)
 
@@ -1876,7 +1878,10 @@ func TestDispatch_VisibilityExtension_NilReceiptHandle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { _ = c.Start(ctx) }()
 
-	time.Sleep(150 * time.Millisecond)
+	// The extender ticks every max(visibilityTimeout/2, 1s) = 1s; wait past the
+	// first tick so the nil-receipt-handle check actually runs (asserting
+	// before it, as this test used to, proved nothing).
+	time.Sleep(1200 * time.Millisecond)
 	assert.False(t, visExtCalled.Load(), "visibility extension must not call SQS without a receipt handle")
 
 	close(handlerDone)

@@ -8,7 +8,12 @@
 *.env
 .go_private_token
 
-# Development tooling and docs
+# Development tooling, docs and the reference monitoring bundle — none are
+# part of the image; excluding them keeps `COPY . .` from invalidating the
+# build cache on a linter bump or dashboard edit. test/ and tools/ are their
+# own Go modules, which the root module's build ignores anyway.
+tools/
+monitoring/
 .claude/
 .github/
 docs/

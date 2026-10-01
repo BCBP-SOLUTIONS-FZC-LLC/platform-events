@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/metrics"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/inbox"
 )
@@ -93,4 +94,42 @@ func TestNewStore_Validation(t *testing.T) {
 
 func TestApplySchema_Validation(t *testing.T) {
 	assert.Error(t, inbox.ApplySchema(context.Background(), nil))
+}
+
+// Tier 1: a duplicate is counted in platform_duplicate_messages_total with the
+// queue name of the SQS delivery (from the handler context), else "unknown".
+func TestHandler_PlatformDuplicateMetric(t *testing.T) {
+	prev := metrics.CurrentPlatform()
+	t.Cleanup(func() { metrics.ReplacePlatform(prev) })
+	reg := prometheus.NewRegistry()
+	_, err := metrics.InitWithIdentity(metrics.Identity{Domain: "iam", Service: "svc", Environment: "test"}, reg, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { metrics.InitWithRegisterer("inbox-test", "v1", prometheus.NewRegistry()) })
+
+	ledger := newLedger()
+	h := inbox.Handler(ledger, func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
+	id := uuid.NewString()
+	ctx := port.WithSourceMessage(context.Background(), func() port.SourceMessage {
+		return port.SourceMessage{QueueURL: "https://sqs.us-east-1.amazonaws.com/123/orders"}
+	})
+	require.NoError(t, h(ctx, env(id)))
+	require.NoError(t, h(ctx, env(id)))                  // duplicate from the SQS consumer
+	require.NoError(t, h(context.Background(), env(id))) // duplicate outside it
+
+	p := metrics.CurrentPlatform()
+	assert.InDelta(t, 1, testutil.ToFloat64(p.DuplicateMessages.WithLabelValues("orders", "T")), 0)
+	assert.InDelta(t, 1, testutil.ToFloat64(p.DuplicateMessages.WithLabelValues("unknown", "T")), 0)
+}
+
+// A handler that dead-letters the message (SendToDLQ, then nil) did not
+// process it: inbox must not record it, so a DLQ redrive is processed.
+func TestHandler_DeadLetteredNotRecorded(t *testing.T) {
+	ledger := newLedger()
+	h := inbox.Handler(ledger, func(ctx context.Context, _ events.Envelope[json.RawMessage]) error {
+		port.DLQAttributionFromContext(ctx).MarkRecorded() // what DLQPublisher.SendToDLQ does
+		return nil
+	})
+	ctx, _ := port.WithDLQAttribution(context.Background(), "explicit")
+	require.NoError(t, h(ctx, env(uuid.NewString())))
+	assert.Equal(t, 0, ledger.marks)
 }

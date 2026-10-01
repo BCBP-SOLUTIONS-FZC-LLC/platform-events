@@ -1,0 +1,48 @@
+# platform-events — reference autoscaling (KEDA) for a service using the
+# library. Copy and adapt; this repository deploys nothing.
+#
+# Enterprise Platform Observability Standard (Backward Compatibility step 6,
+# "migrate HPA references"): HPA/KEDA may only scale on Canonical or legacy
+# metrics. The Tier 1 successors below are Proposed and MUST NOT be used as a
+# scaling signal until ratified — CI enforces this
+# (test/unit/metrics/monitoring_test.go). Each trigger names its successor in
+# an "# after ratification:" comment.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: orders-service
+spec:
+  scaleTargetRef:
+    name: orders-service # the Deployment running the consumer / outbox runner
+  minReplicaCount: 2
+  maxReplicaCount: 10
+  triggers:
+    # 1. Outbox backlog: scale out when unpublished outbox events pile up.
+    #    Runners use SELECT … FOR UPDATE SKIP LOCKED, so replicas share the
+    #    backlog without contention.
+    #    The gauge reads -1 when the count query fails (and is capped at
+    #    100000): drop -1 samples and keep the highest real reading of the
+    #    last 10 minutes, so a briefly failing count — typically under heavy
+    #    load — does not look like an empty backlog. If it keeps failing past
+    #    10 minutes the query returns nothing; ignoreNullValues: "false" makes
+    #    KEDA treat that as an error (holding the current replica count, with
+    #    fallback if configured) instead of as 0, which would scale in.
+    # after ratification: max(platform_outbox_pending_events{domain="orders",service="orders-service",environment="prod"})
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        query: max by (service) (max_over_time((outbox_pending_total{service="orders-service"} >= 0)[10m:30s]))
+        threshold: "500"
+        ignoreNullValues: "false"
+
+    # 2. Queue backlog: KEDA's native SQS scaler reads the queue attributes
+    #    directly (IRSA needs sqs:GetQueueAttributes), so it needs no metric.
+    # after ratification: max(platform_queue_depth{domain="orders",service="orders-service",environment="prod",queue="orders"})
+    - type: aws-sqs-queue
+      authenticationRef:
+        name: keda-aws-irsa
+      metadata:
+        queueURL: https://sqs.eu-west-1.amazonaws.com/123456789012/orders
+        queueLength: "100" # target messages per replica
+        awsRegion: eu-west-1
+        identityOwner: operator

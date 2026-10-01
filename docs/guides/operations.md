@@ -16,7 +16,7 @@ The SQS receive loop is gated by `WithConcurrency(n)` (default: `1`). Each recei
 |--------|-------|----------------|
 | `ApproximateNumberOfMessages` rising | CloudWatch / SQS console | Handlers are slower than the publish rate |
 | `events_consume_duration_seconds` p99 > `SQS_VISIBILITY_TIMEOUT` | Prometheus | Visibility extensions are firing; handler is at risk of double-delivery |
-| `events_consumed_total{status="error"}` rising | Prometheus | Handlers are failing and leaving messages to re-enter the queue |
+| `platform_messages_failed_total{reason="handler_error"}` rising | Prometheus | Handlers are failing and leaving messages to re-enter the queue |
 
 **Tuning order:**
 
@@ -129,9 +129,9 @@ if err != nil {
 |---|---|---|
 | `outbox_pending_total` | > 500 sustained for 5 min | Lower `OUTBOX_POLL_INTERVAL`; add runner pods |
 | `ApproximateNumberOfMessages` (CloudWatch) | > 1000 sustained | Raise `SQS_CONCURRENCY`; add consumer pods |
-| `events_consumed_total{status="error"}` | > 1% error rate | Inspect handler errors; check DLQ depth |
+| `platform_messages_failed_total{reason="handler_error"}` | > 1% error rate | Inspect handler errors; check DLQ depth |
 | `outbox_published_total{status="failed"}` / total | > 1% | Check SNS reachability; inspect `outbox_dead_letters` |
-| `events_dlq_forwarded_total{status="error"}` | > 0 | Check the source queue's `RedrivePolicy` and DLQ IAM permissions |
+| `platform_messages_failed_total{reason="dead_letter_error"}` | > 0 | Check the source queue's `RedrivePolicy` and DLQ IAM permissions |
 
 
 ---
@@ -142,7 +142,7 @@ Use this before declaring a service's event integration production-ready. Each i
 
 ### Publisher checklist
 
-- [ ] `events.Init(appName, buildVersion)` called once at startup ([Prometheus metrics](observability.md#prometheus-metrics))
+- [ ] `events.InitMetrics(events.MetricsIdentity{Domain, Service, Version}, registerer)` called once at startup, with the same registerer/identity as `pgmetrics.InitWithIdentity` ([Prometheus metrics](observability.md#prometheus-metrics))
 - [ ] Outbox schema applied via `outbox.ApplySchema(ctx, migrateRunner)` on startup ([Wiring](outbox.md#wiring))
 - [ ] `outbox.Runner` started with `go runner.Start(ctx)` and deferred `runner.Stop()` ([Wiring](outbox.md#wiring))
 - [ ] All domain-event publish call sites use `outbox.Enqueue` inside `pgcommon.RunInTx` — no bare `publisher.Publish` for transactional events ([Publishing rules](publishing.md#publishing-rules))
@@ -168,9 +168,9 @@ Use this before declaring a service's event integration production-ready. Each i
 
 - [ ] Handler entry logs bind `event_id`, `event_type`, `trace_id`, `tenant_id` via `logger.With(...)` ([Logging correlation](observability.md#logging-correlation))
 - [ ] OTel provider initialised via `gincommon.InitTracingFromEnv()` before the first `consumer.Start` or `publisher.Publish` call ([OpenTelemetry](observability.md#opentelemetry))
-- [ ] Alerts configured on `outbox_pending_total`, `events_consumed_total{status="error"}`, and SQS `ApproximateNumberOfMessages` ([Recommended production defaults — what to monitor on day one](#recommended-production-defaults))
+- [ ] Alerts configured on `outbox_pending_total`, `platform_messages_failed_total{reason="handler_error"}`, and SQS `ApproximateNumberOfMessages` ([Recommended production defaults — what to monitor on day one](#recommended-production-defaults))
 - [ ] SQS DLQ depth alert configured at the queue level (CloudWatch) — the library does not alert on DLQ growth
-- [ ] Alert on `events_dlq_forwarded_total{status="error"}` > 0 — a failing DLQ forward means poison messages are cycling on the source queue
+- [ ] Alert on `platform_messages_failed_total{reason="dead_letter_error"}` > 0 — a failing DLQ forward means poison messages are cycling on the source queue
 
 ### Security checklist
 

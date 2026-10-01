@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Local commit gates: module tidiness, formatting and lint — the same checks
-# CI's Validate / Quality job runs first. Installed by `make setup` /
+# Local commit gates: module tidiness, formatting, lint and the architecture
+# diagram sync — the same checks CI's Validate / Quality job runs first. Installed by `make setup` /
 # `make install-hooks`; bypass once with `git commit --no-verify`.
 set -euo pipefail
 
@@ -8,8 +8,8 @@ echo "[pre-commit] running tidy..."
 make tidy
 # CI fails on go.mod/go.sum drift; tidy may just have fixed it in the working
 # tree, but the fix is not part of this commit until it is staged.
-if ! git diff --quiet -- go.mod go.sum; then
-  echo "[pre-commit] go mod tidy changed go.mod/go.sum — review and 'git add go.mod go.sum', then commit again." >&2
+if ! git diff --quiet -- go.mod go.sum test/go.mod test/go.sum tools/go.mod tools/go.sum; then
+  echo "[pre-commit] 'make tidy' changed a go.mod/go.sum (library, test/ or tools/) — review and stage them, then commit again." >&2
   exit 1
 fi
 
@@ -18,3 +18,6 @@ make fmt-check
 
 echo "[pre-commit] running lint..."
 make lint
+
+echo "[pre-commit] running docs-check..."
+make docs-check

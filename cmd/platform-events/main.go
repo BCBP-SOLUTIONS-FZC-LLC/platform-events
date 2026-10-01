@@ -8,6 +8,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
@@ -28,14 +30,23 @@ func main() {
 	if buildVersion == "" {
 		buildVersion = version
 	}
-	events.Init(appName, buildVersion)
+	// Tier 1 platform_* metrics (Enterprise Platform Observability Standard)
+	// plus the legacy metrics for the compatibility period. The reference CLI
+	// belongs to no business domain, so it reports domain="platform".
+	metricsID := events.MetricsIdentityFromEnv("platform", strings.ToLower(appName), buildVersion)
+	warnings, err := events.InitMetrics(metricsID, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "platform-events: metrics disabled: %v\n", err)
+	}
+	for _, w := range warnings {
+		fmt.Fprintln(os.Stderr, w.Error())
+	}
 
 	fmt.Fprintf(os.Stdout, "platform-events %s\n", buildVersion)
 
 	snsCfg := config.LoadSNS()
 	sqsCfg := config.LoadSQS()
 	outboxCfg := config.LoadOutbox()
-	otelCfg := config.LoadOTel()
 
 	config.LogWarnings(sqsCfg.Warnings)
 	config.LogWarnings(outboxCfg.Warnings)
@@ -67,6 +78,8 @@ func main() {
 	if sqsCfg.MaxReceiveCount == 0 {
 		fmt.Fprintln(os.Stdout, "  (apply events.WithMaxReceiveCount when wiring WithDeadLetterHandler)")
 	}
+	fmt.Fprintf(os.Stdout, "  HandlerTimeout:    %s\n", durationOrOff(sqsCfg.HandlerTimeout))
+	fmt.Fprintf(os.Stdout, "  QueueDepthSample:  %s\n", durationOrOff(sqsCfg.QueueDepthInterval))
 
 	fmt.Fprintln(os.Stdout, "\n=== Outbox Config ===")
 	fmt.Fprintf(os.Stdout, "  %s\n", outboxCfg.String())
@@ -74,10 +87,11 @@ func main() {
 		fmt.Fprintln(os.Stdout, "  ClaimLeaseDuration: 10m (store default when OUTBOX_CLAIM_LEASE_DURATION unset)")
 	}
 
-	fmt.Fprintln(os.Stdout, "\n=== OTel Config ===")
-	fmt.Fprintf(os.Stdout, "  ServiceName:      %s\n", otelCfg.ServiceName)
-	fmt.Fprintf(os.Stdout, "  ExporterEndpoint: %s\n", otelCfg.ExporterEndpoint)
-	fmt.Fprintf(os.Stdout, "  Insecure:         %v\n", otelCfg.Insecure)
+	// Tracing and logging are configured by the consuming service, never by
+	// this library: OTEL_* is read by platform-gincommon's InitTracingFromEnv,
+	// and the logger is the port.Logger the service injects.
+	fmt.Fprintln(os.Stdout, "\n=== OTel / logging ===")
+	fmt.Fprintln(os.Stdout, "  Owned by the consuming service: call gincommon.InitTracingFromEnv() (reads OTEL_*) and inject its ZapLogger as Logger.")
 
 	if len(problems) > 0 {
 		fmt.Fprintln(os.Stderr, "\n=== Configuration problems ===")
@@ -92,7 +106,7 @@ func main() {
 	fmt.Fprintln(os.Stdout, "\n=== Production wiring reminders ===")
 	reminders := []string{
 		"outbox.ApplySchema(ctx, migrateRunner) on startup",
-		"events.Init(serviceName, buildVersion) once at startup (done by this CLI)",
+		"events.InitMetrics(events.MetricsIdentity{Domain, Service, Version}, registry) once at startup (done by this CLI) — same registerer and identity as pgmetrics.InitWithIdentity",
 		"gincommon.InitTracingFromEnv() before first Publish/Start",
 		"SNS→SQS subscription MUST use RawMessageDelivery=true",
 		"outbox.Runner.Ready() before marking the pod ready",
@@ -102,4 +116,12 @@ func main() {
 	for _, r := range reminders {
 		fmt.Fprintf(os.Stdout, "  - %s\n", r)
 	}
+}
+
+// durationOrOff renders an optional duration setting: "off" when unset.
+func durationOrOff(d time.Duration) string {
+	if d <= 0 {
+		return "off"
+	}
+	return d.String()
 }

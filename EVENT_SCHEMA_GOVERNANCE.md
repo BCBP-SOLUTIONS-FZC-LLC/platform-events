@@ -5,7 +5,7 @@ This document defines the rules for designing, evolving, and retiring event sche
 It applies to:
 - All `Envelope.Payload` Go structs defined in consuming services
 - The `event_type` naming convention
-- The `schema_version` envelope field
+- The schema version envelope field — Go `Envelope.SchemaVersion`, wire key `specversion` (written `schema_version` below, after its `WithSchemaVersion` option)
 - The cross-service event type registry
 
 > **Envelope wrapper stability** (field names, types, presence rules) is a library-level guarantee documented in [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees). This document governs payload content, not the wrapper.

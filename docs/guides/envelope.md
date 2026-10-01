@@ -84,7 +84,7 @@ env := events.NewEnvelope("billing.invoices.generated", "billing-worker",
 | Stable and globally unique | Use the canonical service name: `platform-iam`, `billing-service`, `inventory-worker`. It must be unique across all services in the organisation |
 | Immutable across deployments | Do not derive it from hostname, pod name, or any runtime variable — it must be the same value in every environment |
 | Environment-free | Never append `-dev`, `-staging`, `-prod`, or a region suffix. The environment is implicit in which AWS account/topic the event lands on; embedding it in `source` makes Loki/Tempo queries environment-specific and breaks dashboards when you promote code |
-| Set as a constant | Define it once as a package-level constant in the service (`const serviceName = "platform-iam"`) and pass it to `NewEnvelope` and `events.Init` from that single source of truth |
+| Set as a constant | Define it once as a package-level constant in the service (`const serviceName = "platform-iam"`) and pass it to `NewEnvelope` and `events.MetricsIdentity.Service` from that single source of truth |
 
 `source` is used for debugging, tracing (`sns.publish` span attribute), Prometheus metric labels, and consumer routing. Changing it severs observability continuity — historical log queries, dashboards, and alert rules that filter on `source` will silently stop matching.
 
@@ -104,7 +104,7 @@ env := events.NewEnvelope("iam.user.created.v2", "platform-iam", payload,
 )
 ```
 
-Consumers that receive an unrecognised `schema_version` should log a warning and delete the message rather than silently misparsing it. If `schema_version` is absent, treat it as `"1"` for backward compatibility.
+Consumers that receive an unrecognised schema version (`SchemaVersion`, wire key `specversion`) should log a warning and delete the message rather than silently misparsing it. If it is absent, treat it as `"1"` for backward compatibility.
 
 ### Serialisation
 
@@ -185,5 +185,5 @@ func route(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 
 ### Envelope compatibility guarantees
 
-The `id`, `type`, `source`, and `timestamp` fields are **stable** — always present, never removed or renamed, format frozen within `v1.x`. The remaining fields (`tenant_id`, `trace_id`, `correlation_id`, `schema_version`, `subject`, `actor`, `schema_id`) are **contextual** — present when set, never removed. The library may add new optional fields in MINOR releases; existing consumers are unaffected. See [ARCHITECTURE.md § Envelope compatibility guarantees](../../ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field stability class table and the `v1.x` never-break list.
+The `id`, `type`, `source`, and `time` wire fields are **stable** — always present, never removed or renamed, format frozen within `v1.x`. The remaining fields (`tenant_id`, `trace_id`, `correlation_id`, `specversion`, `subject`, `actor`, `dataschema`, `ip_address`, `user_agent`) are **contextual** — present when set, never removed. The library may add new optional fields in MINOR releases; existing consumers are unaffected. See [ARCHITECTURE.md § Envelope compatibility guarantees](../../ARCHITECTURE.md#envelope-compatibility-guarantees) for the full per-field stability class table and the `v1.x` never-break list.
 

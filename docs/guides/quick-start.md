@@ -13,40 +13,55 @@ import (
     "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
     "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
     "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
+    "github.com/prometheus/client_golang/prometheus"
 )
 
 func main() {
     ctx := context.Background()
 
-    // 1. Register Prometheus metrics once.
-    events.Init(os.Getenv("APP_NAME"), os.Getenv("BUILD_VERSION"))
+    // 1. Register the Tier 1 platform_* metrics (Enterprise Platform Observability
+    //    Standard) once — same registerer and identity as pgmetrics.InitWithIdentity.
+    //    Environment defaults to APP_ENV / ENVIRONMENT / "dev"; service to APP_NAME.
+    id := events.MetricsIdentityFromEnv("iam", "", os.Getenv("BUILD_VERSION"))
+    metricWarnings, err := events.InitMetrics(id, prometheus.DefaultRegisterer)
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, w := range metricWarnings {
+        log.Println(w) // a platform_* metric the registry refused — disabled, not fatal
+    }
 
-    // 2. Open the connection pool for the outbox runner.
-    pool, err := pgcommon.NewPool(ctx, pgcommon.Config{
-        DSN:         os.Getenv("DATABASE_URL"),
-        GUCProvider: pgcommon.GUCSetFromContext,
-    })
+    // 2. Load config. Database settings come from platform-pgcommon's
+    //    ConfigFromEnv (DATABASE_URL or PG_*, PG_MAX_CONNS, PG_STATEMENT_TIMEOUT, …).
+    outboxEnv := config.LoadOutbox()
+    config.LogWarnings(outboxEnv.Warnings)
+    if err := outboxEnv.Validate(); err != nil {
+        log.Fatal(err)
+    }
+
+    // 3. Open the connection pool for the outbox runner.
+    dbCfg := outboxEnv.DB
+    dbCfg.GUCProvider = pgcommon.GUCSetFromContext
+    pool, err := pgcommon.NewPool(ctx, dbCfg)
     if err != nil {
         log.Fatal(err)
     }
     defer pool.Close()
 
-    // 3. Apply the outbox schema migration.
-    migrateRunner := &migrate.Runner{DSN: os.Getenv("DATABASE_URL")}
+    // 4. Apply the outbox schema migration (MIGRATION_DATABASE_URL when set).
+    migrateRunner := &migrate.Runner{DSN: outboxEnv.MigrationDatabaseURL}
     if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
         log.Fatal(err)
     }
 
-    // 4. Construct the SNS publisher.
+    // 5. Construct the SNS publisher.
     snsEnv := config.LoadSNS()
     publisher, err := events.NewSNSPublisher(config.SNSConfigFromEnv(snsEnv, logger))
     if err != nil {
         log.Fatal(err)
     }
 
-    // 5. Start the outbox runner (delivers events asynchronously).
-    outboxEnv := config.LoadOutbox()
-    config.LogWarnings(outboxEnv.Warnings)
+    // 6. Start the outbox runner (delivers events asynchronously).
     runner, err := outbox.NewRunner(config.RunnerConfigFromEnv(outboxEnv, pool, publisher, logger))
     if err != nil {
         log.Fatal(err)
@@ -54,7 +69,7 @@ func main() {
     go runner.Start(ctx)
     defer runner.Stop()
 
-    // 6. Construct and start the SQS consumer.
+    // 7. Construct and start the SQS consumer.
     sqsEnv := config.LoadSQS()
     config.LogWarnings(sqsEnv.Warnings)
     consumer, err := events.NewSQSConsumer(

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -49,7 +48,7 @@ func TestInboxStore_EndToEnd(t *testing.T) {
 	assert.Equal(t, 1, calls)
 
 	// Prune: age consumer_a's row, prune in batches of 1, consumer_b untouched.
-	require.NoError(t, pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	require.NoError(t, pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		_, e := tx.Exec(ctx, `INSERT INTO processed_events (event_id, consumer, processed_at) VALUES ($1, 'consumer_a', now() - interval '10 days')`, uuid.NewString())
 		if e != nil {
 			return e

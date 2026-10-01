@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -33,19 +32,19 @@ func TestOutbox_EnqueueAndDeliver_EndToEnd(t *testing.T) {
 	defer cancel()
 
 	// Start infrastructure.
-	ls := fixtures.StartLocalStack(ctx, t)
+	emu := fixtures.StartFloci(ctx, t)
 	pool, cleanupDB := fixtures.NewTestDB(ctx, t)
 	defer cleanupDB()
 
-	topicARN := ls.CreateTopic(ctx, t, "outbox-e2e-topic")
-	queueURL := ls.CreateQueue(ctx, t, "outbox-e2e-queue")
-	ls.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
+	topicARN := emu.CreateTopic(ctx, t, "outbox-e2e-topic")
+	queueURL := emu.CreateQueue(ctx, t, "outbox-e2e-queue")
+	emu.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
 
 	// Create the SNS publisher the runner will use.
 	snsPub, err := events.NewSNSPublisher(events.SNSConfig{
 		TopicARN:    topicARN,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 	})
 	require.NoError(t, err)
 
@@ -71,7 +70,7 @@ func TestOutbox_EnqueueAndDeliver_EndToEnd(t *testing.T) {
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    queueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		WaitSeconds: 1,
 		MaxMessages: 1,
 	}, handler)
@@ -89,7 +88,7 @@ func TestOutbox_EnqueueAndDeliver_EndToEnd(t *testing.T) {
 		events.WithTenantID("acme"),
 		events.WithTraceID("trace-outbox-e2e-001"),
 	)
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return outbox.Enqueue(ctx, tx, env)
 	})
 	require.NoError(t, err, "Enqueue should succeed within a transaction")
@@ -117,18 +116,18 @@ func TestOutbox_MultipleEvents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
+	emu := fixtures.StartFloci(ctx, t)
 	pool, cleanupDB := fixtures.NewTestDB(ctx, t)
 	defer cleanupDB()
 
-	topicARN := ls.CreateTopic(ctx, t, "outbox-multi-topic")
-	queueURL := ls.CreateQueue(ctx, t, "outbox-multi-queue")
-	ls.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
+	topicARN := emu.CreateTopic(ctx, t, "outbox-multi-topic")
+	queueURL := emu.CreateQueue(ctx, t, "outbox-multi-queue")
+	emu.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
 
 	snsPub, err := events.NewSNSPublisher(events.SNSConfig{
 		TopicARN:    topicARN,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 	})
 	require.NoError(t, err)
 
@@ -152,7 +151,7 @@ func TestOutbox_MultipleEvents(t *testing.T) {
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    queueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		WaitSeconds: 1,
 		MaxMessages: 10,
 	}, handler, events.WithConcurrency(3))
@@ -171,7 +170,7 @@ func TestOutbox_MultipleEvents(t *testing.T) {
 			json.RawMessage(`{"item":"widget"}`),
 			events.WithTenantID("tenant-a"),
 		)
-		err := pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+		err := pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 			return outbox.Enqueue(ctx, tx, env)
 		})
 		require.NoError(t, err)
@@ -201,18 +200,18 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
+	emu := fixtures.StartFloci(ctx, t)
 	pool, cleanupDB := fixtures.NewTestDB(ctx, t)
 	defer cleanupDB()
 
-	topicARN := ls.CreateTopic(ctx, t, "outbox-rollback-topic")
-	queueURL := ls.CreateQueue(ctx, t, "outbox-rollback-queue")
-	ls.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
+	topicARN := emu.CreateTopic(ctx, t, "outbox-rollback-topic")
+	queueURL := emu.CreateQueue(ctx, t, "outbox-rollback-queue")
+	emu.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
 
 	snsPub, err := events.NewSNSPublisher(events.SNSConfig{
 		TopicARN:    topicARN,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 	})
 	require.NoError(t, err)
 
@@ -236,7 +235,7 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    queueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		WaitSeconds: 1,
 		MaxMessages: 1,
 	}, handler)
@@ -251,7 +250,7 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 	// Enqueue inside a transaction that we force to roll back by returning an error.
 	rolledBackEnv := events.NewEnvelope("payment.failed", "billing-svc", json.RawMessage(`{}`),
 		events.WithTenantID("test-tenant"))
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		_ = outbox.Enqueue(ctx, tx, rolledBackEnv)
 		return errIntentionalRollback // non-nil error causes RunInTx to rollback
 	})
@@ -261,7 +260,7 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 	// has processed at least one poll cycle after the rollback.
 	sentinelEnv := events.NewEnvelope("heartbeat.ping", "billing-svc", json.RawMessage(`{}`),
 		events.WithTenantID("test-tenant"))
-	err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+	err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		return outbox.Enqueue(ctx, tx, sentinelEnv)
 	})
 	require.NoError(t, err)
@@ -284,7 +283,7 @@ func TestOutbox_RollbackDoesNotPublish(t *testing.T) {
 	sentinel, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    queueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		WaitSeconds: 1,
 		MaxMessages: 5,
 	}, sentinelHandler)

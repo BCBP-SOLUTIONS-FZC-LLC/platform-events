@@ -8,7 +8,13 @@ Wiring, enqueueing, poll cycle, dead letters, pruning and replay guarantees. One
 
 The outbox pattern eliminates dual-write risk: the event is written **inside the business transaction** alongside the domain mutation. If the transaction rolls back, the event is never published. The runner delivers asynchronously with at-least-once guarantee.
 
-Outbox does not guarantee global ordering — use FIFO topics with a stable `MessageGroupID` (e.g. `TenantID`) when ordering is required.
+### Ordering
+
+By default the transactional outbox does **not** preserve publish order, even per aggregate on a FIFO topic: when a record fails (or backs off), later records — including the same aggregate's — are still published, and the failed one goes out after them; several runner replicas also publish concurrently. A FIFO `MessageGroupID` keeps the order SNS *receives*, which is then already out of order.
+
+**Per-key ordering (opt-in per record).** Enqueue with `outbox.EnqueueOrdered(ctx, tx, env, key)` — key = the aggregate, e.g. `"user/<id>"`; requires migration `010`. Records with the same key are published one at a time, in enqueue order, across all runner replicas; records enqueued with `Enqueue` are unaffected. Enqueue order is INSERT order (a sequence, `ordering_seq`), so take the aggregate's row lock (the business `UPDATE` of that row, or `SELECT … FOR UPDATE`) **before** `EnqueueOrdered` — two transactions enqueuing for one key then insert in commit order. A record enqueued while an earlier one of its key is unpublished waits (`scheduled_at = 'infinity'`, so claims never scan it) and is promoted once the key's head is marked published (best-effort, in a follow-up transaction) or inside the transaction that dead-letters it; a sweep with the gauge refresh (at the first poll after `GaugeInterval` has elapsed) catches a record enqueued while its head was being published, or whose promotion failed (promotion is best-effort after the publish is marked). Trade-offs: a failing head holds its key until it is published or dead-lettered after `MaxAttempts` (watch `platform_outbox_ordering_blocked_events`); a replayed dead letter joins the back of its key; a key publishes one record per claim, so the runner re-polls at once while batches publish. On a FIFO topic derive `WithMessageGroupID` from the same key so SNS keeps the order. Without ordering keys, consumers that need order use a per-aggregate sequence number in the payload.
+
+FIFO topics are still useful for SNS-side deduplication (`MessageDeduplicationId` = `Envelope.ID`) and for consumer-side serialisation within a group.
 
 ```
 Legend:  ✅ transaction boundary   🔁 retry point   📦 durable storage   ⚡ async boundary
@@ -51,7 +57,8 @@ Outbox Runner (polls outbox_events)                                   🔁 retry
 
 ```go
 // 1. Apply outbox schema migration (once at startup).
-migrateRunner := &migrate.Runner{DSN: os.Getenv("DATABASE_URL")}
+// DSN from platform-pgcommon: MIGRATION_DATABASE_URL, else DATABASE_URL / PG_*.
+migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv()}
 if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
     log.Fatal(err)
 }
@@ -94,12 +101,12 @@ defer func() {
 //   }
 ```
 
-**Config defaults:** `PollInterval` 5s · `BatchSize` 50 · `MaxAttempts` 5 · `PublishConcurrency` 1 · `PublishTimeout` 10s · `DrainTimeout` 30s · `ClaimLeaseDuration` 10m · `StartupJitter` 0. When `PublishConcurrency` is `1` (default), the runner publishes via SNS `PublishBatch` (10 messages per API call). Values `> 1` publish records in parallel goroutines with per-record `Publish` calls. When a poll cycle fails (e.g. the DB is unreachable), the runner applies exponential backoff (1s → 30s) before retrying instead of hammering the pool every `PollInterval`.
+**Config defaults:** `PollInterval` 5s · `BatchSize` 50 · `MaxAttempts` 5 · `PublishConcurrency` 1 · `PublishTimeout` 10s · `DrainTimeout` 30s · `ClaimLeaseDuration` 10m · `StartupJitter` 0 · `RetryBackoff` 1s · `MaxRetryBackoff` 5m. When `PublishConcurrency` is `1` (default), the runner publishes via SNS `PublishBatch` (10 messages per API call). Values `> 1` publish records in parallel goroutines with per-record `Publish` calls. When a poll cycle fails (e.g. the DB is unreachable), the runner applies exponential backoff (1s → 30s) before retrying instead of hammering the pool every `PollInterval`.
 
 ### Enqueueing inside a transaction
 
 ```go
-err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx pgx.Tx) error {
+err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
     // Business write and event enqueue commit or roll back atomically.
     if err := repo.SaveUser(ctx, tx, user); err != nil {
         return err
@@ -113,7 +120,7 @@ err = pgcommon.RunInTx(ctx, pool, pgx.TxOptions{}, func(ctx context.Context, tx 
 })
 ```
 
-`Enqueue` validates the envelope (non-nil tx; non-empty `ID`/`Type`/`Source`; non-zero `Timestamp`; no null bytes in `ID`/`Type`/`Source`) and rejects payloads whose serialised size exceeds **240 KB** — staying under the SNS 256 KB hard limit so an outbox record that could never publish is never persisted.
+`Enqueue` validates the envelope (non-nil tx; non-empty `ID`/`Type`/`Source`; non-zero `Timestamp`; no null bytes in `ID`/`Type`/`Source`; `ID` a **canonical lowercase UUID**, as `events.NewEnvelope` produces — services that set their own IDs must use `uuid.UUID.String()`) and rejects payloads whose serialised size exceeds **240 KB** — staying under the SNS 256 KB hard limit so an outbox record that could never publish is never persisted.
 
 ### Payload size guidelines
 
@@ -159,7 +166,7 @@ The runner fires one poll immediately on startup, then once per `PollInterval` t
 1. `SELECT … FOR UPDATE SKIP LOCKED WHERE published_at IS NULL AND scheduled_at <= NOW()` — claim up to `BatchSize` records. Safe for horizontal scale; concurrent runners claim disjoint batches.
 2. **Lease:** push `scheduled_at` forward by `ClaimLeaseDuration` (default 10 min) so other runners cannot re-claim the same records while publishing is in progress.
 3. For each outbox record: call `Publisher.Publish`; on success set `published_at = NOW()`.
-4. On failure: increment `attempts`, reset `scheduled_at = NOW()` (releases the lease for immediate retry), set `last_error`. If `attempts >= MaxAttempts` move to `outbox_dead_letters`.
+4. On a permanent failure: increment `attempts`, set `last_error` and `scheduled_at = NOW() + RetryBackoff·2^(attempts-1)` (default 1s, capped at `MaxRetryBackoff` = 5m, jittered). If `attempts >= MaxAttempts` move to `outbox_dead_letters`. Transient failures (below) and shutdown release the lease without counting an attempt.
 5. Sleep `PollInterval`, then repeat.
 
 Horizontal scale is achieved by running multiple outbox runners — `FOR UPDATE SKIP LOCKED` ensures work is safely partitioned across instances.
@@ -181,7 +188,8 @@ Three methods on `Runner` give full programmatic control over dead letters witho
 **Step 1 — Inspect before acting.**
 
 ```go
-// List up to 50 failures for a specific tenant, oldest first.
+// List up to 50 failures for a specific tenant, oldest first (failed_at, id —
+// a replay or discard with the same filter and limit selects the same rows).
 records, err := runner.ListDeadLetters(ctx, outbox.DLQFilter{TenantID: "acme"}, 50)
 for _, r := range records {
     log.Printf("id=%s type=%s attempts=%d failed=%s error=%s",
@@ -225,7 +233,7 @@ log.Printf("discarded %d irrecoverable dead letters", n)
 | `TenantID` | `string` | Exact tenant match (`""` = all tenants) |
 | `FailedBefore` | `time.Time` | Only records where `failed_at < FailedBefore` (zero = no bound) |
 
-**Retryable failures** (SNS throttling: `ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`) do not count toward `MaxAttempts` — the outbox uses `threshold = MaxAttempts+1` for these errors. A period of SNS unavailability will not dead-letter records that are otherwise healthy.
+**Retryable failures** do not count toward `MaxAttempts`: SNS throttling and service-side errors (`Throttled`, `InternalError`, `KMSThrottling`, `ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`), any HTTP 5xx or 429 response (including body-less ones the SDK reports as `UnknownError`; a body-less 4xx stays permanent), per-entry batch failures with `SenderFault=false`, publish timeouts, and failures that never got an answer from SNS (network, DNS, TLS, credential resolution). The lease is released and the record retried after a backoff shared by all records (`RetryBackoff`, doubling once per poll cycle up to `MaxRetryBackoff`) that resets on the next successful publish. A period of SNS unavailability builds a backlog (watch `PlatformEventsOutboxBacklog`) but never dead-letters healthy records. Everything else — authorization, a missing topic, invalid parameters, an oversized request — counts an attempt, backs off per record, and dead-letters at `MaxAttempts`.
 
 ### Idempotency
 
@@ -259,7 +267,7 @@ Replay (via `ReprocessDeadLetters`, manual SQL reset, or SQS DLQ redrive) carrie
 
 | Property | Guarantee |
 |---|---|
-| **Ordering** | None. Replayed events are inserted at the back of the outbox queue and delivered in poll order, not original publish order. A replayed `user.updated` may arrive before an in-flight `user.created` for the same user. |
+| **Ordering** | Unkeyed records: none — replayed events are inserted at the back of the outbox queue and delivered in poll order, not original publish order; a replayed `user.updated` may arrive before an in-flight `user.created` for the same user. Ordered records (`EnqueueOrdered`): a replayed record keeps its key and joins the **back** of it — it is published after the key's records enqueued since, not in its original position. Records replayed together keep their original relative order. |
 | **Idempotency checks triggered again** | The same `Envelope.ID` will be presented to the consumer handler a second time. The `ON CONFLICT DO NOTHING` guard must be in place — this is not a bug, it is the mechanism that makes replay safe. |
 | **Timing** | Replayed events re-enter the standard poll cycle. They are not expedited. Under load, a replayed batch may take multiple poll intervals to publish. |
 | **Partial replay** | `ReprocessDeadLetters(ctx, n)` moves at most `n` records per call. A large dead-letter backlog requires multiple calls or a loop. There is no atomic "replay all" operation. |

@@ -6,49 +6,46 @@ Prometheus metrics, OpenTelemetry and logging correlation. One of the detailed g
 
 ## Observability — Prometheus and OTel
 
-Both Prometheus metrics and OTel tracing are **optional**. The publisher, consumer, and outbox runner work without calling `events.Init` or having an OTel provider registered.
+Both Prometheus metrics and OTel tracing are **optional**. The publisher, consumer, and outbox runner work without initialising metrics or registering an OTel provider.
 
 ### Prometheus metrics
 
-Call once at service startup (idempotent — first caller wins):
+Metrics follow the **Enterprise Platform Observability Standard**. The model, wiring, migration plan and CI enforcement are described in [docs/observability](../observability/README.md). The full inventory, with every metric's labels, allowed values and ratification packet, is generated into [metrics-registry.md](../observability/metrics-registry.md). This section is a summary.
+
+Call once at startup, with the same registerer and identity as platform-pgcommon:
 
 ```go
-events.Init(os.Getenv("APP_NAME"), os.Getenv("BUILD_VERSION"))
+warnings, err := events.InitMetrics(events.MetricsIdentity{
+    Domain: "iam", Service: "event-consumer", Version: os.Getenv("BUILD_VERSION"),
+}, registry) // Environment empty → APP_ENV, then ENVIRONMENT, else "dev"
 ```
 
-For isolated test registries:
+For isolated test registries, pass `prometheus.NewRegistry()`. `events.Init` / `events.InitWithRegisterer` are deprecated: they register only the legacy metrics.
 
-```go
-events.InitWithRegisterer("test-svc", "v0.0.0", prometheus.NewRegistry())
-```
+**Tier 1 metrics** (every one carries `domain`, `service`, `environment`):
 
-Registered metrics:
+| Metric | Type | Labels | Status | Description |
+|---|---|---|---|---|
+| `platform_messages_received_total` | Counter | `queue` | Canonical | Every SQS delivery, redeliveries included |
+| `platform_messages_processed_total` | Counter | `queue`, `event_type` | Canonical | Handler returned `nil`, message deleted (not dead-lettered) |
+| `platform_messages_failed_total` | Counter | `queue`, `event_type`, `reason` | Canonical | `malformed` / `decode_error` / `handler_error` / `handler_panic` / `dead_letter_error` |
+| `platform_retry_total` | Counter | `operation`, `event_type` | Canonical | Failure left for automatic retry (`consume`, `outbox_publish`) |
+| `platform_dlq_messages_total` | Counter | `operation`, `event_type`, `reason` | Canonical | Moved to the SQS DLQ (`consume`) or `outbox_dead_letters` (`outbox_publish`); counted once |
+| `platform_duplicate_messages_total` | Counter | `queue`, `event_type` | Proposed | Redelivery acknowledged by the inbox ledger |
+| `platform_dependency_request_seconds` | Histogram | `dependency`, `operation`, `outcome` | Proposed | SNS / SQS / codec call latency; `_count` counts calls |
+| `platform_event_propagation_seconds` | Histogram | `queue`, `event_type` | Proposed | Envelope `time` → consumer receipt |
+| `platform_messages_published_total` | Counter | `topic`, `event_type`, `outcome` | Proposed | Publish attempts per event |
+| `platform_message_processing_duration_seconds` | Histogram | `queue`, `event_type` | Proposed | Handler / dead-letter handler time |
+| `platform_outbox_pending_events` / `platform_outbox_leased_events` | Gauge | — | Proposed | Outbox backlog / in flight |
+| `platform_outbox_publish_attempts_total` | Counter | `event_type`, `outcome` | Proposed | Runner publish attempts |
+| `platform_outbox_errors_total` | Counter | `operation` | Proposed | `poll` / `unmarshal` / `mark_published` / `pending_count` / `leased_count` |
+| `platform_outbox_dead_letter_operations_total` | Counter | `operation` | Proposed | Records reprocessed / discarded |
+| `platform_telemetry_label_overflow_total` | Counter | `label` | Proposed | `event_type` values over 128 bytes |
+| `platform_library_info` | Gauge | `library`, `library_version` | Proposed | Library version per service |
 
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `events_published_total` | Counter | `service`, `topic`, `event_type`, `status` | SNS publish attempts |
-| `events_publish_duration_seconds` | Histogram | `service`, `topic`, `event_type` | SNS publish latency |
-| `events_consumed_total` | Counter | `service`, `queue`, `event_type`, `status` | SQS messages processed (`status` = `success`/`error`/`malformed`/`dlq_success`/`dlq_error`; `dlq_*` emitted when the dead-letter handler is invoked) |
-| `events_consume_duration_seconds` | Histogram | `service`, `queue`, `event_type` | Handler execution latency |
-| `outbox_pending_total` | Gauge | `service` | Unpublished records in `outbox_events` |
-| `outbox_leased_total` | Gauge | `service` | Records currently claimed (leased) by a runner — combine with `outbox_pending_total` for a complete in-flight picture |
-| `outbox_published_total` | Counter | `service`, `event_type`, `status` | Records published by the runner |
-| `outbox_attempts_total` | Counter | `service`, `event_type` | Total publish attempts by the runner |
-| `outbox_dead_letters_total` | Counter | `service`, `event_type` | Records moved to `outbox_dead_letters` after exhausting `MaxAttempts` — alert on `rate() > 0` |
-| `outbox_dead_letters_reprocessed_total` | Counter | `service` | Dead-letter records re-queued via `ReprocessDeadLetters` or `ReprocessDeadLettersWith` |
-| `outbox_dead_letters_discarded_total` | Counter | `service` | Dead-letter records permanently deleted via `DiscardDeadLetters` |
-| `sqs_receive_errors_total` | Counter | `service`, `queue` | SQS `ReceiveMessage` errors (excludes context cancellation) — alert on `rate() > 0` |
-| `sqs_delete_errors_total` | Counter | `service`, `queue` | SQS `DeleteMessage` errors — a non-zero rate causes duplicate message delivery |
-| `sqs_visibility_extension_errors_total` | Counter | `service`, `queue` | SQS `ChangeMessageVisibility` errors — non-zero rate causes duplicate delivery for long-running handlers |
-| `outbox_poll_errors_total` | Counter | `service` | Outbox poll cycle errors (ClaimBatch / DB errors) — triggers exponential backoff |
-| `outbox_unmarshal_errors_total` | Counter | `service` | Outbox records that failed JSON unmarshal during publish |
-| `outbox_mark_published_errors_total` | Counter | `service` | `MarkPublished` failures after a successful SNS delivery — non-zero rate signals potential duplicate delivery on next poll |
-| `events_codec_encode_total` | Counter | `service`, `topic`, `event_type`, `status` | `Codec.Encode` invocations (`status` = `success`/`noop`/`error`); only incremented when `WithCodec` is configured |
-| `events_codec_encode_duration_seconds` | Histogram | `service`, `topic`, `event_type` | `Codec.Encode` latency |
-| `events_codec_decode_total` | Counter | `service`, `queue`, `event_type`, `status` | `Codec.Decode` invocations (`status` = `success`/`error`); only incremented when `WithConsumerCodec` is configured |
-| `events_codec_decode_duration_seconds` | Histogram | `service`, `queue`, `event_type` | `Codec.Decode` latency |
-| `events_dlq_forwarded_total` | Counter | `service`, `queue`, `event_type`, `status` | Messages forwarded by `DLQPublisher.SendToDLQ` (`queue` = source queue URL; `status` = `success`/`error`) — alert on `status="error"` > 0 |
-| `events_oversized_event_type_label_total` | Counter | `service` | `event_type` values that exceeded 128 bytes and were replaced with `"__oversized__"` — alert on `rate() > 0` to detect misconfigured or adversarial producers |
+- **Using the metrics.** Canonical metrics are safe for alerts, SLOs and HPA. Proposed metrics are shadow-emitted, so graph them but don't alert on them until governance ratifies them.
+- **Legacy metrics.** The pre-standard metrics are still emitted in parallel and marked Deprecated, until `events.WithoutLegacyMetrics()`: `events_published_total`, `events_consumed_total`, `outbox_pending_total`, `outbox_*`, `sqs_*_errors_total`, `events_codec_*`, `events_inbox_duplicates_total`, `events_dlq_forwarded_total`, `events_oversized_event_type_label_total`, `platform_events_build_info`. Each one's successor is listed in [metrics-registry.md](../observability/metrics-registry.md#deprecated-compatibility-period).
+- **Reference rules.** Recording rules, the consumer SLO (99.9%, multi-window burn rate) and operational alerts are in [`monitoring/prometheus/platform-events.rules.yml`](../../monitoring/prometheus/platform-events.rules.yml), with a [runbook](../observability/runbook.md).
 
 ### OpenTelemetry
 

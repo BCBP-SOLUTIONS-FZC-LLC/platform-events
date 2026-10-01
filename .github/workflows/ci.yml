@@ -28,7 +28,8 @@
 #
 # paths-ignore skips this entire (expensive) pipeline for commits that only
 # touch Markdown docs or the mermaid diagrams — those can't affect test/build
-# outcomes. A commit that touches both docs and code still runs normally
+# outcomes. docs/observability/** is deliberately NOT ignored: the runbook
+# anchors and the generated metrics inventory are checked by make metrics-lint. A commit that touches both docs and code still runs normally
 # (paths-ignore only skips when EVERY changed file matches).
 #
 name: CI
@@ -36,10 +37,10 @@ name: CI
 "on":
   push:
     branches: [main, master]
-    paths-ignore: ['**.md', 'docs/architecture/**', 'docs/guides/**']
+    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**', 'docs/lld/**']
   pull_request:
     branches: [main, master]
-    paths-ignore: ['**.md', 'docs/architecture/**', 'docs/guides/**']
+    paths-ignore: ['*.md', '.claude/**', '.github/**/*.md', 'docs/*.md', 'test/**/*.md', 'docs/architecture/**', 'docs/guides/**', 'docs/lld/**']
   workflow_dispatch:
 
 permissions:
@@ -84,12 +85,12 @@ jobs:
       source_date_epoch: ${{ steps.cache.outputs.SOURCE_DATE_EPOCH }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Hadolint
-        uses: hadolint/hadolint-action@v3.3.0
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
           dockerfile: Dockerfile
           ignore: DL3008
@@ -107,18 +108,18 @@ jobs:
 
       # Log in so registry cache reads (and writes on non-fork runs) are authenticated.
       - name: Log in to GHCR
-        uses: docker/login-action@v4.4.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       # Build and write all layers to GHA + registry cache (no local load needed here).
       - name: Build image → cache
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: ./Dockerfile
@@ -148,16 +149,16 @@ jobs:
       actions: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       # Restore from GHA cache (all layers cached → near-instant rebuild).
       - name: Load image from cache
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: ./Dockerfile
@@ -173,7 +174,7 @@ jobs:
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
 
       - name: Cache Trivy DB
-        uses: actions/cache@v6.0.0
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: /tmp/trivy-cache
           key: trivy-db-${{ runner.os }}
@@ -183,7 +184,7 @@ jobs:
       # Table format: human-readable in CI logs; fails on CRITICAL/HIGH/UNKNOWN.
       # Scans both the OS layer and the Go binary's module + stdlib versions.
       - name: Trivy scan — CRITICAL / HIGH / UNKNOWN
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: platform-events-ci-test
           format: table
@@ -194,7 +195,7 @@ jobs:
 
       # SARIF format: uploads to GitHub Security tab.
       - name: Trivy scan — SARIF upload
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: platform-events-ci-test
           format: sarif
@@ -204,14 +205,14 @@ jobs:
           cache-dir: /tmp/trivy-cache
 
       - name: Upload SARIF to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v4.37.0
+        uses: github/codeql-action/upload-sarif@99df26d4f13ea111d4ec1a7dddef6063f76b97e9 # v4.37.0
         continue-on-error: true
         with:
           sarif_file: trivy-results.sarif
 
       # CycloneDX SBOM — full component inventory for compliance / audit.
       - name: Trivy SBOM — CycloneDX
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: platform-events-ci-test
           format: cyclonedx
@@ -220,7 +221,7 @@ jobs:
           cache-dir: /tmp/trivy-cache
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-${{ github.sha }}
           path: sbom.cyclonedx.json
@@ -234,16 +235,16 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       # Restore from GHA cache (all layers cached → near-instant rebuild).
       - name: Load image from cache
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: ./Dockerfile
@@ -265,7 +266,7 @@ jobs:
   interop:
     name: Cross-language compatibility
     needs: validate-test
-    uses: BCBP-SOLUTIONS-FZC-LLC/platform-interop-tests/.github/workflows/interop.yml@main
+    uses: BCBP-SOLUTIONS-FZC-LLC/platform-interop-tests/.github/workflows/interop.yml@87107db3ca534faf15bd1d71d90baa498c3a7f0b # main @ 2026-08-18 — pinned: it receives a private token
     with:
       # This repo's own PR/branch ref; the other libraries default to their main
       # branch (see platform-interop-tests/README.md) — this job exists to catch
@@ -279,19 +280,20 @@ jobs:
     name: PR summary
     runs-on: ubuntu-latest
     needs: [validate-test, validate-quality, build-image, trivy, smoke, interop]
-    if: github.event_name == 'pull_request'
+    # always(): the summary must also report failed / skipped gates.
+    if: always() && github.event_name == 'pull_request'
     timeout-minutes: 5
     permissions:
       contents: read
       pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Post or update summary comment
-        uses: actions/github-script@v7.1.0
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         with:
@@ -318,7 +320,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
@@ -327,7 +329,7 @@ jobs:
         run: bash .github/scripts/set-source-date-epoch.sh
 
       - name: Log in to GHCR
-        uses: docker/login-action@v4.4.0
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -335,7 +337,7 @@ jobs:
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v6.1.0
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
@@ -343,11 +345,11 @@ jobs:
             type=sha,prefix=sha-,format=short
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Build and push
         id: pushed
-        uses: docker/build-push-action@v7.3.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: ./Dockerfile
@@ -371,7 +373,7 @@ jobs:
             type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
 
       - name: Install Cosign
-        uses: sigstore/cosign-installer@v4.1.2
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       # Keyless signing via Sigstore OIDC — no long-lived key to rotate or leak.
       - name: Sign image with Cosign

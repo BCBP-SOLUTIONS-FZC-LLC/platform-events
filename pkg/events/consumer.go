@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	awssqs "github.com/aws/aws-sdk-go-v2/service/sqs"
@@ -35,12 +36,13 @@ type Handler func(ctx context.Context, env Envelope[json.RawMessage]) error
 // SNS subscription requirement: if this queue receives messages via an SNS
 // subscription, the subscription MUST be created with RawMessageDelivery=true.
 // Without raw delivery, SNS wraps each message in a notification envelope that
-// the consumer cannot parse — messages are permanently deleted as malformed.
+// the consumer cannot parse — messages are treated as malformed: forwarded to
+// the DLQ with WithDLQForwarding, otherwise permanently deleted.
 type SQSConfig struct {
 	// QueueURL is required.
 	QueueURL    string
 	Region      string
-	EndpointURL string // optional — LocalStack endpoint for testing
+	EndpointURL string // optional — AWS emulator (floci) endpoint for local runs and tests
 	MaxMessages int32  // 1-10; defaults to 10
 	WaitSeconds int32  // long-poll duration; defaults to 20
 	Logger      port.Logger
@@ -60,10 +62,68 @@ func WithVisibilityTimeout(d time.Duration) ConsumerOption {
 }
 
 // WithDeadLetterHandler sets a handler for messages that have exhausted retries.
+// A nil fn is ignored.
 func WithDeadLetterHandler(fn Handler) ConsumerOption {
+	if fn == nil {
+		return internalsqs.WithDeadLetterHandler(nil)
+	}
 	return internalsqs.WithDeadLetterHandler(func(ctx context.Context, env domain.Envelope[json.RawMessage]) error {
 		return fn(ctx, domainToPublic(env))
 	})
+}
+
+// WithDLQForwarding forwards poison messages — bodies that are not a valid
+// envelope, messages past the WithMaxReceiveCount threshold (after the
+// WithDeadLetterHandler callback, when set, succeeds), and messages past it
+// whose codec decode fails — to the source queue's RedrivePolicy DLQ via p.
+// The original raw body and attributes are forwarded, and the message is
+// deleted only once the forward succeeds; otherwise it stays visible and SQS's
+// own redrive remains the backstop. Without this option malformed messages
+// are deleted and only logged.
+//
+// Start resolves the queue's DLQ first and returns an error wrapping
+// ErrDLQNotConfigured / ErrDLQInvalidRedrivePolicy when the queue has no
+// usable RedrivePolicy (a transient resolution failure is logged and the
+// consumer starts). Each forward is bounded by 30s, capped at half the
+// WithVisibilityTimeout value (minimum 1s) so the message cannot reappear
+// mid-forward.
+//
+// WithMaxReceiveCount (default 5) must be strictly lower than the queue's
+// RedrivePolicy maxReceiveCount, or SQS moves the message first.
+func WithDLQForwarding(p DLQPublisher) ConsumerOption {
+	return internalsqs.WithDLQPublisher(p)
+}
+
+// WithQueueDepthMetrics samples the queue's backlog, and that of the DLQ its
+// RedrivePolicy points at, into platform_queue_depth / platform_dlq_depth
+// every interval (minimum 10s; 0 disables) while the consumer runs. Services
+// cannot read queue attributes themselves (no SQS SDK), so this is how queue
+// depth reaches Prometheus. Each replica polls — one or two
+// sqs:GetQueueAttributes calls per interval; grant that permission on the
+// queue and its DLQ. Both metrics are Proposed: graph them, but don't alert,
+// build SLOs or scale on them until they are ratified.
+func WithQueueDepthMetrics(interval time.Duration) ConsumerOption {
+	return internalsqs.WithQueueDepthMetrics(interval)
+}
+
+// WithHandlerTimeout bounds the processing of each message (codec decode,
+// dead-letter handler and handler) with one deadline d from when a worker
+// picks it up: their contexts are cancelled at it and the message's
+// visibility is no longer extended, so a hung handler cannot keep a message
+// invisible — and out of the queue's redrive — forever; it is redelivered and
+// counts toward MaxReceiveCount. A handler that ignores
+// its context still holds its concurrency slot until it returns. Default 0
+// (unbounded); env SQS_HANDLER_TIMEOUT via config.SQSConsumerOptions.
+func WithHandlerTimeout(d time.Duration) ConsumerOption {
+	return internalsqs.WithHandlerTimeout(d)
+}
+
+// WithMalformedBodyLogging includes the first 512 bytes of a message body
+// that is not a valid envelope in the ERROR log. Off by default — bodies may
+// carry tenant data (PII); the log records the body's size and SHA-256, and
+// with WithDLQForwarding the full body is kept in the DLQ.
+func WithMalformedBodyLogging() ConsumerOption {
+	return internalsqs.WithMalformedBodyLogging()
 }
 
 // WithDrainTimeout sets how long Stop() waits for in-flight handlers to finish.
@@ -72,7 +132,8 @@ func WithDrainTimeout(d time.Duration) ConsumerOption {
 }
 
 // WithMaxReceiveCount sets the ApproximateReceiveCount threshold at which a message
-// is routed to the dead-letter handler. Requires WithDeadLetterHandler to be set.
+// is routed to the dead-letter handler and/or DLQ. Requires WithDeadLetterHandler
+// or WithDLQForwarding.
 func WithMaxReceiveCount(n int) ConsumerOption {
 	return internalsqs.WithMaxReceiveCount(n)
 }
@@ -97,6 +158,9 @@ type SQSClientLike interface {
 
 // NewSQSConsumer constructs an SQS-backed Consumer.
 func NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Consumer, error) {
+	if handler == nil {
+		return nil, errors.New("events: handler is required")
+	}
 	wrappedHandler := func(ctx context.Context, env domain.Envelope[json.RawMessage]) error {
 		return handler(ctx, domainToPublic(env))
 	}
@@ -113,6 +177,9 @@ func NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Con
 // NewSQSConsumerWithClient constructs an SQS-backed Consumer using an injected
 // SQS client. Useful in unit tests to avoid real AWS credentials.
 func NewSQSConsumerWithClient(cfg SQSConfig, client SQSClientLike, handler Handler, opts ...ConsumerOption) (Consumer, error) {
+	if handler == nil {
+		return nil, errors.New("events: handler is required")
+	}
 	wrappedHandler := func(ctx context.Context, env domain.Envelope[json.RawMessage]) error {
 		return handler(ctx, domainToPublic(env))
 	}

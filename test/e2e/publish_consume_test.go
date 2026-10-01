@@ -29,7 +29,7 @@ func setAWSEnv(t *testing.T) {
 }
 
 // TestPublishConsume_EndToEnd tests the complete SNS → SQS → Consumer pipeline
-// using LocalStack.
+// using Floci.
 func TestPublishConsume_EndToEnd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test")
@@ -39,17 +39,17 @@ func TestPublishConsume_EndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
+	emu := fixtures.StartFloci(ctx, t)
 
-	topicARN := ls.CreateTopic(ctx, t, "e2e-topic")
-	queueURL := ls.CreateQueue(ctx, t, "e2e-queue")
-	ls.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
+	topicARN := emu.CreateTopic(ctx, t, "e2e-topic")
+	queueURL := emu.CreateQueue(ctx, t, "e2e-queue")
+	emu.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
 
 	// Create publisher.
 	pub, err := events.NewSNSPublisher(events.SNSConfig{
 		TopicARN:    topicARN,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 	})
 	require.NoError(t, err)
 
@@ -63,7 +63,7 @@ func TestPublishConsume_EndToEnd(t *testing.T) {
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    queueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		WaitSeconds: 1,
 		MaxMessages: 1,
 	}, handler)
@@ -106,13 +106,13 @@ func TestPublishConsume_HandlerError_MessageRetried(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
-	queueURL := ls.CreateQueue(ctx, t, "retry-queue")
+	emu := fixtures.StartFloci(ctx, t)
+	queueURL := emu.CreateQueue(ctx, t, "retry-queue")
 
 	// Publish a message directly to SQS.
 	env := events.NewEnvelope("retry.event", "svc", json.RawMessage(`{}`), events.WithTenantID("test-tenant"))
 	body, _ := json.Marshal(env)
-	_, err := ls.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{
+	_, err := emu.SQSClient.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:    aws.String(queueURL),
 		MessageBody: aws.String(string(body)),
 	})
@@ -128,7 +128,7 @@ func TestPublishConsume_HandlerError_MessageRetried(t *testing.T) {
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    queueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		WaitSeconds: 1,
 		MaxMessages: 1,
 	}, handler)
@@ -161,16 +161,16 @@ func TestPublishConsume_Concurrent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
+	emu := fixtures.StartFloci(ctx, t)
 
-	topicARN := ls.CreateTopic(ctx, t, "concurrent-topic")
-	queueURL := ls.CreateQueue(ctx, t, "concurrent-queue")
-	ls.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
+	topicARN := emu.CreateTopic(ctx, t, "concurrent-topic")
+	queueURL := emu.CreateQueue(ctx, t, "concurrent-queue")
+	emu.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
 
 	pub, err := events.NewSNSPublisher(events.SNSConfig{
 		TopicARN:    topicARN,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 	})
 	require.NoError(t, err)
 
@@ -183,7 +183,7 @@ func TestPublishConsume_Concurrent(t *testing.T) {
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    queueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		WaitSeconds: 1,
 		MaxMessages: 10,
 	}, handler, events.WithConcurrency(3))
@@ -226,16 +226,16 @@ func TestPublishBatch_EndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	ls := fixtures.StartLocalStack(ctx, t)
+	emu := fixtures.StartFloci(ctx, t)
 
-	topicARN := ls.CreateTopic(ctx, t, "batch-topic")
-	queueURL := ls.CreateQueue(ctx, t, "batch-queue")
-	ls.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
+	topicARN := emu.CreateTopic(ctx, t, "batch-topic")
+	queueURL := emu.CreateQueue(ctx, t, "batch-queue")
+	emu.SubscribeQueueToTopic(ctx, t, topicARN, queueURL)
 
 	pub, err := events.NewSNSPublisher(events.SNSConfig{
 		TopicARN:    topicARN,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 	})
 	require.NoError(t, err)
 
@@ -248,7 +248,7 @@ func TestPublishBatch_EndToEnd(t *testing.T) {
 	consumer, err := events.NewSQSConsumer(events.SQSConfig{
 		QueueURL:    queueURL,
 		Region:      "us-east-1",
-		EndpointURL: ls.EndpointURL,
+		EndpointURL: emu.EndpointURL,
 		WaitSeconds: 1,
 		MaxMessages: 10,
 	}, handler)
