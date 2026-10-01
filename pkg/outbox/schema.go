@@ -27,7 +27,7 @@ const MigrationsTable = "outbox_migrations"
 // table ([MigrationsTable]) so the caller can safely reuse their runner for
 // domain migrations before or after this call.
 //
-//	migrateRunner := &migrate.Runner{DSN: cfg.DatabaseURL, Logger: logger}
+//	migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv()} // Logger: a pgcommon domain.Logger (optional)
 //	if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
 //	    log.Fatal(err)
 //	}

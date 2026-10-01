@@ -162,7 +162,9 @@ defer stop()
 
 // 2. Apply the outbox schema via pgcommon's migrate runner (or run this as a
 //    separate migration job — see ApplySchema's rollback note).
-migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv(), Logger: logger}
+// migrate.Runner.Logger is pgcommon's domain.Logger (variadic Field
+// arguments), not port.Logger — pass a pgcommon-compatible logger or omit it.
+migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv()}
 if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
     log.Fatal(err)
 }

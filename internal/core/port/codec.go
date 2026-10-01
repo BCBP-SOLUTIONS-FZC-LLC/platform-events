@@ -26,10 +26,11 @@ import (
 // dev/test, or a producer that never configured WithCodec) and Payload is
 // treated as already-plain-JSON.
 //
-// Errors: wrap a transient registry failure (outage, throttling, timeout) in
-// domain.RetryableError (events.ErrRetryable on the public side) so the
-// outbox retries it without counting toward MaxAttempts; any other Encode
-// error counts as a permanent failure and dead-letters after MaxAttempts.
+// Errors: wrap a transient registry failure (outage, throttling, timeout)
+// around events.ErrRetryable with %w — e.g.
+// fmt.Errorf("glue: %w: %v", events.ErrRetryable, err) — so the outbox retries
+// it without counting toward MaxAttempts; any other Encode error counts as a
+// permanent failure and dead-letters after MaxAttempts.
 type Codec interface {
 	// Encode encodes plain-JSON payload for eventType, returning the codec's
 	// native wire bytes and the schema registry ID to record on

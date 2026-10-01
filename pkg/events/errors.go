@@ -14,8 +14,12 @@ var (
 	ErrInvalidSignature = domain.ErrInvalidSignature
 )
 
-// ErrRetryable matches errors caused by a transient AWS failure (throttling,
-// service unavailable, network timeout). Currently returned by DLQPublisher.
+// ErrRetryable matches errors caused by a transient failure — AWS throttling,
+// 5xx / service unavailable, network or timeout errors — returned (wrapped) by
+// the SNS publisher and DLQPublisher. The outbox retries such failures without
+// counting toward MaxAttempts. A custom Codec (or Publisher) marks its own
+// transient errors by wrapping this sentinel with %w, e.g.
+// fmt.Errorf("glue: %w: %v", events.ErrRetryable, err).
 var ErrRetryable = domain.ErrRetryable
 
 // DLQ error kinds. Every DLQPublisher error is a *DLQError matching exactly
