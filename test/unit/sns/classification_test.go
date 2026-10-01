@@ -142,3 +142,33 @@ func TestPublishBatch_SplitsChunkByRequestSize(t *testing.T) {
 	require.NoError(t, pub.PublishBatch(context.Background(), envs))
 	assert.Equal(t, []int{2, 2}, sizes, "120 KiB ×2 fits; the third starts a new request")
 }
+
+// A codec that wraps ErrRetryable (registry outage / throttling) yields a
+// retryable batch failure, like the single-Publish path; any other encode
+// error stays permanent.
+func TestPublishBatch_CodecErrorClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		retryable bool
+	}{
+		{"registry throttled", &domain.RetryableError{Cause: errors.New("glue: ThrottlingException")}, true},
+		{"schema mismatch", errors.New("glue: schema incompatible"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &mockSNSClient{publishBatchFn: func(context.Context, *sns.PublishBatchInput, ...func(*sns.Options)) (*sns.PublishBatchOutput, error) {
+				t.Fatal("no SNS call when every entry failed to encode")
+				return nil, nil
+			}}
+			codec := &fakeCodec{encodeFn: func(context.Context, string, json.RawMessage) ([]byte, string, error) {
+				return nil, "", tc.err
+			}}
+			pub, err := internalsns.NewWithClient(classifyTopic, client, nil, internalsns.WithCodec(codec))
+			require.NoError(t, err)
+			fs := batchFailures(t, pub.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{makeEnv("a.b.c")}))
+			require.Len(t, fs, 1)
+			assert.Equal(t, "CodecEncodeError", fs[0].Code)
+			assert.Equal(t, tc.retryable, fs[0].Retryable)
+		})
+	}
+}

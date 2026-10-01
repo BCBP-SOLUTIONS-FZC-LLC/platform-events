@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SNS publisher:**
   - SNS's own throttle and internal codes (`Throttled`, `InternalError`, `KMSThrottling`) and body-less 5xx / 429 responses (`UnknownError`) were treated as permanent, so throttling used up attempts. Per-entry failures with `SenderFault=false` are transient too; a body-less 4xx (a proxy's 403 / 413) stays permanent. The SQS DLQ publisher classifies 5xx / 429 the same way.
   - `PublishBatch` splits each 10-message chunk by SNS's 256 KiB request limit as well, so one large event no longer fails its neighbours with `BatchRequestTooLong`.
+  - A codec encode failure in the batch path (the default `PublishConcurrency=1`) always counted toward `MaxAttempts`, so a schema-registry outage dead-lettered the backlog, while the single-`Publish` path already treated a codec error wrapping `ErrRetryable` as transient. Both paths now do; a `Codec` should wrap `events.ErrRetryable` for transient registry errors.
 - **SQS consumer:**
   - A message only started extending its visibility once a worker picked it up. With slow handlers, messages queued behind busy workers reappeared and were processed twice — and with `WithMaxReceiveCount` / `WithDLQForwarding`, healthy messages were dead-lettered. Every received message is now extended from receipt; batches are still received whole. Without `WithVisibilityTimeout` each receive asks only for as many messages as there are free workers. With `WithHandlerTimeout`, a message still waiting when the timeout passes is handed back to the queue; `Stop` hands back undispatched messages at once.
   - An SNS notification wrapper decoded into an envelope with `Type = "Notification"` and no ID, so a handler ignoring unknown types deleted it as processed — silently losing the event.
@@ -99,7 +100,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `VERSIONING.md`, CLAUDE.md, the envelope, consuming and outbox guides, `EVENT_SCHEMA_GOVERNANCE.md` and `CONTRIBUTING.md` use the envelope's real wire keys (`time`, `specversion`, `dataschema`, `data`).
 - The `SQSConsumerOptions` godoc, CLAUDE.md, ARCHITECTURE and the consuming guide describe `WithMaxReceiveCount` routing and trace-link propagation correctly; the consumer `Stop()` godoc describes its actual drain-timeout behaviour.
 - ARCHITECTURE covers `Store.Process` and per-key ordering; the outbox guide covers ordering, the canonical-ID rule, `RetryBackoff` and the full transient classification; the observability README covers the new metrics.
-- Removed the stale `APP_ENV` README row.
+- Removed the stale `APP_ENV` README row and the nonexistent `events.ErrBatchTooLarge`; ARCHITECTURE's public-API tables list `InitMetrics`, the new consumer options, `EnqueueOrdered`, `Store.Process` and `GaugeInterval`; CLAUDE.md's wiring example declares `ctx` first and enqueues before shutdown, and describes `port.Logger` and `outbox.Config` correctly. The reference CLI prints `HandlerTimeout` and the queue-depth interval.
 
 ### Tests
 

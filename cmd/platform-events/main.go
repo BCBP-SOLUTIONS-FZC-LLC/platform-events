@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/config"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
@@ -77,6 +78,8 @@ func main() {
 	if sqsCfg.MaxReceiveCount == 0 {
 		fmt.Fprintln(os.Stdout, "  (apply events.WithMaxReceiveCount when wiring WithDeadLetterHandler)")
 	}
+	fmt.Fprintf(os.Stdout, "  HandlerTimeout:    %s\n", durationOrOff(sqsCfg.HandlerTimeout))
+	fmt.Fprintf(os.Stdout, "  QueueDepthSample:  %s\n", durationOrOff(sqsCfg.QueueDepthInterval))
 
 	fmt.Fprintln(os.Stdout, "\n=== Outbox Config ===")
 	fmt.Fprintf(os.Stdout, "  %s\n", outboxCfg.String())
@@ -113,4 +116,12 @@ func main() {
 	for _, r := range reminders {
 		fmt.Fprintf(os.Stdout, "  - %s\n", r)
 	}
+}
+
+// durationOrOff renders an optional duration setting: "off" when unset.
+func durationOrOff(d time.Duration) string {
+	if d <= 0 {
+		return "off"
+	}
+	return d.String()
 }

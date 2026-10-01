@@ -372,6 +372,10 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 				ID:      env.ID,
 				Code:    "CodecEncodeError",
 				Message: err.Error(),
+				// A Codec signals a transient registry failure (outage,
+				// throttling) by wrapping events.ErrRetryable — same rule as
+				// the single-Publish path.
+				Retryable: errors.Is(err, domain.ErrRetryable),
 			})
 			continue
 		}

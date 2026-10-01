@@ -126,7 +126,7 @@ External dependencies (private modules):
   - `NewSQSConsumer(cfg SQSConfig, handler Handler, opts ...ConsumerOption) (Consumer, error)` — constructs the SQS long-poll loop
   - `SQSConfig{QueueURL, Region, EndpointURL, MaxMessages, WaitSeconds, Logger}` — `QueueURL` required; `MaxMessages` default 10; `WaitSeconds` default 20. `Logger` accepts any `port.Logger` — pass `platform-gincommon`'s `ZapLogger` directly.
   - `Handler` — `func(ctx context.Context, env Envelope[json.RawMessage]) error`; returning a non-nil error skips deletion (message becomes visible again after visibility timeout). The `ctx` passed to each handler has a `platform-gincommon`-compatible `RequestContext` injected (populated from `env.TenantID`, `env.TraceID`) so downstream calls to pgcommon pool helpers (e.g. `pool.WithTx`) pick up the correct GUC values automatically.
-  - `ConsumerOption` — `WithConcurrency(n)` (default 1), `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`, `WithConsumerCodec(codec)` (schema-registry hook — see "Codec" below)
+  - `ConsumerOption` — `WithConcurrency(n)` (default 1), `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)` (nil ignored), `WithMaxReceiveCount(n)`, `WithDrainTimeout(d)`, `WithConsumerCodec(codec)` (schema-registry hook — see "Codec" below), `WithDLQForwarding(dlq)`, `WithHandlerTimeout(d)`, `WithQueueDepthMetrics(interval)`, `WithMalformedBodyLogging()`. `NewSQSConsumer` returns an error for a nil handler.
   - `MockConsumer` (in `pkg/events/mock`) — in-memory queue; `Inject(env)` delivers messages synchronously
 
 - **HMAC helpers**
@@ -137,7 +137,7 @@ External dependencies (private modules):
 
 **`pkg/outbox`** — transactional outbox:
 
-- `Runner{Pool, Publisher, Logger, PollInterval, BatchSize, MaxAttempts}` — configure the outbox runner. `Pool` is a `*pgcommon.Pool` from `platform-pgcommon`; `Publisher` are **required**.
+- `NewRunner(outbox.Config{Pool, Publisher, Logger, PollInterval, BatchSize, MaxAttempts, ClaimLeaseDuration, PublishConcurrency, PublishTimeout, DrainTimeout, StartupJitter, RetryBackoff, MaxRetryBackoff, GaugeInterval}) (*Runner, error)` — configure the outbox runner (`Runner`'s fields are unexported). `Pool` (a `*pgcommon.Pool` from `platform-pgcommon`) and `Publisher` are **required**; `config.RunnerConfigFromEnv` maps the `OUTBOX_*` env vars onto it.
 - `Runner.Start(ctx) error` — start the polling loop; blocks until `ctx` is cancelled.
 - `Runner.Stop() error` — graceful drain; waits for in-flight batch to complete before returning.
 - `Runner.PrunePublished(ctx, olderThan time.Duration, limit int) (int64, error)` — deletes published records older than `olderThan` from `outbox_events` (up to `limit` rows per call) to prevent unbounded table growth. Call periodically from a scheduled job. Applies a 30 s internal DB timeout.
@@ -156,38 +156,45 @@ External dependencies (private modules):
 //    ZapLogger satisfies port.Logger — pass it to every Config.Logger below.
 logger := newServiceLogger() // e.g. platform-gincommon's ZapLogger; call Sync() on shutdown
 
-// 1. Apply outbox schema via pgcommon migrate runner
-migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv(), Logger: logger}
-outbox.ApplySchema(ctx, migrateRunner)
-
-// 2. Load config and log any warnings via the structured logger (preferred over LogWarnings).
-outboxEnv := config.LoadOutbox()
-config.LogWarningsTo(logger, outboxEnv.Warnings) // falls back to stderr when logger is nil
-
-// 3. Construct outbox runner with pgcommon pool.
-// NewRunner returns an error for misconfigured ClaimLeaseDuration.
-// DB config is owned by platform-pgcommon: outboxEnv.DB = pgcommon.ConfigFromEnv().
-pool, _ := pgcommon.NewPool(ctx, outboxEnv.DB)
-runner, err := outbox.NewRunner(outbox.Config{Pool: pool, Publisher: snsPublisher, Logger: logger})
-if err != nil {
-    log.Fatal(err)
-}
-
-// 3. Wire OS signals so SIGTERM/SIGINT trigger graceful shutdown.
+// 1. Wire OS signals so SIGTERM/SIGINT cancel ctx (graceful shutdown).
 ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 defer stop()
 
+// 2. Apply the outbox schema via pgcommon's migrate runner (or run this as a
+//    separate migration job — see ApplySchema's rollback note).
+migrateRunner := &migrate.Runner{DSN: pgcommon.MigrationDSNFromEnv(), Logger: logger}
+if err := outbox.ApplySchema(ctx, migrateRunner); err != nil {
+    log.Fatal(err)
+}
+
+// 3. Load config and log any warnings via the structured logger.
+outboxEnv := config.LoadOutbox()
+config.LogWarningsTo(logger, outboxEnv.Warnings) // falls back to stderr when logger is nil
+
+// 4. Construct the runner on a pgcommon pool. DB config is owned by
+//    platform-pgcommon: outboxEnv.DB = pgcommon.ConfigFromEnv().
+pool, err := pgcommon.NewPool(ctx, outboxEnv.DB)
+if err != nil {
+    log.Fatal(err)
+}
+runner, err := outbox.NewRunner(config.RunnerConfigFromEnv(outboxEnv, pool, snsPublisher, logger))
+if err != nil {
+    log.Fatal(err) // e.g. a ClaimLeaseDuration too short for BatchSize × PublishTimeout
+}
 go func() { _ = runner.Start(ctx) }()
 
-// 4. Wait for termination, then drain in-flight messages.
+// 5. While serving: enqueue inside the business transaction (pgcommon.RunInTx).
+err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+    if err := repo.SaveUser(ctx, tx, user); err != nil { // business write
+        return err
+    }
+    return outbox.Enqueue(ctx, tx, envelope) // event write — same transaction
+})
+
+// 6. On termination, drain the in-flight batch, then close the pool.
 <-ctx.Done()
 _ = runner.Stop()
-
-// 5. Enqueue inside a business transaction (pgcommon.RunInTx)
-pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
-    _ = repo.SaveUser(ctx, tx, user)           // business write
-    return outbox.Enqueue(ctx, tx, envelope)   // event write — same transaction
-})
+pool.Close()
 ```
 
 ### Event Envelope Design
@@ -403,7 +410,7 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 **Idempotent Prometheus registration** — `metrics.Init` is guarded by `sync.Once`. `InitWithRegisterer` bypasses it for test isolation — same pattern as `platform-gincommon` and `platform-pgcommon`.
 
-**`port.Logger` is interface-compatible with platform-gincommon's `ZapLogger`** — both libraries define `Logger` with the same method set (`Info`, `Warn`, `Error`, `With`, `Named`). A consuming service that already constructs a `ZapLogger` from `platform-gincommon` passes it directly to `SNSConfig.Logger`, `SQSConfig.Logger`, and `outbox.Runner.Logger` without any adapter. Do not introduce a second logger abstraction.
+**`port.Logger` is interface-compatible with platform-gincommon's `ZapLogger`** — `port.Logger` is `Debug` / `Info` / `Warn` / `Error`, each taking `(msg string, fields map[string]interface{})` — the shape of platform-gincommon's `ZapLogger`. A consuming service that already constructs a `ZapLogger` passes it directly to `SNSConfig.Logger`, `SQSConfig.Logger`, `DLQConfig.Logger` and `outbox.Config.Logger` without any adapter. Do not introduce a second logger abstraction.
 
 **OTel is always initialised by the consuming service, never by this library** — `platform-events` calls standard `otel.Tracer(...)` / `otel.GetTracerProvider()` and produces no-op spans if no provider is set. The consuming service is responsible for calling `gincommon.InitTracingFromEnv()` (from `platform-gincommon`) at startup. This avoids double-initialisation when both `platform-gincommon` and `platform-events` are imported together.
 

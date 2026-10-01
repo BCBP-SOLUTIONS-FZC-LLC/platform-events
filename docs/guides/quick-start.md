@@ -69,7 +69,7 @@ func main() {
     go runner.Start(ctx)
     defer runner.Stop()
 
-    // 6. Construct and start the SQS consumer.
+    // 7. Construct and start the SQS consumer.
     sqsEnv := config.LoadSQS()
     config.LogWarnings(sqsEnv.Warnings)
     consumer, err := events.NewSQSConsumer(

@@ -21,9 +21,9 @@ The library is organised in concentric Clean Architecture layers. Inner layers h
 ```mermaid
 graph TD
     subgraph pub["Public API  —  pkg/"]
-        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nCodec · NoopCodec · GlueDecodeCodec · WithCodec · WithConsumerCodec\nSQSClientLike\nDLQPublisher · NewSQSDLQPublisher · DLQConfig · DLQClientLike · DLQAttr*\nDLQError · ErrDLQ* · ErrRetryable\nSign · Verify · SignEnvelope · VerifyEnvelope\nInit · InitWithRegisterer\nmock.Publisher · mock.Consumer · mock.DLQPublisher"]
-        inbox_pkg["pkg/inbox\nHandler(ledger, next) · Ledger\nStore · NewStore · IsProcessed · MarkProcessed · Prune · DefaultPruneBatch\nApplySchema · MigrationsTable (inbox_migrations)"]
-        outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · ApplySchema · MigrationsTable · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
+        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nCodec · NoopCodec · GlueDecodeCodec · WithCodec · WithConsumerCodec\nSQSClientLike\nDLQPublisher · NewSQSDLQPublisher · DLQConfig · DLQClientLike · DLQAttr*\nDLQError · ErrDLQ* · ErrRetryable\nSign · Verify · SignEnvelope · VerifyEnvelope\nInitMetrics · MetricsIdentity · WithEventTypes · WithEventTypeLimit\nInit · InitWithRegisterer (deprecated)\nmock.Publisher · mock.Consumer · mock.DLQPublisher"]
+        inbox_pkg["pkg/inbox\nHandler(ledger, next) · Ledger\nStore · NewStore · Process · IsProcessed · MarkProcessed · Prune · DefaultPruneBatch\nApplySchema · MigrationsTable (inbox_migrations)"]
+        outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · EnqueueOrdered · ApplySchema · MigrationsTable · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 
     subgraph cli["CLI  —  cmd/"]
@@ -39,7 +39,7 @@ graph TD
 
     subgraph core["Core  —  internal/core/"]
         port_pkg["port\nPublisher · Consumer · Handler\nCodec · NoopCodec\nLogger · Clock\nOutboxStore · LeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters\nWithEnvelopeTraceID · EnvelopeTraceIDFromContext"]
-        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord · DLQFilter · DeadLetterRecord\nWrapCodecPayload · UnwrapCodecPayload\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature · ErrBatchTooLarge\nErrRetryable · RetryableError\nDLQError · ErrDLQNotConfigured · ErrDLQInvalidRedrivePolicy\nErrDLQUnresolved · ErrDLQSendFailed · ErrDLQInvalidMessage"]
+        domain_pkg["domain  (internal)\nEnvelope[T] · OutboxRecord · DLQFilter · DeadLetterRecord\nWrapCodecPayload · UnwrapCodecPayload\nErrEnvelopeIDRequired · ErrEnvelopeTypeRequired\nErrEnvelopeSourceRequired · ErrKeyTooShort\nErrInvalidSignature\nErrRetryable · RetryableError\nDLQError · ErrDLQNotConfigured · ErrDLQInvalidRedrivePolicy\nErrDLQUnresolved · ErrDLQSendFailed · ErrDLQInvalidMessage"]
         service_pkg["service\nOutboxService · HMACService\nSign · Verify\nLeasedCount · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
 
@@ -164,9 +164,9 @@ graph LR
 | `PublisherOption` | `WithMessageGroupID(fn)`, `WithMessageDeduplicationID(fn)`, `WithAttributes(map)`, `WithCodec(codec)` |
 | `Consumer` | Interface: `Start(ctx) error`; `Stop() error` |
 | `Handler` | `func(ctx context.Context, env Envelope[json.RawMessage]) error` |
-| `NewSQSConsumer(cfg, handler, opts...)` | Constructs the SQS long-poll loop; returns error on empty `QueueURL` or `VisibilityTimeout > 12h` |
+| `NewSQSConsumer(cfg, handler, opts...)` | Constructs the SQS long-poll loop; returns error on a nil handler, empty `QueueURL` or `VisibilityTimeout > 12h` |
 | `SQSConfig` | `QueueURL` (required), `Region`, `EndpointURL`, `MaxMessages`, `WaitSeconds`, `Logger` |
-| `ConsumerOption` | `WithConcurrency(n)`, `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)`, `WithMaxReceiveCount(n)`, `WithDrainTimeout(d)`, `WithConsumerCodec(codec)` |
+| `ConsumerOption` | `WithConcurrency(n)`, `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)` (nil ignored), `WithMaxReceiveCount(n)`, `WithDrainTimeout(d)`, `WithConsumerCodec(codec)`, `WithDLQForwarding(dlq)`, `WithHandlerTimeout(d)`, `WithQueueDepthMetrics(interval)`, `WithMalformedBodyLogging()` |
 | `SQSClientLike` | Interface mirroring the SQS client API — inject in tests via `NewSQSConsumerWithClient` without importing internal packages |
 | `DLQPublisher` | Interface: `SendToDLQ(ctx, sourceQueueURL, body, attrs, reason) error`; `ResolveDLQ(ctx, sourceQueueURL) (string, error)` — forwards to the source queue's `RedrivePolicy` DLQ |
 | `NewSQSDLQPublisher(cfg)` / `NewSQSDLQPublisherWithClient(cfg, client)` | Construct the SQS implementation; the latter takes a `DLQClientLike` (`GetQueueAttributes`, `GetQueueUrl`, `SendMessage`) for tests |
@@ -174,15 +174,15 @@ graph LR
 | `DLQAttrEventType` · `DLQAttrReason` · `DLQAttrOriginalQueue` · `DLQAttrConsumerName` · `DLQAttrFailedAt` | Names of the standard attributes added to forwarded messages (`EventType`, `DLQReason`, `OriginalQueue`, `ConsumerName`, `FailedAt`) |
 | `DLQError` | Error type returned by `DLQPublisher`: `Kind` (one `ErrDLQ*` sentinel), `SourceQueue`, `Cause` |
 | `ErrDLQNotConfigured` · `ErrDLQInvalidRedrivePolicy` · `ErrDLQUnresolved` · `ErrDLQSendFailed` · `ErrDLQInvalidMessage` | `DLQError` kinds — see [Consumer-side DLQ forwarding](#consumer-side-dlq-forwarding) |
-| `ErrRetryable` | Matches errors caused by a transient AWS failure; currently returned (wrapped) by `DLQPublisher` |
+| `ErrRetryable` | Matches errors caused by a transient failure (AWS throttling / 5xx / network, a codec's registry outage); the outbox retries them without counting toward `MaxAttempts`. Returned (wrapped) by the SNS publisher and `DLQPublisher`; a custom `Codec` should wrap it for transient registry errors |
 | `Codec` | Interface: `Encode(ctx, eventType, payload) (encoded []byte, schemaID string, err error)`; `Decode(ctx, schemaID, encoded) (payload json.RawMessage, err error)`. Ships as an interface only — no concrete implementation or schema-registry SDK dependency. |
 | `NoopCodec` | Identity reference `Codec`: `Encode` returns the payload unchanged with an empty `schemaID`; `Decode` returns its input unchanged |
-| `Sign(key, payload)` | Hex-encoded HMAC-SHA256 signature |
+| `Sign(key, payload) (string, error)` | Hex-encoded HMAC-SHA256 signature; `ErrKeyTooShort` for keys < 32 bytes |
 | `Verify(key, payload, sig)` | Constant-time comparison; returns `false` on any error |
 | `SignEnvelope(key, env)` | Signs canonical JSON of envelope |
 | `VerifyEnvelope(key, env, sig)` | Deserialises and verifies; safe for webhook receipt handlers |
-| `Init(service, version)` | Registers Prometheus metrics once (`sync.Once`) |
-| `InitWithRegisterer(service, version, reg)` | Registers against a custom `prometheus.Registerer` (use in tests) |
+| `InitMetrics(id, reg, opts...)` | Registers the Tier 1 `platform_*` metrics with `{domain, service, environment}` const labels (plus the legacy metrics during the compatibility period); returns `RegistrationWarning`s. Options: `WithoutLegacyMetrics`, `WithEventTypeLimit`, `WithEventTypes` |
+| `Init` / `InitWithRegisterer` | **Deprecated** — legacy metrics only; use `InitMetrics` |
 | `mock.Publisher` | In-memory, thread-safe; `Published()`, `SetError()`, `SetBatchError()`, `Reset()`; validates ID/Type/Source like the SNS publisher |
 | `mock.Consumer` | In-memory queue; `Inject(env)` delivers synchronously with the real consumer's handler context (`sqs.HandlerContext` + dead-letter attribution) |
 | `mock.DLQPublisher` | In-memory, thread-safe; `Sent() []DLQMessage`, `SetError()`, `Reset()`; `ResolveDLQ` returns `DLQURL` (default `mock://dlq`) |
@@ -191,7 +191,7 @@ graph LR
 
 | Symbol | Description |
 |--------|-------------|
-| `Config` | `Pool *pgcommon.Pool`, `Publisher`, `Logger`, `PollInterval` (5s), `BatchSize` (50), `MaxAttempts` (5), `ClaimLeaseDuration` (10 min), `PublishConcurrency` (1 — SNS `PublishBatch` path; `> 1` parallel per-record `Publish`), `PublishTimeout` (10s), `DrainTimeout` (30s), `StartupJitter` (0), `RetryBackoff` (1s), `MaxRetryBackoff` (5m) |
+| `Config` | `Pool *pgcommon.Pool`, `Publisher`, `Logger`, `PollInterval` (5s), `BatchSize` (50), `MaxAttempts` (5), `ClaimLeaseDuration` (10 min), `PublishConcurrency` (1 — SNS `PublishBatch` path; `> 1` parallel per-record `Publish`), `PublishTimeout` (10s), `DrainTimeout` (30s), `StartupJitter` (0), `RetryBackoff` (1s), `MaxRetryBackoff` (5m), `GaugeInterval` (15s) |
 | `NewRunner(cfg) (*Runner, error)` | Constructs the outbox runner; applies defaults; returns an error if `ClaimLeaseDuration` is too short for the configured `BatchSize × PublishTimeout`; panics if `Publisher` nil or both `Pool` and `Store` nil (programming errors) |
 | `Runner.Start(ctx)` | Starts the poll loop (immediate first poll, then per `PollInterval`); exponential backoff (1s→30s) on poll-cycle failure; blocks until `ctx` is cancelled |
 | `Runner.Stop()` | Graceful drain; waits up to `DrainTimeout` for the in-flight batch, then returns a non-nil error if it did not finish |
@@ -201,7 +201,8 @@ graph LR
 | `Runner.ReprocessDeadLettersWith(ctx, filter, limit)` | Same as `ReprocessDeadLetters` but restricts to records matching `DLQFilter`; use for targeted replay after fixing a root cause without replaying unrelated failures |
 | `Runner.DiscardDeadLetters(ctx, filter, limit)` | Permanently deletes up to `limit` dead-letter records matching `DLQFilter`; use for poison-pill records that can never succeed; returns `(int64, error)` — always call `ListDeadLetters` first to confirm the selection |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Deletes published records older than `olderThan` from `outbox_events` (batched to `limit` rows). Call periodically (e.g. daily) to prevent unbounded table growth; choose `olderThan ≥` the longest consumer idempotency window (minimum 7 days is safe for most workloads) |
-| `Enqueue(ctx, tx pgcommon.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; validates non-empty `ID`/`Type`/`Source`, non-zero `Timestamp`, and absence of null bytes in string fields; rejects payloads > 240 KB |
+| `Enqueue(ctx, tx pgcommon.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; validates non-empty `ID`/`Type`/`Source`, a canonical lowercase UUID `ID`, non-zero `Timestamp`, and absence of null bytes in string fields; rejects payloads > 240 KB |
+| `EnqueueOrdered(ctx, tx, env, key)` / `MaxOrderingKeyLen` | `Enqueue` with an ordering key (≤ 256 bytes): records with the same key are published one at a time, in enqueue order — see [Write flow § Ordering](#write-flow-and-transactional-outbox) |
 | `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`010` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index, DLQ filter index, unpublished `created_at` index, ordering key) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
 | `MigrationsTable` | Exported constant (`"outbox_migrations"`) — the golang-migrate tracking table used by `ApplySchema`; isolated from the consuming service's `schema_migrations` to prevent version-number collisions |
 
@@ -212,6 +213,7 @@ graph LR
 | `Handler(ledger, next)` | Wraps an `events.Handler`: rejects a non-UUID envelope ID, acknowledges an already-recorded ID without calling `next` (`events_inbox_duplicates_total{consumer}`), otherwise runs `next` and records the ID only if it returned `nil` — see [Idempotency](#idempotency) for the check-then-act caveat |
 | `Ledger` | Interface `Handler` needs: `IsProcessed`, `MarkProcessed`, `Consumer` — satisfied by `*Store`, fakeable in tests |
 | `NewStore(pool, consumer)` | `processed_events` ledger on a `*pgcommon.Pool`, scoped to one consumer name |
+| `Store.Process(ctx, env, fn)` | Claims the event ID inside one transaction and runs `fn(ctx, tx)` in it — exactly-once Postgres writes; duplicates return nil without calling `fn`; a dead-lettered message is not recorded |
 | `Store.Prune(ctx, retention, batch)` | Batched delete of rows older than `retention` (`DefaultPruneBatch` = 5000); keep retention above the 7-day SQS message lifetime |
 | `ApplySchema(ctx, runner)` / `MigrationsTable` | Embedded migration `001`, tracked in `inbox_migrations` |
 
@@ -1004,9 +1006,9 @@ When goroutine 1 finishes:
 |---|---|---|---|
 | Postgres unavailable during `Enqueue` | Caller transaction | Caller's `RunInTx` fails — no business write, no event | Caller's own error handling |
 | Postgres unavailable during poll | `outbox.Runner` | Poll backs off 1 s → 30 s; nothing is published until it recovers; nothing is lost | `outbox_poll_errors_total` |
-| SNS throttled / unavailable | `outbox.Runner` | Retryable — record retried every poll without consuming `MaxAttempts` | `outbox_published_total{status="error"}`, `outbox_pending_total` growth |
+| SNS throttled / unavailable | `outbox.Runner` | Transient — the lease is released without consuming `MaxAttempts`, and retried after a backoff shared by all records (`RetryBackoff` → `MaxRetryBackoff`) that resets on the next successful publish | `outbox_published_total{status="error"}`, `outbox_pending_total` growth |
 | SNS permanent error (bad ARN, access denied) | `outbox.Runner` | `attempts++`; dead-lettered at `MaxAttempts` | `platform_dlq_messages_total{operation="outbox_publish"}` |
-| Schema registry down (`Codec.Encode` fails) | `outbox.Runner` | Treated as a **permanent** publish failure — counts toward `MaxAttempts`; an outage longer than `MaxAttempts × PollInterval` dead-letters records (replayable with `ReprocessDeadLettersWith`) | `events_codec_encode_total{status="error"}`, `platform_dlq_messages_total{operation="outbox_publish"}` |
+| Schema registry down (`Codec.Encode` fails) | `outbox.Runner` | Transient when the codec wraps `events.ErrRetryable` (recommended for outages / throttling) — retried like an SNS outage without consuming `MaxAttempts`. Any other encode error is permanent: it counts toward `MaxAttempts` and dead-letters after the per-record backoff schedule (replayable with `ReprocessDeadLettersWith`) | `events_codec_encode_total{status="error"}`, `platform_dlq_messages_total{operation="outbox_publish"}` |
 | Schema registry down (`Codec.Decode` fails) | SQS consumer | Message left visible — retried, then redriven by SQS; **not** deleted like malformed JSON | `events_codec_decode_total{status="error"}` |
 | SQS `ReceiveMessage` fails | SQS consumer | Backoff 1 s → 30 s with jitter | `sqs_receive_errors_total` (Tier 1: `platform_dependency_request_seconds{dependency="sqs",operation="receive_message",outcome="error"}`, Proposed) |
 | SQS `DeleteMessage` fails | SQS consumer | Logged; the message is redelivered — **duplicate processing** | `sqs_delete_errors_total` |

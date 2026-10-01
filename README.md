@@ -125,7 +125,6 @@ Invalid configuration is rejected at construction; invalid envelopes and DLQ inp
 | `events.ErrEnvelopeIDRequired` / `ErrEnvelopeTypeRequired` / `ErrEnvelopeSourceRequired` | `ParseEnvelope` or `outbox.Enqueue` — missing `id` / `type` / `source` |
 | `events.ErrKeyTooShort` | `Sign` / `SignEnvelope` with a key < 32 bytes |
 | `events.ErrInvalidSignature` | Exported for forward-compatibility; `Verify` / `VerifyEnvelope` return `bool` |
-| `events.ErrBatchTooLarge` | Internal sentinel; `PublishBatch` splits at 10 automatically — never returned |
 | `*events.BatchError` | `PublishBatch` partial failure — one `BatchFailure{ID, Code, Message}` per failed message |
 | `events.ErrDLQInvalidMessage` | `DLQPublisher` — empty source URL / body / reason, invalid UTF-8, > 10 attributes |
 | `events.ErrDLQNotConfigured` | `DLQPublisher` — source queue has no `RedrivePolicy` |
