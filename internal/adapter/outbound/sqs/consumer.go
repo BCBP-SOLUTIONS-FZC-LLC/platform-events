@@ -430,7 +430,7 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		// on Stop(), even before the per-call deadline fires.
 		rcvCtx, rcvCancel := context.WithTimeout(loopCtx, time.Duration(int(c.waitSeconds)+5)*time.Second)
 		rcvStart := time.Now()
-		out, err := c.client.ReceiveMessage(rcvCtx, receiveInput)
+		out, err := c.client.ReceiveMessage(rcvCtx, c.receiveInput(receiveInput, sem, loopCtx))
 		rcvDur := time.Since(rcvStart)
 		rcvCancel()
 		if err != nil {
@@ -472,9 +472,15 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		// message from receipt — including those waiting for a busy worker —
 		// so a batch queued behind slow handlers never reappears and is
 		// processed twice (inflating its receive count towards the DLQ).
+		// With WithHandlerTimeout, waiting is bounded too: a message still
+		// queued when the timeout passes (every worker stuck) is handed back
+		// to the queue instead of being extended forever.
 		exts := make([]*visibilityExtender, len(out.Messages))
 		for i, msg := range out.Messages {
 			exts[i] = c.extendVisibility(msg)
+			if c.handlerTimeout > 0 {
+				exts[i].SetDeadline(time.Now().Add(c.handlerTimeout))
+			}
 		}
 		for i, msg := range out.Messages {
 			ext := exts[i]
@@ -484,13 +490,18 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 			select {
 			case sem <- struct{}{}:
 			case <-loopCtx.Done():
-				// Undispatched messages: stop extending so they become visible
-				// for another consumer after their visibility timeout.
+				// Undispatched messages: hand them back to the queue at once
+				// (visibility 0) so another consumer can take them.
 				for _, e := range exts[i:] {
-					e.Stop()
+					e.Release()
 				}
 				drain()
 				return nil
+			}
+			// The message waited past its deadline and was handed back.
+			if !ext.Claim() {
+				<-sem
+				continue
 			}
 			inflight.Add(1)
 			metrics.AddInFlight(c.queueURL, 1)
@@ -864,10 +875,20 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	metrics.RecordConsume(c.queueURL, env.Type, status, dur.Seconds())
 }
 
+// Extender states: a received message is waiting for a worker, dispatched
+// to one, or released back to the queue — each transition happens once.
+const (
+	extWaiting int32 = iota
+	extDispatched
+	extReleased
+)
+
 // visibilityExtender keeps one received message hidden until stopped.
 type visibilityExtender struct {
 	stop     func()
+	release  func()       // best-effort ChangeMessageVisibility(0)
 	deadline atomic.Int64 // UnixNano; 0 = no deadline
+	state    atomic.Int32
 }
 
 // Stop ends the extension and waits for its goroutine. Safe to call more
@@ -885,12 +906,47 @@ func (e *visibilityExtender) SetDeadline(t time.Time) {
 	}
 }
 
+// Claim marks a waiting message as dispatched; false if it was already
+// released back to the queue (and must not be processed).
+func (e *visibilityExtender) Claim() bool {
+	return e.state.CompareAndSwap(extWaiting, extDispatched)
+}
+
+// Release hands a message that was never dispatched back to the queue
+// (visibility 0) and stops extending it. No-op once dispatched.
+func (e *visibilityExtender) Release() {
+	if !e.state.CompareAndSwap(extWaiting, extReleased) {
+		return
+	}
+	e.Stop()
+	if e.release != nil {
+		e.release()
+	}
+}
+
 // extendVisibility keeps msg hidden from receipt until Stop: every
 // max(visibilityTimeout/2, 1s) it resets the visibility timeout — while the
-// message waits for a worker and while it is processed — and stops early once
-// a deadline set with SetDeadline has passed.
+// message waits for a worker and while it is processed. Once a deadline set
+// with SetDeadline passes it stops; a message still waiting for a worker at
+// that point is released back to the queue.
 func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) *visibilityExtender {
 	ext := &visibilityExtender{}
+	if msg.ReceiptHandle != nil {
+		ext.release = func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := c.client.ChangeMessageVisibility(ctx, &sqs.ChangeMessageVisibilityInput{
+				QueueUrl:          aws.String(c.queueURL),
+				ReceiptHandle:     msg.ReceiptHandle,
+				VisibilityTimeout: 0,
+			}); err != nil && c.logger != nil {
+				c.logger.Warn("sqs: could not release message back to the queue; it reappears after its visibility timeout", map[string]any{
+					"message_id": aws.ToString(msg.MessageId),
+					"error":      err.Error(),
+				})
+			}
+		}
+	}
 	if c.visibilityTimeout <= 0 || msg.ReceiptHandle == nil {
 		return ext
 	}
@@ -916,9 +972,21 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) *visibilityExtender
 			select {
 			case <-ticker.C:
 				// With WithHandlerTimeout, stop extending once it has passed: a
-				// hung handler must not keep the message invisible (and out of
-				// redrive) forever.
+				// hung handler — or a message stuck behind hung handlers — must
+				// not stay invisible (and out of redrive) forever.
 				if d := ext.deadline.Load(); d != 0 && time.Now().UnixNano() > d {
+					if ext.state.CompareAndSwap(extWaiting, extReleased) {
+						if c.logger != nil {
+							c.logger.Warn("sqs: message waited past the handler timeout without a free worker — released back to the queue", map[string]any{
+								"message_id": aws.ToString(msg.MessageId),
+								"timeout":    c.handlerTimeout.String(),
+							})
+						}
+						if ext.release != nil {
+							ext.release()
+						}
+						return
+					}
 					if c.logger != nil {
 						c.logger.Warn("sqs: handler timeout passed — no longer extending visibility; the message will be redelivered", map[string]any{
 							"message_id": aws.ToString(msg.MessageId),
@@ -956,6 +1024,27 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) *visibilityExtender
 		}
 	}()
 	return ext
+}
+
+// receiveInput returns the ReceiveMessage input for the next call. Without a
+// visibility timeout there is no extension, so a message received while every
+// worker is busy would wait on the queue's own visibility timeout and could
+// reappear mid-wait: then ask only for as many messages as there are free
+// workers (waiting for one first). With a visibility timeout the whole batch
+// is taken — waiting messages are extended from receipt.
+func (c *sqsConsumer) receiveInput(base *sqs.ReceiveMessageInput, sem chan struct{}, loopCtx context.Context) *sqs.ReceiveMessageInput {
+	if c.visibilityTimeout > 0 {
+		return base
+	}
+	select {
+	case sem <- struct{}{}:
+		<-sem
+	case <-loopCtx.Done():
+		return base // the receive is cancelled with loopCtx anyway
+	}
+	input := *base
+	input.MaxNumberOfMessages = min(c.maxMessages, int32(cap(sem)-len(sem)))
+	return &input
 }
 
 // decode runs the codec on a context that keeps parent's values, survives

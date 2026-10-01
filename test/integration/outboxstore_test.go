@@ -1501,3 +1501,23 @@ func TestOutboxStore_PrunePublished_RecentRecordsNotDeleted(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(0), deleted, "recently published record must not be pruned")
 }
+
+// A replayed dead letter is a fresh outbox entry: created_at resets, so the
+// oldest-pending-age gauge does not jump to the dead letter's age.
+func TestOutboxStore_Reprocess_ResetsCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+	rec := makeRecord("replay.age")
+	enqueueAndDeadLetter(ctx, t, store, pool, rec)
+	require.NoError(t, pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+		_, err := conn.Exec(ctx, `UPDATE outbox_dead_letters SET created_at = NOW() - interval '3 days' WHERE id = $1`, rec.ID)
+		return err
+	}))
+	n, err := store.ReprocessDeadLetters(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	age, err := store.OldestPendingAge(ctx)
+	require.NoError(t, err)
+	assert.Less(t, age, time.Minute)
+}

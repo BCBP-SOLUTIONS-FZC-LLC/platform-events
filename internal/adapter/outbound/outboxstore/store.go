@@ -466,7 +466,10 @@ func (s *Store) ListDeadLetters(ctx context.Context, filter domain.DLQFilter, li
 }
 
 // ReprocessDeadLettersWith moves up to limit records that match filter from
-// outbox_dead_letters back to outbox_events, resetting attempts to 0.
+// outbox_dead_letters back to outbox_events, resetting attempts to 0 and
+// created_at to NOW() — a replayed record is a fresh outbox entry, so the
+// oldest-pending-age gauge measures delivery delay since the replay rather
+// than the dead letter's age (the envelope keeps its own time).
 // Returns the number of records re-queued.
 func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQFilter, limit int) (int, error) {
 	if limit <= 0 {
@@ -492,7 +495,7 @@ func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQF
 		)
 		INSERT INTO outbox_events
 			(id, event_type, payload, tenant_id, trace_id, attempts, created_at, scheduled_at)
-		SELECT id, event_type, payload, tenant_id, trace_id, 0, created_at, NOW()
+		SELECT id, event_type, payload, tenant_id, trace_id, 0, NOW(), NOW()
 		FROM moved
 	`, where, limitArg)
 
@@ -574,7 +577,7 @@ func (s *Store) ReprocessDeadLetters(ctx context.Context, limit int) (int, error
 			)
 			INSERT INTO outbox_events
 				(id, event_type, payload, tenant_id, trace_id, attempts, created_at, scheduled_at)
-			SELECT id, event_type, payload, tenant_id, trace_id, 0, created_at, NOW()
+			SELECT id, event_type, payload, tenant_id, trace_id, 0, NOW(), NOW()
 			FROM moved
 		`, limit)
 		if err != nil {

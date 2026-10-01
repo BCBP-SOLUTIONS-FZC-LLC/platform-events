@@ -3,6 +3,7 @@ package sqs_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -223,6 +224,7 @@ func TestHandlerTimeout_OneDeadlineAcrossDecodeAndHandler(t *testing.T) {
 func TestStop_QueuedMessagesReleased(t *testing.T) {
 	var mu sync.Mutex
 	extended := map[string]int{}
+	var released []string
 	var once atomic.Bool
 	var batch []sqstypes.Message
 	for i := range 3 {
@@ -240,7 +242,11 @@ func TestStop_QueuedMessagesReleased(t *testing.T) {
 		},
 		changeMessageVisibilityFn: func(_ context.Context, in *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
 			mu.Lock()
-			extended[aws.ToString(in.ReceiptHandle)]++
+			if in.VisibilityTimeout == 0 {
+				released = append(released, aws.ToString(in.ReceiptHandle))
+			} else {
+				extended[aws.ToString(in.ReceiptHandle)]++
+			}
 			mu.Unlock()
 			return &sqs.ChangeMessageVisibilityOutput{}, nil
 		},
@@ -272,4 +278,98 @@ func TestStop_QueuedMessagesReleased(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, before, extended["rh-c"], "no extension for an undispatched message after Stop")
 	assert.Equal(t, int32(1), handled.Load(), "queued messages are not processed after Stop")
+	assert.Equal(t, []string{"rh-b", "rh-c"}, released, "undispatched messages handed back with visibility 0")
+}
+
+// With WithHandlerTimeout, a message waiting behind a stuck worker is handed
+// back to the queue once the timeout passes, and is never processed here.
+func TestHandlerTimeout_WaitingMessageReleased(t *testing.T) {
+	var mu sync.Mutex
+	var released []string
+	var once atomic.Bool
+	first := makeSQSMessage(domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`)))
+	first.ReceiptHandle = aws.String("rh-stuck")
+	second := makeSQSMessage(domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`)))
+	second.ReceiptHandle = aws.String("rh-waiting")
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, _ *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			if once.CompareAndSwap(false, true) {
+				return &sqs.ReceiveMessageOutput{Messages: []sqstypes.Message{first, second}}, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		changeMessageVisibilityFn: func(_ context.Context, in *sqs.ChangeMessageVisibilityInput, _ ...func(*sqs.Options)) (*sqs.ChangeMessageVisibilityOutput, error) {
+			if in.VisibilityTimeout == 0 {
+				mu.Lock()
+				released = append(released, aws.ToString(in.ReceiptHandle))
+				mu.Unlock()
+				return nil, errors.New("throttled") // a failed hand-back is logged, not fatal
+			}
+			return &sqs.ChangeMessageVisibilityOutput{}, nil
+		},
+		deleteMessageFn: func(context.Context, *sqs.DeleteMessageInput, ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+			return &sqs.DeleteMessageOutput{}, nil
+		},
+	}
+	unblock := make(chan struct{})
+	var handled atomic.Int32
+	logger := &fixtures.MockLogger{}
+	c, err := internalsqs.NewWithClient(internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1, Logger: logger}, client,
+		func(context.Context, domain.Envelope[json.RawMessage]) error {
+			handled.Add(1)
+			<-unblock // ignores its context: the worker is stuck
+			return nil
+		}, internalsqs.WithHandlerTimeout(500*time.Millisecond), internalsqs.WithVisibilityTimeout(time.Second),
+		internalsqs.WithDrainTimeout(3*time.Second))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = c.Start(ctx) }()
+
+	eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(released) == 1 && released[0] == "rh-waiting"
+	}, "the waiting message is handed back after the handler timeout")
+	close(unblock)
+	time.Sleep(200 * time.Millisecond)
+	assert.Equal(t, int32(1), handled.Load(), "the released message is not processed by this consumer")
+	var msgs []string
+	for _, e := range logger.Entries() {
+		msgs = append(msgs, e.Message)
+	}
+	assert.Contains(t, msgs, "sqs: message waited past the handler timeout without a free worker — released back to the queue")
+	assert.Contains(t, msgs, "sqs: could not release message back to the queue; it reappears after its visibility timeout")
+	cancel()
+	<-done
+}
+
+// Without a visibility timeout there is no extension, so the consumer asks
+// only for as many messages as it has free workers.
+func TestReceive_NoVisibilityTimeout_SizedToFreeWorkers(t *testing.T) {
+	var mu sync.Mutex
+	var requested []int32
+	client := &mockSQSClient{
+		receiveMessageFn: func(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+			mu.Lock()
+			requested = append(requested, in.MaxNumberOfMessages)
+			mu.Unlock()
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	}
+	c, err := internalsqs.NewWithClient(internalsqs.Config{QueueURL: testQueueURL, WaitSeconds: 1}, client,
+		func(context.Context, domain.Envelope[json.RawMessage]) error { return nil },
+		internalsqs.WithConcurrency(3), internalsqs.WithDrainTimeout(time.Second))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = c.Start(ctx) }()
+	eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(requested) > 0 }, "received")
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, int32(3), requested[0])
 }
