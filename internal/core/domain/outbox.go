@@ -22,8 +22,8 @@ type OutboxRecord struct {
 	CreatedAt   time.Time
 	ScheduledAt time.Time
 	PublishedAt *time.Time
-	// OrderingKey groups records that strict ordering publishes one at a
-	// time, oldest first ("" = unordered). Set by outbox.EnqueueOrdered.
+	// OrderingKey groups records that are published one at a time, in
+	// enqueue order ("" = unordered). Set by outbox.EnqueueOrdered.
 	OrderingKey string
 }
 

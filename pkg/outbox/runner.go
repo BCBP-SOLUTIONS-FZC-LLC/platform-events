@@ -78,17 +78,6 @@ type Config struct {
 	// Set a negative value (e.g. -1) to disable the per-record timeout.
 	PublishTimeout time.Duration
 
-	// StrictOrdering publishes the records of each ordering key (set with
-	// EnqueueOrdered) one at a time, oldest first: a keyed record is claimed
-	// only once every earlier record with the same key is published or
-	// dead-lettered. Records enqueued without a key are unaffected. A key's
-	// throughput is one record per claim, so after a batch that published
-	// anything the runner polls again at once (for up to PollInterval) instead
-	// of waiting for the next tick. Requires outbox migration 010. Watch
-	// platform_outbox_ordering_blocked_events: a failing head record holds up
-	// its key's later records until it is published or dead-lettered.
-	StrictOrdering bool
-
 	// GaugeInterval is how often the runner refreshes the outbox_pending /
 	// outbox_leased gauges (two capped COUNT queries). Defaults to 15s,
 	// independent of PollInterval so a fast poll does not multiply database
@@ -201,9 +190,7 @@ func NewRunner(cfg Config) (*Runner, error) {
 	if cfg.Store != nil {
 		store = cfg.Store
 	} else {
-		pgStore := outboxstore.New(cfg.Pool, cfg.Logger, cfg.ClaimLeaseDuration)
-		pgStore.SetStrictOrdering(cfg.StrictOrdering)
-		store = pgStore
+		store = outboxstore.New(cfg.Pool, cfg.Logger, cfg.ClaimLeaseDuration)
 	}
 
 	inner := &publisherBridge{pub: cfg.Publisher}
@@ -341,15 +328,16 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 	if r.publishOnce(ctx) {
 		return true
 	}
-	// Strict ordering claims one record per key per batch: while batches
-	// keep publishing, poll again straight away (bounded by PollInterval) so
-	// a key's backlog drains at publish speed, not one record per tick.
-	if r.cfg.StrictOrdering {
-		start := time.Now()
-		for r.svc.LastClaimed() > 0 && ctx.Err() == nil && time.Since(start) < r.cfg.PollInterval {
-			if r.publishOnce(ctx) {
-				return true
-			}
+	// While batches keep publishing, poll again straight away (bounded by
+	// PollInterval) so a backlog — and an ordered key, whose next record
+	// becomes due only once its head is published — drains at publish speed
+	// rather than one batch per tick. Stop as soon as a batch publishes
+	// nothing or hits a transient failure: during an outage this must not
+	// turn into a tight claim-and-fail loop.
+	start := time.Now()
+	for r.svc.LastPublished() > 0 && !r.svc.LastHadTransientFailure() && ctx.Err() == nil && time.Since(start) < r.cfg.PollInterval {
+		if r.publishOnce(ctx) {
+			return true
 		}
 	}
 	return false
@@ -389,7 +377,16 @@ func (r *Runner) refreshGauges(ctx context.Context) {
 			metrics.SetOutboxLeased(float64(n))
 		}
 	}
-	if r.cfg.StrictOrdering && metrics.HasOutboxBlockedMetric() {
+	// Promote ordered records whose head was published while they were being
+	// enqueued (normally their head's publish promotes them directly).
+	if n, err := r.svc.PromoteWaiting(ctx); err != nil {
+		if r.cfg.Logger != nil {
+			r.cfg.Logger.Warn("outbox: failed to promote waiting ordered records", map[string]any{"error": err.Error()})
+		}
+	} else if n > 0 && r.cfg.Logger != nil {
+		r.cfg.Logger.Info("outbox: promoted ordered records left waiting", map[string]any{"count": n})
+	}
+	if metrics.HasOutboxBlockedMetric() {
 		bcCtx, bcCancel := context.WithTimeout(ctx, gaugeQueryTimeout)
 		n, blockedErr := r.svc.BlockedCount(bcCtx)
 		bcCancel()

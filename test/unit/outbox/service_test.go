@@ -98,6 +98,7 @@ func (s *mockStore) ReleaseLease(_ context.Context, id, lastError string, _ time
 }
 
 func (s *mockStore) OldestPendingAge(context.Context) (time.Duration, error)    { return 0, nil }
+func (s *mockStore) PromoteWaiting(context.Context) (int64, error)              { return 0, nil }
 func (s *mockStore) BlockedCount(context.Context) (int64, error)                { return 0, nil }
 func (s *mockStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *mockStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }

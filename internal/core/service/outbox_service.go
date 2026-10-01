@@ -62,8 +62,10 @@ type OutboxService struct {
 	// outage slows every retry instead of hammering SNS each poll. The streak
 	// advances at most once per poll cycle (pollGen) — however many records
 	// that cycle failed — and resets on the next successful publish.
-	pollGen        atomic.Uint64
-	lastClaimed    atomic.Int32
+	pollGen atomic.Uint64
+	// Outcome of the latest PublishBatch, for the runner's re-poll decision.
+	lastPublished  atomic.Int32
+	lastTransient  atomic.Bool
 	transientMu    sync.Mutex
 	transientGen   uint64
 	transientCount int
@@ -190,12 +192,12 @@ func (s *OutboxService) Enqueue(ctx context.Context, tx pgcommon.Tx, env domain.
 // is cancelled mid-batch so the runner can distinguish shutdown from DB errors.
 func (s *OutboxService) PublishBatch(ctx context.Context, batchSize int) error {
 	s.beginPoll()
+	s.lastPublished.Store(0)
+	s.lastTransient.Store(false)
 	records, err := s.store.ClaimBatch(ctx, batchSize)
 	if err != nil {
-		s.lastClaimed.Store(0)
 		return err
 	}
-	s.lastClaimed.Store(int32(len(records)))
 	if len(records) == 0 {
 		return nil
 	}
@@ -436,6 +438,7 @@ func isTransient(err error) bool {
 // nextTransientDelay returns the shared transient backoff, advancing the
 // streak on the first transient failure of each poll cycle only.
 func (s *OutboxService) nextTransientDelay() time.Duration {
+	s.lastTransient.Store(true)
 	gen := s.pollGen.Load()
 	s.transientMu.Lock()
 	if s.transientGen != gen || s.transientCount == 0 {
@@ -495,6 +498,7 @@ func (s *OutboxService) handleUnmarshalError(bookkeepCtx context.Context, rec do
 }
 
 func (s *OutboxService) markPublished(bookkeepCtx context.Context, rec domain.OutboxRecord, env domain.Envelope[json.RawMessage]) {
+	s.lastPublished.Add(1) // published to SNS, whether or not the mark succeeds
 	if err := s.store.MarkPublished(bookkeepCtx, rec.ID); err != nil {
 		if s.outboxMetrics != nil {
 			s.outboxMetrics.RecordMarkPublishedError()
@@ -567,8 +571,19 @@ func (s *OutboxService) BlockedCount(ctx context.Context) (int64, error) {
 	return s.store.BlockedCount(ctx)
 }
 
-// LastClaimed returns how many records the most recent PublishBatch claimed.
-func (s *OutboxService) LastClaimed() int { return int(s.lastClaimed.Load()) }
+// LastPublished returns how many records the most recent PublishBatch
+// published (and marked).
+func (s *OutboxService) LastPublished() int { return int(s.lastPublished.Load()) }
+
+// LastHadTransientFailure reports whether the most recent PublishBatch hit a
+// transient publish failure (throttling, outage, timeout).
+func (s *OutboxService) LastHadTransientFailure() bool { return s.lastTransient.Load() }
+
+// PromoteWaiting makes due the ordered records whose key has no earlier
+// unpublished record; see port.OutboxStore.
+func (s *OutboxService) PromoteWaiting(ctx context.Context) (int64, error) {
+	return s.store.PromoteWaiting(ctx)
+}
 
 // OldestPendingAge returns how long the oldest unpublished record has waited.
 func (s *OutboxService) OldestPendingAge(ctx context.Context) (time.Duration, error) {

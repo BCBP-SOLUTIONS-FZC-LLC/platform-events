@@ -37,6 +37,8 @@ type mockOutboxStore struct {
 	oldestErr    error
 	blocked      int64
 	blockedErr   error
+	promoted     int64
+	promoteErr   error
 	claimErr     error
 	claims       int // ClaimBatch calls, for tests that watch the poll loop
 }
@@ -106,6 +108,11 @@ func (s *mockOutboxStore) OldestPendingAge(context.Context) (time.Duration, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.oldestAge, s.oldestErr
+}
+func (s *mockOutboxStore) PromoteWaiting(context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.promoted, s.promoteErr
 }
 func (s *mockOutboxStore) BlockedCount(context.Context) (int64, error) {
 	s.mu.Lock()
@@ -1706,10 +1713,10 @@ func TestRunner_OldestPendingAgeGauge(t *testing.T) {
 	assert.InDelta(t, 90, gauge(), 0, "a failed query leaves the last value")
 }
 
-// With strict ordering the runner keeps polling while batches publish, so a
+// The runner keeps polling while batches publish, so a
 // key's backlog drains in one tick instead of one record per PollInterval;
 // and it samples the ordering-blocked gauge.
-func TestRunner_StrictOrdering_RepollsAndGauges(t *testing.T) {
+func TestRunner_RepollsWhilePublishingAndGauges(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "strict-test", Environment: "dev"}, reg)
 	require.NoError(t, err)
@@ -1724,7 +1731,7 @@ func TestRunner_StrictOrdering_RepollsAndGauges(t *testing.T) {
 	}
 	r, err := outbox.NewRunner(outbox.Config{
 		Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
-		BatchSize: 1, PollInterval: time.Hour, StrictOrdering: true,
+		BatchSize: 1, PollInterval: time.Hour,
 	})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1760,7 +1767,7 @@ func TestRunner_GaugeQueryErrorsLogged(t *testing.T) {
 	store.oldestErr = errors.New("db down")
 	logger := &fixtures.MockLogger{}
 	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
-		Logger: logger, PollInterval: time.Hour, StrictOrdering: true})
+		Logger: logger, PollInterval: time.Hour})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -1774,4 +1781,74 @@ func TestRunner_GaugeQueryErrorsLogged(t *testing.T) {
 	}
 	assert.Contains(t, msgs, "outbox: failed to query ordering-blocked count")
 	assert.Contains(t, msgs, "outbox: failed to query oldest pending age")
+}
+
+// transientBatchPublisher fails every record with a retryable error.
+type transientBatchPublisher struct{}
+
+func (transientBatchPublisher) Publish(context.Context, events.Envelope[json.RawMessage]) error {
+	return events.ErrRetryable
+}
+func (transientBatchPublisher) PublishBatch(_ context.Context, envs []events.Envelope[json.RawMessage]) error {
+	be := &events.BatchError{}
+	for _, e := range envs {
+		be.Failures = append(be.Failures, events.BatchFailure{ID: e.ID, Code: "Throttled", Retryable: true})
+	}
+	return be
+}
+
+// During an outage the immediate re-poll must not become a claim-and-fail
+// loop: a batch that published nothing (or failed transiently) ends the tick.
+func TestRunner_NoRepollOnTransientFailure(t *testing.T) {
+	store := newMockOutboxStore()
+	for range 20 {
+		env := domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		store.records = append(store.records, domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload})
+	}
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: transientBatchPublisher{}, BatchSize: 2, PollInterval: time.Hour})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	<-r.Ready()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	<-done
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Equal(t, 1, store.claims, "one claim this tick — no re-poll after a transient failure")
+}
+
+// The waiting-record sweep runs with the gauges; promotions and failures are logged.
+func TestRunner_PromoteWaitingSweepLogged(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		promoted int64
+		err      error
+		want     string
+	}{
+		{"promoted", 2, nil, "outbox: promoted ordered records left waiting"},
+		{"error", 0, errors.New("db down"), "outbox: failed to promote waiting ordered records"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMockOutboxStore()
+			store.promoted, store.promoteErr = tc.promoted, tc.err
+			logger := &fixtures.MockLogger{}
+			r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+				Logger: logger, PollInterval: time.Hour})
+			require.NoError(t, err)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() { defer close(done); _ = r.Start(ctx) }()
+			<-r.Ready()
+			cancel()
+			<-done
+			var msgs []string
+			for _, e := range logger.Entries() {
+				msgs = append(msgs, e.Message)
+			}
+			assert.Contains(t, msgs, tc.want)
+		})
+	}
 }

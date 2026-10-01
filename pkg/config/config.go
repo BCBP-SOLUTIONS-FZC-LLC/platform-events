@@ -70,9 +70,6 @@ type OutboxConfigEnv struct {
 	// GaugeInterval (OUTBOX_GAUGE_INTERVAL, default 15s) is how often the
 	// runner refreshes the outbox backlog gauges.
 	GaugeInterval time.Duration
-	// StrictOrdering (OUTBOX_STRICT_ORDERING=true) publishes each ordering
-	// key's records one at a time, oldest first (outbox.Config.StrictOrdering).
-	StrictOrdering bool
 	// Warnings is non-empty when one or more env vars were set to invalid values
 	// and defaults were applied. Log these at startup so operators can detect
 	// misconfiguration without relying on unstructured stderr output.
@@ -88,8 +85,8 @@ func (c OutboxConfigEnv) String() string {
 	if c.ClaimLeaseDuration == 0 {
 		claimLease = "0 (runner default: 10m)"
 	}
-	return fmt.Sprintf("{PollInterval:%s BatchSize:%d MaxAttempts:%d DatabaseURL:%s MigrationDatabaseURL:%s ClaimLeaseDuration:%s StartupJitter:%s PublishConcurrency:%d PublishTimeout:%s DrainTimeout:%s RetryBackoff:%s MaxRetryBackoff:%s GaugeInterval:%s StrictOrdering:%t}",
-		c.PollInterval, c.BatchSize, c.MaxAttempts, masked, maskedMigration, claimLease, c.StartupJitter, c.PublishConcurrency, c.PublishTimeout, c.DrainTimeout, c.RetryBackoff, c.MaxRetryBackoff, c.GaugeInterval, c.StrictOrdering)
+	return fmt.Sprintf("{PollInterval:%s BatchSize:%d MaxAttempts:%d DatabaseURL:%s MigrationDatabaseURL:%s ClaimLeaseDuration:%s StartupJitter:%s PublishConcurrency:%d PublishTimeout:%s DrainTimeout:%s RetryBackoff:%s MaxRetryBackoff:%s GaugeInterval:%s}",
+		c.PollInterval, c.BatchSize, c.MaxAttempts, masked, maskedMigration, claimLease, c.StartupJitter, c.PublishConcurrency, c.PublishTimeout, c.DrainTimeout, c.RetryBackoff, c.MaxRetryBackoff, c.GaugeInterval)
 }
 
 func maskDSN(dsn string) string {
@@ -344,10 +341,6 @@ func LoadOutbox() OutboxConfigEnv {
 	if w != "" {
 		warnings = append(warnings, w)
 	}
-	strictOrdering, w := envBoolOrDefault("OUTBOX_STRICT_ORDERING", false)
-	if w != "" {
-		warnings = append(warnings, w)
-	}
 	// Database configuration is owned by platform-pgcommon: the same env vars,
 	// defaults and validation as every other service using pgcommon.NewPool.
 	db, dbWarnings := pgcommon.ConfigFromEnv()
@@ -369,7 +362,6 @@ func LoadOutbox() OutboxConfigEnv {
 		RetryBackoff:         retryBackoff,
 		MaxRetryBackoff:      maxRetryBackoff,
 		GaugeInterval:        gaugeInterval,
-		StrictOrdering:       strictOrdering,
 		Warnings:             warnings,
 	}
 }
@@ -418,18 +410,6 @@ func envIntOrDefault(key string, def int) (int, string) {
 		return def, fmt.Sprintf("platform-events: %s=%q is not a valid integer; using default %d", key, v, def)
 	}
 	return def, ""
-}
-
-func envBoolOrDefault(key string, def bool) (bool, string) {
-	v := os.Getenv(key)
-	if v == "" {
-		return def, ""
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return def, fmt.Sprintf("platform-events: %s=%q is not a valid boolean; using default %t", key, v, def)
-	}
-	return b, ""
 }
 
 func envDurationOrDefault(key string, def time.Duration) (time.Duration, string) {

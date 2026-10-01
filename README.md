@@ -31,7 +31,7 @@ These hold everywhere, always. If a design requires violating one, the design ch
 | Invariant | What it means for you |
 |---|---|
 | **Delivery is at-least-once** | Every handler may be called more than once for the same `Envelope.ID`. Idempotency is not a nice-to-have. |
-| **Outbox ordering is opt-in** | By default the outbox does not preserve publish order (a failed record is published after later ones; replicas publish concurrently), so even FIFO does not give per-aggregate order. For per-aggregate order, enqueue with `outbox.EnqueueOrdered(…, key)` and set `Config.StrictOrdering` (`OUTBOX_STRICT_ORDERING`): each key's records are published one at a time, oldest first — see [Outbox § Ordering](docs/guides/outbox.md#ordering). |
+| **Outbox ordering is opt-in** | By default the outbox does not preserve publish order (a failed record is published after later ones; replicas publish concurrently), so even FIFO does not give per-aggregate order. For per-aggregate order, enqueue with `outbox.EnqueueOrdered(…, key)`: each key's records are published one at a time, in enqueue order — see [Outbox § Ordering](docs/guides/outbox.md#ordering). |
 | **Idempotency is required for all consumers** | No configuration, queue type, or delivery mode removes this requirement. |
 | **Events are immutable once published** | An `event_type` and its payload contract are frozen on first production publish. Breaking changes require a new versioned type (`.v2`). |
 | **The producer has no knowledge of consumers** | Never check "who is listening" before publishing. Consumers come and go; the event type remains. |
@@ -488,7 +488,6 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
 | `SQS_MAX_RECEIVE_COUNT` | `0` (unset) | `WithMaxReceiveCount`; must be **below** the queue's `RedrivePolicy` `maxReceiveCount`. Takes effect with `WithDeadLetterHandler` and/or `WithDLQForwarding`, either of which defaults it to 5 when unset |
 | `SQS_HANDLER_TIMEOUT` | — (off) | `WithHandlerTimeout`: cancels a handler's context after this long and stops extending its message's visibility, so a hung handler's message is redelivered instead of held forever |
-| `OUTBOX_STRICT_ORDERING` | `false` | Per-key ordering for records enqueued with `outbox.EnqueueOrdered`: each key's records published one at a time, oldest first (migration `010`) |
 | `OUTBOX_GAUGE_INTERVAL` | `15s` | How often the runner refreshes the backlog gauges (two `COUNT` queries capped at 100k rows), independent of `OUTBOX_POLL_INTERVAL` |
 | `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | `WithQueueDepthMetrics`: samples `platform_queue_depth` / `platform_dlq_depth` every interval (min 10s). Needs `sqs:GetQueueAttributes` on the queue and its DLQ; skipped when `InitMetrics` hasn't run |
 | `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` | `5s` / `50` / `5` | Runner cadence, batch size, attempts before dead-letter |

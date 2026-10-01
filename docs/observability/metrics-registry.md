@@ -292,13 +292,13 @@ A label name means the same thing on every metric that uses it; each entry below
 ### `platform_outbox_ordering_blocked_events`
 
 - **Type:** gauge · **Tier:** platform · **Status:** proposed
-- **Semantic definition:** Outbox events held back by strict ordering (Config.StrictOrdering): keyed records waiting behind an earlier unpublished record with the same ordering key. Sampled every GaugeInterval, capped at 100000; emitted only with StrictOrdering. A value that keeps growing means a head record is failing and blocking its key.
+- **Semantic definition:** Ordered outbox events (outbox.EnqueueOrdered) waiting behind an earlier unpublished record with the same ordering key. Sampled every GaugeInterval, capped at 100000. A value that keeps growing means a key's head record keeps failing and holds the rest of its key.
 - **Required labels:** `domain`, `service`, `environment`
 - **Approved labels:** —
 - **Cardinality:** One series per service instance.
 - **Aggregation:** max by (domain, service) (platform_outbox_ordering_blocked_events) — every runner reads the same table.
 - **Supersedes:** —
-- **Governance notes:** Proposed by platform-events with the strict-ordering mode. Left at its last value when the query fails (platform_outbox_errors_total{operation="blocked_count"}).
+- **Governance notes:** Proposed by platform-events with per-key ordering. Left at its last value when the query fails (platform_outbox_errors_total{operation="blocked_count"}).
 
 ### `platform_message_timeouts_total`
 

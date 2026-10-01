@@ -36,21 +36,22 @@ func Enqueue(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMe
 const MaxOrderingKeyLen = 256
 
 // EnqueueOrdered is Enqueue with an ordering key — typically the aggregate the
-// event is about (e.g. "user/<id>", or env.Subject). With
-// Config.StrictOrdering the runner publishes each key's records one at a
-// time, in enqueue order: a record waits until every earlier record with the
-// same key is published (or dead-lettered). Without StrictOrdering the key is
-// stored and ignored.
+// event is about (e.g. "user/<id>", or env.Subject). Records with the same key
+// are published one at a time, in enqueue order, across all runner replicas:
+// a record enqueued while an earlier one of its key is unpublished waits, and
+// becomes due when that one is published or moved to outbox_dead_letters.
+// Records enqueued with Enqueue are unaffected. Requires outbox migration 010.
 //
-// Order is enqueue (commit) order, so two transactions enqueuing for the same
-// key must not commit out of order — have them write the aggregate's own row
-// (a row lock), as a business update of that aggregate normally does. On a
-// FIFO topic, derive WithMessageGroupID from the same key so SNS keeps the
-// order the runner established.
+// Enqueue order is the order of the INSERTs (a sequence), so two transactions
+// enqueuing for the same key must not interleave: take the aggregate's row
+// lock (e.g. the business UPDATE of that row, or SELECT … FOR UPDATE) BEFORE
+// calling EnqueueOrdered, so the second transaction's insert happens after the
+// first commits. On a FIFO topic, derive WithMessageGroupID from the same key
+// so SNS keeps the order the runner established.
 //
-// A failing head record blocks its key until it is published or moved to
-// outbox_dead_letters after MaxAttempts; a dead-lettered record no longer
-// blocks, and a replayed one is published after the key's newer records.
+// A failing head record holds its key until it is published or dead-lettered
+// after MaxAttempts (platform_outbox_ordering_blocked_events counts the
+// records waiting); a replayed dead letter joins the back of its key.
 func EnqueueOrdered(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMessage], orderingKey string) error {
 	if orderingKey == "" {
 		return fmt.Errorf("outbox: EnqueueOrdered requires a non-empty ordering key — use Enqueue for unordered events")

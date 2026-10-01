@@ -60,6 +60,7 @@ func (s *stubStore) ReleaseLease(_ context.Context, id, reason string, retryAfte
 }
 func (s *stubStore) PendingCount(_ context.Context) (int64, error)              { return 0, nil }
 func (s *stubStore) OldestPendingAge(context.Context) (time.Duration, error)    { return 0, nil }
+func (s *stubStore) PromoteWaiting(context.Context) (int64, error)              { return 0, nil }
 func (s *stubStore) BlockedCount(context.Context) (int64, error)                { return 0, nil }
 func (s *stubStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *stubStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
