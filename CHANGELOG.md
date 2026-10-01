@@ -10,10 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Upgrade notes
 
 - **`outbox.Enqueue` requires the canonical lowercase UUID form for the envelope ID** (what `events.NewEnvelope` produces). Uppercase, braced or unhyphenated IDs are rejected: Postgres stores the ID canonicalised, and the mismatch with the payload's ID made a failed batch publish look delivered.
+- **The outbox does not preserve publish order** — not even per aggregate on a FIFO topic (a failed or backed-off record is published after later ones; replicas publish concurrently). The docs previously said a FIFO `MessageGroupID` was enough. Consumers that need order must carry a per-aggregate sequence number.
+- **SQS consumer:** a JSON body without `id` / `type` / `source` (e.g. an SNS notification wrapper) is now malformed — forwarded to the DLQ or deleted — instead of reaching the handler with an empty envelope. Malformed bodies are no longer logged by default (size and SHA-256 only; opt back in with `WithMalformedBodyLogging`).
+- **Outbox backlog gauges** (`outbox_pending_total`, `outbox_leased_total`, and their Proposed successors) refresh every `GaugeInterval` (15s), not every poll, and are capped at 100 000. `outbox_leased_total` also counts records waiting out a retry backoff.
 - **`mock` package behaves like production** (tests may need updating):
   - `mock.Consumer.Inject` passes the real consumer's handler context.
   - `mock.DLQPublisher.SendToDLQ` counts the forward and marks the dead-letter attribution, so `inbox.Handler` / `Store.Process` skip a dead-lettered message, as in production.
   - `mock.Publisher` rejects envelopes without ID, Type or Source.
+  - `mock.Consumer.Inject` returns the error instead of calling the handler when the envelope cannot be serialised (invalid raw JSON payload), as on the wire.
 - **`events.NewSQSConsumer` / `NewSQSConsumerWithClient` return an error for a nil handler** (previously every message panicked); `WithDeadLetterHandler(nil)` is ignored.
 - **Custom `events.Publisher` implementations:** a `BatchFailure` is now treated as transient only when `Retryable` is set (or its Code is `TransportError`). A whole-batch failure from the SNS publisher is `TransportError` only when transient; a permanent one keeps its AWS code and counts toward `MaxAttempts`.
 
@@ -25,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Outbox / SNS publisher (regression in the unreleased retry change):**
   - Every whole-batch SNS failure was labelled `TransportError`, so permanent ones (`BatchRequestTooLong`, `AuthorizationError`, `NotFound`, `KMSAccessDenied`, …) were retried forever without counting attempts, holding the healthy records of the same chunk with them. Failures now carry `BatchFailure.Retryable`. Only throttling, SNS-side errors, timeouts and failures without an AWS API error (network, DNS, TLS, credentials) are transient.
   - SNS's own throttle and internal codes (`Throttled`, `InternalError`, `KMSThrottling`) were not recognised as transient, so throttling used up attempts. Per-entry failures with `SenderFault=false` are transient too.
-  - An HTTP 5xx or 429 with no body (from a load balancer or VPC endpoint), which the SDK reports as `UnknownError`, was treated as permanent. Any 5xx / 429 and `UnknownError` are now transient, for the SQS DLQ publisher too.
+  - An HTTP 5xx or 429 with no body (from a load balancer or VPC endpoint), which the SDK reports as `UnknownError`, was treated as permanent. Any 5xx / 429 is now transient, for the SQS DLQ publisher too; a body-less 4xx (a proxy's 403 / 413) stays permanent so it dead-letters rather than retrying forever.
   - Rows written before `Enqueue` required canonical IDs, or replayed from `outbox_dead_letters`, could have a payload ID that differed in case from the stored `rec.ID`. A failed batch publish of such a row was marked published. Failure IDs are now matched in canonical form.
   - `PublishBatch` splits each 10-message chunk by SNS's 256 KiB request limit as well, so one large event no longer fails its neighbours with `BatchRequestTooLong`.
   - With `PublishConcurrency > 1`, the shared transient backoff advanced once per failed record, so a one-second SNS blip parked a 50-record batch for 5 minutes. It now advances once per poll cycle.
@@ -57,8 +61,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Every third-party action and the interop reusable workflow (which receives a private token) are pinned by commit SHA.
   - The lint exclusion for `test/smoke` used v1 syntax and was ignored. It now uses v2 `linters.exclusions.paths`.
 
+- **SQS consumer:**
+  - Each receive asked for `MaxMessages` (10) whatever the free workers, and a message only started extending its visibility once a worker picked it up. With slow handlers, messages queued behind busy workers reappeared and were processed twice — and with `WithMaxReceiveCount` / `WithDLQForwarding`, healthy messages were dead-lettered. Receives now ask for `min(MaxMessages, free workers)`.
+  - An SNS notification wrapper (subscription without `RawMessageDelivery`) decoded into an envelope with `Type = "Notification"` and no ID, so a handler ignoring unknown types deleted it as processed — silently losing the event. It is now malformed.
+  - Malformed bodies were logged (first 512 bytes) at ERROR, putting tenant payloads in logs. Now logged as size + SHA-256 unless `WithMalformedBodyLogging` is set.
+  - New `WithHandlerTimeout` (`SQS_HANDLER_TIMEOUT`): a hung handler no longer keeps its message invisible — and out of the queue's redrive — forever.
+- **Outbox:** the backlog gauges ran two uncapped `COUNT(*)` queries every poll on every replica with a 2s timeout. Under a large backlog they timed out, the gauge read -1 and `PlatformEventsOutboxBacklog` went blind (and the KEDA example scaled in at the peak). They now run every `GaugeInterval` (15s, `OUTBOX_GAUGE_INTERVAL`) with a 5s timeout, capped at 100 000 rows; the KEDA example ignores -1 readings.
+- **Metrics:** `event_type` slots are first come, first served, so unknown types from a misbehaving producer could take all 200 and turn real types into `__other__`. New `events.WithEventTypes(...)` pre-registers the known types.
+- **SNS / SQS DLQ:** `UnknownError` (a body-less error response) is retryable only on 5xx / 429; a body-less 4xx from a proxy stays permanent.
+- **Config:** a backslash-escaped space in an unquoted keyword/value password (`password=a\ b`) is masked whole.
 - **Mocks:** `mock.Consumer.Inject` now gives handlers the real consumer's context (tenant GUC for RLS, trace ID, source message, dead-letter attribution). `mock.DLQPublisher` counts and marks dead-letters like the SQS publisher. `mock.Publisher` validates envelopes and gains `SetBatchError`. Service tests previously passed on behaviour production does not have.
 - **Config:** `OutboxConfigEnv.String()` masks a quoted keyword/value password containing spaces (`password='a b'`) whole; previously part of it was printed.
+
+### Added
+
+- `events.WithHandlerTimeout`, `events.WithMalformedBodyLogging`, `events.WithEventTypes`, `outbox.Config.GaugeInterval`; env `SQS_HANDLER_TIMEOUT`, `OUTBOX_GAUGE_INTERVAL`.
+- Proposed metric `platform_messages_in_flight{queue}` — messages a consumer replica is processing; at the concurrency limit for long means saturation or a hung handler.
 
 ### Changed
 

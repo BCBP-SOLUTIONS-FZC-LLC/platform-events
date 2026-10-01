@@ -45,6 +45,7 @@ type MetricsOption func(*metricsOptions)
 type metricsOptions struct {
 	legacy         bool
 	eventTypeLimit int
+	eventTypes     []string
 }
 
 // WithoutLegacyMetrics stops registering the Deprecated events_* / outbox_* /
@@ -62,6 +63,18 @@ func WithoutLegacyMetrics() MetricsOption {
 // Size it above the number of event types the service legitimately handles.
 func WithEventTypeLimit(n int) MetricsOption {
 	return func(o *metricsOptions) { o.eventTypeLimit = n }
+}
+
+// WithEventTypes pre-registers the event types the service publishes and
+// consumes. They always keep their own event_type label: the limit admits
+// values first come, first served, and consumed event types come from message
+// bodies — without this, unknown values from a misbehaving producer on a
+// shared topic could take every slot and turn the real types into
+// "__other__" until restart. The limit counts these types and is raised to fit
+// them; WithEventTypes(known...) with WithEventTypeLimit(len(known)) records
+// only the known types.
+func WithEventTypes(types ...string) MetricsOption {
+	return func(o *metricsOptions) { o.eventTypes = append(o.eventTypes, types...) }
 }
 
 // InitMetrics registers the Tier 1 platform_* metrics with id's
@@ -111,7 +124,7 @@ func InitMetrics(id MetricsIdentity, reg prometheus.Registerer, opts ...MetricsO
 		}
 		return warnings, err // nothing changed, including the event_type cap
 	}
-	metrics.SetEventTypeLimit(o.eventTypeLimit)
+	metrics.SetEventTypes(o.eventTypeLimit, o.eventTypes)
 	return warnings, nil
 }
 

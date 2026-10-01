@@ -31,7 +31,7 @@ These hold everywhere, always. If a design requires violating one, the design ch
 | Invariant | What it means for you |
 |---|---|
 | **Delivery is at-least-once** | Every handler may be called more than once for the same `Envelope.ID`. Idempotency is not a nice-to-have. |
-| **Ordering is best-effort unless FIFO per group** | Standard SNS/SQS make no ordering promise. FIFO guarantees order only within a single `MessageGroupID`. Cross-group and cross-service ordering is never guaranteed. |
+| **No ordering guarantee through the outbox** | Standard SNS/SQS make no ordering promise; FIFO keeps the order it receives within a `MessageGroupID`. The outbox does not preserve publish order (a failed record is published after later ones, and replicas publish concurrently), so even FIFO does not give per-aggregate order. Consumers that need order use a per-aggregate sequence number in the payload — see [Outbox § Ordering](docs/guides/outbox.md#ordering). |
 | **Idempotency is required for all consumers** | No configuration, queue type, or delivery mode removes this requirement. |
 | **Events are immutable once published** | An `event_type` and its payload contract are frozen on first production publish. Breaking changes require a new versioned type (`.v2`). |
 | **The producer has no knowledge of consumers** | Never check "who is listening" before publishing. Consumers come and go; the event type remains. |
@@ -275,7 +275,7 @@ Producers pass `WithCodec`; consumers of Glue-encoded events pass `WithConsumerC
 
 ### 7. Wire format
 
-SNS→SQS subscriptions **must** use `RawMessageDelivery=true` — without it the consumer deletes every message as malformed. The body is the envelope JSON; with a codec, `data` is a base64 string and `dataschema` holds the schema version ID. Envelope compatibility classes: [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees).
+SNS→SQS subscriptions **must** use `RawMessageDelivery=true` — without it every message is an SNS notification wrapper, which the consumer treats as malformed (forwarded to the DLQ with `WithDLQForwarding`, otherwise deleted) and never passes to the handler. The body is the envelope JSON; with a codec, `data` is a base64 string and `dataschema` holds the schema version ID. Envelope compatibility classes: [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envelope-compatibility-guarantees).
 
 ### 8. Handling errors
 
@@ -487,6 +487,8 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | ≥ 2× p99 handler duration; ≤ 12 h |
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
 | `SQS_MAX_RECEIVE_COUNT` | `0` (unset) | `WithMaxReceiveCount`; must be **below** the queue's `RedrivePolicy` `maxReceiveCount`. Takes effect with `WithDeadLetterHandler` and/or `WithDLQForwarding`, either of which defaults it to 5 when unset |
+| `SQS_HANDLER_TIMEOUT` | — (off) | `WithHandlerTimeout`: cancels a handler's context after this long and stops extending its message's visibility, so a hung handler's message is redelivered instead of held forever |
+| `OUTBOX_GAUGE_INTERVAL` | `15s` | How often the runner refreshes the backlog gauges (two `COUNT` queries capped at 100k rows), independent of `OUTBOX_POLL_INTERVAL` |
 | `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | `WithQueueDepthMetrics`: samples `platform_queue_depth` / `platform_dlq_depth` every interval (min 10s). Needs `sqs:GetQueueAttributes` on the queue and its DLQ; skipped when `InitMetrics` hasn't run |
 | `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` | `5s` / `50` / `5` | Runner cadence, batch size, attempts before dead-letter |
 | `OUTBOX_CLAIM_LEASE_DURATION` | `10m` (store default when unset) | How long a claimed record is hidden from other runners |

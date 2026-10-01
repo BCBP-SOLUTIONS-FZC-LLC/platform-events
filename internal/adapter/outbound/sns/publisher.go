@@ -581,9 +581,6 @@ var retryableErrorCodes = map[string]struct{}{
 	"Throttled":     {},
 	"InternalError": {},
 	"KMSThrottling": {},
-	// The SDK's code for an error response with no body: SNS always sends one,
-	// so this came from infrastructure in between (load balancer, endpoint).
-	"UnknownError": {},
 	// Generic AWS / smithy transient codes.
 	"Throttling":                    {},
 	"ThrottlingException":           {},
@@ -609,7 +606,9 @@ func wrapIfRetryable(err error) error {
 	}
 	// A 5xx or 429 is transient whatever its code — including "UnknownError",
 	// the SDK's code for an error response without a body (typically from a
-	// load balancer or VPC endpoint in front of SNS).
+	// load balancer or VPC endpoint in front of SNS). "UnknownError" on any
+	// other status (a proxy's 403 / 413) stays permanent, so it dead-letters
+	// instead of retrying forever.
 	if respErr, ok := errors.AsType[*smithyhttp.ResponseError](err); ok {
 		if status := respErr.HTTPStatusCode(); status >= 500 || status == 429 {
 			return &domain.RetryableError{Cause: err}

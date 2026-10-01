@@ -93,6 +93,9 @@ func SQSConsumerOptions(env SQSConfigEnv) []events.ConsumerOption {
 	if env.QueueDepthInterval > 0 {
 		opts = append(opts, events.WithQueueDepthMetrics(env.QueueDepthInterval))
 	}
+	if env.HandlerTimeout > 0 {
+		opts = append(opts, events.WithHandlerTimeout(env.HandlerTimeout))
+	}
 	return opts
 }
 
@@ -113,5 +116,6 @@ func RunnerConfigFromEnv(env OutboxConfigEnv, pool *pgcommon.Pool, publisher eve
 		DrainTimeout:       env.DrainTimeout,
 		RetryBackoff:       env.RetryBackoff,
 		MaxRetryBackoff:    env.MaxRetryBackoff,
+		GaugeInterval:      env.GaugeInterval,
 	}
 }

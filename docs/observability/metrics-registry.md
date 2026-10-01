@@ -19,6 +19,7 @@ platform-events' entry in the Platform Observability Registry (Enterprise Platfo
 | `platform_event_propagation_seconds` | histogram | platform | proposed | `domain`, `service`, `environment`, `queue`, `event_type` | — |
 | `platform_queue_depth` | gauge | platform | proposed | `domain`, `service`, `environment`, `queue` | — |
 | `platform_dlq_depth` | gauge | platform | proposed | `domain`, `service`, `environment`, `queue` | — |
+| `platform_messages_in_flight` | gauge | platform | proposed | `domain`, `service`, `environment`, `queue` | — |
 | `platform_messages_published_total` | counter | platform | proposed | `domain`, `service`, `environment`, `topic`, `event_type`, `outcome` | `events_published_total` |
 | `platform_message_processing_duration_seconds` | histogram | platform | proposed | `domain`, `service`, `environment`, `queue`, `event_type` | `events_consume_duration_seconds` |
 | `platform_outbox_pending_events` | gauge | platform | proposed | `domain`, `service`, `environment` | `outbox_pending_total` |
@@ -212,6 +213,18 @@ A label name means the same thing on every metric that uses it; each entry below
 - **Aggregation:** max by (domain, service, queue) (platform_dlq_depth) > 0 — messages awaiting investigation or replay. Complements platform_dlq_messages_total (inflow) with the backlog.
 - **Supersedes:** —
 - **Governance notes:** Registry-proposed example in the standard. Not emitted when the queue has no RedrivePolicy.
+
+### `platform_messages_in_flight`
+
+- **Type:** gauge · **Tier:** platform · **Status:** proposed
+- **Semantic definition:** Messages a consumer has received and is currently processing (decode, dead-letter routing or handler), per replica. At the consumer's concurrency limit for long periods means the replica is saturated; a value that never drops points at a hung handler (see WithHandlerTimeout).
+- **Required labels:** `domain`, `service`, `environment`
+- **Approved labels:** `queue`
+  - `queue`: SQS queue name — the last path segment of the queue URL (e.g. `orders`, `orders.fifo`), never the full URL (it carries the account ID). Bounded by the queues a service consumes (typically 1–5). `unknown` when the queue cannot be determined (e.g. the inbox wrapper used outside the SQS consumer).
+- **Cardinality:** queue (≤5 per service).
+- **Aggregation:** sum by (domain, service, queue) (platform_messages_in_flight) for total work in progress; compare per replica against the configured concurrency for saturation.
+- **Supersedes:** —
+- **Governance notes:** Proposed by platform-events. Complements platform_queue_depth (waiting) with work in progress.
 
 ### `platform_messages_published_total`
 

@@ -768,6 +768,7 @@ func TestNewWithClient_MaxMessages_OutOfRange(t *testing.T) {
 		client,
 		handler,
 		internalsqs.WithDrainTimeout(500*time.Millisecond),
+		internalsqs.WithConcurrency(20), // enough free workers that MaxMessages is the limit
 	)
 	require.NoError(t, err)
 
@@ -1805,6 +1806,7 @@ func TestDispatch_MalformedBody_LongBodyTruncated(t *testing.T) {
 		client,
 		func(_ context.Context, _ domain.Envelope[json.RawMessage]) error { return nil },
 		internalsqs.WithDrainTimeout(2*time.Second),
+		internalsqs.WithMalformedBodyLogging(),
 	)
 	require.NoError(t, err)
 

@@ -245,7 +245,9 @@ Start() →
     back to top
 ```
 
-- **Visibility extension** — if a handler runs longer than `VisibilityTimeout/2`, the consumer automatically calls `ChangeMessageVisibility` to extend by `VisibilityTimeout` until the handler returns.
+- **Receive sizing** — each `ReceiveMessage` asks for at most as many messages as there are free workers (`min(MaxMessages, free slots)`), so no received message waits unextended behind busy workers (it would reappear and be processed twice).
+- **Envelope validation** — a body that is not JSON, or JSON without `id` / `type` / `source` (e.g. an SNS notification wrapper from a subscription without `RawMessageDelivery`), is malformed: forwarded to the DLQ with `WithDLQForwarding`, else deleted; never passed to the handler. Logged with `body_bytes` / `body_sha256` only (`WithMalformedBodyLogging` adds an excerpt — bodies may carry PII).
+- **Visibility extension** — from receipt until dispatch ends (decode, dead-letter handler, DLQ forward, handler), the consumer calls `ChangeMessageVisibility` every `max(VisibilityTimeout/2, 1s)`. `WithHandlerTimeout(d)` (`SQS_HANDLER_TIMEOUT`) cancels the handler ctx after `d` and stops extending, so a hung handler's message is redelivered.
 - **Dead-letter handler** — with `WithDeadLetterHandler` and/or `WithDLQForwarding`, a message whose `ApproximateReceiveCount` exceeds `WithMaxReceiveCount` (default 5; keep it below the queue's RedrivePolicy `maxReceiveCount`) goes to the handler, then — unless the handler already forwarded it with `SendToDLQ` — is forwarded to the DLQ, and is deleted once both succeed. Without either option there is no consumer-side threshold: SQS's own redrive policy moves the message.
 - **Graceful shutdown** — `Stop()` cancels the receive loop, waits for all in-flight handlers to complete (up to `DrainTimeout`, default 30 s), then returns.
 - **OTel** — each message dispatch creates a child span `sqs.receive` with `messaging.system=aws_sqs`, `messaging.destination`, `messaging.message_id`, `messaging.operation=process`. The span starts a new trace with a span **link** to the producer span, extracted from the W3C `traceparent` message attribute the SNS publisher injects (baggage is propagated into the handler ctx too), giving end-to-end visibility across the SNS/SQS boundary in Tempo/Grafana. OTel must be initialised by the consuming service via `gincommon.InitTracingFromEnv()` before starting the consumer.
@@ -278,6 +280,8 @@ The outbox pattern eliminates the dual-write problem: services write the event *
 3. On a permanent failure: increment `attempts`; set `last_error`; retry after `RetryBackoff·2^(attempts-1)` (default 1s, capped at `MaxRetryBackoff` 5m, jittered); if `attempts >= MaxAttempts` move to dead-letter table (`outbox_dead_letters`). Transient failures (transport, throttling, timeouts) and shutdown use `ReleaseLease` — no attempt counted; transient ones back off on one shared schedule that resets on the next successful publish, so an SNS outage builds a backlog instead of dead-lettering it.
 4. Commit; sleep `PollInterval` (default `5s`).
 
+**Ordering** — none, not even per aggregate on a FIFO topic: a failed / backed-off record is published after later records and replicas publish concurrently. Consumers needing order carry a per-aggregate sequence number.
+
 **Idempotency** — `Envelope.ID` (UUID v7) is forwarded as the SNS `MessageDeduplicationID` on FIFO topics and as a message attribute on standard topics. Consumers should use `Envelope.ID` as their idempotency key.
 
 ### HMAC Helpers
@@ -302,7 +306,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 - **Deprecated entry points.** `events.Init` / `InitWithRegisterer` register legacy metrics only (SA1019).
 - **Registry = source of truth.** `internal/adapter/outbound/metrics/registry.go` holds tier, status (Canonical / Proposed / Deprecated), semantic definition, approved labels + values, cardinality, aggregation, `Supersedes` ↔ `SupersededBy`, and sunset. Change a metric → update the registry → `make metrics-doc`.
 - **Canonical:** `platform_messages_received_total{queue}`, `platform_messages_processed_total{queue,event_type}`, `platform_messages_failed_total{queue,event_type,reason}`, `platform_retry_total{operation,event_type}`, `platform_dlq_messages_total{operation,event_type,reason}`.
-- **Proposed** (shadow-emitted, never in alerts/SLO/HPA until ratified): `platform_queue_depth` / `platform_dlq_depth` (opt-in `WithQueueDepthMetrics` / `SQS_QUEUE_DEPTH_INTERVAL`; polls `sqs:GetQueueAttributes`, DLQ URL derived from the RedrivePolicy ARN; client capability checked by type assertion so `SQSClientAPI` is unchanged), `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}`, `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
+- **Proposed** (shadow-emitted, never in alerts/SLO/HPA until ratified): `platform_queue_depth` / `platform_dlq_depth` (opt-in `WithQueueDepthMetrics` / `SQS_QUEUE_DEPTH_INTERVAL`; polls `sqs:GetQueueAttributes`, DLQ URL derived from the RedrivePolicy ARN; client capability checked by type assertion so `SQSClientAPI` is unchanged), `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}`, `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`, `platform_messages_in_flight{queue}` (work in progress per replica).
 - **Deprecated legacy:** `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info`. Still authoritative where the successor is Proposed.
 - **Consumer semantics.**
   - Every delivery is received once and ends processed, failed (+ retry), or dead-lettered.
@@ -310,7 +314,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
   - A handler that calls `SendToDLQ` and returns nil is not counted as processed.
 - **Label rules.**
   - `queue` / `topic` = name, never URL/ARN (`metrics.QueueName` / `TopicName`).
-  - `event_type` goes through `SanitizeEventType`: ≤200 distinct values per process (`WithEventTypeLimit`, then `__other__`), ≤128 bytes (`__oversized__`), empty → `unknown`; replacements counted in `platform_telemetry_label_overflow_total`.
+  - `event_type` goes through `SanitizeEventType`: ≤200 distinct values per process (`WithEventTypeLimit`, then `__other__`), ≤128 bytes (`__oversized__`), empty → `unknown`, invalid UTF-8 repaired; replacements counted in `platform_telemetry_label_overflow_total`. Slots are first come, first served (consumed types come from message bodies), so services should pre-register their known types with `events.WithEventTypes(...)`.
   - Propagation is observed on the first receipt only (`ApproximateReceiveCount ≤ 1`). SQS `receive_message` latency includes long-poll wait; exclude it from latency views.
   - A leftover legacy `Init` after `InitMetrics` is a no-op; `InitWithRegisterer` is the test reset (clears Tier 1).
   - Prohibited: `tenant_id`, `event_id`, `user_id`, `email`, `request_id`, `session_id`, `message_id`, `trace_id`, `span_id`, `correlation_id`, `subject`, `actor`.
@@ -333,6 +337,8 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | Parsed as `time.Duration` |
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
 | `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | Enables `platform_queue_depth` / `platform_dlq_depth` sampling (min 10s) |
+| `SQS_HANDLER_TIMEOUT` | — (off) | `WithHandlerTimeout`: handler ctx deadline + stop extending visibility, so a hung handler's message is redelivered |
+| `OUTBOX_GAUGE_INTERVAL` | `15s` | Backlog-gauge refresh interval; counts capped at `outboxstore.MaxCountedRows` (100k) |
 | `OUTBOX_POLL_INTERVAL` | `5s` | Parsed as `time.Duration` |
 | `OUTBOX_BATCH_SIZE` | `50` | Records per poll cycle |
 | `OUTBOX_MAX_ATTEMPTS` | `5` | Before moving to dead-letter |

@@ -19,7 +19,7 @@ One section per alert in [`monitoring/prometheus/platform-events.rules.yml`](../
 
 **Meaning:** messages keep arriving on a queue but none has been processed successfully for 15 minutes.
 
-**Triage:** every delivery is failing or hanging. Check `platform_messages_failed_total` by reason, handler latency (`platform_message_processing_duration_seconds`), and whether handlers are blocked (DB pool saturation: `pgcommon_pool_*`). A consumer whose visibility timeout is shorter than its handler time redelivers the same messages forever — compare with `SQS_VISIBILITY_TIMEOUT`.
+**Triage:** every delivery is failing or hanging. Check `platform_messages_failed_total` by reason, handler latency (`platform_message_processing_duration_seconds`), and whether handlers are blocked (DB pool saturation: `pgcommon_pool_*`). A consumer whose visibility timeout is shorter than its handler time redelivers the same messages forever — compare with `SQS_VISIBILITY_TIMEOUT`. `platform_messages_in_flight` stuck at the consumer's concurrency means every worker is busy, typically a hung handler — set `WithHandlerTimeout` (`SQS_HANDLER_TIMEOUT`) so such messages are released for redelivery.
 
 **Mitigation:** fix the failing dependency or roll back; scale out only if handlers are healthy but slow.
 
@@ -27,7 +27,7 @@ One section per alert in [`monitoring/prometheus/platform-events.rules.yml`](../
 
 **Meaning:** a queue received bodies that are not valid event envelopes.
 
-**Triage:** the most common cause is an SNS→SQS subscription without `RawMessageDelivery=true` — the body is then an SNS notification wrapper. Otherwise a producer is publishing something other than a platform-events envelope to the topic. With `WithDLQForwarding` the original bodies are in the queue's DLQ (`DLQReason` starts with `malformed message body:`); without it they were deleted after being logged (`sqs: failed to unmarshal message body`, first 512 bytes).
+**Triage:** the most common cause is an SNS→SQS subscription without `RawMessageDelivery=true` — the body is then an SNS notification wrapper. Otherwise a producer is publishing something other than a platform-events envelope to the topic. Valid JSON that lacks an envelope's `id` / `type` / `source` (the SNS wrapper) counts as malformed too. With `WithDLQForwarding` the original bodies are in the queue's DLQ (`DLQReason` starts with `malformed message body:`); without it they were deleted after being logged (`sqs: message body is not a valid event envelope`, with `body_bytes` and `body_sha256` — the body itself only with `WithMalformedBodyLogging`, since it may carry tenant data).
 
 **Mitigation:** fix the subscription or producer; replay from the DLQ with the SQS console / `StartMessageMoveTask` once fixed.
 

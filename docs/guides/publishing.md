@@ -185,7 +185,7 @@ When `TopicARN` ends in `.fifo`, `MessageGroupID` is required; `MessageDeduplica
 > | SQS | Ordered delivery within a `MessageGroupID`; no duplicate delivery **within a single consumer session** | Protection against redelivery after a visibility timeout expires or a consumer crashes mid-handler |
 > | End-to-end | Ordered, deduplicated fan-out from SNS to SQS | That the consumer handler runs exactly once — it will not if the handler crashes after processing but before `DeleteMessage` |
 >
-> **FIFO gives you ordering. Idempotency still gives you safety.** Use `WithMessageGroupID` to enforce processing order within a group (e.g. per-tenant, per-aggregate). Use `Envelope.ID` + `INSERT ... ON CONFLICT DO NOTHING` to make the handler safe to run twice. The two properties are independent and both are required for correct behaviour. See [Implementing idempotency](consuming.md#implementing-idempotency) for the concrete pattern.
+> **FIFO serialises a group; it does not restore order the outbox lost.** `WithMessageGroupID` keeps SNS's received order within a group and serialises its processing — but the outbox may hand SNS a group's events out of order (a failed record is published after later ones; see [Outbox § Ordering](outbox.md#ordering)), so carry a per-aggregate sequence number when order matters. Idempotency still gives you safety. Use `Envelope.ID` + `INSERT ... ON CONFLICT DO NOTHING` to make the handler safe to run twice. The two properties are independent and both are required for correct behaviour. See [Implementing idempotency](consuming.md#implementing-idempotency) for the concrete pattern.
 
 ### Message attributes
 

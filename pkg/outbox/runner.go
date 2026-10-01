@@ -24,6 +24,8 @@ const (
 	defaultMaxAttempts    = 5
 	defaultDrainTimeout   = 30 * time.Second
 	defaultPublishTimeout = 10 * time.Second
+	defaultGaugeInterval  = 15 * time.Second
+	gaugeQueryTimeout     = 5 * time.Second
 
 	// Poll backoff: doubles on each consecutive failure, capped at maxPollBackoff.
 	initPollBackoff = 1 * time.Second
@@ -76,6 +78,12 @@ type Config struct {
 	// Set a negative value (e.g. -1) to disable the per-record timeout.
 	PublishTimeout time.Duration
 
+	// GaugeInterval is how often the runner refreshes the outbox_pending /
+	// outbox_leased gauges (two capped COUNT queries). Defaults to 15s,
+	// independent of PollInterval so a fast poll does not multiply database
+	// load; readings are capped at outboxstore.MaxCountedRows (100k).
+	GaugeInterval time.Duration
+
 	// StartupJitter adds a random delay in [0, StartupJitter) before the first
 	// poll. Use when running multiple runner instances to desynchronise their
 	// initial polls and avoid a thundering-herd burst on the DB.
@@ -103,6 +111,9 @@ type Runner struct {
 
 	// readyCh is closed after the first successful poll cycle (or empty poll),
 	// signalling that the DB connection and schema are healthy. Expose via Ready().
+	// lastGauge is when the backlog gauges were last refreshed (poll loop only).
+	lastGauge time.Time
+
 	// readyClosed records whether readyCh has been closed; guarded by mu.
 	readyCh     chan struct{}
 	readyClosed bool
@@ -142,6 +153,9 @@ func NewRunner(cfg Config) (*Runner, error) {
 	}
 	if cfg.PublishTimeout == 0 {
 		cfg.PublishTimeout = defaultPublishTimeout
+	}
+	if cfg.GaugeInterval <= 0 {
+		cfg.GaugeInterval = defaultGaugeInterval
 	}
 	// PublishConcurrency defaults to 1 (sequential); service constructor handles <= 0.
 
@@ -307,8 +321,17 @@ func (r *Runner) sleepBackoff(ctx, stopCtx context.Context, backoff *time.Durati
 // Returns true when the cycle encountered an infrastructure error (triggers
 // backoff in Start); returns false on success or context cancellation.
 func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
+	if time.Since(r.lastGauge) >= r.cfg.GaugeInterval {
+		r.lastGauge = time.Now()
+		r.refreshGauges(ctx)
+	}
+	return r.publishOnce(ctx)
+}
+
+// refreshGauges updates the backlog gauges from two capped counts.
+func (r *Runner) refreshGauges(ctx context.Context) {
 	if metrics.HasOutboxPendingMetric() {
-		gcCtx, gcCancel := context.WithTimeout(ctx, 2*time.Second)
+		gcCtx, gcCancel := context.WithTimeout(ctx, gaugeQueryTimeout)
 		n, pendErr := r.svc.PendingCount(gcCtx)
 		gcCancel()
 		if pendErr != nil {
@@ -325,7 +348,7 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 		}
 	}
 	if metrics.HasOutboxLeasedMetric() {
-		lcCtx, lcCancel := context.WithTimeout(ctx, 2*time.Second)
+		lcCtx, lcCancel := context.WithTimeout(ctx, gaugeQueryTimeout)
 		n, leasedErr := r.svc.LeasedCount(lcCtx)
 		lcCancel()
 		if leasedErr != nil {
@@ -339,6 +362,10 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 			metrics.SetOutboxLeased(float64(n))
 		}
 	}
+}
+
+// publishOnce runs one publish-batch cycle; see pollOnce for the result.
+func (r *Runner) publishOnce(ctx context.Context) (hadError bool) {
 	if err := r.svc.PublishBatch(ctx, r.cfg.BatchSize); err != nil {
 		// Context cancellation is not an infrastructure error — no backoff.
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

@@ -82,6 +82,7 @@ func exerciseAll() {
 	internalmetrics.IncDuplicate(testQueueURL, et)
 	internalmetrics.IncDuplicate("", et) // inbox outside the SQS consumer → queue="unknown"
 	internalmetrics.SetQueueDepth(testQueueURL, 42)
+	internalmetrics.AddInFlight(testQueueURL, 1)
 	internalmetrics.SetDLQDepth(testQueueURL, 3)
 	for dep, ops := range internalmetrics.DependencyOperations {
 		for _, op := range ops {
@@ -659,5 +660,24 @@ func TestStandard_LabelLessCountersExportedAtZero(t *testing.T) {
 	for _, name := range []string{"outbox_mark_published_errors_total", "events_oversized_event_type_label_total", "outbox_poll_errors_total", "outbox_unmarshal_errors_total"} {
 		assert.True(t, exported[name], "%s exported at 0", name)
 	}
+	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
+}
+
+// WithEventTypes keeps known types labelled even after unknown values have
+// filled the limit.
+func TestStandard_WithEventTypes_KnownTypesAlwaysAdmitted(t *testing.T) {
+	isolatePlatform(t)
+	t.Cleanup(func() { internalmetrics.SetEventTypeLimit(0) })
+	_, err := events.InitMetrics(testIdentity, prometheus.NewRegistry(),
+		events.WithEventTypes("iam.user.created", "iam.user.deleted"), events.WithEventTypeLimit(3), events.WithoutLegacyMetrics())
+	require.NoError(t, err)
+	assert.Equal(t, "junk.one", internalmetrics.SanitizeEventType("junk.one"), "one free slot")
+	assert.Equal(t, internalmetrics.EventTypeOther, internalmetrics.SanitizeEventType("junk.two"))
+	assert.Equal(t, "iam.user.deleted", internalmetrics.SanitizeEventType("iam.user.deleted"), "known type unaffected")
+
+	// Limit raised to fit the known types; invalid entries ignored.
+	internalmetrics.SetEventTypes(1, []string{"a.b.one", "a.b.two", "", strings.Repeat("x", 200)})
+	assert.Equal(t, "a.b.two", internalmetrics.SanitizeEventType("a.b.two"))
+	assert.Equal(t, internalmetrics.EventTypeOther, internalmetrics.SanitizeEventType("a.b.three"))
 	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }

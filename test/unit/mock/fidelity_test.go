@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -115,4 +116,11 @@ func TestMockConsumer_InvalidPayload(t *testing.T) {
 	c.SetHandler(func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
 	env := events.NewEnvelope("a.b.c", "svc", json.RawMessage(`{not json`))
 	assert.Error(t, c.Inject(env), "an envelope that cannot be serialised fails like on the wire")
+}
+
+func TestConsumerOptions_HandlerTimeoutAndBodyLogging(t *testing.T) {
+	_, err := events.NewSQSConsumerWithClient(events.SQSConfig{QueueURL: "https://sqs.us-east-1.amazonaws.com/1/q"}, nil,
+		func(context.Context, events.Envelope[json.RawMessage]) error { return nil },
+		events.WithHandlerTimeout(time.Minute), events.WithMalformedBodyLogging())
+	require.NoError(t, err)
 }

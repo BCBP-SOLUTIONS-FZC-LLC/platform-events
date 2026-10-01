@@ -106,6 +106,24 @@ func WithQueueDepthMetrics(interval time.Duration) ConsumerOption {
 	return internalsqs.WithQueueDepthMetrics(interval)
 }
 
+// WithHandlerTimeout bounds each handler call: its context is cancelled after
+// d and the message's visibility is no longer extended, so a hung handler
+// cannot keep a message invisible — and out of the queue's redrive — forever;
+// it is redelivered and counts toward MaxReceiveCount. A handler that ignores
+// its context still holds its concurrency slot until it returns. Default 0
+// (unbounded); env SQS_HANDLER_TIMEOUT via config.SQSConsumerOptions.
+func WithHandlerTimeout(d time.Duration) ConsumerOption {
+	return internalsqs.WithHandlerTimeout(d)
+}
+
+// WithMalformedBodyLogging includes the first 512 bytes of a message body
+// that is not a valid envelope in the ERROR log. Off by default — bodies may
+// carry tenant data (PII); the log records the body's size and SHA-256, and
+// with WithDLQForwarding the full body is kept in the DLQ.
+func WithMalformedBodyLogging() ConsumerOption {
+	return internalsqs.WithMalformedBodyLogging()
+}
+
 // WithDrainTimeout sets how long Stop() waits for in-flight handlers to finish.
 func WithDrainTimeout(d time.Duration) ConsumerOption {
 	return internalsqs.WithDrainTimeout(d)

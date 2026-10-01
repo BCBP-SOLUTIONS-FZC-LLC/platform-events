@@ -3,6 +3,8 @@ package sqs
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,6 +76,28 @@ func WithDeadLetterHandler(fn port.Handler) ConsumerOption {
 			c.deadLetterHandler = fn
 		}
 	}
+}
+
+// WithHandlerTimeout bounds each handler call: the handler's context is
+// cancelled after d, and the message's visibility is no longer extended past
+// it, so a hung handler cannot hold a message invisible (and out of the
+// queue's redrive) indefinitely — it becomes visible again and is redelivered,
+// counting toward MaxReceiveCount. A handler that ignores its context still
+// occupies its concurrency slot until it returns. 0 (default) is unbounded.
+func WithHandlerTimeout(d time.Duration) ConsumerOption {
+	return func(c *sqsConsumer) {
+		if d > 0 {
+			c.handlerTimeout = d
+		}
+	}
+}
+
+// WithMalformedBodyLogging includes the first 512 bytes of a malformed
+// message's body in its ERROR log. Off by default: bodies may carry tenant
+// data (PII), and the log otherwise records only the body's size and SHA-256
+// — with WithDLQPublisher the full body is preserved in the DLQ.
+func WithMalformedBodyLogging() ConsumerOption {
+	return func(c *sqsConsumer) { c.logMalformedBodies = true }
 }
 
 // WithDLQPublisher forwards poison messages to the source queue's configured
@@ -158,6 +182,11 @@ type sqsConsumer struct {
 	codec             port.Codec
 	// queueDepthInterval > 0 enables the platform_queue_depth / platform_dlq_depth sampler.
 	queueDepthInterval time.Duration
+	// handlerTimeout > 0 bounds each handler call (and the visibility
+	// extension for it); 0 means unbounded.
+	handlerTimeout time.Duration
+	// logMalformedBodies includes a body excerpt in the malformed-message log.
+	logMalformedBodies bool
 
 	maxReceiveCount int
 	cancelFn        context.CancelFunc
@@ -397,9 +426,25 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		// extra 5 s covers AWS control-plane overhead and TLS handshakes.
 		// We pass loopCtx as the parent so cancellation still propagates immediately
 		// on Stop(), even before the per-call deadline fires.
+		// Receive only as many messages as there are free workers. A received
+		// message's visibility timeout starts at once, but it is only extended
+		// once a worker picks it up — messages queued behind busy workers would
+		// reappear (and be processed twice, inflating their receive count) when
+		// handlers are slow. Wait for one free slot first; only this loop takes
+		// slots, so the free count can only grow until messages are dispatched.
+		select {
+		case sem <- struct{}{}:
+			<-sem
+		case <-loopCtx.Done():
+			drain()
+			return nil
+		}
+		input := *receiveInput
+		input.MaxNumberOfMessages = min(c.maxMessages, int32(cap(sem)-len(sem)))
+
 		rcvCtx, rcvCancel := context.WithTimeout(loopCtx, time.Duration(int(c.waitSeconds)+5)*time.Second)
 		rcvStart := time.Now()
-		out, err := c.client.ReceiveMessage(rcvCtx, receiveInput)
+		out, err := c.client.ReceiveMessage(rcvCtx, &input)
 		rcvDur := time.Since(rcvStart)
 		rcvCancel()
 		if err != nil {
@@ -448,7 +493,9 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 				return nil
 			}
 			inflight.Add(1)
+			metrics.AddInFlight(c.queueURL, 1)
 			wg.Go(func() {
+				defer metrics.AddInFlight(c.queueURL, -1)
 				defer inflight.Add(-1)
 				defer func() { <-sem }()
 				defer func() {
@@ -548,33 +595,16 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 
 	var env domain.Envelope[json.RawMessage]
 	body := aws.ToString(msg.Body)
-	if err := json.Unmarshal([]byte(body), &env); err != nil {
-		// Log the body (truncated) so engineers can diagnose schema mismatches
-		// without losing the message content. A malformed message will never
-		// parse successfully, so retrying is futile.
-		logBody := body
-		if len(logBody) > 512 {
-			logBody = logBody[:512] + "...[truncated]"
-		}
-		if c.logger != nil {
-			c.logger.Error("sqs: failed to unmarshal message body", map[string]any{
-				"message_id": aws.ToString(msg.MessageId),
-				"error":      err.Error(),
-				"queue":      c.queueURL,
-				"body":       logBody,
-			})
-		}
-		// A malformed message will never parse, so it must leave the queue:
-		// forward it to the DLQ when one is configured (deleting only once the
-		// forward succeeds), otherwise delete it to avoid infinite retry loops.
-		// Record a metric so operators can detect producer schema mismatches.
-		metrics.RecordConsume(c.queueURL, "unknown", "malformed", 0)
-		metrics.IncFailed(c.queueURL, "unknown", "malformed")
-		if c.dlq != nil && !c.forwardToDLQ(drainCtx, context.Background(), msg, "unknown", "malformed", "malformed message body: "+err.Error()) {
-			metrics.IncRetry("consume", "unknown")
-			return
-		}
-		c.deleteMessage(msg)
+	parseErr := json.Unmarshal([]byte(body), &env)
+	if parseErr == nil {
+		// Valid JSON is not necessarily an envelope: an SNS notification
+		// wrapper (subscription without RawMessageDelivery) decodes "Type"
+		// into env.Type — Go matches keys case-insensitively — and leaves the
+		// rest empty. Require what ParseEnvelope requires of a producer.
+		parseErr = missingEnvelopeFields(env)
+	}
+	if parseErr != nil {
+		c.handleMalformed(drainCtx, msg, body, parseErr)
 		return
 	}
 
@@ -752,6 +782,9 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	// must run to completion during graceful shutdown). context.AfterFunc links
 	// the drain deadline so handlers are cancelled when drain timeout fires.
 	handlerCtx, handlerCancel := context.WithCancel(handlerBase)
+	if c.handlerTimeout > 0 {
+		handlerCtx, handlerCancel = context.WithTimeout(handlerBase, c.handlerTimeout)
+	}
 	stopDrain := context.AfterFunc(drainCtx, handlerCancel)
 	defer stopDrain()
 	defer handlerCancel()
@@ -838,6 +871,12 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) (stop func()) {
 	// extensions continue until dispatch completes, not until drain fires.
 	extCtx, extCancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	// With WithHandlerTimeout, stop extending once it has passed: a hung
+	// handler must not keep the message invisible (and out of redrive) forever.
+	var deadline time.Time
+	if c.handlerTimeout > 0 {
+		deadline = time.Now().Add(c.handlerTimeout)
+	}
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(max(c.visibilityTimeout/2, time.Second))
@@ -845,6 +884,15 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) (stop func()) {
 		for {
 			select {
 			case <-ticker.C:
+				if !deadline.IsZero() && time.Now().After(deadline) {
+					if c.logger != nil {
+						c.logger.Warn("sqs: handler timeout passed — no longer extending visibility; the message will be redelivered", map[string]any{
+							"message_id": aws.ToString(msg.MessageId),
+							"timeout":    c.handlerTimeout.String(),
+						})
+					}
+					return
+				}
 				visStart := time.Now()
 				_, err := c.client.ChangeMessageVisibility(extCtx, &sqs.ChangeMessageVisibilityInput{
 					QueueUrl:          aws.String(c.queueURL),
@@ -925,6 +973,58 @@ func HandlerContext(parent context.Context, tenantID, traceID string, source fun
 	ctx := pgcommon.WithGUCSet(parent, pgdomain.GUCSet{TenantID: tenantID})
 	ctx = port.WithEnvelopeTraceID(ctx, traceID)
 	return port.WithSourceMessage(ctx, source)
+}
+
+// missingEnvelopeFields reports a decoded body that lacks an envelope's
+// required id, type or source.
+func missingEnvelopeFields(env domain.Envelope[json.RawMessage]) error {
+	var missing []string
+	if env.ID == "" {
+		missing = append(missing, "id")
+	}
+	if env.Type == "" {
+		missing = append(missing, "type")
+	}
+	if env.Source == "" {
+		missing = append(missing, "source")
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("not an event envelope: missing %s (an SNS subscription without RawMessageDelivery delivers a notification wrapper)", strings.Join(missing, ", "))
+}
+
+// handleMalformed disposes of a body that is not a valid envelope. It will
+// never parse, so it must leave the queue: forwarded to the DLQ when one is
+// configured (deleted only once the forward succeeds), otherwise deleted to
+// avoid an infinite retry loop. The body is logged only as its size and
+// SHA-256 unless WithMalformedBodyLogging is set — it may carry tenant data.
+func (c *sqsConsumer) handleMalformed(drainCtx context.Context, msg sqstypes.Message, body string, parseErr error) {
+	if c.logger != nil {
+		sum := sha256.Sum256([]byte(body))
+		fields := map[string]any{
+			"message_id":  aws.ToString(msg.MessageId),
+			"error":       parseErr.Error(),
+			"queue":       c.queueURL,
+			"body_bytes":  len(body),
+			"body_sha256": hex.EncodeToString(sum[:]),
+		}
+		if c.logMalformedBodies {
+			excerpt := body
+			if len(excerpt) > 512 {
+				excerpt = excerpt[:512] + "...[truncated]"
+			}
+			fields["body"] = excerpt
+		}
+		c.logger.Error("sqs: message body is not a valid event envelope", fields)
+	}
+	metrics.RecordConsume(c.queueURL, "unknown", "malformed", 0)
+	metrics.IncFailed(c.queueURL, "unknown", "malformed")
+	if c.dlq != nil && !c.forwardToDLQ(drainCtx, context.Background(), msg, "unknown", "malformed", "malformed message body: "+parseErr.Error()) {
+		metrics.IncRetry("consume", "unknown")
+		return
+	}
+	c.deleteMessage(msg)
 }
 
 // errDLQForwardFailed marks a dead-letter routing attempt whose DLQ forward

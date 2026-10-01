@@ -336,6 +336,16 @@ func Registry() []RegistryEntry {
 
 		// ── Tier 1, Proposed (new names) ─────────────────────────────────
 		platformEntry(StatusProposed, RegistryEntry{
+			Name:               "platform_messages_in_flight",
+			Type:               TypeGauge,
+			SemanticDefinition: "Messages a consumer has received and is currently processing (decode, dead-letter routing or handler), per replica. At the consumer's concurrency limit for long periods means the replica is saturated; a value that never drops points at a hung handler (see WithHandlerTimeout).",
+			ApprovedLabels:     []string{"queue"},
+			LabelValueRules:    map[string]string{"queue": QueueLabelRule},
+			Cardinality:        "queue (≤5 per service).",
+			AggregationNotes:   "sum by (domain, service, queue) (platform_messages_in_flight) for total work in progress; compare per replica against the configured concurrency for saturation.",
+			GovernanceNotes:    "Proposed by platform-events. Complements platform_queue_depth (waiting) with work in progress.",
+		}),
+		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_messages_published_total",
 			Type:               TypeCounter,
 			SemanticDefinition: "One event a producer attempted to publish to a topic, by outcome (error includes validation, encoding and broker failures; a batch counts each message).",

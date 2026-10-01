@@ -92,6 +92,7 @@ type Platform struct {
 	LabelOverflow      *prometheus.CounterVec   // platform_telemetry_label_overflow_total
 	LibraryInfo        *prometheus.GaugeVec     // platform_library_info
 	QueueDepth         *prometheus.GaugeVec     // platform_queue_depth
+	InFlight           *prometheus.GaugeVec     // platform_messages_in_flight
 	DLQDepth           *prometheus.GaugeVec     // platform_dlq_depth
 
 	identity Identity
@@ -153,12 +154,26 @@ var eventTypes = struct {
 // records (n <= 0 restores DefaultEventTypeLimit) and forgets the values
 // admitted so far.
 func SetEventTypeLimit(n int) {
-	if n <= 0 {
-		n = DefaultEventTypeLimit
+	SetEventTypes(n, nil)
+}
+
+// SetEventTypes is SetEventTypeLimit plus known: values admitted up front, so
+// they always keep their own label however many unknown values arrive later
+// (e.g. from a misbehaving producer on a shared topic). The limit counts
+// known values too and is raised to fit them.
+func SetEventTypes(limit int, known []string) {
+	if limit <= 0 {
+		limit = DefaultEventTypeLimit
+	}
+	seen := make(map[string]struct{}, len(known))
+	for _, k := range known {
+		if k != "" && len(k) <= maxEventTypeLabelLen && utf8.ValidString(k) {
+			seen[k] = struct{}{}
+		}
 	}
 	eventTypes.Lock()
-	eventTypes.limit = n
-	eventTypes.seen = map[string]struct{}{}
+	eventTypes.limit = max(limit, len(seen))
+	eventTypes.seen = seen
 	eventTypes.Unlock()
 }
 
@@ -467,6 +482,7 @@ func registerPlatform(r *registrar, id Identity) (*Platform, []RegistrationWarni
 		LabelOverflow:      counter("platform_telemetry_label_overflow_total", "label"),
 		LibraryInfo:        gauge("platform_library_info", "library", "library_version"),
 		QueueDepth:         gauge("platform_queue_depth", "queue"),
+		InFlight:           gauge("platform_messages_in_flight", "queue"),
 		DLQDepth:           gauge("platform_dlq_depth", "queue"),
 	}
 
@@ -505,6 +521,9 @@ func InitQueue(queueURL string) {
 	}
 	if p.MessagesFailed != nil {
 		p.MessagesFailed.WithLabelValues(q, "unknown", "malformed")
+	}
+	if p.InFlight != nil {
+		p.InFlight.WithLabelValues(q)
 	}
 }
 
@@ -578,6 +597,13 @@ func IncDLQ(operation, eventType, reason string) {
 func IncDuplicate(queueURL, eventType string) {
 	if p := platform.Load(); p != nil && p.DuplicateMessages != nil {
 		p.DuplicateMessages.WithLabelValues(QueueName(queueURL), SanitizeEventType(eventType)).Inc()
+	}
+}
+
+// AddInFlight adjusts the number of messages queueURL's consumer is processing.
+func AddInFlight(queueURL string, delta float64) {
+	if p := platform.Load(); p != nil && p.InFlight != nil {
+		p.InFlight.WithLabelValues(QueueName(queueURL)).Add(delta)
 	}
 }
 

@@ -159,6 +159,13 @@ func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxR
 
 const defaultStoreQueryTimeout = 5 * time.Second
 
+// MaxCountedRows caps PendingCount and LeasedCount. Counting stops there, so
+// the gauge query stays an index-range scan of bounded cost even when an SNS
+// outage leaves millions of rows pending — an uncapped COUNT(*) would time out
+// (blinding the backlog alert) exactly when the backlog matters. A reading of
+// MaxCountedRows means "at least this many".
+const MaxCountedRows = 100_000
+
 // PendingCount returns the number of records in outbox_events that are waiting
 // to be published (not yet claimed by any runner). Excludes leased records whose
 // scheduled_at has been pushed forward by ClaimBatch — those are in-flight, not
@@ -169,10 +176,13 @@ func (s *Store) PendingCount(ctx context.Context) (int64, error) {
 	var count int64
 	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, `
-			SELECT COUNT(*) FROM outbox_events
-			WHERE published_at IS NULL
-			  AND scheduled_at <= NOW()
-		`).Scan(&count)
+			SELECT COUNT(*) FROM (
+				SELECT 1 FROM outbox_events
+				WHERE published_at IS NULL
+				  AND scheduled_at <= NOW()
+				LIMIT $1
+			) capped
+		`, MaxCountedRows).Scan(&count)
 	})
 	return count, err
 }
@@ -311,19 +321,23 @@ func (s *Store) ReleaseLease(ctx context.Context, id, lastError string, retryAft
 	})
 }
 
-// LeasedCount returns the number of records currently claimed by a runner
-// (scheduled_at > NOW() and published_at IS NULL). These are in-flight records
-// that may not appear in PendingCount, providing a complete outbox health picture.
+// LeasedCount returns the number of unpublished records not yet due
+// (scheduled_at > NOW()): claimed by a runner, or waiting out a retry
+// backoff. They do not appear in PendingCount; together the two give the
+// whole unpublished backlog. Capped at MaxCountedRows.
 func (s *Store) LeasedCount(ctx context.Context) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
 	var count int64
 	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		return conn.QueryRow(ctx, `
-			SELECT COUNT(*) FROM outbox_events
-			WHERE published_at IS NULL
-			  AND scheduled_at > NOW()
-		`).Scan(&count)
+			SELECT COUNT(*) FROM (
+				SELECT 1 FROM outbox_events
+				WHERE published_at IS NULL
+				  AND scheduled_at > NOW()
+				LIMIT $1
+			) capped
+		`, MaxCountedRows).Scan(&count)
 	})
 	return count, err
 }

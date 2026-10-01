@@ -32,6 +32,9 @@ type SQSConfigEnv struct {
 	// QueueDepthInterval (SQS_QUEUE_DEPTH_INTERVAL, e.g. "60s") enables the
 	// platform_queue_depth / platform_dlq_depth sampler; 0 (default) = off.
 	QueueDepthInterval time.Duration
+	// HandlerTimeout (SQS_HANDLER_TIMEOUT, e.g. "5m") bounds each handler call
+	// (events.WithHandlerTimeout); 0 (default) = unbounded.
+	HandlerTimeout time.Duration
 	// Warnings is non-empty when one or more env vars were set to invalid values
 	// and defaults were applied. Log these at startup so operators can detect
 	// misconfiguration without relying on unstructured stderr output.
@@ -64,6 +67,9 @@ type OutboxConfigEnv struct {
 	// (OUTBOX_RETRY_BACKOFF, default 1s; OUTBOX_MAX_RETRY_BACKOFF, default 5m).
 	RetryBackoff    time.Duration
 	MaxRetryBackoff time.Duration
+	// GaugeInterval (OUTBOX_GAUGE_INTERVAL, default 15s) is how often the
+	// runner refreshes the outbox backlog gauges.
+	GaugeInterval time.Duration
 	// Warnings is non-empty when one or more env vars were set to invalid values
 	// and defaults were applied. Log these at startup so operators can detect
 	// misconfiguration without relying on unstructured stderr output.
@@ -173,7 +179,12 @@ func maskKeyValueDSN(dsn string) string {
 				j++ // closing quote
 			}
 		} else {
+			// Unquoted: ends at whitespace, but libpq honours backslash
+			// escapes here too (password=a\ b is "a b").
 			for j < n && !isSpace(dsn[j]) {
+				if dsn[j] == '\\' && j+1 < n {
+					j++
+				}
 				j++
 			}
 		}
@@ -264,6 +275,10 @@ func LoadSQS() SQSConfigEnv {
 	if w != "" {
 		warnings = append(warnings, w)
 	}
+	handlerTimeout, w := envDurationOrDefault("SQS_HANDLER_TIMEOUT", 0)
+	if w != "" {
+		warnings = append(warnings, w)
+	}
 	return SQSConfigEnv{
 		QueueURL:           os.Getenv("SQS_QUEUE_URL"),
 		Region:             envOrDefault("AWS_REGION", "us-east-1"),
@@ -274,6 +289,7 @@ func LoadSQS() SQSConfigEnv {
 		Concurrency:        conc,
 		MaxReceiveCount:    maxRecv,
 		QueueDepthInterval: depthInterval,
+		HandlerTimeout:     handlerTimeout,
 		Warnings:           warnings,
 	}
 }
@@ -321,6 +337,10 @@ func LoadOutbox() OutboxConfigEnv {
 	if w != "" {
 		warnings = append(warnings, w)
 	}
+	gaugeInterval, w := envDurationOrDefault("OUTBOX_GAUGE_INTERVAL", 15*time.Second)
+	if w != "" {
+		warnings = append(warnings, w)
+	}
 	// Database configuration is owned by platform-pgcommon: the same env vars,
 	// defaults and validation as every other service using pgcommon.NewPool.
 	db, dbWarnings := pgcommon.ConfigFromEnv()
@@ -341,6 +361,7 @@ func LoadOutbox() OutboxConfigEnv {
 		DrainTimeout:         drainTimeout,
 		RetryBackoff:         retryBackoff,
 		MaxRetryBackoff:      maxRetryBackoff,
+		GaugeInterval:        gaugeInterval,
 		Warnings:             warnings,
 	}
 }

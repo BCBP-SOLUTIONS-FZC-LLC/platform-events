@@ -20,11 +20,15 @@ spec:
     # 1. Outbox backlog: scale out when unpublished outbox events pile up.
     #    Runners use SELECT … FOR UPDATE SKIP LOCKED, so replicas share the
     #    backlog without contention.
+    #    The gauge reads -1 when the count query fails (and is capped at
+    #    100000): drop -1 samples and keep the highest real reading of the
+    #    last 10 minutes, so a failing count — typically under heavy load —
+    #    never looks like an empty backlog and scales in at the peak.
     # after ratification: max(platform_outbox_pending_events{domain="orders",service="orders-service",environment="prod"})
     - type: prometheus
       metadata:
         serverAddress: http://prometheus.monitoring.svc:9090
-        query: max by (service) (outbox_pending_total{service="orders-service"})
+        query: max by (service) (max_over_time((outbox_pending_total{service="orders-service"} >= 0)[10m:30s]))
         threshold: "500"
 
     # 2. Queue backlog: KEDA's native SQS scaler reads the queue attributes

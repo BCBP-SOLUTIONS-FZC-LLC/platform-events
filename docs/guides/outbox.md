@@ -8,7 +8,11 @@ Wiring, enqueueing, poll cycle, dead letters, pruning and replay guarantees. One
 
 The outbox pattern eliminates dual-write risk: the event is written **inside the business transaction** alongside the domain mutation. If the transaction rolls back, the event is never published. The runner delivers asynchronously with at-least-once guarantee.
 
-Outbox does not guarantee global ordering — use FIFO topics with a stable `MessageGroupID` (e.g. `TenantID`) when ordering is required.
+### Ordering
+
+The transactional outbox does **not** preserve publish order, even per aggregate on a FIFO topic: when a record fails (or backs off), later records — including the same aggregate's — are still published, and the failed one goes out after them; several runner replicas also publish concurrently. A FIFO `MessageGroupID` keeps the order SNS *receives*, which is already out of order. Consumers that need order must enforce it themselves — a per-aggregate version/sequence number in the payload, with stale or out-of-order events ignored or retried.
+
+FIFO topics are still useful for SNS-side deduplication (`MessageDeduplicationId` = `Envelope.ID`) and for consumer-side serialisation within a group.
 
 ```
 Legend:  ✅ transaction boundary   🔁 retry point   📦 durable storage   ⚡ async boundary
@@ -226,7 +230,7 @@ log.Printf("discarded %d irrecoverable dead letters", n)
 | `TenantID` | `string` | Exact tenant match (`""` = all tenants) |
 | `FailedBefore` | `time.Time` | Only records where `failed_at < FailedBefore` (zero = no bound) |
 
-**Retryable failures** do not count toward `MaxAttempts`: SNS throttling and service-side errors (`Throttled`, `InternalError`, `KMSThrottling`, `ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`), any HTTP 5xx or 429 response (including body-less ones the SDK reports as `UnknownError`), per-entry batch failures with `SenderFault=false`, publish timeouts, and failures that never got an answer from SNS (network, DNS, TLS, credential resolution). The lease is released and the record retried after a backoff shared by all records (`RetryBackoff`, doubling once per poll cycle up to `MaxRetryBackoff`) that resets on the next successful publish. A period of SNS unavailability builds a backlog (watch `PlatformEventsOutboxBacklog`) but never dead-letters healthy records. Everything else — authorization, a missing topic, invalid parameters, an oversized request — counts an attempt, backs off per record, and dead-letters at `MaxAttempts`.
+**Retryable failures** do not count toward `MaxAttempts`: SNS throttling and service-side errors (`Throttled`, `InternalError`, `KMSThrottling`, `ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`), any HTTP 5xx or 429 response (including body-less ones the SDK reports as `UnknownError`; a body-less 4xx stays permanent), per-entry batch failures with `SenderFault=false`, publish timeouts, and failures that never got an answer from SNS (network, DNS, TLS, credential resolution). The lease is released and the record retried after a backoff shared by all records (`RetryBackoff`, doubling once per poll cycle up to `MaxRetryBackoff`) that resets on the next successful publish. A period of SNS unavailability builds a backlog (watch `PlatformEventsOutboxBacklog`) but never dead-letters healthy records. Everything else — authorization, a missing topic, invalid parameters, an oversized request — counts an attempt, backs off per record, and dead-letters at `MaxAttempts`.
 
 ### Idempotency
 

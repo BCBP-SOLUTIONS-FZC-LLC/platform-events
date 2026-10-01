@@ -583,9 +583,6 @@ var retryableSQSErrorCodes = map[string]struct{}{
 	"ServiceUnavailable":  {},
 	"InternalFailure":     {},
 	"InternalError":       {},
-	// The SDK's code for an error response without a body — from a load
-	// balancer or endpoint in front of SQS, not SQS itself.
-	"UnknownError": {},
 }
 
 // apiErrorCode returns err's AWS API error code, or "" when it is not an API error.

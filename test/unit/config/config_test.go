@@ -590,3 +590,26 @@ func TestMaskDSN_KeyValueTrailingSpace(t *testing.T) {
 	s := config.OutboxConfigEnv{DatabaseURL: "host=db password=secret   "}.String() //nolint:gosec
 	assert.NotContains(t, s, "secret")
 }
+
+func TestMaskDSN_KeyValueEscapedSpaceUnquoted(t *testing.T) {
+	s := config.OutboxConfigEnv{DatabaseURL: `host=db password=top\ secret dbname=app`}.String() //nolint:gosec
+	assert.NotContains(t, s, "secret")
+	assert.Contains(t, s, "dbname=app")
+}
+
+func TestLoad_NewDurationVars(t *testing.T) {
+	t.Setenv("SQS_HANDLER_TIMEOUT", "5m")
+	t.Setenv("OUTBOX_GAUGE_INTERVAL", "30s")
+	assert.Equal(t, 5*time.Minute, config.LoadSQS().HandlerTimeout)
+	assert.Equal(t, 30*time.Second, config.LoadOutbox().GaugeInterval)
+	opts := config.SQSConsumerOptions(config.LoadSQS())
+	assert.NotEmpty(t, opts)
+
+	t.Setenv("SQS_HANDLER_TIMEOUT", "forever")
+	t.Setenv("OUTBOX_GAUGE_INTERVAL", "often")
+	sqsCfg, outboxCfg := config.LoadSQS(), config.LoadOutbox()
+	assert.Zero(t, sqsCfg.HandlerTimeout)
+	assert.Equal(t, 15*time.Second, outboxCfg.GaugeInterval)
+	assert.Contains(t, strings.Join(sqsCfg.Warnings, "\n"), "SQS_HANDLER_TIMEOUT")
+	assert.Contains(t, strings.Join(outboxCfg.Warnings, "\n"), "OUTBOX_GAUGE_INTERVAL")
+}

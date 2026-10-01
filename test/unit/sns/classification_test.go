@@ -62,7 +62,8 @@ func TestPublishBatch_RequestErrorClassification(t *testing.T) {
 		{"already retryable", &domain.RetryableError{Cause: errors.New("upstream")}, "TransportError", true},
 		{"empty-body 502", httpErr(502, "UnknownError"), "TransportError", true},
 		{"429 with a permanent-looking code", httpErr(429, "SomethingNew"), "TransportError", true},
-		{"UnknownError without status", &mockAPIError{code: "UnknownError"}, "TransportError", true},
+		{"empty-body 403 from a proxy", httpErr(403, "UnknownError"), "UnknownError", false},
+		{"empty-body 413", httpErr(413, "UnknownError"), "UnknownError", false},
 		{"400 InvalidParameter", httpErr(400, "InvalidParameter"), "InvalidParameter", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

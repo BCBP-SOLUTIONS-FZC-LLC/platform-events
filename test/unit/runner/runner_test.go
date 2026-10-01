@@ -31,8 +31,10 @@ type mockOutboxStore struct {
 	published map[string]bool
 	failed    map[string]string
 	released  map[string]string
-	claimErr  error
-	claims    int // ClaimBatch calls, for tests that watch the poll loop
+	// pendingCalls counts PendingCount queries (gauge refreshes).
+	pendingCalls int
+	claimErr     error
+	claims       int // ClaimBatch calls, for tests that watch the poll loop
 }
 
 func newMockOutboxStore() *mockOutboxStore {
@@ -114,6 +116,7 @@ func (s *mockOutboxStore) DiscardDeadLetters(_ context.Context, _ domain.DLQFilt
 func (s *mockOutboxStore) PendingCount(_ context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.pendingCalls++
 	return int64(len(s.records)), nil
 }
 
@@ -1625,4 +1628,27 @@ func TestRunner_ReadyBeforeStart(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond)
 	cancel2()
 	<-done2
+}
+
+// The backlog gauges refresh on GaugeInterval, not every poll: a fast poll
+// must not multiply the COUNT queries on the database.
+func TestRunner_GaugesRefreshOnTheirOwnInterval(t *testing.T) {
+	metrics.InitWithRegisterer("gauge-interval", "v0", prometheus.NewRegistry())
+	store := newMockOutboxStore()
+	r, err := outbox.NewRunner(outbox.Config{
+		Store:         store,
+		Publisher:     &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+		PollInterval:  10 * time.Millisecond,
+		GaugeInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	require.Eventually(t, func() bool { store.mu.Lock(); defer store.mu.Unlock(); return store.claims >= 10 }, 5*time.Second, 5*time.Millisecond)
+	cancel()
+	<-done
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Equal(t, 1, store.pendingCalls, "one refresh on the first poll, none after within GaugeInterval")
 }
