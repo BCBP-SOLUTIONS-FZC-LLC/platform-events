@@ -1,13 +1,14 @@
 package outbox
 
 import (
-	"github.com/google/uuid"
-
 	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 
@@ -28,6 +29,39 @@ import (
 //	    return outbox.Enqueue(ctx, tx, envelope)
 //	})
 func Enqueue(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMessage]) error {
+	return enqueue(ctx, tx, env, "")
+}
+
+// MaxOrderingKeyLen bounds an EnqueueOrdered ordering key.
+const MaxOrderingKeyLen = 256
+
+// EnqueueOrdered is Enqueue with an ordering key — typically the aggregate the
+// event is about (e.g. "user/<id>", or env.Subject). With
+// Config.StrictOrdering the runner publishes each key's records one at a
+// time, in enqueue order: a record waits until every earlier record with the
+// same key is published (or dead-lettered). Without StrictOrdering the key is
+// stored and ignored.
+//
+// Order is enqueue (commit) order, so two transactions enqueuing for the same
+// key must not commit out of order — have them write the aggregate's own row
+// (a row lock), as a business update of that aggregate normally does. On a
+// FIFO topic, derive WithMessageGroupID from the same key so SNS keeps the
+// order the runner established.
+//
+// A failing head record blocks its key until it is published or moved to
+// outbox_dead_letters after MaxAttempts; a dead-lettered record no longer
+// blocks, and a replayed one is published after the key's newer records.
+func EnqueueOrdered(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMessage], orderingKey string) error {
+	if orderingKey == "" {
+		return fmt.Errorf("outbox: EnqueueOrdered requires a non-empty ordering key — use Enqueue for unordered events")
+	}
+	if len(orderingKey) > MaxOrderingKeyLen || !utf8.ValidString(orderingKey) || strings.ContainsRune(orderingKey, '\x00') {
+		return fmt.Errorf("outbox: ordering key must be valid UTF-8 without null bytes, at most %d bytes", MaxOrderingKeyLen)
+	}
+	return enqueue(ctx, tx, env, orderingKey)
+}
+
+func enqueue(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMessage], orderingKey string) error {
 	if tx == nil {
 		return fmt.Errorf("outbox: transaction must not be nil — use pgcommon.RunInTx to obtain a transaction")
 	}
@@ -75,5 +109,6 @@ func Enqueue(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMe
 		TraceID:     env.TraceID,
 		CreatedAt:   now,
 		ScheduledAt: now,
+		OrderingKey: orderingKey,
 	})
 }

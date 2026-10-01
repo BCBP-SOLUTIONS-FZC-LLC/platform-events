@@ -78,6 +78,17 @@ type Config struct {
 	// Set a negative value (e.g. -1) to disable the per-record timeout.
 	PublishTimeout time.Duration
 
+	// StrictOrdering publishes the records of each ordering key (set with
+	// EnqueueOrdered) one at a time, oldest first: a keyed record is claimed
+	// only once every earlier record with the same key is published or
+	// dead-lettered. Records enqueued without a key are unaffected. A key's
+	// throughput is one record per claim, so after a batch that published
+	// anything the runner polls again at once (for up to PollInterval) instead
+	// of waiting for the next tick. Requires outbox migration 010. Watch
+	// platform_outbox_ordering_blocked_events: a failing head record holds up
+	// its key's later records until it is published or dead-lettered.
+	StrictOrdering bool
+
 	// GaugeInterval is how often the runner refreshes the outbox_pending /
 	// outbox_leased gauges (two capped COUNT queries). Defaults to 15s,
 	// independent of PollInterval so a fast poll does not multiply database
@@ -190,7 +201,9 @@ func NewRunner(cfg Config) (*Runner, error) {
 	if cfg.Store != nil {
 		store = cfg.Store
 	} else {
-		store = outboxstore.New(cfg.Pool, cfg.Logger, cfg.ClaimLeaseDuration)
+		pgStore := outboxstore.New(cfg.Pool, cfg.Logger, cfg.ClaimLeaseDuration)
+		pgStore.SetStrictOrdering(cfg.StrictOrdering)
+		store = pgStore
 	}
 
 	inner := &publisherBridge{pub: cfg.Publisher}
@@ -325,7 +338,21 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 		r.lastGauge = time.Now()
 		r.refreshGauges(ctx)
 	}
-	return r.publishOnce(ctx)
+	if r.publishOnce(ctx) {
+		return true
+	}
+	// Strict ordering claims one record per key per batch: while batches
+	// keep publishing, poll again straight away (bounded by PollInterval) so
+	// a key's backlog drains at publish speed, not one record per tick.
+	if r.cfg.StrictOrdering {
+		start := time.Now()
+		for r.svc.LastClaimed() > 0 && ctx.Err() == nil && time.Since(start) < r.cfg.PollInterval {
+			if r.publishOnce(ctx) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // refreshGauges updates the backlog gauges from two capped counts.
@@ -360,6 +387,19 @@ func (r *Runner) refreshGauges(ctx context.Context) {
 			}
 		} else {
 			metrics.SetOutboxLeased(float64(n))
+		}
+	}
+	if r.cfg.StrictOrdering && metrics.HasOutboxBlockedMetric() {
+		bcCtx, bcCancel := context.WithTimeout(ctx, gaugeQueryTimeout)
+		n, blockedErr := r.svc.BlockedCount(bcCtx)
+		bcCancel()
+		if blockedErr != nil {
+			metrics.SetOutboxBlocked(-1)
+			if r.cfg.Logger != nil {
+				r.cfg.Logger.Warn("outbox: failed to query ordering-blocked count", map[string]any{"error": blockedErr.Error()})
+			}
+		} else {
+			metrics.SetOutboxBlocked(float64(n))
 		}
 	}
 	if metrics.HasOutboxOldestAgeMetric() {

@@ -117,5 +117,6 @@ func RunnerConfigFromEnv(env OutboxConfigEnv, pool *pgcommon.Pool, publisher eve
 		RetryBackoff:       env.RetryBackoff,
 		MaxRetryBackoff:    env.MaxRetryBackoff,
 		GaugeInterval:      env.GaugeInterval,
+		StrictOrdering:     env.StrictOrdering,
 	}
 }

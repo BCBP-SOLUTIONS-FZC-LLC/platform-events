@@ -87,6 +87,8 @@ type Platform struct {
 	OutboxPending      *prometheus.GaugeVec     // platform_outbox_pending_events
 	OutboxLeased       *prometheus.GaugeVec     // platform_outbox_leased_events
 	OutboxOldestAge    *prometheus.GaugeVec     // platform_outbox_oldest_pending_age
+	OutboxBlocked      *prometheus.GaugeVec     // platform_outbox_ordering_blocked_events
+	Timeouts           *prometheus.CounterVec   // platform_message_timeouts_total
 	OutboxAttempts     *prometheus.CounterVec   // platform_outbox_publish_attempts_total
 	OutboxErrors       *prometheus.CounterVec   // platform_outbox_errors_total
 	OutboxDLOperations *prometheus.CounterVec   // platform_outbox_dead_letter_operations_total
@@ -478,6 +480,8 @@ func registerPlatform(r *registrar, id Identity) (*Platform, []RegistrationWarni
 		OutboxPending:      gauge("platform_outbox_pending_events"),
 		OutboxLeased:       gauge("platform_outbox_leased_events"),
 		OutboxOldestAge:    gauge("platform_outbox_oldest_pending_age"),
+		OutboxBlocked:      gauge("platform_outbox_ordering_blocked_events"),
+		Timeouts:           counter("platform_message_timeouts_total", "queue", "event_type", "operation"),
 		OutboxAttempts:     counter("platform_outbox_publish_attempts_total", "event_type", "outcome"),
 		OutboxErrors:       counter("platform_outbox_errors_total", "operation"),
 		OutboxDLOperations: counter("platform_outbox_dead_letter_operations_total", "operation"),
@@ -762,6 +766,39 @@ func SetOutboxOldestPendingAge(age time.Duration) {
 	}
 	if p.OutboxOldestAge != nil {
 		p.OutboxOldestAge.WithLabelValues().Set(age.Seconds())
+	}
+}
+
+// SetOutboxBlocked records the number of strict-ordering-blocked outbox
+// events; a negative n signals a failed query (gauge left unchanged,
+// platform_outbox_errors_total{operation="blocked_count"} counted).
+func SetOutboxBlocked(n float64) {
+	p := platform.Load()
+	if p == nil {
+		return
+	}
+	if n < 0 {
+		if p.OutboxErrors != nil {
+			p.OutboxErrors.WithLabelValues("blocked_count").Inc()
+		}
+		return
+	}
+	if p.OutboxBlocked != nil {
+		p.OutboxBlocked.WithLabelValues().Set(n)
+	}
+}
+
+// HasOutboxBlockedMetric reports whether the ordering-blocked gauge is registered.
+func HasOutboxBlockedMetric() bool {
+	p := platform.Load()
+	return p != nil && p.OutboxBlocked != nil
+}
+
+// IncTimeout counts a message whose WithHandlerTimeout deadline expired in
+// stage (one of TimeoutOperationValues).
+func IncTimeout(queueURL, eventType, stage string) {
+	if p := platform.Load(); p != nil && p.Timeouts != nil {
+		p.Timeouts.WithLabelValues(QueueName(queueURL), SanitizeEventType(eventType), stage).Inc()
 	}
 }
 

@@ -613,3 +613,14 @@ func TestLoad_NewDurationVars(t *testing.T) {
 	assert.Contains(t, strings.Join(sqsCfg.Warnings, "\n"), "SQS_HANDLER_TIMEOUT")
 	assert.Contains(t, strings.Join(outboxCfg.Warnings, "\n"), "OUTBOX_GAUGE_INTERVAL")
 }
+
+func TestLoadOutbox_StrictOrdering(t *testing.T) {
+	t.Setenv("OUTBOX_STRICT_ORDERING", "true")
+	cfg := config.LoadOutbox()
+	assert.True(t, cfg.StrictOrdering)
+	assert.True(t, config.RunnerConfigFromEnv(cfg, nil, nil, nil).StrictOrdering)
+	t.Setenv("OUTBOX_STRICT_ORDERING", "sometimes")
+	cfg = config.LoadOutbox()
+	assert.False(t, cfg.StrictOrdering)
+	assert.Contains(t, strings.Join(cfg.Warnings, "\n"), "OUTBOX_STRICT_ORDERING")
+}

@@ -35,6 +35,8 @@ type mockOutboxStore struct {
 	pendingCalls int
 	oldestAge    time.Duration
 	oldestErr    error
+	blocked      int64
+	blockedErr   error
 	claimErr     error
 	claims       int // ClaimBatch calls, for tests that watch the poll loop
 }
@@ -104,6 +106,11 @@ func (s *mockOutboxStore) OldestPendingAge(context.Context) (time.Duration, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.oldestAge, s.oldestErr
+}
+func (s *mockOutboxStore) BlockedCount(context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.blocked, s.blockedErr
 }
 func (s *mockOutboxStore) LeasedCount(_ context.Context) (int64, error)               { return 0, nil }
 func (s *mockOutboxStore) ReprocessDeadLetters(_ context.Context, _ int) (int, error) { return 0, nil }
@@ -1697,4 +1704,74 @@ func TestRunner_OldestPendingAgeGauge(t *testing.T) {
 	failing.oldestErr = errors.New("db down")
 	run(failing)
 	assert.InDelta(t, 90, gauge(), 0, "a failed query leaves the last value")
+}
+
+// With strict ordering the runner keeps polling while batches publish, so a
+// key's backlog drains in one tick instead of one record per PollInterval;
+// and it samples the ordering-blocked gauge.
+func TestRunner_StrictOrdering_RepollsAndGauges(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "strict-test", Environment: "dev"}, reg)
+	require.NoError(t, err)
+	t.Cleanup(func() { metrics.InitWithRegisterer("runner-reset", "v0", prometheus.NewRegistry()) })
+
+	store := newMockOutboxStore()
+	store.blocked = 2
+	for range 3 {
+		env := domain.NewEnvelope("user.updated", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		store.records = append(store.records, domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload, OrderingKey: "user/a"})
+	}
+	r, err := outbox.NewRunner(outbox.Config{
+		Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+		BatchSize: 1, PollInterval: time.Hour, StrictOrdering: true,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return len(store.published) == 3
+	}, 5*time.Second, 5*time.Millisecond, "all three drained in the first tick (PollInterval is 1h)")
+	cancel()
+	<-done
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	found := false
+	for _, mf := range mfs {
+		if mf.GetName() == "platform_outbox_ordering_blocked_events" {
+			found = true
+			assert.InDelta(t, 2, mf.GetMetric()[0].GetGauge().GetValue(), 0)
+		}
+	}
+	assert.True(t, found)
+}
+
+// Failed gauge queries are logged and leave the gauges unchanged.
+func TestRunner_GaugeQueryErrorsLogged(t *testing.T) {
+	_, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "gauge-err", Environment: "dev"}, prometheus.NewRegistry())
+	require.NoError(t, err)
+	t.Cleanup(func() { metrics.InitWithRegisterer("runner-reset", "v0", prometheus.NewRegistry()) })
+	store := newMockOutboxStore()
+	store.blockedErr = errors.New("db down")
+	store.oldestErr = errors.New("db down")
+	logger := &fixtures.MockLogger{}
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+		Logger: logger, PollInterval: time.Hour, StrictOrdering: true})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	<-r.Ready()
+	cancel()
+	<-done
+	var msgs []string
+	for _, e := range logger.Entries() {
+		msgs = append(msgs, e.Message)
+	}
+	assert.Contains(t, msgs, "outbox: failed to query ordering-blocked count")
+	assert.Contains(t, msgs, "outbox: failed to query oldest pending age")
 }

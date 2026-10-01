@@ -33,6 +33,10 @@ type OutboxStore interface {
 	// transient failures that say nothing about the record itself.
 	ReleaseLease(ctx context.Context, id, lastError string, retryAfter time.Duration) error
 
+	// BlockedCount returns the number of keyed records held back behind an
+	// earlier unpublished record with the same ordering key (strict ordering).
+	BlockedCount(ctx context.Context) (int64, error)
+
 	// OldestPendingAge returns how long the oldest unpublished record has been
 	// waiting (now − created_at), or 0 when none is unpublished.
 	OldestPendingAge(ctx context.Context) (time.Duration, error)

@@ -63,6 +63,7 @@ type OutboxService struct {
 	// advances at most once per poll cycle (pollGen) — however many records
 	// that cycle failed — and resets on the next successful publish.
 	pollGen        atomic.Uint64
+	lastClaimed    atomic.Int32
 	transientMu    sync.Mutex
 	transientGen   uint64
 	transientCount int
@@ -191,8 +192,10 @@ func (s *OutboxService) PublishBatch(ctx context.Context, batchSize int) error {
 	s.beginPoll()
 	records, err := s.store.ClaimBatch(ctx, batchSize)
 	if err != nil {
+		s.lastClaimed.Store(0)
 		return err
 	}
+	s.lastClaimed.Store(int32(len(records)))
 	if len(records) == 0 {
 		return nil
 	}
@@ -557,6 +560,15 @@ func (s *OutboxService) publishRecord(ctx, bookkeepCtx context.Context, rec doma
 func (s *OutboxService) PendingCount(ctx context.Context) (int64, error) {
 	return s.store.PendingCount(ctx)
 }
+
+// BlockedCount returns the number of keyed records waiting behind an earlier
+// unpublished record with the same ordering key.
+func (s *OutboxService) BlockedCount(ctx context.Context) (int64, error) {
+	return s.store.BlockedCount(ctx)
+}
+
+// LastClaimed returns how many records the most recent PublishBatch claimed.
+func (s *OutboxService) LastClaimed() int { return int(s.lastClaimed.Load()) }
 
 // OldestPendingAge returns how long the oldest unpublished record has waited.
 func (s *OutboxService) OldestPendingAge(ctx context.Context) (time.Duration, error) {

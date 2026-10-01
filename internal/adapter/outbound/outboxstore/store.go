@@ -21,7 +21,17 @@ type Store struct {
 	pool               *pgcommon.Pool
 	logger             port.Logger
 	claimLeaseDuration time.Duration
+	// strictOrdering makes ClaimBatch skip a record while an earlier
+	// unpublished record with the same ordering key exists.
+	strictOrdering bool
 }
+
+// SetStrictOrdering enables per-key ordering in ClaimBatch: a record with an
+// ordering key is claimed only when no earlier unpublished record (by
+// created_at, id) has the same key — so each key's records are published one
+// at a time, oldest first. Records without a key are unaffected. Set before
+// the runner starts.
+func (s *Store) SetStrictOrdering(on bool) { s.strictOrdering = on }
 
 // New creates a new Postgres outbox store.
 // claimLeaseDuration controls how long a claimed record is hidden from other
@@ -47,9 +57,9 @@ func InsertRecord(ctx context.Context, tx pgcommon.Tx, record domain.OutboxRecor
 	}
 	_, err := tx.Exec(ctx, `
 		INSERT INTO outbox_events
-			(id, event_type, payload, tenant_id, trace_id, created_at, scheduled_at)
+			(id, event_type, payload, tenant_id, trace_id, created_at, scheduled_at, ordering_key)
 		VALUES
-			($1, $2, $3, $4, $5, NOW(), NOW() + make_interval(secs => $6))
+			($1, $2, $3, $4, $5, NOW(), NOW() + make_interval(secs => $6), NULLIF($7, ''))
 	`,
 		record.ID,
 		record.EventType,
@@ -57,6 +67,7 @@ func InsertRecord(ctx context.Context, tx pgcommon.Tx, record domain.OutboxRecor
 		record.TenantID,
 		record.TraceID,
 		delaySecs,
+		record.OrderingKey,
 	)
 	return err
 }
@@ -84,16 +95,7 @@ func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxR
 	var records []domain.OutboxRecord
 	err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		records = nil
-		rows, err := tx.Query(ctx, `
-			SELECT id, event_type, payload, tenant_id, trace_id,
-			       attempts, last_error, created_at, scheduled_at, published_at
-			FROM outbox_events
-			WHERE published_at IS NULL
-			  AND scheduled_at <= NOW()
-			ORDER BY scheduled_at, id
-			LIMIT $1
-			FOR UPDATE SKIP LOCKED
-		`, batchSize)
+		rows, err := tx.Query(ctx, s.claimQuery(), batchSize)
 		if err != nil {
 			return err
 		}
@@ -114,6 +116,7 @@ func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxR
 				&rec.CreatedAt,
 				&rec.ScheduledAt,
 				&publishedAt,
+				&rec.OrderingKey,
 			); err != nil {
 				return err
 			}
@@ -158,6 +161,65 @@ func (s *Store) ClaimBatch(ctx context.Context, batchSize int) ([]domain.OutboxR
 }
 
 const defaultStoreQueryTimeout = 5 * time.Second
+
+// claimColumns is the column list ClaimBatch scans, in order.
+const claimColumns = `id, event_type, payload, tenant_id, trace_id,
+	attempts, last_error, created_at, scheduled_at, published_at, COALESCE(ordering_key, '')`
+
+// earlierUnpublished matches an unpublished record with the same ordering key
+// as the row aliased o that precedes it (created_at, then id — UUID v7, so
+// enqueue order within a transaction). Served by idx_outbox_events_ordering.
+const earlierUnpublished = `EXISTS (
+	SELECT 1 FROM outbox_events prev
+	WHERE prev.ordering_key = o.ordering_key
+	  AND prev.published_at IS NULL
+	  AND (prev.created_at, prev.id) < (o.created_at, o.id)
+)`
+
+// claimQuery selects the next due records. With strict ordering a keyed
+// record is due only when it is its key's oldest unpublished record — the
+// earlier one may be leased by another runner or backing off, and it holds
+// the key until it is published or dead-lettered.
+func (s *Store) claimQuery() string {
+	if !s.strictOrdering {
+		return `SELECT ` + claimColumns + `
+			FROM outbox_events o
+			WHERE published_at IS NULL
+			  AND scheduled_at <= NOW()
+			ORDER BY scheduled_at, id
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED`
+	}
+	return `SELECT ` + claimColumns + `
+		FROM outbox_events o
+		WHERE published_at IS NULL
+		  AND scheduled_at <= NOW()
+		  AND (ordering_key IS NULL OR NOT ` + earlierUnpublished + `)
+		ORDER BY scheduled_at, id
+		LIMIT $1
+		FOR UPDATE SKIP LOCKED`
+}
+
+// BlockedCount returns the number of keyed records held back behind an
+// earlier unpublished record with the same ordering key (strict ordering's
+// head-of-line wait), capped at MaxCountedRows.
+func (s *Store) BlockedCount(ctx context.Context) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
+	defer cancel()
+	var count int64
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+		return conn.QueryRow(ctx, `
+			SELECT COUNT(*) FROM (
+				SELECT 1 FROM outbox_events o
+				WHERE published_at IS NULL
+				  AND ordering_key IS NOT NULL
+				  AND `+earlierUnpublished+`
+				LIMIT $1
+			) capped
+		`, MaxCountedRows).Scan(&count)
+	})
+	return count, err
+}
 
 // MaxCountedRows caps PendingCount and LeasedCount. Counting stops there, so
 // the gauge query stays an index-range scan of bounded cost even when an SNS
@@ -260,13 +322,13 @@ func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastErr
 			// count rather than leaving stale data.
 			_, err = tx.Exec(ctx, `
 				INSERT INTO outbox_dead_letters
-					(id, event_type, payload, tenant_id, trace_id, attempts, last_error, created_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+					(id, event_type, payload, tenant_id, trace_id, attempts, last_error, created_at, ordering_key)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, ''))
 				ON CONFLICT (id) DO UPDATE SET
 					attempts   = EXCLUDED.attempts,
 					last_error = EXCLUDED.last_error,
 					failed_at  = NOW()
-			`, rec.ID, rec.EventType, rec.Payload, rec.TenantID, rec.TraceID, newAttempts, lastError, rec.CreatedAt)
+			`, rec.ID, rec.EventType, rec.Payload, rec.TenantID, rec.TraceID, newAttempts, lastError, rec.CreatedAt, rec.OrderingKey)
 			if err != nil {
 				return err
 			}
@@ -491,11 +553,11 @@ func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQF
 				ORDER BY failed_at ASC
 				LIMIT $%d
 			)
-			RETURNING id, event_type, payload, tenant_id, trace_id, created_at
+			RETURNING id, event_type, payload, tenant_id, trace_id, created_at, ordering_key
 		)
 		INSERT INTO outbox_events
-			(id, event_type, payload, tenant_id, trace_id, attempts, created_at, scheduled_at)
-		SELECT id, event_type, payload, tenant_id, trace_id, 0, NOW(), NOW()
+			(id, event_type, payload, tenant_id, trace_id, attempts, created_at, scheduled_at, ordering_key)
+		SELECT id, event_type, payload, tenant_id, trace_id, 0, NOW(), NOW(), ordering_key
 		FROM moved
 	`, where, limitArg)
 
@@ -573,11 +635,11 @@ func (s *Store) ReprocessDeadLetters(ctx context.Context, limit int) (int, error
 					ORDER BY failed_at
 					LIMIT $1
 				)
-				RETURNING id, event_type, payload, tenant_id, trace_id, created_at
+				RETURNING id, event_type, payload, tenant_id, trace_id, created_at, ordering_key
 			)
 			INSERT INTO outbox_events
-				(id, event_type, payload, tenant_id, trace_id, attempts, created_at, scheduled_at)
-			SELECT id, event_type, payload, tenant_id, trace_id, 0, NOW(), NOW()
+				(id, event_type, payload, tenant_id, trace_id, attempts, created_at, scheduled_at, ordering_key)
+			SELECT id, event_type, payload, tenant_id, trace_id, 0, NOW(), NOW(), ordering_key
 			FROM moved
 		`, limit)
 		if err != nil {

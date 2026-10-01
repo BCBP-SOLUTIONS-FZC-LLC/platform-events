@@ -259,3 +259,16 @@ func TestEnqueue_NonCanonicalID_Rejected(t *testing.T) {
 	tx := newStubTx(pgcommon.Tx.Exec)
 	require.NoError(t, outbox.Enqueue(context.Background(), tx, base))
 }
+
+func TestEnqueueOrdered_ValidatesKeyAndStoresIt(t *testing.T) {
+	env := events.NewEnvelope("user.updated", "svc", json.RawMessage(`{}`))
+	for _, key := range []string{"", strings.Repeat("k", outbox.MaxOrderingKeyLen+1), "bad\x00key", string([]byte{0xff})} {
+		tx := newStubTx(pgcommon.Tx.Exec)
+		assert.Error(t, outbox.EnqueueOrdered(context.Background(), tx, env, key), "%q", key)
+		assert.Empty(t, tx.execSQL)
+	}
+	tx := newStubTx(pgcommon.Tx.Exec)
+	require.NoError(t, outbox.EnqueueOrdered(context.Background(), tx, env, "user/42"))
+	assert.Contains(t, tx.execSQL, "ordering_key")
+	assert.Equal(t, "user/42", tx.execArgs[len(tx.execArgs)-1])
+}

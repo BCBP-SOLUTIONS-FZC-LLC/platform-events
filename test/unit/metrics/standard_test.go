@@ -85,6 +85,9 @@ func exerciseAll() {
 	internalmetrics.AddInFlight(testQueueURL, 1)
 	internalmetrics.SetOutboxOldestPendingAge(90 * time.Second)
 	internalmetrics.SetOutboxOldestPendingAge(-1)
+	internalmetrics.SetOutboxBlocked(3)
+	internalmetrics.SetOutboxBlocked(-1)
+	internalmetrics.IncTimeout(testQueueURL, et, "handler")
 	internalmetrics.SetDLQDepth(testQueueURL, 3)
 	for dep, ops := range internalmetrics.DependencyOperations {
 		for _, op := range ops {

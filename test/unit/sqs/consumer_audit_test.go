@@ -373,3 +373,44 @@ func TestReceive_NoVisibilityTimeout_SizedToFreeWorkers(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, int32(3), requested[0])
 }
+
+// A handler that runs past WithHandlerTimeout is counted in
+// platform_message_timeouts_total{operation="handler"} as well as failed.
+func TestHandlerTimeout_CountedInTimeoutsMetric(t *testing.T) {
+	reg := initPlatformMetrics(t)
+	consumeOnce(t, makeSQSMessage(domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`))),
+		func(ctx context.Context, _ domain.Envelope[json.RawMessage]) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}, internalsqs.WithHandlerTimeout(100*time.Millisecond))
+	eventually(t, func() bool {
+		return counterValue(t, reg, "platform_message_timeouts_total", map[string]string{"queue": testQueue, "event_type": "a.b.c", "operation": "handler"}) == 1
+	}, "timeout counted")
+	assert.InDelta(t, 1, counterValue(t, reg, "platform_messages_failed_total", map[string]string{"queue": testQueue, "event_type": "a.b.c", "reason": "handler_error"}), 0)
+}
+
+// Decode and dead-letter-handler timeouts are counted under their stage.
+func TestHandlerTimeout_DecodeAndDLHStages(t *testing.T) {
+	t.Run("decode", func(t *testing.T) {
+		reg := initPlatformMetrics(t)
+		env := makeCodecEncodedEnvelope(t, "a.b.c", "schema-1", json.RawMessage(`{"a":1}`))
+		slow := &fakeCodec{decodeFn: func(ctx context.Context, _ string, _ []byte) (json.RawMessage, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}
+		consumeOnce(t, withReceiveCount(makeSQSMessage(env), "1"), nil, internalsqs.WithCodec(slow), internalsqs.WithHandlerTimeout(100*time.Millisecond))
+		eventually(t, func() bool {
+			return counterValue(t, reg, "platform_message_timeouts_total", map[string]string{"queue": testQueue, "event_type": "a.b.c", "operation": "decode"}) == 1
+		}, "decode timeout counted")
+	})
+	t.Run("dead_letter_handler", func(t *testing.T) {
+		reg := initPlatformMetrics(t)
+		env := domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`))
+		dlh := func(ctx context.Context, _ domain.Envelope[json.RawMessage]) error { <-ctx.Done(); return ctx.Err() }
+		consumeOnce(t, withReceiveCount(makeSQSMessage(env), "6"), nil, internalsqs.WithDeadLetterHandler(dlh),
+			internalsqs.WithMaxReceiveCount(5), internalsqs.WithHandlerTimeout(100*time.Millisecond))
+		eventually(t, func() bool {
+			return counterValue(t, reg, "platform_message_timeouts_total", map[string]string{"queue": testQueue, "event_type": "a.b.c", "operation": "dead_letter_handler"}) == 1
+		}, "dead-letter handler timeout counted")
+	})
+}

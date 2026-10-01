@@ -202,7 +202,7 @@ graph LR
 | `Runner.DiscardDeadLetters(ctx, filter, limit)` | Permanently deletes up to `limit` dead-letter records matching `DLQFilter`; use for poison-pill records that can never succeed; returns `(int64, error)` — always call `ListDeadLetters` first to confirm the selection |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Deletes published records older than `olderThan` from `outbox_events` (batched to `limit` rows). Call periodically (e.g. daily) to prevent unbounded table growth; choose `olderThan ≥` the longest consumer idempotency window (minimum 7 days is safe for most workloads) |
 | `Enqueue(ctx, tx pgcommon.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; validates non-empty `ID`/`Type`/`Source`, non-zero `Timestamp`, and absence of null bytes in string fields; rejects payloads > 240 KB |
-| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`009` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index, DLQ filter index, unpublished `created_at` index) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
+| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`010` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index, DLQ filter index, unpublished `created_at` index, ordering key) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
 | `MigrationsTable` | Exported constant (`"outbox_migrations"`) — the golang-migrate tracking table used by `ApplySchema`; isolated from the consuming service's `schema_migrations` to prevent version-number collisions |
 
 ### pkg/inbox
@@ -338,7 +338,9 @@ A numbered walkthrough of what happens between a domain mutation and a processed
 7. **`Publisher.Publish` called** — SNS receives the event, sets `EventType`, `TenantID`, `Source`, `EventID`, and `Subject` (when non-empty) as message attributes for filter-policy routing.
 8. **Row marked published** (`published_at = NOW()`). On a permanent failure, `attempts` is incremented and `scheduled_at = NOW() + RetryBackoff·2^(attempts-1)` (capped at `MaxRetryBackoff`, jittered); after `MaxAttempts` the row moves to `outbox_dead_letters`. Transient failures and shutdown release the lease without counting an attempt.
 
-> **Ordering:** The transactional outbox does **not** preserve publish order, even per aggregate on a FIFO topic: when a record fails (or backs off), later records — including the same aggregate's — are still published, and the failed one goes out after them; several runner replicas also publish concurrently. A FIFO `MessageGroupID` keeps the order SNS *receives*, which is already out of order. Consumers that need order must enforce it themselves — a per-aggregate version/sequence number in the payload, with stale or out-of-order events ignored or retried.
+> **Ordering:** By default the transactional outbox does **not** preserve publish order, even per aggregate on a FIFO topic: when a record fails (or backs off), later records — including the same aggregate's — are still published, and the failed one goes out after them; several runner replicas also publish concurrently. A FIFO `MessageGroupID` keeps the order SNS *receives*, which is then already out of order.
+
+**Strict ordering (opt-in).** Enqueue with `outbox.EnqueueOrdered(ctx, tx, env, key)` — key = the aggregate, e.g. `"user/<id>"` — and set `outbox.Config.StrictOrdering` (`OUTBOX_STRICT_ORDERING=true`; requires migration `010`). The runner then claims a keyed record only when every earlier record with the same key (by commit time, then UUID v7 id) is published, so each key's records go out one at a time, in enqueue order, across all runner replicas; unkeyed records are unaffected. Trade-offs: a key's throughput is one record per claim (the runner re-polls at once while batches publish); a failing head record blocks its key until it is published or dead-lettered after `MaxAttempts` (watch `platform_outbox_ordering_blocked_events`); a dead-lettered record no longer blocks, and a replayed one is published after the key's newer records. Two transactions enqueuing for the same key must commit in order — have them write the aggregate's row (a row lock). On a FIFO topic derive `WithMessageGroupID` from the same key so SNS keeps the order. Without strict ordering, consumers that need order use a per-aggregate sequence number in the payload.
 
 > **⚠️ Publishing rule (mandatory):** all domain events tied to a database write **must** go through `outbox.Enqueue` inside a `pgcommon.RunInTx` callback. Calling `publisher.Publish` directly for transactional events introduces an unrecoverable crash window — the DB write commits but the event is silently lost if the process dies before the SNS call. `publisher.Publish` is only valid for best-effort, non-transactional notifications where event loss is explicitly acceptable. See [Publishing guide § Publishing rules](docs/guides/publishing.md#publishing-rules) for the full decision table and crash-window diagram.
 
@@ -509,7 +511,7 @@ erDiagram
         timestamptz processed_at "Prune cut-off"
     }
     outbox_migrations {
-        bigint version PK "golang-migrate tracking for pkg/outbox (001–009)"
+        bigint version PK "golang-migrate tracking for pkg/outbox (001–010)"
         boolean dirty
     }
     inbox_migrations {
@@ -1050,7 +1052,7 @@ When goroutine 1 finishes:
 | Batch split at 10 | `PublishBatch` splits silently; partial failures return `BatchError` per message |
 | Sequential batch transport errors | When `PublishConcurrency=1`, a non-`BatchError` from SNS marks all records in the claimed batch failed — safe at-least-once, may over-count attempts if SNS partially succeeded |
 | Handlers must be idempotent | SQS delivers at least once; use `Envelope.ID` as the idempotency key. Recommended: `INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING` inside the same transaction — see [Consuming guide § Implementing idempotency](docs/guides/consuming.md#implementing-idempotency) |
-| No ordering guarantee | The outbox publishes a failed / backed-off record after later ones and replicas publish concurrently, so not even a FIFO group gets per-aggregate order. Consumers that need order use a per-aggregate sequence number |
+| No ordering by default | The outbox publishes a failed / backed-off record after later ones and replicas publish concurrently. Per-aggregate order is opt-in: `EnqueueOrdered` + `Config.StrictOrdering` publish each key's records one at a time, oldest first |
 | Event types are immutable once published | Breaking payload changes require a new versioned type (`iam.user.created.v2`); additive `omitempty` fields are the only safe in-place evolution — see [EVENT_SCHEMA_GOVERNANCE.md § Event versioning](EVENT_SCHEMA_GOVERNANCE.md#event-versioning) |
 | Outbox required for transactional events | Direct `publisher.Publish` bypasses the transaction boundary and has no retry — event is silently lost on process crash. Domain events that drive downstream state **must** go through `outbox.Enqueue` inside `pgcommon.RunInTx`. See [Publishing guide § Publishing rules](docs/guides/publishing.md#publishing-rules). |
 

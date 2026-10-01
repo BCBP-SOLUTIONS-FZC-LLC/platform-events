@@ -70,9 +70,10 @@ func renderInventory() string {
 	w("| `topic` | requested | %s |\n", internalmetrics.TopicLabelRule)
 	w("| `event_type` | approved | %s |\n", internalmetrics.EventTypeLabelRule)
 	w("| `reason` | approved | failures: %s; dead-letters: %s |\n", codeList(internalmetrics.FailureReasonValues), codeList(internalmetrics.DLQReasonValues))
-	w("| `operation` | approved | message flow: %s; dependency calls: %s; outbox errors: %s; dead-letter actions: %s |\n",
+	w("| `operation` | approved | message flow: %s; dependency calls: %s; outbox errors: %s; dead-letter actions: %s; timeouts: %s |\n",
 		codeList(internalmetrics.FlowOperationValues), codeList(internalmetrics.DependencyOperationValues),
-		codeList(internalmetrics.OutboxErrorOperationValues), codeList(internalmetrics.DeadLetterOperationValues))
+		codeList(internalmetrics.OutboxErrorOperationValues), codeList(internalmetrics.DeadLetterOperationValues),
+		codeList(internalmetrics.TimeoutOperationValues))
 	deps := make([]string, 0, len(internalmetrics.DependencyOperations))
 	for d := range internalmetrics.DependencyOperations {
 		deps = append(deps, d)

@@ -645,6 +645,12 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		handlerBase, cancelDeadline = context.WithDeadline(handlerBase, deadline)
 		defer cancelDeadline()
 	}
+	// timedOut reports whether the WithHandlerTimeout deadline has expired
+	// (as opposed to a drain-timeout cancellation).
+	deadlineCtx := handlerBase
+	timedOut := func() bool {
+		return c.handlerTimeout > 0 && errors.Is(deadlineCtx.Err(), context.DeadlineExceeded)
+	}
 	// Propagation is creation → FIRST receipt; a redelivery's age would add
 	// retry delay. A missing receive count (0) is treated as a first receipt.
 	if receiveCount <= 1 {
@@ -668,6 +674,9 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		if decErr != nil {
 			metrics.RecordCodecDecode(c.queueURL, env.Type, "error", dur.Seconds())
 			metrics.IncFailed(c.queueURL, env.Type, "decode_error")
+			if timedOut() {
+				metrics.IncTimeout(c.queueURL, env.Type, "decode")
+			}
 			if c.logger != nil {
 				c.logger.Error("sqs: codec decode failed — message left visible for retry", map[string]any{
 					"message_id": aws.ToString(msg.MessageId),
@@ -759,6 +768,9 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 
 			if dlhErr != nil {
 				metrics.IncFailed(c.queueURL, env.Type, "dead_letter_error")
+				if timedOut() {
+					metrics.IncTimeout(c.queueURL, env.Type, "dead_letter_handler")
+				}
 				metrics.IncRetry("consume", env.Type)
 				return // do NOT delete — leave visible for retry
 			}
@@ -862,6 +874,9 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		}
 		// Do not delete — leave visible for retry.
 		metrics.IncFailed(c.queueURL, env.Type, "handler_error")
+		if timedOut() {
+			metrics.IncTimeout(c.queueURL, env.Type, "handler")
+		}
 		metrics.IncRetry("consume", env.Type)
 	} else {
 		span.SetStatus(codes.Ok, "")

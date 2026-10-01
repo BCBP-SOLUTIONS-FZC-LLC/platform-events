@@ -155,7 +155,11 @@ var (
 
 	// OutboxErrorOperationValues: outbox runner steps that can fail outside
 	// a publish attempt.
-	OutboxErrorOperationValues = []string{"poll", "unmarshal", "mark_published", "pending_count", "leased_count", "oldest_pending"}
+	OutboxErrorOperationValues = []string{"poll", "unmarshal", "mark_published", "pending_count", "leased_count", "oldest_pending", "blocked_count"}
+
+	// TimeoutOperationValues: the processing stage a WithHandlerTimeout
+	// deadline expired in.
+	TimeoutOperationValues = []string{"decode", "dead_letter_handler", "handler"}
 
 	// DeadLetterOperationValues: operator actions on outbox_dead_letters.
 	DeadLetterOperationValues = []string{"reprocess", "discard"}
@@ -392,6 +396,25 @@ func Registry() []RegistryEntry {
 			GovernanceNotes:    "Proposed by platform-events. Left at its last value when the query fails (platform_outbox_errors_total{operation=\"oldest_pending\"}).",
 		}),
 		platformEntry(StatusProposed, RegistryEntry{
+			Name:               "platform_outbox_ordering_blocked_events",
+			Type:               TypeGauge,
+			SemanticDefinition: "Outbox events held back by strict ordering (Config.StrictOrdering): keyed records waiting behind an earlier unpublished record with the same ordering key. Sampled every GaugeInterval, capped at 100000; emitted only with StrictOrdering. A value that keeps growing means a head record is failing and blocking its key.",
+			Cardinality:        "One series per service instance.",
+			AggregationNotes:   "max by (domain, service) (platform_outbox_ordering_blocked_events) — every runner reads the same table.",
+			GovernanceNotes:    "Proposed by platform-events with the strict-ordering mode. Left at its last value when the query fails (platform_outbox_errors_total{operation=\"blocked_count\"}).",
+		}),
+		platformEntry(StatusProposed, RegistryEntry{
+			Name:               "platform_message_timeouts_total",
+			Type:               TypeCounter,
+			SemanticDefinition: "A received message whose WithHandlerTimeout deadline expired, by the stage it expired in: decode (codec decode), dead_letter_handler, or handler. Each is also counted in platform_messages_failed_total under its usual reason (decode_error, dead_letter_error, handler_error) — this counter separates timeouts from other failures without changing that Canonical metric's vocabulary.",
+			ApprovedLabels:     []string{"queue", "event_type", "operation"},
+			LabelValueRules:    queueAndType,
+			LabelValues:        map[string][]string{"operation": TimeoutOperationValues},
+			Cardinality:        "queue (≤5) × event_type (≤30) × operation (3).",
+			AggregationNotes:   "Timeout share of failures: sum by (domain, service, queue) (rate(platform_message_timeouts_total[5m])) / sum by (domain, service, queue) (rate(platform_messages_failed_total[5m])).",
+			GovernanceNotes:    "Proposed by platform-events. Emitted only when the consumer uses WithHandlerTimeout.",
+		}),
+		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_publish_attempts_total",
 			Type:               TypeCounter,
 			SemanticDefinition: "One attempt by the outbox runner to publish a claimed outbox event, by outcome.",
@@ -405,10 +428,10 @@ func Registry() []RegistryEntry {
 		platformEntry(StatusProposed, RegistryEntry{
 			Name:               "platform_outbox_errors_total",
 			Type:               TypeCounter,
-			SemanticDefinition: "An outbox runner step that failed outside a publish attempt: poll (claiming a batch), unmarshal (a stored envelope that no longer parses), mark_published (an event published but not marked — it will be delivered again), pending_count / leased_count (a backlog gauge query).",
+			SemanticDefinition: "An outbox runner step that failed outside a publish attempt: poll (claiming a batch), unmarshal (a stored envelope that no longer parses), mark_published (an event published but not marked — it will be delivered again), pending_count / leased_count / oldest_pending / blocked_count (a gauge query).",
 			ApprovedLabels:     []string{"operation"},
 			LabelValues:        map[string][]string{"operation": OutboxErrorOperationValues},
-			Cardinality:        "operation (5).",
+			Cardinality:        "operation (7).",
 			AggregationNotes:   "sum by (domain, service, operation) (rate(platform_outbox_errors_total[5m])) > 0.",
 			Supersedes:         []string{"outbox_poll_errors_total", "outbox_unmarshal_errors_total", "outbox_mark_published_errors_total"},
 		}),

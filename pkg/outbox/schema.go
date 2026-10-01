@@ -58,7 +58,7 @@ func ApplySchema(ctx context.Context, runner *migrate.Runner) error {
 // dsnWithMigrationsTable sets x-migrations-table=table on the DSN so that
 // golang-migrate's pgx/v5 driver tracks the outbox schema in its own table. An
 // explicit value already in the DSN (typically the service's own tracking
-// table) is replaced: sharing it would make outbox versions 1–9 collide with
+// table) is replaced: sharing it would make outbox versions 1–10 collide with
 // the service's migration versions. Same rule as inbox.ApplySchema.
 func dsnWithMigrationsTable(dsn, table string) (string, error) {
 	u, err := url.Parse(dsn)
