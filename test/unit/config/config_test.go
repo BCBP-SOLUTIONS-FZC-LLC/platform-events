@@ -19,6 +19,7 @@ import (
 func TestLoadSNS_Defaults(t *testing.T) {
 	t.Setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:123:topic")
 	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
 	t.Setenv("AWS_ENDPOINT_URL", "")
 
 	cfg := config.LoadSNS()
@@ -65,6 +66,7 @@ func TestLoadSQS_Defaults(t *testing.T) {
 	t.Setenv("SQS_CONCURRENCY", "")
 	t.Setenv("SQS_MAX_RECEIVE_COUNT", "")
 	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
 
 	cfg := config.LoadSQS()
 	assert.Equal(t, int32(10), cfg.MaxMessages)
@@ -628,4 +630,20 @@ func TestLoad_NewDurationVars(t *testing.T) {
 	assert.Equal(t, 15*time.Second, outboxCfg.GaugeInterval)
 	assert.Contains(t, strings.Join(sqsCfg.Warnings, "\n"), "SQS_HANDLER_TIMEOUT")
 	assert.Contains(t, strings.Join(outboxCfg.Warnings, "\n"), "OUTBOX_GAUGE_INTERVAL")
+}
+
+// AWS_DEFAULT_REGION is used when AWS_REGION is unset (the SDK's environment
+// chain); us-east-1 only when neither is set.
+func TestLoad_RegionFallsBackToAWSDefaultRegion(t *testing.T) {
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "eu-west-1")
+	assert.Equal(t, "eu-west-1", config.LoadSNS().Region)
+	assert.Equal(t, "eu-west-1", config.LoadSQS().Region)
+
+	t.Setenv("AWS_REGION", "ap-south-1")
+	assert.Equal(t, "ap-south-1", config.LoadSNS().Region, "AWS_REGION wins")
+
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	assert.Equal(t, "us-east-1", config.LoadSQS().Region)
 }

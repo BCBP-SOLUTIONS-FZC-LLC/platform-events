@@ -295,3 +295,103 @@ func TestDataschemaOnPlainJSONPayload_PassedThrough(t *testing.T) {
 	cancel()
 	require.NoError(t, c.Stop())
 }
+
+// A busy FIFO group whose total processing time exceeds WithHandlerTimeout is
+// not cut short: later messages wait for the earlier ones by design, so only
+// a message that hangs releases the rest of its group.
+func TestFIFO_HandlerTimeout_BusyGroupNotReleased(t *testing.T) {
+	var batch []sqstypes.Message
+	for _, l := range []string{"a1", "a2", "a3", "a4", "a5"} {
+		batch = append(batch, fifoMessage("A", l))
+	}
+	client := newFIFOClient(batch)
+	var mu sync.Mutex
+	var handled []string
+	handler := func(_ context.Context, env domain.Envelope[json.RawMessage]) error {
+		time.Sleep(300 * time.Millisecond) // 5 × 300ms spans the 1s extension tick, well past the 400ms timeout
+		mu.Lock()
+		handled = append(handled, env.Subject)
+		mu.Unlock()
+		return nil
+	}
+	c, err := internalsqs.NewWithClient(internalsqs.Config{QueueURL: testFIFOQueueURL, WaitSeconds: 1}, client, handler,
+		internalsqs.WithVisibilityTimeout(2*time.Second), internalsqs.WithHandlerTimeout(400*time.Millisecond))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Start(ctx) }()
+	require.Eventually(t, func() bool { return client.wasDeleted(batch[4]) }, 5*time.Second, 10*time.Millisecond)
+	cancel()
+	require.NoError(t, c.Stop())
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"a1", "a2", "a3", "a4", "a5"}, handled)
+	for _, m := range batch {
+		assert.False(t, client.wasReleased(m), "no message of a busy group may be handed back")
+	}
+}
+
+// A message whose delete fails is not settled: its group stops, so the next
+// message cannot run (and be deleted) before it is redelivered.
+func TestFIFO_FailedDeleteStopsGroup(t *testing.T) {
+	a1, a2 := fifoMessage("A", "a1"), fifoMessage("A", "a2")
+	client := newFIFOClient([]sqstypes.Message{a1, a2})
+	inner := client.deleteMessageFn
+	client.deleteMessageFn = func(ctx context.Context, in *sqs.DeleteMessageInput, o ...func(*sqs.Options)) (*sqs.DeleteMessageOutput, error) {
+		if aws.ToString(in.ReceiptHandle) == aws.ToString(a1.ReceiptHandle) {
+			return nil, assert.AnError
+		}
+		return inner(ctx, in, o...)
+	}
+	var mu sync.Mutex
+	var handled []string
+	handler := func(_ context.Context, env domain.Envelope[json.RawMessage]) error {
+		mu.Lock()
+		handled = append(handled, env.Subject)
+		mu.Unlock()
+		return nil
+	}
+	c, err := internalsqs.NewWithClient(internalsqs.Config{QueueURL: testFIFOQueueURL, WaitSeconds: 1}, client, handler,
+		internalsqs.WithVisibilityTimeout(30*time.Second))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Start(ctx) }()
+	require.Eventually(t, func() bool { return client.wasReleased(a2) }, 5*time.Second, 10*time.Millisecond)
+	cancel()
+	require.NoError(t, c.Stop())
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"a1"}, handled)
+	assert.False(t, client.wasDeleted(a2))
+}
+
+// Without a visibility timeout (no extension) a FIFO receive takes one
+// message, so no group message ever waits unextended behind another.
+func TestFIFO_NoVisibilityTimeout_ReceivesOne(t *testing.T) {
+	var mu sync.Mutex
+	var maxMsgs []int32
+	client := &mockSQSClient{receiveMessageFn: func(ctx context.Context, in *sqs.ReceiveMessageInput, _ ...func(*sqs.Options)) (*sqs.ReceiveMessageOutput, error) {
+		mu.Lock()
+		maxMsgs = append(maxMsgs, in.MaxNumberOfMessages)
+		n := len(maxMsgs)
+		mu.Unlock()
+		if n < 2 {
+			return &sqs.ReceiveMessageOutput{}, nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	c, err := internalsqs.NewWithClient(internalsqs.Config{QueueURL: testFIFOQueueURL, WaitSeconds: 1}, client,
+		func(context.Context, domain.Envelope[json.RawMessage]) error { return nil }, internalsqs.WithConcurrency(4))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { _ = c.Start(ctx) }()
+	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(maxMsgs) >= 2 }, 5*time.Second, 5*time.Millisecond)
+	cancel()
+	require.NoError(t, c.Stop())
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, int32(1), maxMsgs[0])
+}

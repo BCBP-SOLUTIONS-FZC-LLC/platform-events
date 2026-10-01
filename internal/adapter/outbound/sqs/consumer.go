@@ -498,13 +498,24 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		exts := make([]*visibilityExtender, len(out.Messages))
 		for i, msg := range out.Messages {
 			exts[i] = c.extendVisibility(msg)
-			if c.handlerTimeout > 0 {
-				exts[i].SetDeadline(time.Now().Add(c.handlerTimeout))
-			}
 		}
 		// A unit is what one worker processes: one message, or — on a FIFO
 		// queue — one message group's messages of this batch, in order.
 		units := c.workUnits(out.Messages)
+		if c.handlerTimeout > 0 {
+			now := time.Now()
+			for _, unit := range units {
+				// The unit's first message may wait one handler timeout for a
+				// worker. A FIFO group's later messages also wait for the
+				// messages ahead of them by design, so they get the head's
+				// waiting and processing budget; processGroup re-arms them as
+				// each message is dispatched.
+				exts[unit[0]].SetDeadline(now.Add(c.handlerTimeout))
+				for _, i := range unit[1:] {
+					exts[i].SetDeadline(now.Add(2 * c.handlerTimeout))
+				}
+			}
+		}
 		for u, unit := range units {
 			// Interruptible semaphore acquire: if loopCtx is cancelled while all
 			// concurrency slots are busy the blocking send would hold Start() forever,
@@ -580,24 +591,46 @@ func (c *sqsConsumer) workUnits(msgs []sqstypes.Message) [][]int {
 func (c *sqsConsumer) processGroup(drainCtx, loopCtx context.Context, msgs []sqstypes.Message, exts []*visibilityExtender, unit []int, inflight *atomic.Int32) {
 	for k, i := range unit {
 		if loopCtx.Err() != nil {
-			releaseAll(exts, unit[k:])
+			c.releaseGroupTail(msgs, exts, unit[k:], "consumer stopping")
 			return
 		}
 		c.resetDeadline(exts[i])
 		if !exts[i].Claim() {
-			releaseAll(exts, unit[k+1:])
+			c.releaseGroupTail(msgs, exts, unit[k+1:], "message waited past the handler timeout")
 			return
 		}
+		// The rest of the group waits while this message runs: give each one
+		// this message's processing budget plus its own waiting budget, so a
+		// busy group is never released — only one whose message hangs.
+		if c.handlerTimeout > 0 {
+			rest := time.Now().Add(2 * c.handlerTimeout)
+			for _, j := range unit[k+1:] {
+				exts[j].SetDeadline(rest)
+			}
+		}
 		if !c.runOne(drainCtx, loopCtx, msgs[i], exts[i], inflight) {
-			releaseAll(exts, unit[k+1:])
+			c.releaseGroupTail(msgs, exts, unit[k+1:], "message not settled")
 			return
 		}
 	}
 }
 
-func releaseAll(exts []*visibilityExtender, idx []int) {
+// releaseGroupTail hands a FIFO group's remaining messages of this batch back
+// unprocessed; SQS redelivers them after the message that stopped the group.
+func (c *sqsConsumer) releaseGroupTail(msgs []sqstypes.Message, exts []*visibilityExtender, idx []int, reason string) {
+	if len(idx) == 0 {
+		return
+	}
 	for _, i := range idx {
 		exts[i].Release()
+	}
+	if c.logger != nil {
+		c.logger.Warn("sqs: FIFO group stopped — its later messages were handed back unprocessed", map[string]any{
+			"queue":            c.queueURL,
+			"message_group_id": msgs[idx[0]].Attributes[string(sqstypes.MessageSystemAttributeNameMessageGroupId)],
+			"released":         len(idx),
+			"reason":           reason,
+		})
 	}
 }
 
@@ -1177,6 +1210,12 @@ func (c *sqsConsumer) receiveInput(base *sqs.ReceiveMessageInput, sem chan struc
 	}
 	input := *base
 	input.MaxNumberOfMessages = min(c.maxMessages, int32(cap(sem)-len(sem)))
+	if c.fifo {
+		// A FIFO group's later messages wait on one worker for the earlier
+		// ones; without extension they could reappear and be taken (out of
+		// order) by another consumer. One message per receive never waits.
+		input.MaxNumberOfMessages = 1
+	}
 	return &input
 }
 
@@ -1281,12 +1320,12 @@ func (c *sqsConsumer) handleMalformed(drainCtx context.Context, msg sqstypes.Mes
 }
 
 // settle stops msg's visibility extension — so no extension call races the
-// delete — and deletes it. It reports true: the message has been handled
-// (a failed delete is logged and the message redelivered, a duplicate).
+// delete — and deletes it. It reports whether the delete succeeded: a failed
+// delete (logged) leaves the message to be redelivered, so on a FIFO queue
+// its group must stop — running the next message now would reorder them.
 func (c *sqsConsumer) settle(msg sqstypes.Message, ext *visibilityExtender) bool {
 	ext.Stop()
-	c.deleteMessage(msg)
-	return true
+	return c.deleteMessage(msg) == nil
 }
 
 // errDLQForwardFailed marks a dead-letter routing attempt whose DLQ forward
@@ -1404,14 +1443,14 @@ const deleteMessageTimeout = 10 * time.Second
 
 // deleteMessage deletes a processed message from SQS. It uses its own bounded
 // context so a network partition cannot hold a goroutine slot indefinitely.
-func (c *sqsConsumer) deleteMessage(msg sqstypes.Message) {
+func (c *sqsConsumer) deleteMessage(msg sqstypes.Message) error {
 	if msg.ReceiptHandle == nil {
 		if c.logger != nil {
 			c.logger.Error("sqs: cannot delete message with nil ReceiptHandle — skipping", map[string]any{
 				"message_id": aws.ToString(msg.MessageId),
 			})
 		}
-		return
+		return errors.New("sqs: message has no receipt handle")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), deleteMessageTimeout)
 	defer cancel()
@@ -1430,4 +1469,5 @@ func (c *sqsConsumer) deleteMessage(msg sqstypes.Message) {
 			})
 		}
 	}
+	return err
 }

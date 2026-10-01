@@ -272,3 +272,23 @@ func TestEnqueueOrdered_ValidatesKeyAndStoresIt(t *testing.T) {
 	assert.Contains(t, tx.execSQL, "ordering_key")
 	assert.Equal(t, "user/42", tx.execArgs[len(tx.execArgs)-1])
 }
+
+// Postgres jsonb rejects the \u0000 escape, so a NUL anywhere in the
+// envelope is rejected before the INSERT (which would roll back the caller's
+// business transaction on every retry); a literal backslash-u0000 is fine.
+func TestEnqueue_NULCharacter_Rejected(t *testing.T) {
+	for name, env := range map[string]events.Envelope[json.RawMessage]{
+		"payload": events.NewEnvelope("x.y", "svc", json.RawMessage(`{"name":"a\u0000b"}`)),
+		"actor":   events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`), events.WithActor("bad\x00actor")),
+		"tenant":  events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`), events.WithTenantID("t\x00")),
+	} {
+		tx := newStubTx(pgcommon.Tx.Exec)
+		err := outbox.Enqueue(context.Background(), tx, env)
+		require.Error(t, err, name)
+		assert.Empty(t, tx.execSQL, "%s: nothing may be inserted", name)
+	}
+
+	tx := newStubTx(pgcommon.Tx.Exec)
+	ok := events.NewEnvelope("x.y", "svc", json.RawMessage(`{"path":"C:\\u0000"}`))
+	require.NoError(t, outbox.Enqueue(context.Background(), tx, ok), "an escaped backslash followed by u0000 is not a NUL")
+}

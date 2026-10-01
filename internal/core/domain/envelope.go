@@ -10,8 +10,11 @@ import (
 
 // SystemTenantID is the well-known tenant identifier for events that apply
 // globally across all tenants. Use WithSystemTenant() (pkg/events) when
-// publishing; receiving a SystemTenantID on the consumer side disables per-tenant
-// RLS scoping, which is the intended behaviour for global events.
+// publishing. The SQS consumer injects it like any tenant (app.tenant_id =
+// 'system' via pgcommon's GUC set) — RLS is NOT disabled, so tenant-scoped
+// policies match no rows and reject inserts. A handler for global events
+// needs a separate pool or role that bypasses RLS (or policies that admit
+// 'system').
 const SystemTenantID = "system"
 
 // Envelope is the canonical wire format for all inter-service events.

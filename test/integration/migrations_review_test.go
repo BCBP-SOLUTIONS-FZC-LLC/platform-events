@@ -5,6 +5,7 @@ package integration_test
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -101,6 +102,14 @@ func TestMigration003_RebuildsOnlyWhenShapeDiffers(t *testing.T) {
 		return conn.QueryRow(ctx, `SELECT pg_get_indexdef('idx_outbox_events_pending'::regclass)`).Scan(&def)
 	}))
 	assert.Contains(t, def, "(scheduled_at, id) WHERE (published_at IS NULL)")
+
+	// An INVALID index of the right shape (a failed CREATE INDEX
+	// CONCURRENTLY) serves no queries and is rebuilt.
+	exec(`UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'idx_outbox_events_pending'::regclass`)
+	invalid := oid()
+	exec(string(sql))
+	assert.NotEqual(t, invalid, oid(), "an INVALID index must be rebuilt")
+	assert.EqualValues(t, 1, queryInt(ctx, t, pool, `SELECT count(*) FROM pg_index WHERE indexrelid = 'idx_outbox_events_pending'::regclass AND indisvalid`))
 }
 
 // Migration 011 replaces the failed_at-only dead-letter index with
@@ -117,8 +126,10 @@ func TestMigration011_DeadLetterIndex(t *testing.T) {
 // outbox_dead_letters and the other dead letters are replayed.
 func TestReprocessDeadLetters_SkipsIDAlreadyInOutbox(t *testing.T) {
 	ctx := context.Background()
-	store, pool, cleanup := setupOutboxTest(ctx, t)
+	pool, cleanup := fixtures.NewTestDB(ctx, t)
 	defer cleanup()
+	logger := &fixtures.MockLogger{}
+	store := outboxstore.New(pool, logger, 0)
 
 	colliding, other := makeRecord("dl.collide"), makeRecord("dl.collide")
 	enqueueAndDeadLetter(ctx, t, store, pool, colliding) // oldest failure: selected first
@@ -139,6 +150,14 @@ func TestReprocessDeadLetters_SkipsIDAlreadyInOutbox(t *testing.T) {
 	assert.EqualValues(t, 0, queryInt(ctx, t, pool, `SELECT count(*) FROM outbox_dead_letters WHERE id = $1`, other.ID),
 		"the other dead letter was replayed")
 	assert.EqualValues(t, 1, queryInt(ctx, t, pool, `SELECT count(*) FROM outbox_events WHERE id = $1`, other.ID))
+
+	warned := false
+	for _, e := range logger.Entries() {
+		if e.Level == "WARN" && strings.Contains(e.Message, "dead letters left in place") {
+			warned = true
+		}
+	}
+	assert.True(t, warned, "the left-behind dead letter is reported")
 }
 
 // MarkFailed on a record another runner already published (lease expired

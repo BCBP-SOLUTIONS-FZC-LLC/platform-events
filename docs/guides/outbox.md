@@ -123,7 +123,7 @@ err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context
 })
 ```
 
-`Enqueue` validates the envelope (non-nil tx; non-empty `ID`/`Type`/`Source`; non-zero `Timestamp`; no null bytes in `ID`/`Type`/`Source`; `ID` a **canonical lowercase UUID**, as `events.NewEnvelope` produces — services that set their own IDs must use `uuid.UUID.String()`) and rejects payloads whose serialised size exceeds **240 KB** — staying under the SNS 256 KB hard limit so an outbox record that could never publish is never persisted.
+`Enqueue` validates the envelope (non-nil tx; non-empty `ID`/`Type`/`Source`; non-zero `Timestamp`; no null bytes in `ID`/`Type`/`Source`/`TenantID`/`TraceID` and no NUL (`\u0000`) anywhere in the serialised envelope — Postgres `jsonb` cannot store it, so strip NULs from user input; `ID` a **canonical lowercase UUID**, as `events.NewEnvelope` produces — services that set their own IDs must use `uuid.UUID.String()`) and rejects payloads whose serialised size exceeds **240 KB** — staying under the SNS 256 KB hard limit so an outbox record that could never publish is never persisted.
 
 ### Payload size guidelines
 

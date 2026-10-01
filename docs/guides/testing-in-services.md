@@ -83,7 +83,7 @@ The `mock.Consumer` API:
 | `Start(ctx)` | No-op; marks consumer as running |
 | `Stop()` | No-op; marks consumer as stopped |
 | `SetHandler(fn)` | Registers the handler called by `Inject` |
-| `Inject(env)` | Delivers the envelope synchronously to the registered handler, with the context the SQS consumer gives: the tenant as pgcommon's GUC set (RLS), `events.TraceIDFromContext`, `events.SourceMessageFromContext` (body = the envelope JSON, queue = `QueueURL` or `mock.MockQueueURL`) and the dead-letter attribution |
+| `Inject(env)` | Delivers the envelope synchronously to the registered handler, with the context the SQS consumer gives: the tenant as pgcommon's GUC set (RLS), `events.TraceIDFromContext`, `events.SourceMessageFromContext` (body = the envelope JSON, queue = `QueueURL` or `mock.MockQueueURL`) and the dead-letter attribution. Like production it returns `mock.ErrMalformedEnvelope` without calling the handler when `ID` / `Type` / `Source` is missing, round-trips the envelope through JSON, and decodes a codec-encoded payload (`dataschema` + JSON-string `data`) with the consumer's `Codec` field (an error when none is set) |
 | `IsRunning()` | Reports whether `Start` has been called without a matching `Stop` |
 
 ### Mock DLQPublisher

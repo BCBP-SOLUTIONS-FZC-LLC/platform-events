@@ -16,7 +16,9 @@ for f in test/go.mod tools/go.mod; do
     status=1
   fi
 done
-got=$(sed -n 's/^FROM golang:\([0-9][0-9.]*\)-.*/\1/p' Dockerfile | head -n1)
+# Any FROM form: --platform=…, a registry prefix (docker.io/library/golang),
+# with or without a variant suffix (-alpine) or digest.
+got=$(grep -E '^FROM ' Dockerfile | grep -oE 'golang:[0-9][0-9.]*[0-9]' | head -n1 | cut -d: -f2)
 if [ "$got" != "$want" ]; then
   echo "::error file=Dockerfile::builder image golang:${got:-<none>} — go.mod has toolchain go${want}"
   status=1

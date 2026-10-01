@@ -143,7 +143,7 @@ External dependencies (private modules):
   - `SQSConfig{QueueURL, Region, EndpointURL, MaxMessages, WaitSeconds, Logger}` — `QueueURL` required; `MaxMessages` default 10; `WaitSeconds` default 20. `Logger` accepts any `port.Logger` — pass `platform-gincommon`'s `ZapLogger` directly.
   - `Handler` — `func(ctx context.Context, env Envelope[json.RawMessage]) error`; returning a non-nil error skips deletion (message becomes visible again after visibility timeout). The `ctx` passed to each handler has a `platform-gincommon`-compatible `RequestContext` injected (populated from `env.TenantID`, `env.TraceID`) so downstream calls to pgcommon pool helpers (e.g. `pool.WithTx`) pick up the correct GUC values automatically.
   - `ConsumerOption` — `WithConcurrency(n)` (default 1), `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)` (nil ignored), `WithMaxReceiveCount(n)`, `WithDrainTimeout(d)`, `WithConsumerCodec(codec)` (schema-registry hook — see "Codec" below), `WithDLQForwarding(dlq)`, `WithHandlerTimeout(d)`, `WithQueueDepthMetrics(interval)`, `WithMalformedBodyLogging()`. `NewSQSConsumer` returns an error for a nil handler.
-  - `MockConsumer` (in `pkg/events/mock`) — in-memory queue; `Inject(env)` delivers messages synchronously
+  - `MockConsumer` (in `pkg/events/mock`) — in-memory queue; `Inject(env)` delivers messages synchronously, like production: `ErrMalformedEnvelope` (handler not called) without id / type / source, JSON round-trip, codec decode via its `Codec` field
 
 - **HMAC helpers**
   - `Sign(key []byte, payload []byte) (string, error)` — returns hex-encoded HMAC-SHA256 signature; `ErrKeyTooShort` for keys < 32 bytes
@@ -254,7 +254,7 @@ The JSON keys follow CloudEvents naming (`specversion`, `dataschema`, `time`, `d
 
 `NewSNSPublisher` wraps `aws-sdk-go-v2/service/sns`. Key behaviours:
 
-- **Message attributes** — `EventType`, `TenantID`, `Source`, `EventID`, and `Subject` (when non-empty) are set as SNS message attributes to enable SQS subscription filter policies without deserialising the body. `Actor` is not forwarded as an attribute — it is an audit-trail field, not a routing field.
+- **Message attributes** — at most 10 per message (SNS limit); over it, OTel `baggage` then `tracestate` are dropped (logged once) before the publish fails. `EventType`, `TenantID`, `Source`, `EventID`, and `Subject` (when non-empty) are set as SNS message attributes to enable SQS subscription filter policies without deserialising the body. `Actor` is not forwarded as an attribute — it is an audit-trail field, not a routing field.
 - **FIFO topics** — if `TopicARN` ends in `.fifo`, the publisher requires `MessageGroupID`; `MessageDeduplicationID` defaults to `Envelope.ID` (content-based deduplication must be disabled at the topic level).
 - **Batching** — `PublishBatch` uses `sns:PublishBatch` (max 10 per call); batches larger than 10 are automatically split.
 - **Retry** — caller is responsible for retry (the outbox runner handles this); the SNS adapter does not retry internally. `Publish` returns the AWS error, wrapped in `RetryableError` (`errors.Is(err, events.ErrRetryable)`) when transient: SNS throttling / internal codes (`Throttled`, `InternalError`, `KMSThrottling`, …) and any failure without an AWS API error (network, DNS, TLS, timeouts, credentials). `errors.As(err, &smithy.APIError)` still reaches the underlying error. `PublishBatch` failures carry `BatchFailure.Retryable` (and Code `TransportError` for a transient whole-request failure; a permanent one keeps its AWS code). Chunks are split by count (10) **and** by SNS's 256 KiB request size.
@@ -277,7 +277,7 @@ Start() →
 ```
 
 - **Batch receive, extended from receipt** — each `ReceiveMessage` takes up to `MaxMessages`; every received message's visibility is extended from receipt (while it waits for a worker, then while processed), so a batch queued behind slow handlers never reappears and is processed twice. Without a visibility timeout (no extension) a receive asks only for `min(MaxMessages, free workers)`. With `WithHandlerTimeout`, a message still waiting when the timeout passes is handed back (visibility 0); `Stop` hands back undispatched messages at once.
-- **FIFO queues** — on a `.fifo` queue the batch is split by `MessageGroupId`; each group runs on one worker in receive order, and a message that is not settled (handler error, failed decode / DLQ forward, panic) stops its group: the group's later messages are handed back unprocessed so SQS redelivers them after it. Receives carry a fresh `ReceiveRequestAttemptId`. Use `WithVisibilityTimeout` on FIFO queues.
+- **FIFO queues** — on a `.fifo` queue the batch is split by `MessageGroupId`; each group runs on one worker in receive order, and a message that is not settled (handler error, failed decode / DLQ forward, panic) stops its group: the group's later messages are handed back unprocessed so SQS redelivers them after it. Receives carry a fresh `ReceiveRequestAttemptId`. Use `WithVisibilityTimeout` on FIFO queues. At most one message per group is in flight per replica; with `WithHandlerTimeout` a group's later messages get the running message's budget (re-armed per dispatch), so a busy group is never handed back. Without a visibility timeout a FIFO receive takes one message; a failed delete also stops the group.
 - **Envelope validation** — a body that is not JSON, or JSON without `id` / `type` / `source` (e.g. an SNS notification wrapper from a subscription without `RawMessageDelivery`), is malformed: forwarded to the DLQ with `WithDLQForwarding`, else deleted; never passed to the handler. Logged with `body_bytes` / `body_sha256` only (`WithMalformedBodyLogging` adds an excerpt — bodies may carry PII).
 - **Visibility extension** — from receipt until dispatch ends (decode, dead-letter handler, DLQ forward, handler), the consumer calls `ChangeMessageVisibility` every `max(VisibilityTimeout/2, 1s)`. `WithHandlerTimeout(d)` (`SQS_HANDLER_TIMEOUT`) is one deadline from when a worker picks the message up, for decode, dead-letter handler and handler contexts and for the extension, so a hung handler's message is redelivered.
 - **Dead-letter handler** — with `WithDeadLetterHandler` and/or `WithDLQForwarding`, a message whose `ApproximateReceiveCount` exceeds `WithMaxReceiveCount` (default 5; keep it below the queue's RedrivePolicy `maxReceiveCount`) goes to the handler, then — unless the handler already forwarded it with `SendToDLQ` — is forwarded to the DLQ, and is deleted once both succeed. Without either option there is no consumer-side threshold: SQS's own redrive policy moves the message.
@@ -361,7 +361,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `AWS_REGION` | `us-east-1` | Applies to both SNS and SQS clients |
+| `AWS_REGION` → `AWS_DEFAULT_REGION` | `us-east-1` | Applies to both SNS and SQS clients |
 | `SNS_TOPIC_ARN` | — | Required for SNS publisher |
 | `SQS_QUEUE_URL` | — | Required for SQS consumer |
 | `SQS_MAX_MESSAGES` | `10` | 1–10; SQS hard limit |
@@ -369,6 +369,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | Parsed as `time.Duration` |
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
 | `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | Enables `platform_queue_depth` / `platform_dlq_depth` sampling (min 10s) |
+| `SQS_DRAIN_TIMEOUT` | `30s` | `WithDrainTimeout`: how long `Stop` waits for in-flight handlers (below `terminationGracePeriodSeconds`) |
 | `SQS_HANDLER_TIMEOUT` | — (off) | `WithHandlerTimeout`: handler ctx deadline + stop extending visibility, so a hung handler's message is redelivered |
 | `OUTBOX_GAUGE_INTERVAL` | `15s` | Backlog-gauge refresh interval; counts capped at `outboxstore.MaxCountedRows` (100k) |
 | `OUTBOX_POLL_INTERVAL` | `5s` | Parsed as `time.Duration` |
@@ -408,7 +409,7 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 - `test/fixtures/` — shared floci and Postgres containers (one per package; fresh database per `NewTestDB`, `NewEmptyTestDB` for schema tests), `MockLogger`, `FakeClock`
 - `test/testenv/` — loads `.env-example` for tests
 - White-box tests stay beside the sources in the root module (`internal/core/service/*_test.go`).
-- Merged coverage (root + unit + integration + e2e, `-race`) is **98.7%**; the CI gate is 97%.
+- Merged coverage (root + unit + integration + e2e, `-race`) is **98.5%**; the CI gate is 97%.
 
 ## Key Design Decisions
 

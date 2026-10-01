@@ -17,6 +17,7 @@
 
 | Rev | Date | Change |
 |---|---|---|
+| 2.6 | 2026-10-01 | Second review round: FIFO group messages get the running message's handler-timeout budget (re-armed per dispatch), one message per receive without a visibility timeout, a failed delete stops the group (§7.1); SNS drops `baggage` / `tracestate` before failing on the 10-attribute limit (§7.2); `Enqueue` rejects NUL (§10.3); replay inserts first with `ON CONFLICT` and counts skipped rows after commit (§8.6); 003 also rebuilds an INVALID index; `AWS_DEFAULT_REGION` fallback and `SQS_DRAIN_TIMEOUT` (§12); `mock.Consumer` validates and decodes (M-2); `SystemTenantID` does not disable RLS (E-7). |
 | 2.5 | 2026-10-01 | Production review of v1.6.0: FIFO source queues processed per message group in order (§7.1); FIFO DLQ dedup ID unique per forward (§10.3); a `dataschema` on a non-string `data` is passed through (§7.3, EVT-5); migration 010 down releases waiting records, 003 rebuilds only when the shape differs, new 011 `(failed_at, id)` dead-letter index (§4, §19.5); replay skips IDs already in `outbox_events` (§8.6); shutdown mid-batch releases at once (§8.4); metrics rollback on legacy failure; extension calls bounded; DSN masking of `sslpassword`. |
 | 2.4 | 2026-10-01 | v1.6.0 released: CHANGELOG `[Unreleased]` folded into `[1.6.0]`; status, §13.4 deployment stage, OQ-8 closed, release appendix. No design change. |
 | 2.3 | 2026-10-01 | platform-pgcommon v1.4.2 → v1.4.3 (documentation-only upstream release — pgcommon's own LLD and doc corrections; none of the corrected claims are repeated here). No code change. OQ-6 still open: v1.4.3's `release.yml` still has no `latest=false`. |
@@ -59,7 +60,7 @@ This document is the low-level design for **`platform-events`**, the shared Go l
 
 Refined into an implementable specification, this document gives the exact tables and indexes the library creates in a service's database, the public signatures and their behavioural contracts, the state machines behind publish / consume / outbox / inbox, the invariants that hold across them, configuration, metrics, and the operational procedures a service owner needs. Where this LLD and the code disagree, **the code is authoritative**; the discrepancy is a documentation bug and this document is updated with the change.
 
-**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `feat/observability-standard` at revision 2.5 (merged coverage 98.7%, `make ci` green).
+**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `fix/production-review` (v1.6.0 + `[Unreleased]`) at revision 2.6 (merged coverage 98.5%, `make ci` green).
 
 ### 1.1 Relationship to the architecture documents
 
@@ -363,7 +364,7 @@ The library's tables carry `tenant_id` but **no RLS policy**: the runner reads a
 | E-4 | `Envelope.JSON` | `() ([]byte, error)` — canonical JSON, payload inline |
 | E-5 | `ParseEnvelope[T]` | `(data []byte) (Envelope[T], error)` — requires `id`, `type`, `source`, `time` |
 | E-6 | `TraceIDFromContext` | `(ctx) string` — envelope trace ID in a consumer handler |
-| E-7 | `SystemTenantID` | `"system"` |
+| E-7 | `SystemTenantID` | `"system"` — injected as the RLS tenant like any other (`app.tenant_id = 'system'`); RLS is not disabled, so global-event handlers need an RLS-bypassing pool or role |
 
 ### 5.3 Publisher (`pkg/events`)
 
@@ -420,7 +421,7 @@ The library's tables carry `tenant_id` but **no RLS policy**: the runner reads a
 | O-1 | `Config` | `Pool`, `Store` (tests), `Publisher`, `Logger`, `PollInterval` (5s), `BatchSize` (50), `MaxAttempts` (5), `ClaimLeaseDuration` (10m), `DrainTimeout` (30s), `PublishConcurrency` (1), `PublishTimeout` (10s), `GaugeInterval` (15s), `StartupJitter` (0), `RetryBackoff` (1s), `MaxRetryBackoff` (5m) |
 | O-2 | `NewRunner` | `(cfg Config) (*Runner, error)` — error if the lease is shorter than `BatchSize×PublishTimeout+1m` (30s minimum when `PublishTimeout` is disabled) |
 | O-3 | `Runner.Start` / `Stop` / `Ready` | `Start(ctx) error` blocks; `Stop() error` drains; `Ready() <-chan struct{}` closes after the first successful (or empty) poll |
-| O-4 | `Enqueue` | `(ctx, tx pgcommon.Tx, env events.Envelope[json.RawMessage]) error` — validates fields, canonical UUID, ≤ 240 KiB serialised |
+| O-4 | `Enqueue` | `(ctx, tx pgcommon.Tx, env events.Envelope[json.RawMessage]) error` — validates fields, canonical UUID, no NUL (`\u0000`; jsonb cannot store it), ≤ 240 KiB serialised |
 | O-5 | `EnqueueOrdered` | `(ctx, tx, env, orderingKey string) error` — key non-empty, valid UTF-8, no NUL, ≤ `MaxOrderingKeyLen` (256) |
 | O-6 | `Runner.ListDeadLetters` | `(ctx, filter DLQFilter, limit int) ([]DeadLetterRecord, error)` |
 | O-7 | `Runner.ReprocessDeadLetters[With]` | `(ctx[, filter], limit int) (int, error)` — moves rows back to `outbox_events` |
@@ -454,7 +455,7 @@ O-6 … O-9 apply a 30s internal DB timeout each and order by `failed_at, id`. `
 | K-5 | `LogWarnings` / `LogWarningsTo(logger, warnings)` | stderr / structured logger |
 | K-6 | `LoadOTel` / `OTelConfigEnv` | Deprecated — tracing config belongs to gincommon |
 | M-1 | `mock.Publisher` | Validates ID/Type/Source like SNS; `SetError`, `SetBatchError` (partial / `Retryable` failures), `Published`, `Reset` |
-| M-2 | `mock.Consumer` | `SetHandler(h)`, `Start` / `Stop` / `IsRunning` (no polling); `Inject(env)` runs the handler with the real handler context (`sqs.HandlerContext`: tenant GUC, trace ID, source message from `env.JSON()`, plus the `explicit` dead-letter attribution); `QueueURL` / `MockQueueURL` |
+| M-2 | `mock.Consumer` | `SetHandler(h)`, `Start` / `Stop` / `IsRunning` (no polling); `Inject(env)` runs the handler with the real handler context (`sqs.HandlerContext`: tenant GUC, trace ID, source message from `env.JSON()`, plus the `explicit` dead-letter attribution); like production it returns `ErrMalformedEnvelope` without calling the handler when id / type / source is missing, round-trips through JSON, and decodes codec payloads with `Codec` (error when unset); `QueueURL` / `MockQueueURL` |
 | M-3 | `mock.DLQPublisher` | Same input validation as the SQS publisher; counts `platform_dlq_messages_total` and marks the attribution; `Sent() []DLQMessage`, `SetError`, `DLQURL` (default `mock://dlq`) |
 
 ---
@@ -529,7 +530,7 @@ flowchart TD
 - **Dead-letter routing** only with `WithDeadLetterHandler` and/or `WithDLQForwarding`; `WithMaxReceiveCount` defaults to 5 when either is set. Panics in the handler, dead-letter handler or codec are recovered and counted.
 - **Shutdown**: `Stop()` cancels receiving, hands back undispatched messages, waits up to `DrainTimeout` for in-flight handlers (whose contexts survive `Stop` but are cancelled at the drain deadline), and returns when `Start` returns. `WithDLQForwarding` resolves the DLQ at `Start`; a missing / invalid `RedrivePolicy` fails `Start`.
 - **SNS wrapper**: a raw SNS notification body (subscription without raw message delivery) is treated as malformed — subscriptions must enable raw message delivery.
-- **FIFO queues** (URL ending `.fifo`): receives request `MessageGroupId` and carry a fresh `ReceiveRequestAttemptId`; a batch is split by group and each group is processed by **one** worker in receive order. A message that is not settled (handler error, failed decode or DLQ forward, panic, waited past its deadline) stops its group: the group's later messages in that batch are handed back unprocessed, so SQS redelivers them after it. Other groups run in parallel up to `WithConcurrency`. Set `WithVisibilityTimeout` on FIFO queues so a group's queued messages are extended while they wait.
+- **FIFO queues** (URL ending `.fifo`): receives request `MessageGroupId` and carry a fresh `ReceiveRequestAttemptId`; a batch is split by group and each group is processed by **one** worker in receive order. A message that is not settled (handler error, failed decode or DLQ forward, panic, waited past its deadline) stops its group: the group's later messages in that batch are handed back unprocessed, so SQS redelivers them after it. A failed `DeleteMessage` also stops the group. Other groups run in parallel up to `WithConcurrency`; at most one message per group is in flight per replica. With `WithHandlerTimeout`, a group's later messages wait two timeouts (the running message's processing budget plus their own), re-armed as each message is dispatched, so a busy group is never handed back — only one whose message hangs. Set `WithVisibilityTimeout` on FIFO queues; without it (no extension) a FIFO receive takes one message so none waits unextended. A cut-short group is logged (Warn, `message_group_id`, `released`).
 - **Settling**: a message's extension is stopped before `DeleteMessage`, so no extension call races the delete; each extension call is bounded by `min(max(VT/2, 1s), 10s)`.
 
 ### 7.2 Outbound — SNS publisher
@@ -563,7 +564,7 @@ Source: `internal/core/domain/envelope.go`. JSON, CloudEvents key names.
 
 Within `v1.x` the library only adds optional (`omitempty`) fields; it never removes or renames a field, makes an optional field required, or changes the format of `id` / `time` (full rules: `ARCHITECTURE.md` § Envelope compatibility guarantees). Consumers must not use `DisallowUnknownFields`.
 
-**SNS message attributes:** `EventType`, `TenantID`, `Source`, `EventID`, `Subject` (when set), the W3C propagator headers (`traceparent`, baggage), and `WithAttributes` extras — at most 10. `ordering_key` is a database column only, never on the wire.
+**SNS message attributes:** `EventType`, `TenantID`, `Source`, `EventID`, `Subject` (when set), the W3C propagator headers (`traceparent`, `tracestate`, `baggage`), and `WithAttributes` extras — at most 10. Over the limit, `baggage` then `tracestate` are dropped (logged once per publisher) before the publish fails, so the caller's request context cannot make a publish fail. `ordering_key` is a database column only, never on the wire.
 
 **Codec wire format:** `Encode`'s bytes are base64-encoded into a JSON string in `data`, keeping the SNS `Message` UTF-8. `GlueDecodeCodec` strips the 18-byte Glue header (`0x03` version, `0x00` compression, 16-byte schema version UUID); compressed payloads are rejected; `Encode` always fails (decode-only).
 
@@ -982,7 +983,7 @@ Loaded by `pkg/config` (invalid values → default + entry in `Warnings`).
 
 | Variable | Default | Maps to |
 |---|---|---|
-| `AWS_REGION` | `us-east-1` | SNS / SQS region |
+| `AWS_REGION` → `AWS_DEFAULT_REGION` | `us-east-1` | SNS / SQS region |
 | `AWS_ENDPOINT_URL` | — | emulator endpoint (floci `http://localhost:4574`) |
 | `SNS_TOPIC_ARN` | — (required) | `SNSConfig.TopicARN` |
 | `SQS_QUEUE_URL` | — (required) | `SQSConfig.QueueURL` |
@@ -993,6 +994,7 @@ Loaded by `pkg/config` (invalid values → default + entry in `Warnings`).
 | `SQS_MAX_RECEIVE_COUNT` | `0` (unset) | `WithMaxReceiveCount` |
 | `SQS_QUEUE_DEPTH_INTERVAL` | off | `WithQueueDepthMetrics` (min 10s) |
 | `SQS_HANDLER_TIMEOUT` | off | `WithHandlerTimeout` |
+| `SQS_DRAIN_TIMEOUT` | 30s | `WithDrainTimeout` |
 | `OUTBOX_POLL_INTERVAL` | `5s` | `Config.PollInterval` |
 | `OUTBOX_BATCH_SIZE` | `50` | `BatchSize` |
 | `OUTBOX_MAX_ATTEMPTS` | `5` | `MaxAttempts` |
@@ -1056,7 +1058,7 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 
 ## 14. Testing Strategy
 
-`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **98.7%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, toolchain-check, fmt-check, vet, lint (incl. tagged files), docs-check, metrics-lint, rules-check, dashboards-check, test-ci, build. `Validate / Quality` additionally runs an HTML-entity check, the RLS-6 grep, `make toolchain-check` (the Go toolchain identical in the three `go.mod` files and the Dockerfile), `make vuln-check` and the Dockerfile digest-pinning check. Both validate jobs delete the private-module token right after `go mod download`, before any PR code runs; only push runs write the registry build cache the signed images are built from; `changelog-check.yml` requires a `CHANGELOG.md` entry for PRs touching `internal/`, `pkg/` or `cmd/`; `release.yml` also builds CLI binaries for 5 platforms. Developer targets: `setup`, `install-hooks`, `test-unit` / `test-int` / `test-e2e` / `test-smoke`, `cover` / `cover-func`, `docker-up` / `docker-down`, `pin-base-images`.
+`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **98.5%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, toolchain-check, fmt-check, vet, lint (incl. tagged files), docs-check, metrics-lint, rules-check, dashboards-check, test-ci, build. `Validate / Quality` additionally runs an HTML-entity check, the RLS-6 grep, `make toolchain-check` (the Go toolchain identical in the three `go.mod` files and the Dockerfile), `make vuln-check` and the Dockerfile digest-pinning check. Both validate jobs delete the private-module token right after `go mod download`, before any PR code runs; only push runs write the registry build cache the signed images are built from; `changelog-check.yml` requires a `CHANGELOG.md` entry for PRs touching `internal/`, `pkg/` or `cmd/`; `release.yml` also builds CLI binaries for 5 platforms. Developer targets: `setup`, `install-hooks`, `test-unit` / `test-int` / `test-e2e` / `test-smoke`, `cover` / `cover-func`, `docker-up` / `docker-down`, `pin-base-images`.
 
 ### 14.1 Unit tests
 
@@ -1330,4 +1332,4 @@ Summary of the v1.6.0 changes (and the `[Unreleased]` production-review fixes, r
 | 7 | Inbox `Store.Process` (exactly-once) and dead-letter awareness | §7.4 |
 | 8 | New Proposed metrics: `platform_messages_in_flight`, `platform_outbox_oldest_pending_age`, `platform_outbox_ordering_blocked_events`, `platform_message_timeouts_total` | §11.2 |
 | 9 | platform-pgcommon v1.4.3; release scripts parity; `latest=false`; `make docs-check` | §14, §16 |
-| 10 | `[Unreleased]`: FIFO per-group consumer ordering; FIFO DLQ dedup; `dataschema` pass-through; migrations 003 / 010-down / 011; replay collision skip; shutdown batch release; CI cache and token hardening; `make toolchain-check` | §4, §7.1, §8.6, §10.3, §14, §19.5 |
+| 10 | `[Unreleased]`: FIFO per-group consumer ordering (handler-timeout budget per group, receive 1 without VT, failed delete stops the group); SNS trace-attribute shedding; `Enqueue` NUL rejection; replay `ON CONFLICT`; `AWS_DEFAULT_REGION`; `SQS_DRAIN_TIMEOUT`; production-faithful `mock.Consumer`; FIFO DLQ dedup; `dataschema` pass-through; migrations 003 / 010-down / 011; replay collision skip; shutdown batch release; CI cache and token hardening; `make toolchain-check` | §4, §7.1, §8.6, §10.3, §14, §19.5 |

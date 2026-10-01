@@ -1,6 +1,7 @@
 package outbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -78,8 +79,9 @@ func enqueue(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMe
 	if env.Timestamp.IsZero() {
 		return fmt.Errorf("outbox: Enqueue requires a non-zero Timestamp — use events.NewEnvelope to construct envelopes")
 	}
-	if strings.ContainsRune(env.ID, '\x00') || strings.ContainsRune(env.Type, '\x00') || strings.ContainsRune(env.Source, '\x00') {
-		return fmt.Errorf("outbox: envelope fields (ID, Type, Source) must not contain null bytes")
+	if strings.ContainsRune(env.ID, '\x00') || strings.ContainsRune(env.Type, '\x00') || strings.ContainsRune(env.Source, '\x00') ||
+		strings.ContainsRune(env.TenantID, '\x00') || strings.ContainsRune(env.TraceID, '\x00') {
+		return fmt.Errorf("outbox: envelope fields (ID, Type, Source, TenantID, TraceID) must not contain null bytes")
 	}
 	// The ID is stored in a uuid column and read back in canonical form, while
 	// publish failures are reported under the ID in the payload: anything but
@@ -90,6 +92,12 @@ func enqueue(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMe
 	b, err := json.Marshal(env)
 	if err != nil {
 		return err
+	}
+	// The payload column is jsonb, which rejects the \u0000 escape: the
+	// INSERT would fail and roll back the caller's business transaction on
+	// every retry. Reject it here with a clear error instead.
+	if containsJSONNul(b) {
+		return fmt.Errorf("outbox: envelope contains a NUL character (\\u0000) — Postgres jsonb cannot store it; strip it from the payload and string fields")
 	}
 	// SNS message size limit is 256 KB. Reject early to avoid persisting records
 	// that will always fail at publish time and burn outbox attempt budget.
@@ -112,4 +120,26 @@ func enqueue(ctx context.Context, tx pgcommon.Tx, env events.Envelope[json.RawMe
 		ScheduledAt: now,
 		OrderingKey: orderingKey,
 	})
+}
+
+// containsJSONNul reports whether JSON text b contains the escape \u0000 — an
+// unescaped backslash followed by u0000 (a literal "\\u0000" in a string is
+// two characters, backslash and "u0000", and is fine).
+func containsJSONNul(b []byte) bool {
+	for i := 0; i < len(b); {
+		j := bytes.Index(b[i:], []byte(`\u0000`))
+		if j < 0 {
+			return false
+		}
+		k := i + j
+		n := 0
+		for p := k; p >= 0 && b[p] == '\\'; p-- {
+			n++
+		}
+		if n%2 == 1 {
+			return true
+		}
+		i = k + 1
+	}
+	return false
 }

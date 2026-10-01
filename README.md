@@ -90,7 +90,7 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | Symbol | Purpose |
 |---|---|
 | `mock.Publisher` | `Published()`, `SetError()`, `SetBatchError()` (partial / `Retryable` batch failures), `Reset()`; rejects envelopes without ID, Type or Source like the SNS publisher |
-| `mock.Consumer` | `Inject(env)` delivers synchronously with the real consumer's handler context: tenant GUC (RLS), trace ID, source message, dead-letter attribution |
+| `mock.Consumer` | `Inject(env)` delivers synchronously with the real consumer's handler context: tenant GUC (RLS), trace ID, source message, dead-letter attribution; rejects malformed envelopes (`ErrMalformedEnvelope`) and decodes codec payloads with `Codec`, as production does |
 | `mock.DLQPublisher` | `Sent()`, `SetError()`, `Reset()`; `ResolveDLQ` returns `DLQURL`; counts the forward and marks the attribution like the SQS publisher (so inbox skips dead-lettered messages in tests too) |
 
 ### `pkg/outbox` — transactional outbox
@@ -154,7 +154,7 @@ if err := dlq.SendToDLQ(ctx, queueURL, body, nil, reason); err != nil {
 |---|---|
 | `TopicARN` must be an SNS ARN | `NewSNSPublisher` rejects empty values and anything without an `arn:aws:sns:` / `arn:aws-cn:sns:` / `arn:aws-us-gov:sns:` prefix |
 | `VisibilityTimeout` ≤ 12 h | `NewSQSConsumer` rejects larger values (SQS hard limit) |
-| Outbox payload ≤ 240 KB | `outbox.Enqueue` rejects larger envelopes (the SNS limit is 256 KB) and null bytes in string fields |
+| Outbox payload ≤ 240 KB | `outbox.Enqueue` rejects larger envelopes (the SNS limit is 256 KB) and NUL characters anywhere (Postgres `jsonb` cannot store `\u0000`) |
 | Malformed message bodies are not retried | Counted as `platform_messages_failed_total{reason="malformed"}` (legacy `events_consumed_total{status="malformed"}`); forwarded verbatim to the queue's DLQ with `WithDLQForwarding`, otherwise deleted immediately |
 | `WithMaxReceiveCount(n)` must be **lower** than the queue's `RedrivePolicy` `maxReceiveCount` | Otherwise SQS moves the message before the dead-letter handler runs — see [Forwarding to the SQS DLQ](docs/guides/consuming.md#forwarding-to-the-sqs-dlq) |
 | DLQ forwards carry authoritative metadata | `DLQReason`, `OriginalQueue`, `FailedAt`, `ConsumerName` override caller values; `DLQReason` capped at 1 KiB |
@@ -217,7 +217,7 @@ The layer rules are a convention checked in review; CI enforces the depguard rul
 | Concern | Technology | Notes |
 |---|---|---|
 | **Outbound events** | AWS SNS (standard or FIFO) | Attributes `EventType` · `TenantID` · `Source` · `EventID` · `Subject` for filter policies; `PublishBatch` splits at 10 entries and 256 KiB per request |
-| **Inbound events** | AWS SQS (standard or FIFO) | Long poll (≤ 20 s), visibility extended from receipt, `ApproximateReceiveCount`-based dead-letter routing; FIFO message groups processed in order (one worker per group, a failure holds the group); `RawMessageDelivery=true` required on SNS subscriptions |
+| **Inbound events** | AWS SQS (standard or FIFO) | Long poll (≤ 20 s), visibility extended from receipt, `ApproximateReceiveCount`-based dead-letter routing; FIFO message groups processed in order (one worker per group, a failure or failed delete holds the group; one in flight per group per replica); `RawMessageDelivery=true` required on SNS subscriptions |
 | **Dead letters (producer)** | Postgres `outbox_dead_letters` | Records that exhausted `MaxAttempts`; managed via the `Runner` DLQ API |
 | **Dead letters (consumer)** | The queue's SQS DLQ | Via `RedrivePolicy`, or forwarded explicitly with `DLQPublisher` |
 | **Outbox / inbox** | PostgreSQL via `platform-pgcommon` | `outbox_events` (with optional per-key ordering), `outbox_dead_letters`, `processed_events`; own migration tracking tables |
@@ -476,7 +476,7 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 
 ### Coverage
 
-CI (`Validate / Test`: `make test-ci`, then `.github/scripts/coverage-gate.sh`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **98.7%** (verified 2026-10-01).
+CI (`Validate / Test`: `make test-ci`, then `.github/scripts/coverage-gate.sh`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **98.5%** (verified 2026-10-01).
 
 ---
 
@@ -486,7 +486,7 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AWS_REGION` | `us-east-1` | SNS and SQS clients |
+| `AWS_REGION` (then `AWS_DEFAULT_REGION`) | `us-east-1` | SNS and SQS clients |
 | `AWS_ENDPOINT_URL` | — | `http://localhost:4574` for the local floci stack |
 | `SNS_TOPIC_ARN` | — | Required for the SNS publisher |
 | `SQS_QUEUE_URL` | — | Required for the SQS consumer |
@@ -494,6 +494,7 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | ≥ 2× p99 handler duration; ≤ 12 h |
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
 | `SQS_MAX_RECEIVE_COUNT` | `0` (unset) | `WithMaxReceiveCount`; must be **below** the queue's `RedrivePolicy` `maxReceiveCount`. Takes effect with `WithDeadLetterHandler` and/or `WithDLQForwarding`, either of which defaults it to 5 when unset |
+| `SQS_DRAIN_TIMEOUT` | `30s` | `WithDrainTimeout`: how long `Stop` waits for in-flight handlers; keep it below the pod's `terminationGracePeriodSeconds` |
 | `SQS_HANDLER_TIMEOUT` | — (off) | `WithHandlerTimeout`: cancels a handler's context after this long and stops extending its message's visibility, so a hung handler's message is redelivered instead of held forever |
 | `OUTBOX_GAUGE_INTERVAL` | `15s` | How often the runner refreshes the backlog gauges (two `COUNT` queries capped at 100k rows), independent of `OUTBOX_POLL_INTERVAL` |
 | `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | `WithQueueDepthMetrics`: samples `platform_queue_depth` / `platform_dlq_depth` every interval (min 10s). Needs `sqs:GetQueueAttributes` on the queue and its DLQ; skipped when `InitMetrics` hasn't run |

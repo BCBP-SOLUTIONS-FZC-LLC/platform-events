@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sns"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
@@ -18,7 +17,11 @@ type BatchError struct {
 }
 
 func (e *BatchError) Error() string {
-	return fmt.Sprintf("events: %d message(s) failed in batch", len(e.Failures))
+	if len(e.Failures) == 0 {
+		return domain.FormatBatchError("events", 0, nil)
+	}
+	f := e.Failures[0]
+	return domain.FormatBatchError("events", len(e.Failures), &domain.BatchFailure{ID: f.ID, Code: f.Code, Message: f.Message})
 }
 
 // BatchFailure describes a single failed message within a batch.

@@ -12,10 +12,16 @@
 -- CREATE INDEX scan, and this migration is re-run once by services that move
 -- their outbox tracking to outbox_migrations (see CHANGELOG 1.6.0) — or that
 -- pre-created the index CONCURRENTLY as advised above.
+-- An INVALID index (a failed CREATE INDEX CONCURRENTLY) has the same
+-- definition but serves no queries, so it is rebuilt too. Pre-create it under
+-- this exact name: an equivalent index under another name is not detected and
+-- this migration then builds a second one, blocking writes while it does.
 DO $$
 BEGIN
     IF coalesce(pg_get_indexdef(to_regclass('idx_outbox_events_pending')), '')
-       NOT LIKE '%(scheduled_at, id) WHERE (published_at IS NULL)' THEN
+           NOT LIKE '%(scheduled_at, id) WHERE (published_at IS NULL)'
+       OR NOT coalesce((SELECT indisvalid FROM pg_index
+                        WHERE indexrelid = to_regclass('idx_outbox_events_pending')), false) THEN
         DROP INDEX IF EXISTS idx_outbox_events_pending;
         CREATE INDEX idx_outbox_events_pending
             ON outbox_events (scheduled_at, id)

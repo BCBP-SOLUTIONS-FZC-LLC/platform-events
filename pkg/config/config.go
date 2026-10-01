@@ -35,6 +35,10 @@ type SQSConfigEnv struct {
 	// HandlerTimeout (SQS_HANDLER_TIMEOUT, e.g. "5m") bounds each handler call
 	// (events.WithHandlerTimeout); 0 (default) = unbounded.
 	HandlerTimeout time.Duration
+	// DrainTimeout (SQS_DRAIN_TIMEOUT, e.g. "45s") is how long Stop waits for
+	// in-flight handlers (events.WithDrainTimeout); 0 (default) = the
+	// consumer's 30s. Keep it below the pod's terminationGracePeriodSeconds.
+	DrainTimeout time.Duration
 	// Warnings is non-empty when one or more env vars were set to invalid values
 	// and defaults were applied. Log these at startup so operators can detect
 	// misconfiguration without relying on unstructured stderr output.
@@ -254,7 +258,7 @@ func (c OutboxConfigEnv) Validate() error {
 func LoadSNS() SNSConfigEnv {
 	return SNSConfigEnv{
 		TopicARN:    os.Getenv("SNS_TOPIC_ARN"),
-		Region:      envOrDefault("AWS_REGION", "us-east-1"),
+		Region:      awsRegion(),
 		EndpointURL: os.Getenv("AWS_ENDPOINT_URL"),
 	}
 }
@@ -290,9 +294,13 @@ func LoadSQS() SQSConfigEnv {
 	if w != "" {
 		warnings = append(warnings, w)
 	}
+	drainTimeout, w := envDurationOrDefault("SQS_DRAIN_TIMEOUT", 0)
+	if w != "" {
+		warnings = append(warnings, w)
+	}
 	return SQSConfigEnv{
 		QueueURL:           os.Getenv("SQS_QUEUE_URL"),
-		Region:             envOrDefault("AWS_REGION", "us-east-1"),
+		Region:             awsRegion(),
 		EndpointURL:        os.Getenv("AWS_ENDPOINT_URL"),
 		MaxMessages:        int32(maxMsg),
 		WaitSeconds:        int32(waitSec),
@@ -301,6 +309,7 @@ func LoadSQS() SQSConfigEnv {
 		MaxReceiveCount:    maxRecv,
 		QueueDepthInterval: depthInterval,
 		HandlerTimeout:     handlerTimeout,
+		DrainTimeout:       drainTimeout,
 		Warnings:           warnings,
 	}
 }
@@ -404,6 +413,16 @@ func LoadOTel() OTelConfigEnv {
 		Insecure:         insecure,
 		Warnings:         warnings,
 	}
+}
+
+// awsRegion resolves the region like the AWS SDK's environment chain:
+// AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1. Passing us-east-1 when
+// only AWS_DEFAULT_REGION is set would point the client at the wrong region.
+func awsRegion() string {
+	if r := os.Getenv("AWS_REGION"); r != "" {
+		return r
+	}
+	return envOrDefault("AWS_DEFAULT_REGION", "us-east-1")
 }
 
 func envOrDefault(key, def string) string {

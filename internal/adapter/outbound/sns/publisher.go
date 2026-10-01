@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -62,7 +63,11 @@ type BatchFailure struct {
 }
 
 func (e *BatchError) Error() string {
-	return fmt.Sprintf("sns: %d message(s) failed in batch", len(e.Failures))
+	if len(e.Failures) == 0 {
+		return domain.FormatBatchError("sns", 0, nil)
+	}
+	f := e.Failures[0]
+	return domain.FormatBatchError("sns", len(e.Failures), &domain.BatchFailure{ID: f.ID, Code: f.Code, Message: f.Message})
 }
 
 // Publisher is the functional-option type for snsPublisher construction.
@@ -99,6 +104,41 @@ type snsPublisher struct {
 	deduplicationIDFn func(domain.Envelope[json.RawMessage]) string
 	extraAttributes   map[string]string
 	codec             port.Codec
+	// droppedTraceAttrs is set once optional trace attributes were dropped
+	// to fit the SNS limit, so the warning is logged once per publisher.
+	droppedTraceAttrs atomic.Bool
+}
+
+// maxSNSMessageAttributes is the SNS limit on message attributes per message.
+const maxSNSMessageAttributes = 10
+
+// optionalTraceAttrs are dropped, in this order, when a message would exceed
+// the SNS attribute limit: baggage and tracestate are optional context, while
+// traceparent (the cross-service span link) and the routing attributes are
+// kept. Without this, whether a publish succeeded would depend on the
+// baggage the caller's request happened to carry.
+var optionalTraceAttrs = []string{"baggage", "tracestate"}
+
+// fitAttributeLimit drops optional trace attributes until attrs fits the
+// SNS limit and logs the first time it has to.
+func (p *snsPublisher) fitAttributeLimit(attrs map[string]snstypes.MessageAttributeValue, eventType string) {
+	var dropped []string
+	for _, k := range optionalTraceAttrs {
+		if len(attrs) <= maxSNSMessageAttributes {
+			break
+		}
+		if _, ok := attrs[k]; ok {
+			delete(attrs, k)
+			dropped = append(dropped, k)
+		}
+	}
+	if len(dropped) > 0 && p.logger != nil && p.droppedTraceAttrs.CompareAndSwap(false, true) {
+		p.logger.Warn("sns: dropped optional trace attributes to fit the SNS limit of 10 message attributes (logged once)", map[string]any{
+			"dropped":    dropped,
+			"topic":      p.topicARN,
+			"event_type": eventType,
+		})
+	}
 }
 
 // Config holds the parameters for constructing an SNS publisher.
@@ -161,9 +201,10 @@ func NewWithClient(topicARN string, client SNSClientAPI, logger port.Logger, opt
 		opt(p)
 	}
 	// Warn at construction time if extra attributes are close to the SNS limit.
-	// 4 reserved + N extra + OTel headers (typically 1-3) must not exceed 10.
+	// 4 reserved + Subject + traceparent are kept (baggage / tracestate are
+	// dropped first), so more than 4 extra attributes can exceed 10.
 	if p.logger != nil && len(p.extraAttributes) >= 5 {
-		p.logger.Warn("sns: WithAttributes count is high; combined with 4 reserved attributes and OTel headers the SNS limit of 10 may be exceeded at publish time", map[string]any{
+		p.logger.Warn("sns: WithAttributes count is high; with the 4 reserved attributes, Subject and traceparent the SNS limit of 10 may be exceeded at publish time (baggage / tracestate are dropped first)", map[string]any{
 			"extra_attributes_count": len(p.extraAttributes),
 			"topic":                  topicARN,
 		})
@@ -264,9 +305,11 @@ func (p *snsPublisher) Publish(ctx context.Context, env domain.Envelope[json.Raw
 		}
 	}
 
-	// SNS hard limit: 10 message attributes per message. Validate before the
-	// API call so callers get a clear error rather than an opaque InvalidParameter.
-	if n := len(input.MessageAttributes); n > 10 {
+	// SNS hard limit: 10 message attributes per message. Shed optional trace
+	// context first, then validate before the API call so callers get a clear
+	// error rather than an opaque InvalidParameter.
+	p.fitAttributeLimit(input.MessageAttributes, env.Type)
+	if n := len(input.MessageAttributes); n > maxSNSMessageAttributes {
 		metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
 		if p.logger != nil {
 			p.logger.Error("sns: message attribute count exceeds SNS limit of 10", map[string]any{
@@ -416,9 +459,10 @@ func (p *snsPublisher) publishChunk(ctx context.Context, envs []domain.Envelope[
 			}
 		}
 		// SNS hard limit: 10 message attributes per message. Mirror the single-
-		// Publish validation so batch callers also get a clear error rather than
+		// Publish handling so batch callers also get a clear error rather than
 		// an opaque InvalidParameter from the API.
-		if n := len(attrs); n > 10 {
+		p.fitAttributeLimit(attrs, env.Type)
+		if n := len(attrs); n > maxSNSMessageAttributes {
 			metrics.RecordPublish(p.topicARN, env.Type, "error", 0)
 			if marshalErr == nil {
 				marshalErr = &BatchError{}

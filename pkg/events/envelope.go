@@ -66,6 +66,10 @@ func (e *Envelope[T]) UnmarshalJSON(b []byte) error {
 	e.UserAgent = raw.UserAgent
 	e.SchemaID = raw.SchemaID
 	e.Timestamp = raw.Timestamp
+	// Reset first: decoding into a reused Envelope whose JSON has no data
+	// must not keep the previous message's payload.
+	var zero T
+	e.Payload = zero
 	if len(raw.Data) > 0 {
 		return json.Unmarshal(raw.Data, &e.Payload)
 	}
@@ -121,6 +125,10 @@ const SystemTenantID = domain.SystemTenantID
 // WithSystemTenant marks the envelope as a system-level event with no tenant
 // scope. Use for background jobs and scheduled tasks that publish across tenants
 // or are not associated with any specific tenant.
+//
+// Consumers receive TenantID "system" and the SQS consumer sets it as the RLS
+// tenant (app.tenant_id = 'system'): RLS is not disabled, so handlers of such
+// events need a pool or role that bypasses RLS, or policies admitting 'system'.
 func WithSystemTenant() EnvelopeOpt {
 	return WithTenantID(SystemTenantID)
 }
@@ -219,7 +227,15 @@ func TraceIDFromContext(ctx context.Context) string {
 }
 
 // ParseEnvelope deserialises and validates a JSON-encoded envelope.
-// Returns errors for missing required fields (ID, Type, Source).
+// Returns ErrEnvelopeIDRequired / ErrEnvelopeTypeRequired /
+// ErrEnvelopeSourceRequired for a missing id / type / source, and an error for
+// a missing time.
+//
+// It is deliberately stricter than the SQS consumer, which requires only id,
+// type and source and passes an envelope without time to the handler (time
+// only feeds the propagation metric) — so a producer in another language that
+// omits time still has its events delivered. Producers must always set time
+// (NewEnvelope does).
 func ParseEnvelope[T any](data []byte) (Envelope[T], error) {
 	var env Envelope[T]
 	if err := json.Unmarshal(data, &env); err != nil {
