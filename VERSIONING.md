@@ -49,8 +49,8 @@ See [ARCHITECTURE.md § Envelope compatibility guarantees](ARCHITECTURE.md#envel
 
 | Version | Status | Go module | Supported until |
 |---------|--------|-----------|-----------------|
-| `v1.6.x` | **Current** | `@v1.6.0` | Active; patch releases as needed |
-| `v1.0.x` – `v1.5.x` | Superseded | `@v1.5.0` … `@v1.0.0` | Upgrade to `v1.6.x` — MINOR releases are backward compatible (read the `[1.6.0]` upgrade notes) |
+| `v1.6.x` | **Current** | `@v1.6.1` | Active; patch releases as needed |
+| `v1.0.x` – `v1.5.x` | Superseded | `@v1.5.0` … `@v1.0.0` | Upgrade to `v1.6.x` — MINOR releases are backward compatible (read the `[1.6.0]` and `[1.6.1]` upgrade notes) |
 | `< v1.0.0` | — | — | No tagged releases before `v1.0.0` |
 
 When a new **MAJOR** line ships (e.g. `v2`), the previous major receives **security fixes only** for a period defined by the platform team (typically 6 months after `v2.0.0`).

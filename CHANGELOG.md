@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.1] - 2026-10-02
+
 ### Upgrade notes
 
 - **platform-pgcommon v1.5.1 is inherited** (from v1.4.3) — read its upgrade notes. The ones that matter here:
