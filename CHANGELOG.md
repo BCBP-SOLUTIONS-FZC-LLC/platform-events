@@ -102,6 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `SQSConsumerOptions` godoc, CLAUDE.md, ARCHITECTURE and the consuming guide describe `WithMaxReceiveCount` routing and trace-link propagation correctly; the consumer `Stop()` godoc describes its actual drain-timeout behaviour.
 - ARCHITECTURE covers `Store.Process` and per-key ordering; the outbox guide covers ordering, the canonical-ID rule, `RetryBackoff` and the full transient classification; the observability README covers the new metrics.
 - Removed the stale `APP_ENV` README row and the nonexistent `events.ErrBatchTooLarge`; ARCHITECTURE's public-API tables list `InitMetrics`, the new consumer options, `EnqueueOrdered`, `Store.Process` and `GaugeInterval`; CLAUDE.md's wiring example declares `ctx` first and enqueues before shutdown, and describes `port.Logger` and `outbox.Config` correctly. The reference CLI prints `HandlerTimeout` and the queue-depth interval.
+- `docs/lld/platform-events-lld.md` (rev 2.0) follows the platform LLD structure (the `iam-org-membership` LLD's 21 sections): API IDs, caching design, event / failure / consistency / operational invariant registers, failure-scenario table, deployment and scaling, data lifecycle, sign-off register, error taxonomy, integration, migration, operations and performance. ARCHITECTURE's threat model describes malformed-body hashing and the `platform_telemetry_label_overflow_total` overflow counter.
 
 ### Tests
 
