@@ -9,113 +9,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
-- **platform-pgcommon v1.4.1 is inherited** (from v1.4.0). From its upgrade notes, the ones that matter here:
-  - `outbox.ApplySchema` / `inbox.ApplySchema` now fail with `migrate.ErrVersionNotInSource` when the database was migrated by a newer platform-events, and with `migrate.ErrMigrationDirty` after an interrupted migration. Services that apply the schema at startup will refuse to start an older image after a newer one migrated — and this release adds outbox migrations `009` and `010`. Roll back by migrating the outbox schema down first (tracking table `outbox_migrations`), or run `ApplySchema` as a separate migration job.
+- **platform-pgcommon v1.4.1 is inherited** (from v1.4.0). Its upgrade notes that matter here:
+  - `outbox.ApplySchema` / `inbox.ApplySchema` fail with `migrate.ErrVersionNotInSource` when the database was migrated by a newer platform-events, and with `migrate.ErrMigrationDirty` after an interrupted migration. Services that apply the schema at startup will refuse to start an older image after a newer one migrated — and this release adds outbox migrations `009` and `010`. Roll back by migrating the outbox schema down first (tracking table `outbox_migrations`), or run `ApplySchema` as a separate migration job.
   - The migration lock wait is the full `lock_timeout` (30s by default) instead of 15s.
   - `NewPool` rejects negative pool durations, and DSN `pool_*` parameters are now honoured.
   - pgcommon query metrics count the caller's statements only (internal `set_config` / BEGIN / COMMIT are excluded unless they fail), so query rates drop and error ratios rise to their true values.
   - Span errors carry only the SQLSTATE unless full statements are allowed.
-
-- **`outbox.Enqueue` requires the canonical lowercase UUID form for the envelope ID** (what `events.NewEnvelope` produces). Uppercase, braced or unhyphenated IDs are rejected: Postgres stores the ID canonicalised, and the mismatch with the payload's ID made a failed batch publish look delivered.
-- **The outbox does not preserve publish order by default** — not even per aggregate on a FIFO topic (a failed or backed-off record is published after later ones; replicas publish concurrently). The docs previously said a FIFO `MessageGroupID` was enough. Use the new opt-in per-key ordering (`outbox.EnqueueOrdered`) or a per-aggregate sequence number.
-- **SQS consumer:** a JSON body without `id` / `type` / `source` (e.g. an SNS notification wrapper) is now malformed — forwarded to the DLQ or deleted — instead of reaching the handler with an empty envelope. Malformed bodies are no longer logged by default (size and SHA-256 only; opt back in with `WithMalformedBodyLogging`).
-- **`ReprocessDeadLetters` / `ReprocessDeadLettersWith` reset `created_at` to the replay time** (a replay is a fresh outbox entry, so the oldest-pending-age gauge does not jump to the dead letter's age). A record that dead-letters again shows the replay time as its `created_at`; the envelope keeps its original `time`.
-- **Outbox backlog gauges** (`outbox_pending_total`, `outbox_leased_total`, and their Proposed successors) refresh every `GaugeInterval` (15s), not every poll, and are capped at 100 000. `outbox_leased_total` also counts records waiting out a retry backoff.
-- **`mock` package behaves like production** (tests may need updating):
-  - `mock.Consumer.Inject` passes the real consumer's handler context.
-  - `mock.DLQPublisher.SendToDLQ` counts the forward and marks the dead-letter attribution, so `inbox.Handler` / `Store.Process` skip a dead-lettered message, as in production.
-  - `mock.Publisher` rejects envelopes without ID, Type or Source.
-  - `mock.Consumer.Inject` returns the error instead of calling the handler when the envelope cannot be serialised (invalid raw JSON payload), as on the wire.
+- **Outbox retries back off, and transient failures no longer count toward `MaxAttempts`.**
+  - A permanent publish failure retries after `RetryBackoff·2^(attempt-1)` (default 1s, capped at `MaxRetryBackoff` = 5m, jittered) instead of on the next poll. With the defaults the first retries still land on the next poll, so a poison record reaches `outbox_dead_letters` in about the same ~25s; larger `MaxAttempts` values spread out up to 5m apart.
+  - Throttling, SNS-side errors, HTTP 5xx / 429, timeouts and failures without an AWS answer (network, DNS, TLS, credentials) release the lease without counting an attempt, so an SNS outage builds a backlog instead of dead-lettering it. Shutdown no longer counts an attempt either.
+  - Tune with `outbox.Config.RetryBackoff` / `MaxRetryBackoff` or `OUTBOX_RETRY_BACKOFF` / `OUTBOX_MAX_RETRY_BACKOFF`.
+- **Custom `events.Publisher` implementations:** a `BatchFailure` is transient only when `Retryable` is set (or its Code is `TransportError`). Set it only for failures that say nothing about the message.
+- **`outbox.Enqueue` requires the canonical lowercase UUID form for the envelope ID** (what `events.NewEnvelope` produces). Postgres stores the ID canonicalised, and a mismatch with the payload's ID made a failed batch publish look delivered.
+- **`outbox.ApplySchema` always tracks its migrations in `outbox_migrations`**, also when the DSN sets `x-migrations-table` (inbox already did this). A service that passed its own tracking table re-runs outbox migrations `001`–`010` into `outbox_migrations` once; every one is idempotent.
+- **The outbox does not preserve publish order by default** — not even per aggregate on a FIFO topic (a failed or backed-off record is published after later ones; replicas publish concurrently). The docs previously said a FIFO `MessageGroupID` was enough. Use the new per-key ordering (`outbox.EnqueueOrdered`) or a per-aggregate sequence number.
+- **`ReprocessDeadLetters` / `ReprocessDeadLettersWith` reset `created_at` to the replay time**, so the oldest-pending-age gauge does not jump to a dead letter's age. A record that dead-letters again shows the replay time as its `created_at`; the envelope keeps its original `time`.
+- **Outbox backlog gauges** (`outbox_pending_total`, `outbox_leased_total` and their Proposed successors) refresh every `GaugeInterval` (15s), not every poll, and are capped at 100 000. `outbox_leased_total` also counts records waiting out a retry backoff (not ordered records waiting for their key — those are `platform_outbox_ordering_blocked_events`).
+- **SQS consumer:** a JSON body without `id` / `type` / `source` (e.g. an SNS notification wrapper) is malformed — forwarded to the DLQ or deleted — instead of reaching the handler with an empty envelope. Malformed bodies are no longer logged by default (size and SHA-256 only; opt back in with `WithMalformedBodyLogging`).
 - **`events.NewSQSConsumer` / `NewSQSConsumerWithClient` return an error for a nil handler** (previously every message panicked); `WithDeadLetterHandler(nil)` is ignored.
-- **Custom `events.Publisher` implementations:** a `BatchFailure` is now treated as transient only when `Retryable` is set (or its Code is `TransportError`). A whole-batch failure from the SNS publisher is `TransportError` only when transient; a permanent one keeps its AWS code and counts toward `MaxAttempts`.
-
-- **Outbox retries back off, and transient failures no longer count toward `MaxAttempts`.** A permanent publish failure now retries after `RetryBackoff·2^(attempt-1)` (default 1s, capped at `MaxRetryBackoff` = 5m, jittered) instead of on the next poll. With the defaults the first retries still land on the next poll (the backoff is shorter than the 5s `PollInterval`), so a poison record reaches `outbox_dead_letters` in about the same ~25s; larger `MaxAttempts` values now spread out up to 5m apart. Transport errors, throttling and timeouts release the lease without counting an attempt, so an SNS outage builds a backlog (watch `PlatformEventsOutboxBacklog`) instead of dead-lettering it. Tune with `outbox.Config.RetryBackoff` / `MaxRetryBackoff` or `OUTBOX_RETRY_BACKOFF` / `OUTBOX_MAX_RETRY_BACKOFF`.
-- **`outbox.ApplySchema` always tracks its migrations in `outbox_migrations`**, also when the DSN sets `x-migrations-table` (inbox already did this). A service that passed its own tracking table re-runs outbox migrations 001–010 into `outbox_migrations` once; every one is idempotent (`IF NOT EXISTS`).
+- **The `mock` package behaves like production** (service tests may need updating):
+  - `mock.Consumer.Inject` passes the real consumer's handler context (tenant GUC for RLS, trace ID, source message, dead-letter attribution), and returns the error instead of calling the handler when the envelope cannot be serialised.
+  - `mock.DLQPublisher.SendToDLQ` counts the forward and marks the dead-letter attribution, so `inbox.Handler` / `Store.Process` skip a dead-lettered message.
+  - `mock.Publisher` rejects envelopes without ID, Type or Source, and gains `SetBatchError`.
 
 ### Fixed
 
-- **Outbox / SNS publisher (regression in the unreleased retry change):**
-  - Every whole-batch SNS failure was labelled `TransportError`, so permanent ones (`BatchRequestTooLong`, `AuthorizationError`, `NotFound`, `KMSAccessDenied`, …) were retried forever without counting attempts, holding the healthy records of the same chunk with them. Failures now carry `BatchFailure.Retryable`. Only throttling, SNS-side errors, timeouts and failures without an AWS API error (network, DNS, TLS, credentials) are transient.
-  - SNS's own throttle and internal codes (`Throttled`, `InternalError`, `KMSThrottling`) were not recognised as transient, so throttling used up attempts. Per-entry failures with `SenderFault=false` are transient too.
-  - An HTTP 5xx or 429 with no body (from a load balancer or VPC endpoint), which the SDK reports as `UnknownError`, was treated as permanent. Any 5xx / 429 is now transient, for the SQS DLQ publisher too; a body-less 4xx (a proxy's 403 / 413) stays permanent so it dead-letters rather than retrying forever.
-  - Rows written before `Enqueue` required canonical IDs, or replayed from `outbox_dead_letters`, could have a payload ID that differed in case from the stored `rec.ID`. A failed batch publish of such a row was marked published. Failure IDs are now matched in canonical form.
-  - `PublishBatch` splits each 10-message chunk by SNS's 256 KiB request limit as well, so one large event no longer fails its neighbours with `BatchRequestTooLong`.
-  - With `PublishConcurrency > 1`, the shared transient backoff advanced once per failed record, so a one-second SNS blip parked a 50-record batch for 5 minutes. It now advances once per poll cycle.
-- **Inbox:**
-  - A message the handler dead-lettered (`SendToDLQ`, then nil) was recorded as processed, so a DLQ redrive after the fix was acked as a duplicate and never processed. It is no longer recorded.
-  - New `Store.Process(ctx, env, fn)` claims the ID inside the handler's transaction, so Postgres writes happen exactly once, including for concurrent copies and a failed record step. `Handler`'s best-effort semantics are now documented, and the `Prune` retention guidance is corrected.
 - **Outbox:**
-  - A short SNS outage (≈30s with the defaults) moved the whole pending backlog to `outbox_dead_letters`: failed records were retried on every poll with no backoff, and transient failures still used up attempts (the old `MaxAttempts+1` threshold only bought one extra try). Records stranded by shutdown no longer count an attempt either (`port.OutboxStore.ReleaseLease`).
+  - A short SNS outage (≈30s with the defaults) moved the whole pending backlog to `outbox_dead_letters`: failed records were retried every poll with no backoff, and transient failures used up attempts.
+  - Rows written before `Enqueue` required canonical IDs, or replayed from `outbox_dead_letters`, could have a payload ID that differed in case from the stored ID; a failed batch publish of such a row was marked published. Failure IDs are now matched in canonical form.
   - `Runner.Ready()` called before `Start` (the documented `go runner.Start(ctx); <-runner.Ready()` pattern) could return a channel that was never closed.
-  - `ReprocessDeadLetters` / `ReprocessDeadLettersWith` replay in `failed_at` order, like `ListDeadLetters` / `DiscardDeadLetters`, so list-then-replay with the same filter and limit replays exactly the inspected records.
+  - `ReprocessDeadLetters` / `ReprocessDeadLettersWith` replay in `failed_at` order, like `ListDeadLetters` / `DiscardDeadLetters`, so list-then-replay replays exactly the inspected records.
+  - The backlog gauges ran two uncapped `COUNT(*)` queries every poll on every replica with a 2s timeout. Under a large backlog they timed out, the gauge read -1 and `PlatformEventsOutboxBacklog` went blind (and the KEDA example scaled in at the peak).
+- **SNS publisher:**
+  - SNS's own throttle and internal codes (`Throttled`, `InternalError`, `KMSThrottling`) and body-less 5xx / 429 responses (`UnknownError`) were treated as permanent, so throttling used up attempts. Per-entry failures with `SenderFault=false` are transient too; a body-less 4xx (a proxy's 403 / 413) stays permanent. The SQS DLQ publisher classifies 5xx / 429 the same way.
+  - `PublishBatch` splits each 10-message chunk by SNS's 256 KiB request limit as well, so one large event no longer fails its neighbours with `BatchRequestTooLong`.
 - **SQS consumer:**
-  - A dead-letter handler that forwarded the message itself (`SendToDLQ`) with `WithDLQForwarding` also enabled put it in the DLQ twice and counted it twice.
+  - A message only started extending its visibility once a worker picked it up. With slow handlers, messages queued behind busy workers reappeared and were processed twice — and with `WithMaxReceiveCount` / `WithDLQForwarding`, healthy messages were dead-lettered. Every received message is now extended from receipt; batches are still received whole. Without `WithVisibilityTimeout` each receive asks only for as many messages as there are free workers. With `WithHandlerTimeout`, a message still waiting when the timeout passes is handed back to the queue; `Stop` hands back undispatched messages at once.
+  - An SNS notification wrapper decoded into an envelope with `Type = "Notification"` and no ID, so a handler ignoring unknown types deleted it as processed — silently losing the event.
+  - Malformed bodies were logged (first 512 bytes) at ERROR, putting tenant payloads in logs.
+  - A dead-letter handler that forwarded the message itself with `WithDLQForwarding` also enabled put it in the DLQ twice and counted it twice.
   - A `Stop()` during `Start`'s DLQ check (up to 10s) was lost and `Start` kept running.
-  - A panic in the dead-letter handler or `Codec.Decode` left the delivery with no outcome metric. It is now counted as failed (`dead_letter_error` / `decode_error`) and retried.
-  - Codec decode ran on the loop context, so `Stop()` turned in-flight decodes into spurious `decode_error`s. It now completes like the handler, bounded by the drain deadline.
-  - The visibility timeout is now extended during codec decode, the dead-letter handler and the DLQ forward, not just the handler, so slow dead-letter handling cannot be redelivered mid-flight.
+  - A panic in the dead-letter handler or `Codec.Decode` left the delivery with no outcome metric; it is now counted as failed and retried.
+  - Codec decode ran on the loop context, so `Stop()` turned in-flight decodes into spurious `decode_error`s.
+  - The visibility timeout is now also extended during codec decode, the dead-letter handler and the DLQ forward.
+- **Inbox:**
+  - A message the handler dead-lettered (`SendToDLQ`, then nil) was recorded as processed, so a DLQ redrive after the fix was acked as a duplicate and never processed.
+  - `Handler`'s best-effort semantics are now documented, and the `Prune` retention guidance is corrected.
 - **Metrics:**
-  - An `event_type` that is not valid UTF-8 made the Prometheus client panic inside `Publish`. It is now repaired (U+FFFD).
-  - Counters without variable labels (`outbox_mark_published_errors_total`, `events_oversized_event_type_label_total`, …) are exported at 0 on registration, so `increase()` alerts see their first increment after a restart.
+  - An `event_type` that is not valid UTF-8 made the Prometheus client panic inside `Publish`; it is now repaired (U+FFFD).
+  - Counters without variable labels are exported at 0 on registration, so `increase()` alerts see their first increment after a restart.
   - A failed `InitMetrics` (invalid identity) no longer resets the `event_type` cap.
+  - `event_type` slots are first come, first served, so unknown types from a misbehaving producer could take all 200 and turn real types into `__other__`; see `events.WithEventTypes`.
 - **Alert rules:**
-  - `PlatformEventsMessagesDeadLettered` missed the first dead-letter of each `event_type` / reason per pod, because `platform_dlq_messages_total` series are born at 1. The recording rule now counts series born in the window.
-  - `PlatformEventsConsumerStalled` no longer fires on a queue whose messages are all dead-lettered on purpose. Dead-lettering on one queue cannot hide a stall on another: it suppresses only when the service's dead-letter rate covers the stalled queue's traffic.
-  - The dead-letter recording rule treats a series as new only if it had no sample in the hour before the window, so a scrape gap no longer re-counts old dead-letters.
+  - `PlatformEventsMessagesDeadLettered` missed the first dead-letter of each `event_type` / reason per pod (those series are born at 1); the recording rule now counts series with no sample in the hour before the window, without re-counting after a scrape gap.
+  - `PlatformEventsConsumerStalled` no longer fires on a queue whose messages are all dead-lettered on purpose, and dead-lettering on one queue cannot hide a stall on another.
   - The promtool tests now start those series absent instead of at 0, which had hidden the gap.
+- **Config:** `OutboxConfigEnv.String()` masks quoted (`password='a b'`) and backslash-escaped (`password=a\ b`) keyword/value passwords whole; previously part of them was printed.
 - **CI:**
-  - The release image signature check only accepted tag refs, so a manual `workflow_dispatch` release failed after pushing the image. It now verifies the exact `release.yml@<ref>` identity.
+  - The release image signature check only accepted tag refs, so a manual `workflow_dispatch` release failed after pushing the image.
   - `PR summary` now runs (`always()`) when a gate fails, and reports the 97% coverage gate.
   - Every third-party action and the interop reusable workflow (which receives a private token) are pinned by commit SHA.
-  - The lint exclusion for `test/smoke` used v1 syntax and was ignored. It now uses v2 `linters.exclusions.paths`.
-
-- **SQS consumer:**
-  - A message only started extending its visibility once a worker picked it up. With slow handlers, messages of a batch queued behind busy workers reappeared and were processed twice — and with `WithMaxReceiveCount` / `WithDLQForwarding`, healthy messages were dead-lettered. Every received message is now extended from receipt, while it waits and while it is processed; batches are still received whole (`MaxMessages`). Without `WithVisibilityTimeout` (no extension possible) each receive asks only for as many messages as there are free workers. With `WithHandlerTimeout`, a message still waiting for a worker when the timeout passes (every worker stuck) is handed back to the queue (visibility 0) instead of being extended forever; on `Stop`, undispatched messages are handed back immediately too.
-  - An SNS notification wrapper (subscription without `RawMessageDelivery`) decoded into an envelope with `Type = "Notification"` and no ID, so a handler ignoring unknown types deleted it as processed — silently losing the event. It is now malformed.
-  - Malformed bodies were logged (first 512 bytes) at ERROR, putting tenant payloads in logs. Now logged as size + SHA-256 unless `WithMalformedBodyLogging` is set.
-  - New `WithHandlerTimeout` (`SQS_HANDLER_TIMEOUT`): a hung handler no longer keeps its message invisible — and out of the queue's redrive — forever. It is one deadline for the whole message (codec decode, dead-letter handler, handler) from when a worker picks it up, shared by the contexts and the visibility extension.
-- **Outbox:** the backlog gauges ran two uncapped `COUNT(*)` queries every poll on every replica with a 2s timeout. Under a large backlog they timed out, the gauge read -1 and `PlatformEventsOutboxBacklog` went blind (and the KEDA example scaled in at the peak). They now run every `GaugeInterval` (15s, `OUTBOX_GAUGE_INTERVAL`) with a 5s timeout, capped at 100 000 rows; the KEDA example ignores -1 readings and sets `ignoreNullValues: "false"` so a count failing for longer is not read as an empty backlog.
-- **Metrics:** `event_type` slots are first come, first served, so unknown types from a misbehaving producer could take all 200 and turn real types into `__other__`. New `events.WithEventTypes(...)` pre-registers the known types.
-- **SNS / SQS DLQ:** `UnknownError` (a body-less error response) is retryable only on 5xx / 429; a body-less 4xx from a proxy stays permanent.
-- **Config:** a backslash-escaped space in an unquoted keyword/value password (`password=a\ b`) is masked whole.
-- **Mocks:** `mock.Consumer.Inject` now gives handlers the real consumer's context (tenant GUC for RLS, trace ID, source message, dead-letter attribution). `mock.DLQPublisher` counts and marks dead-letters like the SQS publisher. `mock.Publisher` validates envelopes and gains `SetBatchError`. Service tests previously passed on behaviour production does not have.
-- **Config:** `OutboxConfigEnv.String()` masks a quoted keyword/value password containing spaces (`password='a b'`) whole; previously part of it was printed.
+  - The lint exclusion for `test/smoke` used v1 syntax and was ignored.
+  - Release: `docker/metadata-action`'s default `flavor: latest=auto` tagged `latest` on every stable release, whatever the floating-tag selection said; it is now `latest=false`.
 
 ### Added
 
-- **Per-key ordering for the outbox (opt-in per record).** `outbox.EnqueueOrdered(ctx, tx, env, orderingKey)`: records with the same key are published one at a time, in enqueue (INSERT) order, across replicas — callers take the aggregate's row lock before enqueueing so insert order is commit order. A record behind an unpublished one of its key waits (`scheduled_at = 'infinity'`) and is promoted when the key's head is published or dead-lettered, so claims never scan a key's backlog. Migration `010` adds `ordering_key` (outbox and dead-letter tables, kept through dead-lettering and replay), `ordering_seq` (a sequence) and their partial index — metadata-only on existing rows.
-- **Migration `010` changed during development** (it now creates `outbox_events_ordering_seq` and `ordering_seq`). It is unreleased; a development database that applied an earlier draft of `010` must be rolled back to `009` (`migrate down 1`) and migrated again.
-- **Outbox runner re-polls while batches publish** (bounded by `PollInterval`), so a backlog drains at publish speed instead of one batch per tick; it stops on a batch that published nothing or hit a transient failure, so an outage never becomes a claim-and-fail loop.
-- Proposed metrics `platform_outbox_ordering_blocked_events` (records waiting behind their key's head) and `platform_message_timeouts_total{queue,event_type,operation}` (`WithHandlerTimeout` expiries by stage: `decode`, `dead_letter_handler`, `handler`). Timeouts are still counted in `platform_messages_failed_total` under their usual reason; the new counter separates them without changing that Canonical metric's vocabulary.
-
-- `events.WithHandlerTimeout`, `events.WithMalformedBodyLogging`, `events.WithEventTypes`, `outbox.Config.GaugeInterval`; env `SQS_HANDLER_TIMEOUT`, `OUTBOX_GAUGE_INTERVAL`.
-- Proposed metric `platform_outbox_oldest_pending_age` — age in seconds of the oldest unpublished outbox event; catches a stalled outbox whose backlog is too small for `PlatformEventsOutboxBacklog` (transient failures never dead-letter). Its alert ships commented out until ratification. Outbox migration `009` adds the partial index it reads (`CREATE INDEX` without `CONCURRENTLY` — on a large outbox, create it concurrently by hand first).
-- Proposed metric `platform_messages_in_flight{queue}` — messages a consumer replica is processing; at the concurrency limit for long means saturation or a hung handler.
+- **Per-key outbox ordering (opt-in per record).** `outbox.EnqueueOrdered(ctx, tx, env, orderingKey)`: records with the same key are published one at a time, in enqueue (INSERT) order, across replicas — callers take the aggregate's row lock before enqueueing so insert order is commit order. A record behind an unpublished one of its key waits (`scheduled_at = 'infinity'`) and is promoted once the key's head is published (best-effort, with a sweep as fallback) or dead-lettered, so claims never scan a key's backlog. Migration `010` adds `ordering_key` (outbox and dead-letter tables, kept through dead-lettering and replay), `ordering_seq` (a sequence) and their partial index — metadata-only on existing rows.
+- **Outbox runner re-polls while batches publish** (bounded by `PollInterval`), so a backlog drains at publish speed instead of one batch per tick; it stops on a batch that published nothing or hit a transient failure, and on `Stop`.
+- **`inbox.Store.Process(ctx, env, fn)`** claims the event ID inside the handler's transaction, so Postgres writes happen exactly once, including for concurrent copies.
+- `events.WithHandlerTimeout` (`SQS_HANDLER_TIMEOUT`): one deadline per message, from when a worker picks it up, for codec decode, dead-letter handler, handler and the visibility extension — a hung handler no longer keeps its message invisible and out of redrive forever.
+- `events.WithMalformedBodyLogging`, `events.WithEventTypes`, `outbox.Config.GaugeInterval` (`OUTBOX_GAUGE_INTERVAL`), `BatchFailure.Retryable`.
+- Proposed metrics:
+  - `platform_outbox_oldest_pending_age` — age in seconds of the oldest unpublished outbox event; catches a stalled outbox whose backlog is too small for `PlatformEventsOutboxBacklog`. Its alert ships commented out until ratification. Migration `009` adds the partial index it reads (`CREATE INDEX` without `CONCURRENTLY` — on a large outbox, create it concurrently by hand first).
+  - `platform_outbox_ordering_blocked_events` — ordered records waiting behind their key's head.
+  - `platform_message_timeouts_total{queue,event_type,operation}` — `WithHandlerTimeout` expiries by stage (`decode`, `dead_letter_handler`, `handler`). They are still counted in `platform_messages_failed_total` under their usual reason; this separates them without changing that Canonical metric's vocabulary.
+  - `platform_messages_in_flight{queue}` — messages a consumer replica is processing.
 
 ### Changed
 
-- `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` v1.4.0 → **v1.4.1** (root and `test/` modules); pgx stays v5.11.0. No code change was needed: all suites pass unchanged.
+- `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` v1.4.0 → **v1.4.1** (root and `test/` modules); pgx stays v5.11.0. No code change was needed.
+- AWS SDK for Go v2 upgraded: core v1.47.1, `service/sns` v1.47.2, `service/sqs` v1.52.1, `smithy-go` v1.28.2.
 - Release workflow parity with platform-pgcommon v1.4.1:
   - `verify-release-tag.sh` refuses a `workflow_dispatch` from a ref other than `main` or the tag, and a tag not reachable from `origin/main`.
-  - `release-image-tags.sh`: the floating image tags `X.Y` / `X` / `latest` only move forward, so a hotfix of an older line no longer re-points `latest`, and pre-releases never move them.
+  - `release-image-tags.sh`: the floating image tags `X.Y` / `X` / `latest` only move forward, so a hotfix of an older line no longer re-points them, and pre-releases never move them.
   - `changelog-section.sh`: a release candidate may use its base version's CHANGELOG section.
-- AWS SDK for Go v2 upgraded: core v1.47.1, `service/sns` v1.47.2, `service/sqs` v1.52.1, `smithy-go` v1.28.2.
 
 ### Docs
 
-- `VERSIONING.md`, the envelope, consuming and outbox guides, `EVENT_SCHEMA_GOVERNANCE.md` and `CONTRIBUTING.md` now use the envelope's real wire keys (`time`, `specversion`, `dataschema`, `data`).
-- The `SQSConsumerOptions` godoc and ARCHITECTURE / consuming guide describe `WithMaxReceiveCount` routing correctly.
-- ARCHITECTURE now covers `Store.Process`; the outbox guide covers the canonical-ID rule, `RetryBackoff` and the full transient classification.
+- `VERSIONING.md`, CLAUDE.md, the envelope, consuming and outbox guides, `EVENT_SCHEMA_GOVERNANCE.md` and `CONTRIBUTING.md` use the envelope's real wire keys (`time`, `specversion`, `dataschema`, `data`).
+- The `SQSConsumerOptions` godoc, CLAUDE.md, ARCHITECTURE and the consuming guide describe `WithMaxReceiveCount` routing and trace-link propagation correctly; the consumer `Stop()` godoc describes its actual drain-timeout behaviour.
+- ARCHITECTURE covers `Store.Process` and per-key ordering; the outbox guide covers ordering, the canonical-ID rule, `RetryBackoff` and the full transient classification; the observability README covers the new metrics.
 - Removed the stale `APP_ENV` README row.
-
-- CLAUDE.md:
-  - The envelope JSON now uses the real keys (`specversion`, `dataschema`, `time`, `data`).
-  - The over-`MaxReceiveCount` routing and trace-link propagation descriptions now match the code.
-- `Stop()` godoc now describes the drain-timeout behaviour the consumer actually has.
 
 ### Tests
 
-- Merged coverage raised from 97.7% to 99.1%. New tests cover outbox/inbox store error paths (missing tables, Prune validation), SNS invalid-payload, batch marshal and codec failures, envelope `UnmarshalJSON` type errors, inbox `ApplySchema` DSN validation, outbox poll-failure backoff, queue-depth sampling interrupted by Stop, and baggage propagation into handlers.
+- Merged coverage is 99.0% (from 97.7%). New tests cover outbox and inbox store error paths, SNS failure classification and batch splitting, the consumer's visibility, timeout, malformed-body and shutdown paths, per-key ordering against Postgres (including commit order vs transaction start and an end-to-end runner run with a failing head), the runner's re-poll and gauges, and mock fidelity.
 - Fixed `TestDispatch_VisibilityExtension_NilReceiptHandle`: it slept 150ms, shorter than the extender's 1s minimum tick, so it never exercised the extension path.
 
 ## [1.6.0] - 2026-10-01

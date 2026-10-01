@@ -21,9 +21,11 @@
 # that was scanned and smoke-tested — not a rebuild that could differ.
 #
 # Differences from ci.yml, all release-specific: the verify job; checkouts pin
-# the tag; images are tagged vX.Y.Z / vX.Y / vX / latest instead of branch /
-# sha; provenance is mode=max and exported; the Cosign identity must be a tag
-# ref; binaries + publish replace pr-summary.
+# the tag; images are tagged X.Y.Z (plus X.Y / X / latest only when this tag
+# is the highest stable version of that line) instead of branch / sha;
+# provenance is mode=max and exported; the Cosign identity is release.yml at
+# the run's ref (the tag, or main for a dispatch); binaries + publish replace
+# pr-summary.
 name: Release
 
 "on":
@@ -397,9 +399,13 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.IMAGE_NAME }}
-          # Produces vMAJOR.MINOR.PATCH, plus the floating tags verify selected.
           # X.Y.Z always; X.Y, X and latest only when this tag is the highest
           # stable version of that line (release-image-tags.sh in verify).
+          # latest=false: metadata-action's default (latest=auto) adds latest
+          # to every stable semver tag, which would move it backwards on a
+          # hotfix of an older line.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ env.RELEASE_TAG }}
             type=semver,pattern={{major}}.{{minor}},value=${{ env.RELEASE_TAG }},enable=${{ needs.verify.outputs.tag_minor == 'true' }}

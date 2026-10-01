@@ -231,7 +231,9 @@ func promoteNext(ctx context.Context, tx pgcommon.Tx, key string) error {
 // earlier unpublished record, and returns how many it promoted. Publishing
 // or dead-lettering a head promotes its successor directly; this sweep only
 // catches a record enqueued while its head was being published (its insert
-// saw the head still unpublished). The runner calls it every GaugeInterval.
+// saw the head still unpublished) or whose best-effort promotion failed. The
+// runner calls it with the gauge refresh: every GaugeInterval, or
+// PollInterval if that is longer.
 func (s *Store) PromoteWaiting(ctx context.Context) (int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
