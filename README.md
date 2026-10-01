@@ -241,7 +241,7 @@ This is a **private module**. Configure Go before fetching:
 ```bash
 go env -w GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*
 git config --global url."ssh://git@github.com/".insteadOf "https://github.com/"   # SSH key registered with the org
-go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@v1.5.0
+go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@v1.6.0
 ```
 
 **CI / Docker builds:** add a GitHub PAT (classic `repo` scope, or fine-grained Contents: Read on all `BCBP-SOLUTIONS-FZC-LLC/*` repos) as the repository secret `GO_PRIVATE_TOKEN`, and configure git credentials before `go mod download`:
@@ -560,8 +560,8 @@ This is a library — it is never deployed; consuming services pin a Git tag. Th
 | **PATCH** | Bug fix, performance improvement, documentation correction |
 
 ```bash
-git tag -a v1.5.0 -m "v1.5.0"
-git push origin v1.5.0     # triggers release.yml
+git tag -a v1.6.0 -m "v1.6.0"
+git push origin v1.6.0     # triggers release.yml
 ```
 
 `release.yml` is the **same pipeline as `ci.yml`**, run at the tag: a fast `Verify tag + CHANGELOG` job (tag = checkout, `## [X.Y.Z]` section present), then the identical `Validate / Test`, `Validate / Quality`, `Build image (cache)`, `Trivy CVE scan` (CRITICAL / HIGH / UNKNOWN), `Smoke tests` and `Cross-language compatibility` gates, plus 5-platform CLI binaries. Only after **all** of them pass does `Push image → GHCR` publish the image (`vX.Y.Z`, `vX.Y`, `vX`, `latest`) — a cache hit of the exact image that was scanned and smoke-tested — with SBOM, SLSA provenance and a Cosign keyless signature, and `GitHub Release` publishes the notes from the matching `CHANGELOG.md` section with binaries, checksums, SBOM and provenance attached. SemVer rules and supported versions: [VERSIONING.md](VERSIONING.md).

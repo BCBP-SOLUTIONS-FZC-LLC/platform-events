@@ -7,16 +7,17 @@
 | Document type | Low-Level Design (LLD) |
 | Library | `platform-events` — shared Go library (never deployed as a service) |
 | Go module | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events` (`go 1.26.0`, `toolchain go1.26.8`) |
-| Status | v1.6.0 + `[Unreleased]` — implemented on branch `feat/observability-standard` |
+| Status | v1.6.0 — released 2026-10-01 (PR #12) |
 | Base documents | [`ARCHITECTURE.md`](../../ARCHITECTURE.md), [`README.md`](../../README.md), [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md), [`EVENT_SCHEMA_GOVERNANCE.md`](../../EVENT_SCHEMA_GOVERNANCE.md), [`docs/observability/`](../observability/README.md) |
 | Sibling libraries | `platform-pgcommon` v1.4.3 (database, transactions, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
 | Consumers | Platform services (e.g. `iam-org-membership`, whose LLD §7 / §9 / §20 rely on the outbox and consumer contracts defined here) |
-| Deployment stage | Library — consumed via `go get`; v1.6.0 not yet tagged; branch unpushed (see §13.4) |
+| Deployment stage | Library — consumed via `go get …@v1.6.0` (see §13.4) |
 
 ### Revision history
 
 | Rev | Date | Change |
 |---|---|---|
+| 2.4 | 2026-10-01 | v1.6.0 released: CHANGELOG `[Unreleased]` folded into `[1.6.0]`; status, §13.4 deployment stage, OQ-8 closed, release appendix. No design change. |
 | 2.3 | 2026-10-01 | platform-pgcommon v1.4.2 → v1.4.3 (documentation-only upstream release — pgcommon's own LLD and doc corrections; none of the corrected claims are repeated here). No code change. OQ-6 still open: v1.4.3's `release.yml` still has no `latest=false`. |
 | 2.2 | 2026-10-01 | Two-way gap audit against the code. Corrected: the layer rule is convention (only depguard is CI-enforced) and depguard skips `test/smoke` (§3.2); `port.Logger` has no `With`/`Named` (§3.3.1); `Enqueue` enforces a canonical UUID, v7 by convention (§4.2); the failure reason when a forward fails depends on the path (§8.7, §9.3); extender bound `WithConcurrency + MaxMessages` (§9.1); connection budget counts `PublishConcurrency` (§13.2); gauges refresh at the first poll after `GaugeInterval` (§8.4, §21.3); extension cadence `max(VT/2, 1s)` (§21.4); the CI `Smoke tests` job checks only the image (§14.4). Added: lifecycle semantics (§5.4, §5.6), `NewPublisherBridge` (O-12), remaining exported symbols (§5.5, §5.7, §5.8), receive-loop backoff and fixed per-call timeouts (§9.1), the bookkeeping budget (§8.4), DLQ send details (§10.3), inbox UUID rule (§7.4), queue-depth sampler and propagation details, label value sets, legacy successors and sunset (§11.2), a log catalogue (§11.4), CI gates and developer targets (§14), the `x-migrations-table` note (§19.4). Code: dead-letter list / replay / discard now order by `failed_at, id`, so a list-then-replay selects the same rows. |
 | 2.1 | 2026-10-01 | Accuracy pass against the code: public `DLQConfig` has no `Clock`; the consumer requires `id`/`type`/`source` (only `ParseEnvelope` also requires `time`); constructor errors vs clamped values (§12); all three `NewSNSPublisher` construction errors; envelope sentinels come from `ParseEnvelope` and outbox validation, not the SNS publisher; `ErrInvalidSignature` is reserved; white-box test scope; release appendix (`DLQPublisher` shipped in v1.5.0); gauge cadence max(`GaugeInterval`, `PollInterval`) in §21.3. |
@@ -57,7 +58,7 @@ This document is the low-level design for **`platform-events`**, the shared Go l
 
 Refined into an implementable specification, this document gives the exact tables and indexes the library creates in a service's database, the public signatures and their behavioural contracts, the state machines behind publish / consume / outbox / inbox, the invariants that hold across them, configuration, metrics, and the operational procedures a service owner needs. Where this LLD and the code disagree, **the code is authoritative**; the discrepancy is a documentation bug and this document is updated with the change.
 
-**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `feat/observability-standard` at revision 2.3 (merged coverage 99.0%, `make ci` green).
+**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `feat/observability-standard` at revision 2.4 (merged coverage 99.0%, `make ci` green).
 
 ### 1.1 Relationship to the architecture documents
 
@@ -89,7 +90,7 @@ Other documents and their roles:
 | `EVENT_SCHEMA_GOVERNANCE.md` | Payload schema evolution rules and the cross-service event-type registry (owned by producing services) |
 | `docs/guides/*.md` | Task guides: quick start, envelope, publishing, consuming, outbox, codec, HMAC, observability, operations, testing in services |
 | `docs/observability/` | Observability standard as applied here, generated metrics registry (`metrics-registry.md`), runbook |
-| `CHANGELOG.md` | Release history; `[Unreleased]` + `[1.6.0]` describe the state this LLD documents |
+| `CHANGELOG.md` | Release history; `[1.6.0]` describes the state this LLD documents |
 
 ---
 
@@ -1040,9 +1041,8 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 
 | Item | State (2026-10-01) |
 |---|---|
-| Latest tag | `v1.5.0` |
-| Next release | `v1.6.0` (CHANGELOG `[1.6.0]` + `[Unreleased]`), not yet tagged |
-| Branch | `feat/observability-standard`, unpushed; no PR open |
+| Latest tag | `v1.6.0` (CHANGELOG `[1.6.0]`; previous `v1.5.0`) |
+| Source | PR #12 (`feat/observability-standard`) merged to `main` |
 | Dependencies | platform-pgcommon v1.4.3, aws-sdk-go-v2 v1.47.1 (sns v1.47.2, sqs v1.52.1), Go toolchain 1.26.8 |
 | Consumers | Platform services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z` (`GOPRIVATE=github.com/BCBP-SOLUTIONS-FZC-LLC/*`) |
 
@@ -1129,7 +1129,7 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | OQ-5 | `PlatformEventsConsumerStalled` suppression uses the service-wide dead-letter rate (`platform_dlq_messages_total` has no `queue` label) | Observability standard owners | Accepted |
 | OQ-6 | platform-pgcommon's `release.yml` uses `docker/metadata-action` `latest=auto` (fixed here with `latest=false`) | pgcommon owners | Upstream fix pending (still open in v1.4.3) |
 | OQ-7 | Migration `010` changed during development; a dev database that applied an earlier draft needs `migrate down 1` and re-migrating | Release owner | Note for the PR |
-| OQ-8 | Release `v1.6.0`: push the branch, open the PR, tag after merge; update §13.4 | Release owner | Pending |
+| OQ-8 | Release `v1.6.0`: push the branch, open the PR, tag after merge; update §13.4 | Release owner | Closed — tagged `v1.6.0` |
 
 **Known limitations (accepted by design):**
 
@@ -1233,7 +1233,7 @@ The library's migrations are versioned separately in `outbox_migrations` / `inbo
 
 ### 19.4 Historical upgrade notes
 
-`ARCHITECTURE.md` § Migration 003 — production upgrade runbook covers the pending-index migration for tables that predate it. `CHANGELOG.md` `[Unreleased]` → Upgrade notes: a service that passed its own `x-migrations-table` re-runs outbox migrations `001`–`010` into `outbox_migrations` once (all idempotent).
+`ARCHITECTURE.md` § Migration 003 — production upgrade runbook covers the pending-index migration for tables that predate it. `CHANGELOG.md` `[1.6.0]` → Upgrade notes: a service that passed its own `x-migrations-table` re-runs outbox migrations `001`–`010` into `outbox_migrations` once (all idempotent).
 
 ### 19.5 Rollback
 
@@ -1309,7 +1309,7 @@ Raise `BatchSize` for throughput, `PublishConcurrency` for per-record latency, l
 
 ## Appendix — Changes in this release
 
-Summary of the v1.6.0 + `[Unreleased]` changes this LLD reflects (full list in `CHANGELOG.md`):
+Summary of the v1.6.0 changes this LLD reflects (full list in `CHANGELOG.md`):
 
 | # | Change | Sections |
 |---|---|---|
