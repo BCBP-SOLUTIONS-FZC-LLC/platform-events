@@ -464,6 +464,18 @@ func TestStandard_LegacyRegistrationFailureIsAnError(t *testing.T) {
 	require.Error(t, err)
 	assert.Same(t, before, internalmetrics.CurrentPlatform(), "a failed init must not replace the active set")
 	assert.Same(t, legacyBefore, internalmetrics.EventsPublishedTotal)
+
+	// Nothing is left on the registerer either: the legacy collectors that
+	// did register are removed, so they are absent rather than exported at 0.
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		assert.Equal(t, "events_published_total", mf.GetName(), "only the caller's own collector may remain")
+	}
+
+	// A retry without legacy metrics succeeds on the same registerer.
+	_, err = events.InitMetrics(testIdentity, reg, events.WithoutLegacyMetrics())
+	require.NoError(t, err)
 }
 
 func TestStandard_NilRegistererUsesDefault(t *testing.T) {

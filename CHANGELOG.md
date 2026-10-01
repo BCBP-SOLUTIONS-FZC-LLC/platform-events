@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **New outbox migration `011`** replaces the dead-letter index `idx_outbox_dead_letters_failed_at (failed_at DESC)` with `idx_outbox_dead_letters_failed_at_id (failed_at, id)` — the order list, replay and discard use. Rolling back past it needs `migrate down` first (see 1.6.0's `ErrVersionNotInSource` note).
+- **FIFO source queues are now processed per message group, in order.** A `.fifo` queue's batch is split by `MessageGroupId`; each group runs on one worker in receive order, and a message that is not settled (handler error, failed decode or DLQ forward, panic) hands the group's later messages of that batch back unprocessed. FIFO consumers lose cross-message parallelism within a group (groups still run in parallel up to `WithConcurrency`) — set `WithVisibilityTimeout` so queued group messages are extended while they wait.
+- **A `dataschema` on a plain-JSON `data` is passed through undecoded.** Only a JSON-string `data` (the codec wire format) is decoded. Consumers on 1.6.0 or older still dead-letter such messages, so do not use `WithSchemaID` as an informational tag.
+
+### Fixed
+
+- **SQS consumer:**
+  - FIFO queues lost per-group order: messages of one group ran in parallel, and after a failure the group's later messages were still processed and deleted.
+  - A message dispatched right at its waiting deadline (`WithHandlerTimeout`) could stop being extended before processing and be delivered twice.
+  - `Stop` could return before the queue-depth sampler goroutine had exited.
+  - A visibility-extension call could race `DeleteMessage`, logging a spurious "possible duplicate delivery" warning and counting a dependency error.
+  - A `dataschema` on a JSON-object `data` failed decode on every delivery and dead-lettered the message.
+- **DLQ publisher:** a FIFO DLQ deduplicated a second forward of the same event within 5 minutes (two queues sharing one DLQ, a redriven message failing again) while reporting success, so the source message was deleted and the dead-letter lost. `MessageDeduplicationId` is now unique per forward.
+- **Outbox:**
+  - Rolling migration `010` back stranded ordered records waiting at `scheduled_at = 'infinity'` (never claimed by the older code); `010` down now makes them due first.
+  - Migration `003` dropped and rebuilt `idx_outbox_events_pending` under an `ACCESS EXCLUSIVE` lock on every run — including the one-time re-run 1.6.0 causes for services that passed their own `x-migrations-table`. It now rebuilds only when the index has a different shape.
+  - A shutdown during `PublishBatch` released the unsent records with the shared transient backoff (up to `MaxRetryBackoff`), hiding them from other replicas and advancing the backoff; they are now released at once.
+  - A dead letter whose ID was re-enqueued into `outbox_events` failed every `ReprocessDeadLetters` call on the primary key (it is always selected first); it is now left in place and logged.
+  - `MarkFailed` on a record another runner had already published or dead-lettered counted `platform_retry_total`.
+- **Metrics:** `InitMetrics` left the legacy collectors it had registered on the registerer when a later legacy registration failed, so they were exported at zero ("healthy") rather than absent.
+- **`GlueDecodeCodec`** passed a non-JSON (e.g. Avro-format or empty) payload to the handler; it now returns a decode error.
+- **Config:** `OutboxConfigEnv.String()` did not mask `sslpassword`, and `%#v` printed the raw DSN (new `GoString`).
+
+### Changed
+
+- Each visibility-extension `ChangeMessageVisibility` call is bounded by `min(max(VisibilityTimeout/2, 1s), 10s)`.
+- FIFO receives carry a fresh `ReceiveRequestAttemptId`, so an SDK-retried receive does not block its message groups until the visibility timeout.
+- Monitoring: legacy recording rules and alerts aggregate by `namespace` too, and the KEDA example selects it, so one Prometheus scraping several environments does not mix them. Alert descriptions of `PlatformEventsOutboxPollFailing` and `PlatformEventsConsumerStalled` match their windows; `identityOwner` removed from the KEDA SQS trigger.
+- CI: pull requests no longer write the registry build cache the signed `main` / release images are built from; the private-module token is deleted right after `go mod download`; the Trivy DB cache key rolls daily; new `make toolchain-check` (in `make ci` and `Validate / Quality`) keeps the Go toolchain identical across the three `go.mod` files and the Dockerfile.
+
+### Docs
+
+- HMAC: canonicalisation fixes the envelope field order but does not re-sort payload keys (CLAUDE.md said it did); `WithoutLegacyMetrics` warns that it silences the producer alerts until the successors are ratified; close the pool only after `runner.Stop()` returns nil; LLD rev 2.5 (FIFO consumer, migrations 003 / 010 / 011, replay collision, known limitations L-6 / L-7).
+
+### Tests
+
+- FIFO group order and failure hold, FIFO receive input, no extension after delete, `dataschema` pass-through; shutdown mid-batch release; migration `010` down, `003` no-rebuild, `011` index, replay collision, `MarkFailed` on a published record; metrics rollback; Glue non-JSON; `sslpassword` / `%#v` masking; promtool tests for `OutboxPollFailing`, `SQSReceiveFailing`, `OversizedEventType`.
+
 ## [1.6.0] - 2026-10-01
 
 ### Upgrade notes (action required)

@@ -60,6 +60,14 @@ jobs:
           (cd test && go mod download)
           (cd tools && go mod download)
 
+      # The token reaches other private repositories: remove it before any
+      # PR-controlled code (tests, linters, make targets) runs.
+      - name: Remove private module credentials
+        if: always()
+        run: |
+          rm -f ~/.git-credentials
+          git config --global --unset-all credential.helper || true
+
       # Three modules (library, test/, tools/) — see the Makefile's module layout.
       - name: Verify modules
         run: make mod-verify
@@ -134,6 +142,9 @@ jobs:
       # ARCHITECTURE.md (docs-only changes: docs.yml).
       - name: Architecture diagram sync
         run: make docs-check
+
+      - name: Toolchain consistency
+        run: make toolchain-check
 
       - name: Vulnerability check
         run: |

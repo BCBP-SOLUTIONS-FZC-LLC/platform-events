@@ -381,3 +381,37 @@ func TestCanonicalID(t *testing.T) {
 	assert.Equal(t, id, canonicalID("{"+id+"}"))
 	assert.Equal(t, "not-a-uuid", canonicalID("not-a-uuid"), "non-UUIDs are compared as-is")
 }
+
+// shutdownBatchPublisher is cancelled mid-batch: like the SNS publisher, it
+// reports the entries it could not send as retryable failures.
+type shutdownBatchPublisher struct{ cancel context.CancelFunc }
+
+func (shutdownBatchPublisher) Publish(context.Context, domain.Envelope[json.RawMessage]) error {
+	return nil
+}
+func (p shutdownBatchPublisher) PublishBatch(_ context.Context, envs []domain.Envelope[json.RawMessage]) error {
+	p.cancel()
+	be := &domain.BatchError{}
+	for _, e := range envs {
+		be.Failures = append(be.Failures, domain.BatchFailure{ID: e.ID, Code: "TransportError", Message: "context canceled", Retryable: true})
+	}
+	return be
+}
+
+// TestPublishBatch_ShutdownMidBatch_ReleasesImmediately: entries left unsent
+// by a shutdown are handed back at once — not hidden for the transient
+// backoff as if SNS were failing.
+func TestPublishBatch_ShutdownMidBatch_ReleasesImmediately(t *testing.T) {
+	rec := testRecord(t, "shutdown.batch")
+	store := &claimStore{stubStore: newStubStore(), recs: []domain.OutboxRecord{rec}}
+	ctx, cancel := context.WithCancel(context.Background())
+	svc := NewOutboxService(store, shutdownBatchPublisher{cancel}, nil, nil, 5, 1, 0)
+
+	_ = svc.PublishBatch(ctx, 10)
+
+	assert.NotContains(t, store.failed, rec.ID, "shutdown must not count an attempt")
+	require.Contains(t, store.released, rec.ID)
+	assert.Contains(t, store.released[rec.ID], "publish interrupted by shutdown")
+	assert.Zero(t, store.releasedIn[rec.ID], "a record stranded by shutdown is claimable at once")
+	assert.False(t, svc.LastHadTransientFailure(), "shutdown is not an SNS outage")
+}

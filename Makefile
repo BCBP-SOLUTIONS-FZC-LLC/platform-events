@@ -185,6 +185,12 @@ mod-verify:
 	cd test && $(GO) mod verify
 	cd tools && $(GO) mod verify
 
+# toolchain-check: the Go toolchain is identical in the three go.mod files and
+# the Dockerfile builder image (bump them together for a stdlib CVE fix).
+.PHONY: toolchain-check
+toolchain-check:
+	bash .github/scripts/toolchain-check.sh
+
 .PHONY: vuln-check
 vuln-check:
 	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./internal/... ./pkg/...
@@ -324,7 +330,7 @@ docker-down:
 # -----------------------------
 
 .PHONY: ci
-ci: tidy mod-verify fmt-check vet lint docs-check metrics-lint rules-check dashboards-check test-ci build
+ci: tidy mod-verify toolchain-check fmt-check vet lint docs-check metrics-lint rules-check dashboards-check test-ci build
 
 # -----------------------------
 # OBSERVABILITY STANDARD

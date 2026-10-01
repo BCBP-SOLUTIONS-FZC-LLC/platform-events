@@ -87,6 +87,9 @@ defer func() {
     if err := runner.Stop(); err != nil {
         logger.Warn("outbox runner drain timeout — records retry after lease expiry", map[string]any{"error": err.Error()})
     }
+    // Close the pool only after this: after a drain timeout the in-flight
+    // batch may still be marking records published on a detached context, and
+    // a closed pool turns those records into re-publishes.
 }()
 
 // Optional: gate the Kubernetes readiness probe until the first poll succeeds.

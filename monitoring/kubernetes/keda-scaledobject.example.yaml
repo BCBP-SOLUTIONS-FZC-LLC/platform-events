@@ -31,7 +31,9 @@ spec:
     - type: prometheus
       metadata:
         serverAddress: http://prometheus.monitoring.svc:9090
-        query: max by (service) (max_over_time((outbox_pending_total{service="orders-service"} >= 0)[10m:30s]))
+        # Legacy metrics carry only a service label: select the namespace too,
+        # or a staging backlog scrapes into prod's scaling decision.
+        query: max by (namespace, service) (max_over_time((outbox_pending_total{namespace="orders-prod",service="orders-service"} >= 0)[10m:30s]))
         threshold: "500"
         ignoreNullValues: "false"
 
@@ -45,4 +47,3 @@ spec:
         queueURL: https://sqs.eu-west-1.amazonaws.com/123456789012/orders
         queueLength: "100" # target messages per replica
         awsRegion: eu-west-1
-        identityOwner: operator

@@ -7,7 +7,7 @@
 | Document type | Low-Level Design (LLD) |
 | Library | `platform-events` — shared Go library (never deployed as a service) |
 | Go module | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events` (`go 1.26.0`, `toolchain go1.26.8`) |
-| Status | v1.6.0 — released 2026-10-01 (PR #12) |
+| Status | v1.6.0 (released 2026-10-01) + `[Unreleased]` production-review fixes on branch `fix/production-review` |
 | Base documents | [`ARCHITECTURE.md`](../../ARCHITECTURE.md), [`README.md`](../../README.md), [`.claude/CLAUDE.md`](../../.claude/CLAUDE.md), [`EVENT_SCHEMA_GOVERNANCE.md`](../../EVENT_SCHEMA_GOVERNANCE.md), [`docs/observability/`](../observability/README.md) |
 | Sibling libraries | `platform-pgcommon` v1.4.3 (database, transactions, migrations), `platform-gincommon` (tracing init, logger, request context — interface-compatible, not imported) |
 | Consumers | Platform services (e.g. `iam-org-membership`, whose LLD §7 / §9 / §20 rely on the outbox and consumer contracts defined here) |
@@ -17,6 +17,7 @@
 
 | Rev | Date | Change |
 |---|---|---|
+| 2.5 | 2026-10-01 | Production review of v1.6.0: FIFO source queues processed per message group in order (§7.1); FIFO DLQ dedup ID unique per forward (§10.3); a `dataschema` on a non-string `data` is passed through (§7.3, EVT-5); migration 010 down releases waiting records, 003 rebuilds only when the shape differs, new 011 `(failed_at, id)` dead-letter index (§4, §19.5); replay skips IDs already in `outbox_events` (§8.6); shutdown mid-batch releases at once (§8.4); metrics rollback on legacy failure; extension calls bounded; DSN masking of `sslpassword`. |
 | 2.4 | 2026-10-01 | v1.6.0 released: CHANGELOG `[Unreleased]` folded into `[1.6.0]`; status, §13.4 deployment stage, OQ-8 closed, release appendix. No design change. |
 | 2.3 | 2026-10-01 | platform-pgcommon v1.4.2 → v1.4.3 (documentation-only upstream release — pgcommon's own LLD and doc corrections; none of the corrected claims are repeated here). No code change. OQ-6 still open: v1.4.3's `release.yml` still has no `latest=false`. |
 | 2.2 | 2026-10-01 | Two-way gap audit against the code. Corrected: the layer rule is convention (only depguard is CI-enforced) and depguard skips `test/smoke` (§3.2); `port.Logger` has no `With`/`Named` (§3.3.1); `Enqueue` enforces a canonical UUID, v7 by convention (§4.2); the failure reason when a forward fails depends on the path (§8.7, §9.3); extender bound `WithConcurrency + MaxMessages` (§9.1); connection budget counts `PublishConcurrency` (§13.2); gauges refresh at the first poll after `GaugeInterval` (§8.4, §21.3); extension cadence `max(VT/2, 1s)` (§21.4); the CI `Smoke tests` job checks only the image (§14.4). Added: lifecycle semantics (§5.4, §5.6), `NewPublisherBridge` (O-12), remaining exported symbols (§5.5, §5.7, §5.8), receive-loop backoff and fixed per-call timeouts (§9.1), the bookkeeping budget (§8.4), DLQ send details (§10.3), inbox UUID rule (§7.4), queue-depth sampler and propagation details, label value sets, legacy successors and sunset (§11.2), a log catalogue (§11.4), CI gates and developer targets (§14), the `x-migrations-table` note (§19.4). Code: dead-letter list / replay / discard now order by `failed_at, id`, so a list-then-replay selects the same rows. |
@@ -58,7 +59,7 @@ This document is the low-level design for **`platform-events`**, the shared Go l
 
 Refined into an implementable specification, this document gives the exact tables and indexes the library creates in a service's database, the public signatures and their behavioural contracts, the state machines behind publish / consume / outbox / inbox, the invariants that hold across them, configuration, metrics, and the operational procedures a service owner needs. Where this LLD and the code disagree, **the code is authoritative**; the discrepancy is a documentation bug and this document is updated with the change.
 
-**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `feat/observability-standard` at revision 2.4 (merged coverage 99.0%, `make ci` green).
+**The code is at this design.** Every table, signature, SQL fragment and invariant below was checked against the branch `feat/observability-standard` at revision 2.5 (merged coverage 98.7%, `make ci` green).
 
 ### 1.1 Relationship to the architecture documents
 
@@ -172,7 +173,7 @@ pkg/
   events/                         public API: envelope, publisher, consumer, DLQ, codec, Glue, HMAC, metrics init
   events/mock/                    Publisher, Consumer, DLQPublisher test doubles
   outbox/                         Runner, Config, Enqueue/EnqueueOrdered, ApplySchema, dead-letter API
-  outbox/migrations/              001–010 (embedded)
+  outbox/migrations/              001–011 (embedded)
   inbox/                          Handler, Store (Process, Prune), ApplySchema
   inbox/migrations/               001 (embedded)
   config/                         env loading (LoadSNS/LoadSQS/LoadOutbox) and wiring helpers
@@ -306,7 +307,7 @@ PK `processed_events_pkey (event_id, consumer)`.
 | `outbox_events` | `idx_outbox_events_published_at` (007) | `(published_at) WHERE published_at IS NOT NULL` | `PrunePublished` |
 | `outbox_events` | `idx_outbox_events_unpublished_created` (009) | `(created_at) WHERE published_at IS NULL` | `OldestPendingAge` (single probe) |
 | `outbox_events` | `idx_outbox_events_ordering` (010) | `(ordering_key, ordering_seq) WHERE published_at IS NULL AND ordering_key IS NOT NULL` | per-key head checks, `promoteKeySQL`, the claim guard |
-| `outbox_dead_letters` | `idx_outbox_dead_letters_failed_at` (004) | `(failed_at DESC)` | list / replay / discard ordering |
+| `outbox_dead_letters` | `idx_outbox_dead_letters_failed_at_id` (011; replaces 004's `(failed_at DESC)`) | `(failed_at, id)` | list / replay / discard ordering, `FailedBefore` filter |
 | `outbox_dead_letters` | `idx_outbox_dead_letters_created_at` (005) | `(created_at ASC)` | retention purges |
 | `outbox_dead_letters` | `idx_outbox_dead_letters_event_type_tenant_id` (008) | `(event_type, tenant_id)` | `DLQFilter` |
 | `processed_events` | `idx_processed_events_processed_at` | `(processed_at)` | `Prune` |
@@ -317,7 +318,7 @@ List, replay and discard all order dead letters by `failed_at, id` (a total orde
 
 | Schema | Files | Tracking table |
 |---|---|---|
-| Outbox | `pkg/outbox/migrations/001`–`010` (`.up` / `.down`) | `outbox_migrations` (`outbox.MigrationsTable`) |
+| Outbox | `pkg/outbox/migrations/001`–`011` (`.up` / `.down`) | `outbox_migrations` (`outbox.MigrationsTable`) |
 | Inbox | `pkg/inbox/migrations/001` | `inbox_migrations` (`inbox.MigrationsTable`) |
 
 | # | Outbox migration | Effect |
@@ -326,7 +327,10 @@ List, replay and discard all order dead letters by `failed_at, id` (a total orde
 | 002 | `create_outbox_dead_letters` | `outbox_dead_letters` |
 | 003–008 | indexes and defaults | pending index (003), dead-letter indexes (004, 005, 008), dead-letter defaults (006), prune index (007) |
 | 009 | `add_unpublished_created_index` | `idx_outbox_events_unpublished_created` |
-| 010 | `add_ordering_key` | sequence, `ordering_key` / `ordering_seq` on `outbox_events`, `ordering_key` on `outbox_dead_letters`, `idx_outbox_events_ordering` |
+| 010 | `add_ordering_key` | sequence, `ordering_key` / `ordering_seq` on `outbox_events`, `ordering_key` on `outbox_dead_letters`, `idx_outbox_events_ordering`; down first makes waiting (`'infinity'`) rows due |
+| 011 | `dead_letters_failed_at_id_index` | `idx_outbox_dead_letters_failed_at_id (failed_at, id)` replaces `idx_outbox_dead_letters_failed_at` |
+
+003 rebuilds `idx_outbox_events_pending` only when its definition is not already `(scheduled_at, id) WHERE published_at IS NULL`, so a re-run (tracking-table move, or an index pre-built `CONCURRENTLY`) takes no `ACCESS EXCLUSIVE` lock.
 
 - `ApplySchema` always sets `x-migrations-table` to its own table, replacing any value in the DSN, so library versions never collide with the service's migration versions.
 - All up migrations are idempotent (`IF NOT EXISTS`). Indexes are created without `CONCURRENTLY` because pgcommon runs each file in a transaction — on a large outbox, create 009 / 010's indexes concurrently by hand first (§19.3).
@@ -509,7 +513,7 @@ flowchart TD
     W -- Stop --> HB
     W -- yes --> P[parse envelope]
     P -- not JSON / missing id,type,source --> M[malformed: DLQ forward or delete; log size + sha256]
-    P --> D{dataschema set?}
+    P --> D{dataschema set and data a JSON string?}
     D -- yes --> DEC[codec decode]
     DEC -- error --> F1[failed decode_error, retry; DLQ forward past threshold]
     D -- no --> T{receive count > WithMaxReceiveCount?}
@@ -525,6 +529,8 @@ flowchart TD
 - **Dead-letter routing** only with `WithDeadLetterHandler` and/or `WithDLQForwarding`; `WithMaxReceiveCount` defaults to 5 when either is set. Panics in the handler, dead-letter handler or codec are recovered and counted.
 - **Shutdown**: `Stop()` cancels receiving, hands back undispatched messages, waits up to `DrainTimeout` for in-flight handlers (whose contexts survive `Stop` but are cancelled at the drain deadline), and returns when `Start` returns. `WithDLQForwarding` resolves the DLQ at `Start`; a missing / invalid `RedrivePolicy` fails `Start`.
 - **SNS wrapper**: a raw SNS notification body (subscription without raw message delivery) is treated as malformed — subscriptions must enable raw message delivery.
+- **FIFO queues** (URL ending `.fifo`): receives request `MessageGroupId` and carry a fresh `ReceiveRequestAttemptId`; a batch is split by group and each group is processed by **one** worker in receive order. A message that is not settled (handler error, failed decode or DLQ forward, panic, waited past its deadline) stops its group: the group's later messages in that batch are handed back unprocessed, so SQS redelivers them after it. Other groups run in parallel up to `WithConcurrency`. Set `WithVisibilityTimeout` on FIFO queues so a group's queued messages are extended while they wait.
+- **Settling**: a message's extension is stopped before `DeleteMessage`, so no extension call races the delete; each extension call is bounded by `min(max(VT/2, 1s), 10s)`.
 
 ### 7.2 Outbound — SNS publisher
 
@@ -579,7 +585,7 @@ Within `v1.x` the library only adds optional (`omitempty`) fields; it never remo
 | EVT-2 | **The envelope ID is the idempotency key.** It is a canonical lowercase UUID v7, forwarded as `EventID` attribute and FIFO `MessageDeduplicationId`, and is the `processed_events.event_id`. |
 | EVT-3 | **At-least-once delivery.** Both the outbox (publish before mark) and SQS can deliver more than once; consumers must be idempotent (§7.4). |
 | EVT-4 | **Routing without the body.** `EventType`, `TenantID`, `Source`, `EventID`, `Subject` are message attributes, so filter policies never need the payload; audit fields (`actor`, `ip_address`, `user_agent`) are never attributes. |
-| EVT-5 | **`dataschema` is the decode signal.** Empty → `data` is plain JSON and no codec runs; non-empty → the consumer codec decodes before any handler sees the message. |
+| EVT-5 | **`dataschema` with a JSON-string `data` is the decode signal.** The codec wire format is a base64 JSON string; non-empty `dataschema` + string `data` → the consumer codec decodes before any handler sees the message. Empty `dataschema`, or a non-string `data` (an informational tag), → `data` is passed through and no codec runs. |
 | EVT-6 | **Decode failures are retried, not deleted.** A registry outage is transient; the message stays visible (`decode_error`) and is forwarded to the DLQ only past the receive threshold. |
 | EVT-7 | **Malformed messages never reach a handler.** Unparseable bodies or missing required fields are forwarded (with `WithDLQForwarding`) or deleted, logged as size + SHA-256. |
 | EVT-8 | **Forward the raw message.** DLQ forwards (automatic and handler-initiated) carry the body and attributes as received (`SourceMessageFromContext`), never a re-serialised envelope. |
@@ -672,7 +678,7 @@ sequenceDiagram
 
 1. `ListDeadLetters(ctx, DLQFilter{EventType, TenantID, FailedBefore}, limit)` — inspect, oldest `failed_at` first.
 2. Fix the root cause (topic policy, payload bug, codec).
-3. `ReprocessDeadLettersWith(ctx, filter, limit)` — same filter and limit as step 1, so the same rows move back to `outbox_events` (`attempts = 0`, `created_at = NOW()`; keyed rows join the back of their key). Repeat until it returns 0.
+3. `ReprocessDeadLettersWith(ctx, filter, limit)` — same filter and limit as step 1, so the same rows move back to `outbox_events` (`attempts = 0`, `created_at = NOW()`; keyed rows join the back of their key). Repeat until it returns 0. A dead letter whose ID is already back in `outbox_events` (re-enqueued by the application) is left in place and logged (Warn, with a count) instead of failing the replay; inspect and discard it.
 4. `DiscardDeadLetters(ctx, filter, limit)` for records that must never be delivered.
 
 Each call is recorded in `platform_outbox_dead_letter_operations_total{operation}`.
@@ -701,7 +707,7 @@ _ = consumer.Stop() // hand back undispatched, drain in-flight ≤ DrainTimeout
 _ = runner.Stop()   // finish the batch in flight, release the rest ≤ DrainTimeout
 ```
 
-The pod's `terminationGracePeriodSeconds` must exceed both drain timeouts.
+The pod's `terminationGracePeriodSeconds` must exceed both drain timeouts. Close the pool only after `runner.Stop()` returns nil: after a drain timeout the batch's settle writes (detached context, §8.4) may still be running, and a closed pool turns its published records into re-publishes.
 
 ### 8.9 Startup
 
@@ -861,7 +867,7 @@ All AWS calls use the SDK's TLS endpoints; `EndpointURL` / `AWS_ENDPOINT_URL` is
 
 - `Enqueue`: required fields, canonical UUID, no NUL bytes, ≤ 240 KiB; `EnqueueOrdered`: key ≤ 256 bytes, valid UTF-8, no NUL.
 - Consumer: a body must be JSON with `id`, `type` and `source` (`ParseEnvelope` additionally requires `time`); malformed bodies never reach handlers; the codec is gated on `dataschema`.
-- `DLQPublisher`: rejects invalid input before any AWS call (`ErrDLQInvalidMessage`: empty body / reason, characters SQS disallows, invalid attribute names, body + attributes > 1 MiB); `DLQReason` truncated to 1024 bytes; empty-valued caller attributes dropped; diagnostic attributes always override caller values; more than SQS's 10 attributes → caller attributes kept in priority order `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical, the rest dropped and logged — or rejected under `StrictAttributes`. `EventType` comes from the body when it parses as an envelope, else `attrs["EventType"]`, else `unknown`. A FIFO DLQ gets `MessageGroupId` = `MessageDeduplicationId` = the envelope ID, or SHA-256 of the body when there is no valid ID.
+- `DLQPublisher`: rejects invalid input before any AWS call (`ErrDLQInvalidMessage`: empty body / reason, characters SQS disallows, invalid attribute names, body + attributes > 1 MiB); `DLQReason` truncated to 1024 bytes; empty-valued caller attributes dropped; diagnostic attributes always override caller values; more than SQS's 10 attributes → caller attributes kept in priority order `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical, the rest dropped and logged — or rejected under `StrictAttributes`. `EventType` comes from the body when it parses as an envelope, else `attrs["EventType"]`, else `unknown`. A FIFO DLQ gets `MessageGroupId` = the envelope ID (SHA-256 of the body when there is no valid ID) and a `MessageDeduplicationId` unique per `SendToDLQ` call — a content-derived one made SQS drop a second forward of the same event within 5 minutes (two source queues sharing a DLQ, a redrive that fails again) while reporting success, so the source message was deleted and the dead-letter lost.
 - HMAC: keys ≥ 32 bytes (`ErrKeyTooShort`), constant-time `hmac.Equal`, `Verify` returns false on any decode error, canonical JSON for envelopes.
 
 ### 10.4 Authorization (IAM permissions)
@@ -1050,7 +1056,7 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 
 ## 14. Testing Strategy
 
-`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **99.0%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, fmt-check, vet, lint (incl. tagged files), docs-check, metrics-lint, rules-check, dashboards-check, test-ci, build. `Validate / Quality` additionally runs an HTML-entity check, the RLS-6 grep, `make vuln-check` and the Dockerfile digest-pinning check; `changelog-check.yml` requires a `CHANGELOG.md` entry for PRs touching `internal/`, `pkg/` or `cmd/`; `release.yml` also builds CLI binaries for 5 platforms. Developer targets: `setup`, `install-hooks`, `test-unit` / `test-int` / `test-e2e` / `test-smoke`, `cover` / `cover-func`, `docker-up` / `docker-down`, `pin-base-images`.
+`make test-ci` runs root / unit / integration / e2e in parallel with `-race`, merging profiles (`scripts/merge_coverage.py`) over `./internal/...` + `./pkg/...` with `-coverpkg`. Merged coverage: **98.7%**; CI gate 97% (`.github/scripts/coverage-gate.sh`). `make ci` mirrors CI: tidy, mod-verify, toolchain-check, fmt-check, vet, lint (incl. tagged files), docs-check, metrics-lint, rules-check, dashboards-check, test-ci, build. `Validate / Quality` additionally runs an HTML-entity check, the RLS-6 grep, `make toolchain-check` (the Go toolchain identical in the three `go.mod` files and the Dockerfile), `make vuln-check` and the Dockerfile digest-pinning check. Both validate jobs delete the private-module token right after `go mod download`, before any PR code runs; only push runs write the registry build cache the signed images are built from; `changelog-check.yml` requires a `CHANGELOG.md` entry for PRs touching `internal/`, `pkg/` or `cmd/`; `release.yml` also builds CLI binaries for 5 platforms. Developer targets: `setup`, `install-hooks`, `test-unit` / `test-int` / `test-e2e` / `test-smoke`, `cover` / `cover-func`, `docker-up` / `docker-down`, `pin-base-images`.
 
 ### 14.1 Unit tests
 
@@ -1140,6 +1146,8 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | L-3 | `inbox.Handler` is best-effort (separate transactions); exactly-once needs `Store.Process` and Postgres writes. |
 | L-4 | `ApplySchema` at startup refuses an older image after a newer schema (`ErrVersionNotInSource`, §19.5). |
 | L-5 | Raw message delivery must be enabled on SNS → SQS subscriptions; SNS-wrapped bodies are malformed. |
+| L-6 | The `PromoteWaiting` sweep costs one index probe per waiting (`'infinity'`) row. A key whose head keeps failing can build a large waiting backlog, slowing each sweep (5 s timeout; a failed sweep is retried at the next refresh). A per-key head scan would be O(keys with unpublished rows) instead — cheaper for a hot key, dearer in the common case of many keys and no waiting rows — so it is not done; watch `platform_outbox_ordering_blocked_events`. |
+| L-7 | `inbox.Store.Prune` filters by `consumer` and `processed_at`; the shipped index is `(processed_at)`. Several consumers with different retentions sharing `processed_events` re-scan each other's old rows — add `(consumer, processed_at)` `CONCURRENTLY` by hand on a large table (a migration would lock inserts while it builds). |
 
 ---
 
@@ -1233,11 +1241,11 @@ The library's migrations are versioned separately in `outbox_migrations` / `inbo
 
 ### 19.4 Historical upgrade notes
 
-`ARCHITECTURE.md` § Migration 003 — production upgrade runbook covers the pending-index migration for tables that predate it. `CHANGELOG.md` `[1.6.0]` → Upgrade notes: a service that passed its own `x-migrations-table` re-runs outbox migrations `001`–`010` into `outbox_migrations` once (all idempotent).
+`ARCHITECTURE.md` § Migration 003 — production upgrade runbook covers the pending-index migration for tables that predate it. `CHANGELOG.md` `[1.6.0]` → Upgrade notes: a service that passed its own `x-migrations-table` re-runs outbox migrations `001`–`010` into `outbox_migrations` once (all idempotent; since 1.6.1, 003 skips the index rebuild when the index already has its target shape).
 
 ### 19.5 Rollback
 
-`ApplySchema` returns `migrate.ErrVersionNotInSource` when the recorded version is newer than the library's embedded migrations (e.g. after rolling a service back to an older image), and `migrate.ErrMigrationDirty` after an interrupted migration. Either migrate the schema down first (`.down.sql`; 010 down drops the ordering columns, index and sequence), or run `ApplySchema` as a separate migration Job so application pods never apply schema at startup.
+`ApplySchema` returns `migrate.ErrVersionNotInSource` when the recorded version is newer than the library's embedded migrations (e.g. after rolling a service back to an older image), and `migrate.ErrMigrationDirty` after an interrupted migration. Either migrate the schema down first (`.down.sql`; 010 down first makes ordered records still waiting at `'infinity'` due — the older claim query would never select them — then drops the ordering columns, index and sequence), or run `ApplySchema` as a separate migration Job so application pods never apply schema at startup.
 
 ---
 
@@ -1309,7 +1317,7 @@ Raise `BatchSize` for throughput, `PublishConcurrency` for per-record latency, l
 
 ## Appendix — Changes in this release
 
-Summary of the v1.6.0 changes this LLD reflects (full list in `CHANGELOG.md`):
+Summary of the v1.6.0 changes (and the `[Unreleased]` production-review fixes, row 10) this LLD reflects (full list in `CHANGELOG.md`):
 
 | # | Change | Sections |
 |---|---|---|
@@ -1322,3 +1330,4 @@ Summary of the v1.6.0 changes this LLD reflects (full list in `CHANGELOG.md`):
 | 7 | Inbox `Store.Process` (exactly-once) and dead-letter awareness | §7.4 |
 | 8 | New Proposed metrics: `platform_messages_in_flight`, `platform_outbox_oldest_pending_age`, `platform_outbox_ordering_blocked_events`, `platform_message_timeouts_total` | §11.2 |
 | 9 | platform-pgcommon v1.4.3; release scripts parity; `latest=false`; `make docs-check` | §14, §16 |
+| 10 | `[Unreleased]`: FIFO per-group consumer ordering; FIFO DLQ dedup; `dataschema` pass-through; migrations 003 / 010-down / 011; replay collision skip; shutdown batch release; CI cache and token hardening; `make toolchain-check` | §4, §7.1, §8.6, §10.3, §14, §19.5 |

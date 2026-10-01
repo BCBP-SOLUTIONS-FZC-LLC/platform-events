@@ -42,6 +42,10 @@ type SQSConfigEnv struct {
 }
 
 // OutboxConfigEnv holds environment-derived outbox runner configuration.
+//
+// Log it with %v / %s / %#v (String / GoString mask credentials). DB,
+// DatabaseURL and MigrationDatabaseURL carry the raw DSN: never log them, or
+// the struct through json.Marshal or a reflection-based logger field.
 type OutboxConfigEnv struct {
 	PollInterval time.Duration
 	BatchSize    int
@@ -89,6 +93,12 @@ func (c OutboxConfigEnv) String() string {
 		c.PollInterval, c.BatchSize, c.MaxAttempts, masked, maskedMigration, claimLease, c.StartupJitter, c.PublishConcurrency, c.PublishTimeout, c.DrainTimeout, c.RetryBackoff, c.MaxRetryBackoff, c.GaugeInterval)
 }
 
+// GoString masks credentials for %#v as String does for %v / %s. The DB field
+// (pgcommon.Config) is omitted: it carries the raw DSN and password.
+func (c OutboxConfigEnv) GoString() string {
+	return "config.OutboxConfigEnv" + c.String()
+}
+
 func maskDSN(dsn string) string {
 	const sep = "://"
 	idx := strings.Index(dsn, sep)
@@ -109,7 +119,8 @@ func maskDSN(dsn string) string {
 	return maskKeyValueDSN(dsn)
 }
 
-// maskQueryParams replaces the value of any key named "password" or "passwd" in
+// maskQueryParams replaces the value of any key named "password", "passwd" or
+// "sslpassword" (the client-key passphrase) in
 // an ampersand-delimited query string (e.g. "host=h&password=secret&sslmode=require").
 // Percent-decoded key names are compared so that %70assword=secret is also masked.
 func maskQueryParams(query string) string {
@@ -124,14 +135,14 @@ func maskQueryParams(query string) string {
 			key = decoded
 		}
 		switch strings.ToLower(key) {
-		case "password", "passwd":
+		case "password", "passwd", "sslpassword":
 			parts[i] = part[:eqIdx+1] + "***"
 		}
 	}
 	return strings.Join(parts, "&")
 }
 
-// maskKeyValueDSN masks password/passwd in a libpq keyword/value string
+// maskKeyValueDSN masks password/passwd/sslpassword in a libpq keyword/value string
 // ("host=h password='a b' dbname=d"). Values follow libpq's rules: spaces are
 // allowed around "=", and a value may be single-quoted with backslash escapes,
 // so a quoted password containing spaces or quotes is masked whole.
@@ -189,7 +200,7 @@ func maskKeyValueDSN(dsn string) string {
 			}
 		}
 		switch strings.ToLower(key) {
-		case "password", "passwd":
+		case "password", "passwd", "sslpassword":
 			out.WriteString(key + "=***")
 		default:
 			out.WriteString(key + "=" + dsn[valStart:j])

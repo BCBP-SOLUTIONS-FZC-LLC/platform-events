@@ -27,7 +27,7 @@ Detailed how-to guides split out of the top-level README, which keeps a short, t
 
 | Document | Covers |
 |----------|--------|
-| [`platform-events-lld.md`](lld/platform-events-lld.md) | Responsibilities and boundaries, module/package layout, data model (migrations 001–010), public API contract, envelope wire format, publish / consume / outbox / ordering / inbox flows, retry classification, configuration, observability, concurrency, security, testing, CI/CD, open questions |
+| [`platform-events-lld.md`](lld/platform-events-lld.md) | Responsibilities and boundaries, module/package layout, data model (migrations 001–011), public API contract, envelope wire format, publish / consume / outbox / ordering / inbox flows, retry classification, configuration, observability, concurrency, security, testing, CI/CD, open questions |
 
 ---
 

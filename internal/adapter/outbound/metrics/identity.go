@@ -134,17 +134,19 @@ func (w RegistrationWarning) Error() string {
 
 // tryRegister registers c with reg. An identical collector already registered
 // is reused (so a re-init shares series); any other failure is returned.
-func tryRegister[T prometheus.Collector](reg prometheus.Registerer, c T) (T, error) {
+// tryRegister registers c, or reuses an identical collector already
+// registered; fresh reports whether c itself was registered by this call.
+func tryRegister[T prometheus.Collector](reg prometheus.Registerer, c T) (_ T, fresh bool, _ error) {
 	if err := reg.Register(c); err != nil {
 		if are, ok := errors.AsType[prometheus.AlreadyRegisteredError](err); ok {
 			if existing, ok := are.ExistingCollector.(T); ok {
-				return existing, nil
+				return existing, false, nil
 			}
 		}
 		var zero T
-		return zero, err
+		return zero, false, err
 	}
-	return c, nil
+	return c, true, nil
 }
 
 // wrapCollision matches the error prometheus.WrapRegistererWith returns when
@@ -159,6 +161,17 @@ var wrapCollision = regexp.MustCompile(`already existing label name "([a-zA-Z_][
 type registrar struct {
 	reg      prometheus.Registerer
 	injected map[string]bool
+	// added lists the collectors this registrar registered (not reused), so
+	// a failed registration step can be undone.
+	added []prometheus.Collector
+}
+
+// rollback unregisters the collectors registered since mark (len(added)).
+func (r *registrar) rollback(mark int) {
+	for _, c := range r.added[mark:] {
+		r.reg.Unregister(c)
+	}
+	r.added = r.added[:mark]
 }
 
 func newRegistrar(reg prometheus.Registerer) *registrar {
@@ -179,8 +192,11 @@ func (r *registrar) withoutInjected(labels prometheus.Labels) prometheus.Labels 
 // the registerer reports it already applies.
 func register[T prometheus.Collector](r *registrar, labels prometheus.Labels, droppable []string, build func(prometheus.Labels) T) (T, error) {
 	for range len(droppable) + 1 {
-		c, err := tryRegister(r.reg, build(r.withoutInjected(labels)))
+		c, fresh, err := tryRegister(r.reg, build(r.withoutInjected(labels)))
 		if err == nil {
+			if fresh {
+				r.added = append(r.added, c)
+			}
 			return c, nil
 		}
 		m := wrapCollision.FindStringSubmatch(err.Error())

@@ -70,6 +70,14 @@ jobs:
           go mod download
           (cd test && go mod download)
 
+      # The token reaches other private repositories: remove it before any
+      # PR-controlled code (tests, linters, make targets) runs.
+      - name: Remove private module credentials
+        if: always()
+        run: |
+          rm -f ~/.git-credentials
+          git config --global --unset-all credential.helper || true
+
       - name: Verify modules
         run: |
           go mod verify

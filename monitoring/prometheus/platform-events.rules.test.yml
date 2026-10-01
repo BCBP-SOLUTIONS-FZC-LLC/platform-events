@@ -71,7 +71,7 @@ tests:
               queue: orders
             exp_annotations:
               summary: "event-consumer receives messages on orders but processes none"
-              description: "Messages have been delivered for 15 minutes without a single successful handler completion."
+              description: "Messages have been delivered for about 25 minutes (a 10-minute window held for 15 minutes) without a single successful handler completion."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumerstalled"
 
   # The first malformed message after a restart alerts: the failed counter is
@@ -220,7 +220,7 @@ tests:
               queue: wedged
             exp_annotations:
               summary: "event-consumer receives messages on wedged but processes none"
-              description: "Messages have been delivered for 15 minutes without a single successful handler completion."
+              description: "Messages have been delivered for about 25 minutes (a 10-minute window held for 15 minutes) without a single successful handler completion."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumerstalled"
 
   # A scrape gap around the window's start does not re-count an old series.
@@ -232,3 +232,58 @@ tests:
       - eval_time: 55m
         alertname: PlatformEventsMessagesDeadLettered
         exp_alerts: []
+
+  # Poll errors for 10 minutes page; namespaces stay separate.
+  - interval: 1m
+    input_series:
+      - series: 'outbox_poll_errors_total{service="orders",namespace="prod"}'
+        values: '0+1x30'
+      - series: 'outbox_poll_errors_total{service="orders",namespace="staging"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PlatformEventsOutboxPollFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: orders
+              namespace: prod
+            exp_annotations:
+              summary: "orders's outbox runner cannot claim events"
+              description: "Outbox poll cycles have kept failing for 10 minutes (at least one failure in every 5-minute window); outbox events may not be delivered."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxpollfailing"
+
+  # SQS receive failures for 10 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'sqs_receive_errors_total{service="worker",queue="orders"}'
+        values: '0+2x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PlatformEventsSQSReceiveFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: worker
+              queue: orders
+            exp_annotations:
+              summary: "worker cannot receive from SQS"
+              description: "ReceiveMessage has been failing for 10 minutes (credentials, IAM, network or a deleted queue)."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventssqsreceivefailing"
+
+  # One oversized event_type in the last hour raises an info alert.
+  - interval: 1m
+    input_series:
+      - series: 'events_oversized_event_type_label_total{service="worker"}'
+        values: '0 0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PlatformEventsOversizedEventType
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              service: worker
+            exp_annotations:
+              summary: "worker saw event_type values over 128 bytes"
+              description: "A producer is sending event types outside the registry's naming convention; they are counted as __oversized__."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoversizedeventtype"

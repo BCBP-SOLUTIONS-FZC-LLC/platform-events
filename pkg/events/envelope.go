@@ -164,8 +164,13 @@ func WithUserAgent(ua string) EnvelopeOpt {
 // SchemaID is normally set automatically by the SNS publisher from the
 // codec's Encode return value — do not call WithSchemaID yourself in that
 // case, since the encode step overwrites it at publish time. WithSchemaID
-// remains useful for manual/advanced construction (e.g. republishing an
-// already-encoded payload) or non-codec informational tagging.
+// remains useful for manual/advanced construction, e.g. republishing an
+// already-encoded payload (a base64 JSON string).
+//
+// Do not use it as an informational tag on a plain-JSON payload: consumers
+// treat a dataschema with a JSON-string payload as codec-encoded. (Since
+// v1.6.1 the SQS consumer passes a non-string payload through undecoded, but
+// older consumers dead-letter it.)
 func WithSchemaID(id string) EnvelopeOpt {
 	return func(c *envelopeConfig) { c.schemaID = id }
 }

@@ -343,9 +343,9 @@ func (s *Store) MarkPublished(ctx context.Context, id string) error {
 func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int, retryAfter time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
-	deadLettered := false
+	deadLettered, found := false, false
 	err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
-		deadLettered = false
+		deadLettered, found = false, false
 		// Read only the current attempts count under FOR UPDATE to serialise against
 		// a concurrent runner that re-claimed this record after lease expiry. The
 		// payload and other fields come from the in-memory rec — they are identical
@@ -370,6 +370,7 @@ func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastErr
 			}
 			return fmt.Errorf("outboxstore: MarkFailed query failed: %w", err)
 		}
+		found = true
 
 		newAttempts := attempts + 1
 		deadLettered = newAttempts >= maxAttempts
@@ -421,9 +422,12 @@ func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastErr
 	}
 	// Increment the dead-letter counter only after a successful commit so the
 	// metric never overcounts on a rolled-back transaction.
-	if deadLettered {
+	// A record another runner already published or dead-lettered was neither
+	// retried nor dead-lettered here.
+	switch {
+	case deadLettered:
 		metrics.RecordOutboxDeadLetter(rec.EventType)
-	} else {
+	case found:
 		metrics.IncRetry("outbox_publish", rec.EventType)
 	}
 	return nil
@@ -528,6 +532,20 @@ func (s *Store) PrunePublished(ctx context.Context, olderThan time.Duration, lim
 // buildDLQWhere constructs the optional WHERE clause and its positional args for
 // DLQ filter operations. Returns an empty string when the filter is a zero value
 // (matches all rows). argOffset is the $N index to start numbering from.
+// inOutbox matches dead letters whose ID is (back) in outbox_events.
+const (
+	inOutbox    = "EXISTS (SELECT 1 FROM outbox_events e WHERE e.id = outbox_dead_letters.id)"
+	notInOutbox = "NOT " + inOutbox
+)
+
+// appendCondition adds cond to a WHERE clause built by buildDLQWhere.
+func appendCondition(where, cond string) string {
+	if where == "" {
+		return " WHERE " + cond
+	}
+	return where + " AND " + cond
+}
+
 func buildDLQWhere(f domain.DLQFilter, argOffset int) (string, []any) {
 	var parts []string
 	var args []any
@@ -605,6 +623,11 @@ func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQF
 	defer cancel()
 
 	where, filterArgs := buildDLQWhere(filter, 1)
+	// A dead letter whose ID is back in outbox_events (re-enqueued by the
+	// application, e.g. with a deterministic ID) cannot be re-inserted; it
+	// stays in outbox_dead_letters instead of failing the whole replay on the
+	// primary key — every later batch would select it again (oldest first).
+	where = appendCondition(where, notInOutbox)
 	// LIMIT arg comes after filter args in the inner SELECT.
 	limitArg := len(filterArgs) + 1
 	filterArgs = append(filterArgs, limit)
@@ -625,7 +648,7 @@ func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQF
 		FROM (SELECT * FROM moved ORDER BY id) m
 	`, where, limitArg)
 
-	var moved int
+	var moved, skipped int
 	err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
 		tag, err := tx.Exec(ctx, query, filterArgs...)
 		if err != nil {
@@ -633,9 +656,18 @@ func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQF
 		}
 		moved = int(tag.RowsAffected())
 		// Replayed keyed records were queued behind their keys; make the heads due.
-		_, err = tx.Exec(ctx, promoteAllSQL)
-		return err
+		if _, err = tx.Exec(ctx, promoteAllSQL); err != nil {
+			return err
+		}
+		skippedWhere, skippedArgs := buildDLQWhere(filter, 1)
+		return tx.QueryRow(ctx, `SELECT count(*) FROM (SELECT 1 FROM outbox_dead_letters`+
+			appendCondition(skippedWhere, inOutbox)+` LIMIT 1000) x`, skippedArgs...).Scan(&skipped)
 	})
+	if err == nil && skipped > 0 && s.logger != nil {
+		s.logger.Warn("outboxstore: dead letters left in place — their IDs are already in outbox_events (inspect, then discard)", map[string]any{
+			"count": skipped,
+		})
+	}
 	if err == nil && moved > 0 {
 		metrics.RecordOutboxDeadLettersReprocessed(moved)
 	}
@@ -689,34 +721,5 @@ func (s *Store) ReprocessDeadLetters(ctx context.Context, limit int) (int, error
 	if limit <= 0 {
 		return 0, fmt.Errorf("outboxstore: limit must be positive (got %d)", limit)
 	}
-	ctx, cancel := context.WithTimeout(ctx, defaultPruneTimeout)
-	defer cancel()
-	var moved int
-	err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
-		tag, err := tx.Exec(ctx, `
-			WITH moved AS (
-				DELETE FROM outbox_dead_letters
-				WHERE id IN (
-					SELECT id FROM outbox_dead_letters
-					ORDER BY failed_at ASC, id ASC
-					LIMIT $1
-				)
-				RETURNING id, event_type, payload, tenant_id, trace_id, created_at, ordering_key
-			)
-			INSERT INTO outbox_events
-				(id, event_type, payload, tenant_id, trace_id, attempts, created_at, scheduled_at, ordering_key, ordering_seq)
-			SELECT id, event_type, payload, tenant_id, trace_id, 0, NOW(), `+replayScheduledAt+`, ordering_key, `+replayOrderingSeq+`
-			FROM (SELECT * FROM moved ORDER BY id) m
-		`, limit)
-		if err != nil {
-			return err
-		}
-		moved = int(tag.RowsAffected())
-		_, err = tx.Exec(ctx, promoteAllSQL)
-		return err
-	})
-	if err == nil && moved > 0 {
-		metrics.RecordOutboxDeadLettersReprocessed(moved)
-	}
-	return moved, err
+	return s.ReprocessDeadLettersWith(ctx, domain.DLQFilter{}, limit)
 }

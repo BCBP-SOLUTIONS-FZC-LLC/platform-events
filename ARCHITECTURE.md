@@ -47,7 +47,7 @@ graph TD
 
     subgraph infra["Infrastructure"]
         config_pkg["pkg/config\nLoadSNS · LoadSQS · LoadOutbox\nRunnerConfigFromEnv · SQSConsumerOptions"]
-        migs_pkg["pkg/outbox/migrations · pkg/inbox/migrations\nembed.FS (outbox 001–010, inbox 001)"]
+        migs_pkg["pkg/outbox/migrations · pkg/inbox/migrations\nembed.FS (outbox 001–011, inbox 001)"]
     end
 
     subgraph tests["Tests  —  test/"]
@@ -205,7 +205,7 @@ graph LR
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Deletes published records older than `olderThan` from `outbox_events` (batched to `limit` rows). Call periodically (e.g. daily) to prevent unbounded table growth; choose `olderThan ≥` the longest consumer idempotency window (minimum 7 days is safe for most workloads) |
 | `Enqueue(ctx, tx pgcommon.Tx, env)` | Inserts serialised envelope into `outbox_events` within caller's transaction; validates non-empty `ID`/`Type`/`Source`, a canonical lowercase UUID `ID`, non-zero `Timestamp`, and absence of null bytes in string fields; rejects payloads > 240 KB |
 | `EnqueueOrdered(ctx, tx, env, key)` / `MaxOrderingKeyLen` | `Enqueue` with an ordering key (≤ 256 bytes): records with the same key are published one at a time, in enqueue order — see [Write flow § Ordering](#write-flow-and-transactional-outbox) |
-| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`010` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index, DLQ filter index, unpublished `created_at` index, ordering key) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
+| `ApplySchema(ctx, runner *migrate.Runner)` | Applies embedded migrations `001`–`011` (outbox tables, indexes, dead-letter indexes, dead-letter `created_at` default, prune index, DLQ filter index, unpublished `created_at` index, ordering key, `(failed_at, id)` dead-letter index) using an isolated tracking table (`outbox_migrations`) so the caller's domain migrations remain unaffected |
 | `MigrationsTable` | Exported constant (`"outbox_migrations"`) — the golang-migrate tracking table used by `ApplySchema`; isolated from the consuming service's `schema_migrations` to prevent version-number collisions |
 
 ### pkg/inbox
@@ -394,10 +394,11 @@ The SQS consumer long-polls, dispatches each message to a bounded pool of handle
 ### Consume path
 
 1. **Receive.** The loop long-polls (`ReceiveMessage`, `WaitSeconds` default 20) for up to `MaxMessages` (default 10). Without `WithVisibilityTimeout` it asks only for as many messages as there are free workers.
-2. **Extend from receipt.** Each received message gets a visibility extender at once (`ChangeMessageVisibility` every max(`VisibilityTimeout/2`, 1s)), so messages waiting behind busy workers never reappear and are processed twice. With `WithHandlerTimeout`, a message still waiting when the timeout passes is handed back (visibility 0); `Stop` hands back undispatched messages immediately.
+2. **Extend from receipt.** Each received message gets a visibility extender at once (`ChangeMessageVisibility` every max(`VisibilityTimeout/2`, 1s), each call bounded by min(that, 10 s)), so messages waiting behind busy workers never reappear and are processed twice. With `WithHandlerTimeout`, a message still waiting when the timeout passes is handed back (visibility 0); `Stop` hands back undispatched messages immediately. A message's extension stops before it is deleted.
+   - **FIFO queues** (`.fifo`): the batch is split by `MessageGroupId` and each group runs on one worker, in order; a message that is not settled (error, failed decode / forward, panic) stops its group — the group's later messages are handed back unprocessed, so SQS redelivers them after it. Receives carry a fresh `ReceiveRequestAttemptId`.
 3. **Validate.** The body must be an envelope with `id`, `type` and `source`. Anything else — invalid JSON, or an SNS notification wrapper from a subscription without `RawMessageDelivery` — is malformed: forwarded to the DLQ (`WithDLQForwarding`) or deleted, never passed to the handler; logged as size + SHA-256 only.
 4. **Enrich the context.** `sqs.HandlerContext` adds the tenant GUC (`pgcommon.WithGUCSet`, so pool queries are RLS-scoped), the envelope trace ID and the source message; dispatch adds the dead-letter attribution and, with `WithHandlerTimeout`, one deadline for decode, dead-letter handler and handler.
-5. **Decode** (when `SchemaID` is set): a codec failure leaves the message visible (forwarded to the DLQ once past `WithMaxReceiveCount`).
+5. **Decode** (when `SchemaID` is set and `data` is a JSON string — the codec wire format; a `dataschema` on a JSON object is informational and passed through): a codec failure leaves the message visible (forwarded to the DLQ once past `WithMaxReceiveCount`).
 6. **Route.** Past `WithMaxReceiveCount` (with a dead-letter handler and/or DLQ forwarding) the dead-letter handler runs and the message is forwarded unless the handler already did; otherwise the handler runs under span `sqs.receive` (linked to the producer's `traceparent`). `nil` deletes the message; an error or panic leaves it visible for retry.
 7. **Metrics.** `platform_messages_received_total`, then exactly one of processed / failed{reason} (+ retry) / dead-lettered; `platform_message_processing_duration_seconds`, `platform_event_propagation_seconds` (first receipt), `platform_messages_in_flight`, `platform_message_timeouts_total` (legacy `events_consumed_total` in parallel).
 
@@ -486,7 +487,7 @@ erDiagram
         timestamptz processed_at "Prune cut-off"
     }
     outbox_migrations {
-        bigint version PK "golang-migrate tracking for pkg/outbox (001–010)"
+        bigint version PK "golang-migrate tracking for pkg/outbox (001–011)"
         boolean dirty
     }
     inbox_migrations {
@@ -501,7 +502,7 @@ erDiagram
 |---|---|---|
 | `idx_outbox_events_pending (scheduled_at, id) WHERE published_at IS NULL` | `outbox_events` | `ClaimBatch` — the poll query's `ORDER BY scheduled_at, id` (migration 003) |
 | `idx_outbox_events_published_at WHERE published_at IS NOT NULL` | `outbox_events` | `PrunePublished` (migration 007) |
-| `idx_outbox_dead_letters_failed_at (failed_at DESC)` | `outbox_dead_letters` | `ListDeadLetters` / `ReprocessDeadLetters*` / `DiscardDeadLetters` ordering (`failed_at, id` — oldest failure first, a total order so list → replay / discard select the same rows) and retention queries (migration 004) |
+| `idx_outbox_dead_letters_failed_at_id (failed_at, id)` | `outbox_dead_letters` | `ListDeadLetters` / `ReprocessDeadLetters*` / `DiscardDeadLetters` ordering (`failed_at, id` — oldest failure first, a total order so list → replay / discard select the same rows) and retention queries (migration 011, replacing 004's `(failed_at DESC)`) |
 | `idx_outbox_dead_letters_created_at (created_at ASC)` | `outbox_dead_letters` | Ad-hoc inspection by enqueue time (migration 005; replay now orders by `failed_at, id`) |
 | `idx_outbox_dead_letters_event_type_tenant_id` | `outbox_dead_letters` | `DLQFilter` on `EventType` / `TenantID` (migration 008) |
 | `idx_outbox_events_unpublished_created (created_at) WHERE published_at IS NULL` | `outbox_events` | `OldestPendingAge` — `platform_outbox_oldest_pending_age` (migration 009) |
@@ -717,7 +718,7 @@ sequenceDiagram
     end
 
     opt DLQ name ends in .fifo
-        SQSAdp ->> SQSAdp: MessageGroupId = MessageDeduplicationId = envelope ID (else SHA-256 of body)
+        SQSAdp ->> SQSAdp: MessageGroupId = envelope ID (else SHA-256 of body), MessageDeduplicationId unique per forward
     end
 
     SQSAdp ->>+ SQS: SendMessage(DLQ URL, body verbatim, attributes)
@@ -958,7 +959,8 @@ When goroutine 1 finishes:
 - **Claim** — `SELECT … FOR UPDATE SKIP LOCKED` over pending rows, then a lease `UPDATE scheduled_at = NOW() + ClaimLeaseDuration` in the same transaction. Concurrent runners claim disjoint batches with no distributed lock. `NewRunner` rejects a `ClaimLeaseDuration` too short for `BatchSize × PublishTimeout`, so a lease cannot expire while its batch is still publishing.
 - **`MarkFailed`** — reads `attempts` with `SELECT … FOR UPDATE` (deliberately **not** `SKIP LOCKED`: a second runner that re-claimed after lease expiry must block, not skip) so attempts can never be double-incremented and a record can never be dead-lettered early.
 - **Shutdown** — records stranded by context cancellation are released with `ReleaseLease` (claimable immediately, no attempt counted), so rolling restarts never push a record towards the dead-letter table. Settle writes run on a context detached from `Start`'s, budgeted at the publish budget + `(n+1) × 500 ms`, so a batch published during shutdown is still recorded.
-- **Dead-letter management** — `ListDeadLetters`, `ReprocessDeadLetters*` and `DiscardDeadLetters` order by `failed_at, id`, so a list followed by a replay or discard with the same filter and limit acts on the rows the list showed (barring rows dead-lettered in between).
+- **Dead-letter management** — `ListDeadLetters`, `ReprocessDeadLetters*` and `DiscardDeadLetters` order by `failed_at, id`, so a list followed by a replay or discard with the same filter and limit acts on the rows the list showed (barring rows dead-lettered in between). Replay leaves in place (and logs) a dead letter whose ID is already back in `outbox_events`, instead of failing on the primary key every time.
+- **Shutdown mid-batch** — entries a cancelled `PublishBatch` could not send are released at once, not with the transient backoff (shutdown is not an SNS outage).
 
 ### Idempotency
 
@@ -1031,6 +1033,7 @@ When goroutine 1 finishes:
 | Per-key order (opt-in) | `EnqueueOrdered`: `ordering_seq` drawn at INSERT; a record behind an unpublished one of its key waits at `scheduled_at = 'infinity'` until promoted; the claim query's guard never claims a record with an earlier unpublished one of its key |
 | Bounded re-poll | The runner re-polls only while batches publish and stops on a transient failure, an empty batch, or `Stop` |
 | Visibility from receipt | Every received message is extended from receipt until processed; `WithHandlerTimeout` bounds waiting and processing with one deadline, after which the message is handed back |
+| FIFO group order | On a `.fifo` queue a message group's messages of a batch run on one worker in order; an unsettled message hands the rest of its group back |
 | VisibilityTimeout bounded at 12h | `NewSQSConsumer` rejects `VisibilityTimeout > 12h` at construction — SQS API hard limit; prevents silent extension failures |
 | No SQS SDK import in consumer services | `events.DLQPublisher` is the only DLQ path; `mock.DLQPublisher` covers tests — services never need `aws-sdk-go-v2/service/sqs` |
 | DLQ forward never loses the original | `SendToDLQ` returns an error on any failure; callers return it so the source message stays visible. Invalid input is rejected before any AWS call |
@@ -1129,7 +1132,7 @@ graph LR
 - **Smoke** (`test/smoke/`, `-tags=smoke`, live AWS) — manual only, before the first deploy to a new AWS account; excluded from CI and from lint.
 - **Interop** — `platform-interop-tests` (CI job `interop`) runs Go and Python probes against shared fixtures and compares envelope JSON and HMAC output byte-for-byte.
 
-`make test-ci` runs unit, integration and e2e in parallel with `-race`, each writing its own profile to `.coverage/`, merged by `scripts/merge_coverage.py` (max-count) into `coverage.out`. Coverage is measured over `./internal/...` + `./pkg/...` with `-coverpkg` (tests live in the separate `test/` module). CI fails below **97%**; the merged total is **99.0%** (verified 2026-10-01). `make vet` and `make lint` run a second pass with `-tags=integration,e2e`, so tagged test files are vetted and linted too.
+`make test-ci` runs unit, integration and e2e in parallel with `-race`, each writing its own profile to `.coverage/`, merged by `scripts/merge_coverage.py` (max-count) into `coverage.out`. Coverage is measured over `./internal/...` + `./pkg/...` with `-coverpkg` (tests live in the separate `test/` module). CI fails below **97%**; the merged total is **98.7%** (verified 2026-10-01). `make vet` and `make lint` run a second pass with `-tags=integration,e2e`, so tagged test files are vetted and linted too.
 
 ---
 
@@ -1143,6 +1146,7 @@ Before a service (Go via this library, or Python via `platform-eventcommon`) con
 - [ ] The queue's resource policy restricts `sqs:SendMessage` to the expected topic ARN (`aws:SourceArn`).
 
 **Decoding**
+- [ ] On a FIFO queue, set `WithVisibilityTimeout` so a message group's queued messages are extended while the group's earlier messages run.
 - [ ] If producers use a schema-registry codec (the envelope carries `dataschema`), the consumer wires `WithConsumerCodec` — for AWS Glue, `events.GlueDecodeCodec{}` suffices (no registry client). Without it, every encoded message fails decode and ends in the DLQ.
 - [ ] Unknown `type` values are logged and acknowledged (`return nil`), not errored — new event types appear without notice.
 - [ ] Unknown JSON fields are ignored — never decode payloads with `DisallowUnknownFields()`.
@@ -1315,7 +1319,7 @@ Judgment calls where the requirements left an internals-only detail open. Each i
 2. **The DLQ lookup cache stores successes only and never expires.** A queue whose `RedrivePolicy` is added after a failed lookup is picked up on the next call; a policy retargeted to a *different* DLQ is picked up on restart. Concurrent cold-cache lookups may duplicate the two attribute calls — harmless, and it avoids holding a lock across network I/O.
 3. **One error type with a `Kind`, not one type per failure.** `*DLQError` unwraps to both its `Kind` sentinel and its AWS cause (`Unwrap() []error`), so callers branch with `errors.Is(err, events.ErrDLQNotConfigured)` and `errors.Is(err, events.ErrRetryable)` independently, and still reach the SDK error with `errors.As`. `ErrRetryable` was exported for this; it had been internal.
 4. **Too many message attributes is rejected, not truncated.** SQS allows 10; the DLQ publisher reserves 4–5. Silently dropping caller attributes would lose diagnostics without anyone noticing, so the call fails with `ErrDLQInvalidMessage` before any AWS request — the caller still holds the original message.
-5. **FIFO DLQ identity is the envelope ID.** `MessageGroupId` and `MessageDeduplicationId` are both set to `Envelope.ID` (SHA-256 of the body when the body isn't an envelope). Per-message groups maximise DLQ consumer parallelism; ordering inside a DLQ has no value.
+5. **FIFO DLQ: group = envelope ID, dedup ID unique per forward.** `MessageGroupId` is `Envelope.ID` (SHA-256 of the body when the body isn't an envelope) — per-message groups maximise DLQ consumer parallelism; ordering inside a DLQ has no value. `MessageDeduplicationId` is unique per `SendToDLQ` call: a content-derived one let SQS drop a second forward of the same event within 5 minutes (two queues sharing a DLQ, a redrive that fails again) while reporting success, so the source message was deleted and the dead-letter lost.
 6. **`WithMaxReceiveCount(n) < maxReceiveCount` is documented, not enforced.** The consumer could read the queue's `RedrivePolicy` at startup and reject a misconfigured `n`, but that adds an IAM permission and a startup AWS call to every consumer. It is called out in the README, the guides, `.env-example` and this document instead; enforcing it is a candidate follow-up.
 7. **Codec decode failures are retried, malformed JSON is not.** Unparseable JSON will never parse, so it is deleted; a decode failure may be a registry outage, so the message is left visible for SQS's own redrive to handle.
 8. **`inbox.Handler` is check-then-act.** A wrapper cannot join a transaction the handler opens itself; `inbox.Store.Process` inverts that — it opens the transaction and hands it to the handler — for exactly-once Postgres writes. See [Idempotency](#idempotency).

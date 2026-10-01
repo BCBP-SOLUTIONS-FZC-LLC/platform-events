@@ -102,7 +102,7 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | `NewRunner(Config)`, `Runner.Start` / `Stop` / `Ready` | Poll → claim (`SKIP LOCKED` + lease) → publish → mark; per-record retry backoff (`RetryBackoff` / `MaxRetryBackoff`), transient failures never count toward `MaxAttempts`; re-polls while batches publish |
 | `Runner.ListDeadLetters` / `ReprocessDeadLetters` / `ReprocessDeadLettersWith` / `DiscardDeadLetters` | Inspect / replay / discard `outbox_dead_letters` (`DLQFilter`, `DeadLetterRecord`) |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Batched delete of old published rows |
-| `ApplySchema(ctx, migrateRunner)`, `MigrationsTable` | Embedded migrations `001`–`010`, isolated `outbox_migrations` tracking table |
+| `ApplySchema(ctx, migrateRunner)`, `MigrationsTable` | Embedded migrations `001`–`011`, isolated `outbox_migrations` tracking table |
 
 ### `pkg/inbox` — consumer-side deduplication
 
@@ -172,7 +172,7 @@ platform-events/
 ├── pkg/                               # Public API — the only packages services may import
 │   ├── events/                        # Envelope, Publisher, Consumer, DLQPublisher, Codec, GlueDecodeCodec, HMAC, InitMetrics / MetricsRegistry
 │   │   └── mock/                      # mock.Publisher, mock.Consumer, mock.DLQPublisher
-│   ├── outbox/                        # Enqueue, EnqueueOrdered, Runner, dead-letter API, ApplySchema + embedded migrations/ (001–010)
+│   ├── outbox/                        # Enqueue, EnqueueOrdered, Runner, dead-letter API, ApplySchema + embedded migrations/ (001–011)
 │   ├── inbox/                         # processed_events ledger (Store.Process, Handler), ApplySchema + migrations/
 │   └── config/                        # Env loaders + wiring helpers
 ├── internal/
@@ -217,7 +217,7 @@ The layer rules are a convention checked in review; CI enforces the depguard rul
 | Concern | Technology | Notes |
 |---|---|---|
 | **Outbound events** | AWS SNS (standard or FIFO) | Attributes `EventType` · `TenantID` · `Source` · `EventID` · `Subject` for filter policies; `PublishBatch` splits at 10 entries and 256 KiB per request |
-| **Inbound events** | AWS SQS | Long poll (≤ 20 s), visibility extended from receipt, `ApproximateReceiveCount`-based dead-letter routing; `RawMessageDelivery=true` required on SNS subscriptions |
+| **Inbound events** | AWS SQS (standard or FIFO) | Long poll (≤ 20 s), visibility extended from receipt, `ApproximateReceiveCount`-based dead-letter routing; FIFO message groups processed in order (one worker per group, a failure holds the group); `RawMessageDelivery=true` required on SNS subscriptions |
 | **Dead letters (producer)** | Postgres `outbox_dead_letters` | Records that exhausted `MaxAttempts`; managed via the `Runner` DLQ API |
 | **Dead letters (consumer)** | The queue's SQS DLQ | Via `RedrivePolicy`, or forwarded explicitly with `DLQPublisher` |
 | **Outbox / inbox** | PostgreSQL via `platform-pgcommon` | `outbox_events` (with optional per-key ordering), `outbox_dead_letters`, `processed_events`; own migration tracking tables |
@@ -276,7 +276,7 @@ To keep a poison message rather than drop it, forward it with `DLQPublisher.Send
 
 ### 6. Schema registry (optional)
 
-Producers pass `WithCodec`; consumers of Glue-encoded events pass `WithConsumerCodec(events.GlueDecodeCodec{})`. Envelopes with an empty `dataschema` never reach a codec, so mixed traffic is safe — [Codec](docs/guides/codec.md).
+Producers pass `WithCodec`; consumers of Glue-encoded events pass `WithConsumerCodec(events.GlueDecodeCodec{})`. Envelopes with an empty `dataschema` (or a `dataschema` on a non-string `data`) never reach a codec, so mixed traffic is safe — [Codec](docs/guides/codec.md).
 
 ### 7. Wire format
 
@@ -339,6 +339,7 @@ Three Go modules, the same layout as platform-pgcommon, so consuming services in
 | `make metrics-doc` | Regenerate `docs/observability/metrics-registry.md` from the metrics registry |
 | `make rules-check` | `promtool check rules` + alert unit tests for `monitoring/prometheus/` (Docker) |
 | `make dashboards-check` | PromQL syntax gate for `monitoring/grafana/*.json`: every panel and variable query checked with promtool (Docker, jq) |
+| `make toolchain-check` | The Go toolchain is identical in the three `go.mod` files and the Dockerfile builder image |
 | `make docs-check` | Diagram drift gate: every `docs/architecture/mermaid/*.mmd` embedded byte-identically in `ARCHITECTURE.md` |
 | `make pin-base-images` | Re-pin every image this repository runs by digest: Dockerfile, promtool, docker-compose, testcontainers fixtures (recorded in `.docker-digests`) |
 | `make mod-verify` | `go mod verify` |
@@ -475,7 +476,7 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 
 ### Coverage
 
-CI (`Validate / Test`: `make test-ci`, then `.github/scripts/coverage-gate.sh`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **99.0%** (verified 2026-10-01).
+CI (`Validate / Test`: `make test-ci`, then `.github/scripts/coverage-gate.sh`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **98.7%** (verified 2026-10-01).
 
 ---
 
@@ -575,7 +576,7 @@ Five workflow files, mirroring `iam-org-membership` — the org's reference pipe
 - **`docs.yml`** — on docs-only changes to `ARCHITECTURE.md` / `docs/architecture/**` (which `ci.yml` skips): the diagram sync check.
 - **`ci.yml`** — orchestrator on push / PR to `main`. `Validate / Test`, `Validate / Quality` and `Build image (cache)` run in parallel; `Trivy CVE scan` and `Smoke tests` gate on the test job and the image; `Cross-language compatibility` (`platform-interop-tests`) gates on the test job; `PR summary` posts one status comment per PR; on push to `main`, `Push image → GHCR` publishes and Cosign-signs the reference-CLI image. Docs-only commits (`**.md`, `docs/architecture/**`, `docs/guides/**`) skip the pipeline.
 - **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 97%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
-- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make dashboards-check` (dashboard PromQL) → `make docs-check` (diagram sync) → `make vuln-check` → digest-pinning check (Dockerfile, docker-compose and the testcontainers images).
+- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make dashboards-check` (dashboard PromQL) → `make docs-check` (diagram sync) → `make toolchain-check` → `make vuln-check` → digest-pinning check (Dockerfile, docker-compose and the testcontainers images).
 - **`changelog-check.yml`** — fails a PR touching `internal/`, `pkg/` or `cmd/` without a `CHANGELOG.md` update.
 - **`release.yml`** — on `v*.*.*` tags: the same job graph as `ci.yml` plus verify / binaries / publish — see [Releasing](#releasing).
 

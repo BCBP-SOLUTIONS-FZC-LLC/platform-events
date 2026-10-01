@@ -69,7 +69,7 @@ func recordingRules(t *testing.T) map[string][]string {
 // registry metrics it references.
 func checkExpr(t *testing.T, where, expr string, records map[string][]string) []internalmetrics.RegistryStatus {
 	t.Helper()
-	allowed := map[string]bool{"le": true}
+	allowed := map[string]bool{"le": true, "namespace": true} // namespace: scrape-target label (see rules_test.go)
 	var statuses []internalmetrics.RegistryStatus
 	refs := 0
 	for _, ref := range metricRefs(expr) {

@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -289,8 +290,23 @@ func TestOutboxConfigEnv_String_MasksURLPassword(t *testing.T) {
 		BatchSize:    50,
 	}
 	s := cfg.String()
-	assert.NotContains(t, s, "supersecret")
+	assert.NotContains(t, s, "hunter2")
 	assert.Contains(t, s, "***")
+}
+
+// sslpassword (the client-key passphrase) is masked in URL and keyword forms,
+// and %#v masks like %v.
+func TestOutboxConfigEnv_MasksSSLPasswordAndGoString(t *testing.T) {
+	for _, dsn := range []string{
+		"postgres://app@db:5432/events?sslmode=verify-full&sslpassword=keyphrase",
+		"host=db user=app sslpassword=keyphrase dbname=events",
+	} {
+		cfg := config.OutboxConfigEnv{DatabaseURL: dsn, MigrationDatabaseURL: dsn} //nolint:gosec
+		for _, out := range []string{cfg.String(), fmt.Sprintf("%v", cfg), fmt.Sprintf("%#v", cfg)} {
+			assert.NotContains(t, out, "keyphrase", dsn)
+			assert.Contains(t, out, "sslpassword=***", dsn)
+		}
+	}
 }
 
 func TestOutboxConfigEnv_String_MasksKeyValuePassword(t *testing.T) {

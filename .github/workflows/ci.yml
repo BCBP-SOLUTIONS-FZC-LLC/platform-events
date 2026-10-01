@@ -103,10 +103,14 @@ jobs:
         id: cache
         env:
           REGISTRY_REF: ${{ env.IMAGE_NAME }}:buildcache
-          CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          # Only push / manual runs on main write the registry cache: the main
+          # and release push jobs read it before Cosign-signing, so a PR must
+          # not be able to seed it (PRs still write the GHA cache, which is
+          # scoped to the PR ref and invisible to main).
+          CAN_PUSH: ${{ github.event_name != 'pull_request' }}
         run: bash .github/scripts/docker-build-prep.sh
 
-      # Log in so registry cache reads (and writes on non-fork runs) are authenticated.
+      # Log in so registry cache reads (and writes on push runs) are authenticated.
       - name: Log in to GHCR
         uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
         with:
@@ -173,11 +177,17 @@ jobs:
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
 
+      # A dated key: an exact-match key is saved once and never updated, so a
+      # fixed key would pin the DB to its first download.
+      - name: Trivy DB cache key
+        id: trivy-day
+        run: bash .github/scripts/utc-date.sh
+
       - name: Cache Trivy DB
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: /tmp/trivy-cache
-          key: trivy-db-${{ runner.os }}
+          key: trivy-db-${{ runner.os }}-${{ steps.trivy-day.outputs.day }}
           restore-keys: |
             trivy-db-${{ runner.os }}-
 

@@ -214,11 +214,17 @@ jobs:
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
 
+      # A dated key: an exact-match key is saved once and never updated, so a
+      # fixed key would pin the DB to its first download.
+      - name: Trivy DB cache key
+        id: trivy-day
+        run: bash .github/scripts/utc-date.sh
+
       - name: Cache Trivy DB
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: /tmp/trivy-cache
-          key: trivy-db-${{ runner.os }}
+          key: trivy-db-${{ runner.os }}-${{ steps.trivy-day.outputs.day }}
           restore-keys: |
             trivy-db-${{ runner.os }}-
 
