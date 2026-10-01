@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-01
+
+### Upgrade notes (action required)
+
+Upgrading from 1.5.x. Everything else in this release is additive or a fix. This stays a **minor** release on purpose: no exported API is removed or changed incompatibly (`outbox.Enqueue` takes `pgcommon.Tx`, an alias of `pgx.Tx`), and the items below are small, local changes.
+
+- **Switch to `events.InitMetrics`.** `events.Init` / `InitWithRegisterer` are deprecated (staticcheck `SA1019` fails lint until you switch). Call `events.InitMetrics(events.MetricsIdentity{Domain: "<domain>", Service: "<service>", Version: buildVersion}, registerer)` once at startup, with the same registerer and identity you pass to platform-pgcommon's `pgmetrics.InitWithIdentity`. Log the returned `RegistrationWarning`s. In IAM services that already register `platform_retry_total` / `platform_dependency_request_seconds` with another label set, those two are disabled rather than failing startup.
+- **Dashboards and alerts.** The new `platform_*` metrics are emitted alongside the legacy `events_*` / `outbox_*` / `sqs_*` ones, which keep working. Migrate panels and alerts using `docs/observability` and `monitoring/` (reference rules, dashboard and KEDA example). Proposed metrics must not back alerts, SLOs or HPA until ratified.
+- **`event_type` label cap (also on the legacy metrics).** At most 200 distinct values per process; further ones are recorded as `__other__`. A service legitimately handling more event types must raise the cap with `events.WithEventTypeLimit(n)`.
+- **`DLQPublisher.SendToDLQ` behaviour:**
+  - Messages with more than 10 attributes have their lowest-priority caller attributes dropped instead of being rejected; set `DLQConfig.StrictAttributes` to keep rejecting.
+  - Rejections of the message itself by `SendMessage` (`InvalidParameterValue`, `InvalidMessageContents`, `InvalidAttributeName`, `InvalidAttributeValue`) now return `ErrDLQInvalidMessage` instead of `ErrDLQSendFailed`. Revisit code that branches on `errors.Is(err, events.ErrDLQSendFailed)`.
+- **`WithDLQForwarding` (new) fails `Start()` on a queue without a usable `RedrivePolicy`.** This is intended: otherwise poison messages are never deleted. Provision the DLQ before enabling it.
+- **platform-pgcommon v1.4.0 and pgx v5.11 are inherited.** Follow pgcommon's 1.4.0 upgrade notes. The ones most likely to matter: custom `pgx.Rows` mocks need `TypeMap()`; connection URIs are parsed like libpq; text-format `timestamptz` values come back in `time.Local`; pgcommon metrics gain a `pool` label and its span attributes are renamed. A service that already pinned the original v1.4.0 tag must clear its module cache, including `$(go env GOMODCACHE)/cache/vcs`, and refresh `go.sum`: the tag was re-released.
+- **`go` directive `1.26.0` + `toolchain go1.26.8`** (was `go 1.26.6`). Consumers are no longer pinned to a patch release.
+- **`config.LoadOTel` / `OTelConfigEnv` are deprecated.** Tracing is configured by the service through platform-gincommon's `InitTracingFromEnv`. The `OTEL_*` variables were never read by the library.
+
+
 ### Added
 
 - **Enterprise Platform Observability Standard metrics.** All platform-events metrics are now Tier 1 `platform_*`, the same model as platform-pgcommon's `platform_db_*`. See [docs/observability](docs/observability/README.md).
@@ -39,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI parity with platform-pgcommon:** `actions/setup-go` v7.0.0, `actions/checkout` v7.0.1, govulncheck v1.8.0, and a coverage gate of **97%** (was 95%; the merged total is 97.7%). The disabled Dependabot config now lists all three Go modules, so it works as soon as it is re-enabled.
 - **pgcommon-only now covers tests too.** The last two pgx imports, both in unit-test `pgx.Tx` fakes, are gone: `noopTx` embeds `pgcommon.Tx`, and `stubTx` infers `Exec`'s result type from `pgcommon.Tx` itself (`newStubTx(pgcommon.Tx.Exec)`). The depguard `pgcommon-only` rule applies to every file and also rejects `golang-migrate`. No file in the repository imports pgx, `database/sql` or golang-migrate; pgx is only an indirect dependency through platform-pgcommon.
 - **Shared Postgres container per test package**, with a fresh database per `fixtures.NewTestDB` (both schemas applied, dropped `WITH (FORCE)` on cleanup) instead of a container per test. The integration suite drops from about 116s to about 15s.
 - **Shared floci resources are cleaned up per test:** `CreateTopic` / `CreateQueue` delete what they created when the test ends. Before this, a repeat run (`-count=2`) reused the previous run's queues and read their leftover messages. Found by running the suites twice in one process, which now pass, integration under `-race`.

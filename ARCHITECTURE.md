@@ -1061,7 +1061,7 @@ The CLI is also built into a digest-pinned distroless image (`Dockerfile`, ~6 MB
 
 | Stage | Where | What it proves |
 |---|---|---|
-| `Validate / Test` | `validate-test.yml` | unit + integration + e2e with `-race`; merged coverage ≥ 95% |
+| `Validate / Test` | `validate-test.yml` | unit + integration + e2e with `-race`; merged coverage ≥ 97% |
 | `Validate / Quality` | `validate-quality.yml` | fmt, tidy, vet + lint (incl. tagged tests), govulncheck, RLS-6 grep, Dockerfile digest pinning |
 | `Build image (cache)` → `Trivy CVE scan` / `Smoke tests` | `ci.yml` | Hadolint; no fixable CRITICAL/HIGH/UNKNOWN CVE in the image; the binary starts, validates config, stamps its version |
 | `Cross-language compatibility` | `ci.yml` → `platform-interop-tests` | Go ↔ Python envelope JSON and HMAC byte-for-byte |
@@ -1134,7 +1134,7 @@ graph LR
 - **Smoke** (`test/smoke/`, `-tags=smoke`, live AWS) — manual only, before the first deploy to a new AWS account; excluded from CI and from lint.
 - **Interop** — `platform-interop-tests` (CI job `interop`) runs Go and Python probes against shared fixtures and compares envelope JSON and HMAC output byte-for-byte.
 
-`make test-ci` runs unit, integration and e2e in parallel with `-race`, each writing its own profile to `.coverage/`, merged by `scripts/merge_coverage.py` (max-count) into `coverage.out`. Coverage is measured over `./internal/...` + `./pkg/...` with `-coverpkg` (tests live in a separate package tree). CI fails below **95%**; the merged total is **97.0%** (verified 2026-09-30). `make vet` and `make lint` run a second pass with `-tags=integration,e2e`, so tagged test files are vetted and linted too.
+`make test-ci` runs unit, integration and e2e in parallel with `-race`, each writing its own profile to `.coverage/`, merged by `scripts/merge_coverage.py` (max-count) into `coverage.out`. Coverage is measured over `./internal/...` + `./pkg/...` with `-coverpkg` (tests live in the separate `test/` module). CI fails below **97%**; the merged total is **97.7%** (verified 2026-10-01). `make vet` and `make lint` run a second pass with `-tags=integration,e2e`, so tagged test files are vetted and linted too.
 
 ---
 

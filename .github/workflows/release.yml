@@ -62,7 +62,7 @@ jobs:
       source_date_epoch: ${{ steps.sde.outputs.SOURCE_DATE_EPOCH }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_REF }}
           fetch-depth: 0
@@ -112,7 +112,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_REF }}
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
@@ -175,7 +175,7 @@ jobs:
       actions: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_REF }}
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
@@ -263,7 +263,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_REF }}
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
@@ -309,14 +309,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_REF }}
           persist-credentials: false
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Set up Go
-        uses: actions/setup-go@v6.5.0
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -368,7 +368,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_REF }}
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
@@ -466,7 +466,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ env.RELEASE_REF }}
           fetch-depth: 0

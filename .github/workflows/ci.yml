@@ -85,7 +85,7 @@ jobs:
       source_date_epoch: ${{ steps.cache.outputs.SOURCE_DATE_EPOCH }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
@@ -149,7 +149,7 @@ jobs:
       actions: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
@@ -235,7 +235,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
@@ -287,7 +287,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
@@ -319,7 +319,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 

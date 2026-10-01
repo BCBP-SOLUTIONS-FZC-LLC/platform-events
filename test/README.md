@@ -175,7 +175,7 @@ make cover-func   # per-function summary (quick check)
 make cover        # HTML report (open in browser)
 ```
 
-The CI gate requires **≥95%** combined coverage.
+The CI gate requires **≥97%** combined coverage (same as platform-pgcommon).
 
 ---
 

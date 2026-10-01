@@ -413,7 +413,7 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 GitHub Actions mirrors `iam-org-membership`'s pipeline — the org ruleset on `main` requires its job names (`Validate / Test / test`, `Validate / Quality / quality`, `Build image (cache)`, `Trivy CVE scan`, `Smoke tests`, `PR summary`), so **do not rename those jobs**. This is a **private module** with no production deployment; the Docker image is the reference CLI (`cmd/platform-events`), built only so CI can Trivy-scan and smoke-test the compiled binary.
 
-- **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → `.github/scripts/coverage-gate.sh` (≥ 95%).
+- **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → `.github/scripts/coverage-gate.sh` (≥ 97%).
 - **`validate-quality.yml`** (reusable) — `go mod verify`, HTML-entity check, RLS-6 grep, `gofmt`, tidy drift, `make vet` / `make lint` (each also with `-tags=integration,e2e`), `make metrics-lint` + `make rules-check` (Observability Standard), `make vuln-check`, Dockerfile digest-pinning check. `golangci-lint` runs via `go tool` (the `tool` directive in `go.mod` is not propagated to consumers).
 - **`ci.yml`** (push/PR to main) — the two gates + `Build image (cache)` in parallel → `Trivy CVE scan` / `Smoke tests` → `Cross-language compatibility` → `PR summary`; on push, `Push image → GHCR` (Cosign-signed).
 - **`changelog-check.yml`** — PRs touching `internal/`, `pkg/`, `cmd/` must update `CHANGELOG.md`.

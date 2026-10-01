@@ -469,7 +469,7 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 
 ### Coverage
 
-CI (`ci.yml` → `make cover-func`) fails below **95%** total, measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.7%** (verified 2026-10-01).
+CI (`ci.yml` → `make cover-func`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **97.7%** (verified 2026-10-01).
 
 ---
 
@@ -486,7 +486,8 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 | `SQS_MAX_MESSAGES` / `SQS_WAIT_SECONDS` | `10` / `20` | Batch size (1–10) / long-poll duration |
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | ≥ 2× p99 handler duration; ≤ 12 h |
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
-| `SQS_MAX_RECEIVE_COUNT` | `0` (unset) | `WithMaxReceiveCount`; must be **below** the queue's `RedrivePolicy` `maxReceiveCount`, and only takes effect with `WithDeadLetterHandler` |
+| `SQS_MAX_RECEIVE_COUNT` | `0` (unset) | `WithMaxReceiveCount`; must be **below** the queue's `RedrivePolicy` `maxReceiveCount`. Takes effect with `WithDeadLetterHandler` and/or `WithDLQForwarding`, either of which defaults it to 5 when unset |
+| `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | `WithQueueDepthMetrics`: samples `platform_queue_depth` / `platform_dlq_depth` every interval (min 10s). Needs `sqs:GetQueueAttributes` on the queue and its DLQ; skipped when `InitMetrics` hasn't run |
 | `OUTBOX_POLL_INTERVAL` / `OUTBOX_BATCH_SIZE` / `OUTBOX_MAX_ATTEMPTS` | `5s` / `50` / `5` | Runner cadence, batch size, attempts before dead-letter |
 | `OUTBOX_CLAIM_LEASE_DURATION` | `10m` (store default when unset) | How long a claimed record is hidden from other runners |
 | `OUTBOX_STARTUP_JITTER` | `0` | Use `5s`–`10s` with multiple replicas |
@@ -564,7 +565,7 @@ git push origin v1.5.0     # triggers release.yml
 Five workflow files, mirroring `iam-org-membership` — the org's reference pipeline, whose job names are the required status checks on `main`:
 
 - **`ci.yml`** — orchestrator on push / PR to `main`. `Validate / Test`, `Validate / Quality` and `Build image (cache)` run in parallel; `Trivy CVE scan` and `Smoke tests` gate on the test job and the image; `Cross-language compatibility` (`platform-interop-tests`) gates on the test job; `PR summary` posts one status comment per PR; on push to `main`, `Push image → GHCR` publishes and Cosign-signs the reference-CLI image. Docs-only commits (`**.md`, `docs/architecture/**`, `docs/guides/**`) skip the pipeline.
-- **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 95%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
+- **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 97%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
 - **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make dashboards-check` (dashboard PromQL) → `make vuln-check` → digest-pinning check (Dockerfile, docker-compose and the testcontainers images).
 - **`changelog-check.yml`** — fails a PR touching `internal/`, `pkg/` or `cmd/` without a `CHANGELOG.md` update.
 - **`release.yml`** — on `v*.*.*` tags: the same job graph as `ci.yml` plus verify / binaries / publish — see [Releasing](#releasing).

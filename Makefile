@@ -51,7 +51,7 @@ COVER_PKG_LIST := $(shell $(GO) list ./internal/... ./pkg/... 2>/dev/null | tr '
 
 # Pinned to prevent unintended breakage from new advisories landing mid-CI.
 # To upgrade: go run golang.org/x/vuln/cmd/govulncheck@latest --version, then update below.
-GOVULNCHECK_VERSION ?= v1.1.4
+GOVULNCHECK_VERSION ?= v1.8.0
 
 # -----------------------------
 # SETUP

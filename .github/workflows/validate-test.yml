@@ -39,14 +39,14 @@ jobs:
       pct: ${{ steps.gate.outputs.pct }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.0
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Set up Go
-        uses: actions/setup-go@v6.5.0
+        uses: actions/setup-go@v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -86,9 +86,10 @@ jobs:
         run: make test-ci
 
       # make test-ci merges all three coverage profiles into coverage.out via
-      # _merge-coverage. Assert the combined statement coverage meets 95%.
+      # _merge-coverage. Assert the combined statement coverage meets 97%
+      # (same gate as platform-pgcommon). Do not lower this threshold.
       # Do not lower this threshold.
-      - name: Coverage threshold gate (≥ 95%)
+      - name: Coverage threshold gate (≥ 97%)
         id: gate
         run: bash .github/scripts/coverage-gate.sh
 
