@@ -1852,3 +1852,40 @@ func TestRunner_PromoteWaitingSweepLogged(t *testing.T) {
 		})
 	}
 }
+
+// slowPublisher takes a while per batch, so a re-poll loop is observable.
+type slowPublisher struct{ delay time.Duration }
+
+func (p slowPublisher) Publish(context.Context, events.Envelope[json.RawMessage]) error {
+	time.Sleep(p.delay)
+	return nil
+}
+func (p slowPublisher) PublishBatch(context.Context, []events.Envelope[json.RawMessage]) error {
+	time.Sleep(p.delay)
+	return nil
+}
+
+// Stop ends the re-poll loop promptly even with a long PollInterval and a
+// steady backlog: it drains the batch in flight, then returns.
+func TestRunner_StopEndsRepollLoop(t *testing.T) {
+	store := newMockOutboxStore()
+	for range 500 {
+		env := domain.NewEnvelope("a.b.c", "svc", json.RawMessage(`{}`))
+		payload, _ := json.Marshal(env)
+		store.records = append(store.records, domain.OutboxRecord{ID: env.ID, EventType: env.Type, Payload: payload})
+	}
+	r, err := outbox.NewRunner(outbox.Config{Store: store, Publisher: slowPublisher{delay: 20 * time.Millisecond},
+		BatchSize: 1, PollInterval: time.Minute, DrainTimeout: 2 * time.Second})
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(context.Background()) }()
+	<-r.Ready()
+	time.Sleep(100 * time.Millisecond) // the re-poll loop is draining the backlog
+	start := time.Now()
+	require.NoError(t, r.Stop())
+	<-done
+	assert.Less(t, time.Since(start), time.Second, "Stop returns after the batch in flight, not after PollInterval")
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Less(t, len(store.published), 500, "the loop stopped before draining everything")
+}

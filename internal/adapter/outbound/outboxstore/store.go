@@ -190,21 +190,32 @@ func (s *Store) claimQuery() string {
 
 // replayScheduledAt / replayOrderingSeq place a replayed record: unkeyed ones
 // are due at once; keyed ones join the back of their key (a fresh sequence
-// number) and wait until promoteHeadsSQL finds nothing ahead of them.
+// number) and wait until promoteAllSQL finds nothing ahead of them.
 const (
 	replayScheduledAt = `CASE WHEN ordering_key IS NULL THEN NOW() ELSE 'infinity'::timestamptz END`
 	replayOrderingSeq = `CASE WHEN ordering_key IS NOT NULL THEN nextval('outbox_events_ordering_seq') END`
 )
 
-// promoteHeadsSQL makes waiting keyed records due once nothing precedes them
-// in their key. $1 restricts it to one key ("" = every key).
-const promoteHeadsSQL = `
+// promoteKeySQL makes key $1's waiting record due once nothing precedes it
+// (one probe of idx_outbox_events_ordering — it runs on every keyed publish).
+// promoteAllSQL does the same for every key (sweep and replay); it walks the
+// 'infinity' tail of idx_outbox_events_pending. Two statements rather than one
+// with "$1 = ” OR key = $1": a cached generic plan of that cannot use the
+// ordering index, turning every keyed publish into a scan of all waiting rows.
+const (
+	promoteKeySQL = `
+	UPDATE outbox_events o SET scheduled_at = NOW()
+	WHERE o.ordering_key = $1
+	  AND o.published_at IS NULL
+	  AND o.scheduled_at = 'infinity'
+	  AND NOT ` + earlierUnpublished
+	promoteAllSQL = `
 	UPDATE outbox_events o SET scheduled_at = NOW()
 	WHERE o.published_at IS NULL
 	  AND o.scheduled_at = 'infinity'
 	  AND o.ordering_key IS NOT NULL
-	  AND ($1 = '' OR o.ordering_key = $1)
 	  AND NOT ` + earlierUnpublished
+)
 
 // promoteNext makes the next waiting record of key due, inside tx — called
 // when key's head is published or dead-lettered.
@@ -212,7 +223,7 @@ func promoteNext(ctx context.Context, tx pgcommon.Tx, key string) error {
 	if key == "" {
 		return nil
 	}
-	_, err := tx.Exec(ctx, promoteHeadsSQL, key)
+	_, err := tx.Exec(ctx, promoteKeySQL, key)
 	return err
 }
 
@@ -226,7 +237,7 @@ func (s *Store) PromoteWaiting(ctx context.Context) (int64, error) {
 	defer cancel()
 	var n int64
 	err := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
-		tag, err := tx.Exec(ctx, promoteHeadsSQL, "")
+		tag, err := tx.Exec(ctx, promoteAllSQL)
 		n = tag.RowsAffected()
 		return err
 	})
@@ -286,30 +297,40 @@ func (s *Store) PendingCount(ctx context.Context) (int64, error) {
 func (s *Store) MarkPublished(ctx context.Context, id string) error {
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
-	return pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+	var key string
+	err := s.pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
 		// WHERE published_at IS NULL prevents a concurrent runner from overwriting
-		// an already-published timestamp and suppressing the RowsAffected==0 warning.
-		var key string
-		err := tx.QueryRow(ctx,
+		// an already-published timestamp and suppressing the no-rows warning.
+		return conn.QueryRow(ctx,
 			`UPDATE outbox_events SET published_at = NOW() WHERE id = $1 AND published_at IS NULL
 			 RETURNING COALESCE(ordering_key, '')`, id).Scan(&key)
-		if errors.Is(err, pgcommon.ErrNoRows) {
-			// Record was deleted by a concurrent runner (e.g. moved to dead-letters
-			// between ClaimBatch and MarkPublished). Log at warn — not fatal since
-			// the event was published; we just can't mark it.
-			if s.logger != nil {
-				s.logger.Warn("outboxstore: MarkPublished matched no rows — record may have been removed by a concurrent runner", map[string]any{
-					"id": id,
-				})
-			}
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		// The key's next record (if any) is now its head.
-		return promoteNext(ctx, tx, key)
 	})
+	if errors.Is(err, pgcommon.ErrNoRows) {
+		// Record was deleted by a concurrent runner (e.g. moved to dead-letters
+		// between ClaimBatch and MarkPublished). Log at warn — not fatal since
+		// the event was published; we just can't mark it.
+		if s.logger != nil {
+			s.logger.Warn("outboxstore: MarkPublished matched no rows — record may have been removed by a concurrent runner", map[string]any{
+				"id": id,
+			})
+		}
+		return nil
+	}
+	if err != nil || key == "" {
+		return err
+	}
+	// The key's next record is now its head. Promote it best-effort, after the
+	// publish is durably marked: a failed promotion must not roll the mark back
+	// (that would re-publish the head after its lease). The runner's
+	// PromoteWaiting sweep promotes it later.
+	if perr := pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+		return promoteNext(ctx, tx, key)
+	}); perr != nil && s.logger != nil {
+		s.logger.Warn("outboxstore: could not promote the next ordered record — the waiting-record sweep will", map[string]any{
+			"id": id, "error": perr.Error(),
+		})
+	}
+	return nil
 }
 
 // MarkFailed increments attempts and sets last_error.
@@ -454,6 +475,7 @@ func (s *Store) LeasedCount(ctx context.Context) (int64, error) {
 				SELECT 1 FROM outbox_events
 				WHERE published_at IS NULL
 				  AND scheduled_at > NOW()
+				  AND scheduled_at <> 'infinity' -- waiting ordered records: BlockedCount
 				LIMIT $1
 			) capped
 		`, MaxCountedRows).Scan(&count)
@@ -609,7 +631,7 @@ func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQF
 		}
 		moved = int(tag.RowsAffected())
 		// Replayed keyed records were queued behind their keys; make the heads due.
-		_, err = tx.Exec(ctx, promoteHeadsSQL, "")
+		_, err = tx.Exec(ctx, promoteAllSQL)
 		return err
 	})
 	if err == nil && moved > 0 {
@@ -688,7 +710,7 @@ func (s *Store) ReprocessDeadLetters(ctx context.Context, limit int) (int, error
 			return err
 		}
 		moved = int(tag.RowsAffected())
-		_, err = tx.Exec(ctx, promoteHeadsSQL, "")
+		_, err = tx.Exec(ctx, promoteAllSQL)
 		return err
 	})
 	if err == nil && moved > 0 {

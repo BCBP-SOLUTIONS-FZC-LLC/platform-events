@@ -271,7 +271,7 @@ func (r *Runner) Start(ctx context.Context) error {
 
 	// Run one poll immediately on startup so events that arrived while the runner
 	// was stopped are not delayed by a full PollInterval.
-	if r.pollOnce(ctx) {
+	if r.pollOnce(ctx, stopCtx) {
 		if !r.sleepBackoff(ctx, stopCtx, &pollBackoff) {
 			return nil
 		}
@@ -286,7 +286,7 @@ func (r *Runner) Start(ctx context.Context) error {
 		case <-stopCtx.Done():
 			return nil
 		case <-ticker.C:
-			if r.pollOnce(ctx) {
+			if r.pollOnce(ctx, stopCtx) {
 				if !r.sleepBackoff(ctx, stopCtx, &pollBackoff) {
 					return nil
 				}
@@ -320,7 +320,9 @@ func (r *Runner) sleepBackoff(ctx, stopCtx context.Context, backoff *time.Durati
 // pollOnce runs a single gauge-update + publish-batch cycle.
 // Returns true when the cycle encountered an infrastructure error (triggers
 // backoff in Start); returns false on success or context cancellation.
-func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
+// stopCtx is cancelled by Stop: it does not interrupt the batch in flight
+// (Stop drains it), but ends the re-poll loop so Stop returns promptly.
+func (r *Runner) pollOnce(ctx, stopCtx context.Context) (hadError bool) {
 	if time.Since(r.lastGauge) >= r.cfg.GaugeInterval {
 		r.lastGauge = time.Now()
 		r.refreshGauges(ctx)
@@ -335,7 +337,8 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 	// nothing or hits a transient failure: during an outage this must not
 	// turn into a tight claim-and-fail loop.
 	start := time.Now()
-	for r.svc.LastPublished() > 0 && !r.svc.LastHadTransientFailure() && ctx.Err() == nil && time.Since(start) < r.cfg.PollInterval {
+	for r.svc.LastPublished() > 0 && !r.svc.LastHadTransientFailure() &&
+		ctx.Err() == nil && stopCtx.Err() == nil && time.Since(start) < r.cfg.PollInterval {
 		if r.publishOnce(ctx) {
 			return true
 		}
@@ -378,7 +381,9 @@ func (r *Runner) refreshGauges(ctx context.Context) {
 		}
 	}
 	// Promote ordered records whose head was published while they were being
-	// enqueued (normally their head's publish promotes them directly).
+	// enqueued, or whose promotion failed (normally their head's publish
+	// promotes them directly). Runs with the gauges: every GaugeInterval, or
+	// PollInterval if that is longer.
 	if n, err := r.svc.PromoteWaiting(ctx); err != nil {
 		if r.cfg.Logger != nil {
 			r.cfg.Logger.Warn("outbox: failed to promote waiting ordered records", map[string]any{"error": err.Error()})

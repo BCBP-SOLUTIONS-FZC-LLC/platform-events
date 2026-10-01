@@ -66,6 +66,9 @@ func TestOutboxStore_Ordering(t *testing.T) {
 	assert.EqualValues(t, 2, blocked(), "a2 and a3 wait behind a1")
 	assert.Equal(t, sorted(a1, b1, free), ids(), "only each key's head, plus unkeyed records")
 	assert.Empty(t, ids(), "heads are leased; their successors still wait")
+	leased, err := store.LeasedCount(ctx)
+	require.NoError(t, err)
+	assert.EqualValues(t, 3, leased, "the claimed records only — waiting ones are BlockedCount, not leased")
 
 	// a1 fails and is released: still the head, a2 still waiting.
 	require.NoError(t, store.ReleaseLease(ctx, a1, "throttled", 0))
