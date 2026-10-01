@@ -20,8 +20,12 @@ func TestRunnerConfigFromEnv_MapsFields(t *testing.T) {
 		PublishConcurrency: 1,
 		PublishTimeout:     15 * time.Second,
 		DrainTimeout:       45 * time.Second,
+		RetryBackoff:       2 * time.Second,
+		MaxRetryBackoff:    10 * time.Minute,
 	}
 	cfg := config.RunnerConfigFromEnv(env, nil, nil, nil)
+	assert.Equal(t, 2*time.Second, cfg.RetryBackoff)
+	assert.Equal(t, 10*time.Minute, cfg.MaxRetryBackoff)
 	assert.Equal(t, 2*time.Second, cfg.PollInterval)
 	assert.Equal(t, 25, cfg.BatchSize)
 	assert.Equal(t, 3, cfg.MaxAttempts)

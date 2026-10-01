@@ -80,6 +80,15 @@ type Config struct {
 	// poll. Use when running multiple runner instances to desynchronise their
 	// initial polls and avoid a thundering-herd burst on the DB.
 	StartupJitter time.Duration
+
+	// RetryBackoff is the delay before a record's first retry; each further
+	// failure doubles it (with jitter) up to MaxRetryBackoff. Defaults: 1s, 5m.
+	// Failures that describe the publisher rather than the record (transport
+	// errors, throttling, timeouts) never count toward MaxAttempts; they back
+	// off on one shared schedule that resets on the next successful publish,
+	// so an SNS outage builds a backlog instead of dead-lettering it.
+	RetryBackoff    time.Duration
+	MaxRetryBackoff time.Duration
 }
 
 // Runner polls the outbox_events table and publishes pending records.
@@ -94,8 +103,9 @@ type Runner struct {
 
 	// readyCh is closed after the first successful poll cycle (or empty poll),
 	// signalling that the DB connection and schema are healthy. Expose via Ready().
-	readyCh   chan struct{}
-	readyOnce sync.Once
+	// readyClosed records whether readyCh has been closed; guarded by mu.
+	readyCh     chan struct{}
+	readyClosed bool
 }
 
 // outboxMetricsAdapter routes OutboxService metric callbacks to the adapter
@@ -178,6 +188,7 @@ func NewRunner(cfg Config) (*Runner, error) {
 		cfg.PublishTimeout,
 	)
 	svc.SetOutboxMetrics(outboxMetricsAdapter{})
+	svc.SetRetryBackoff(cfg.RetryBackoff, cfg.MaxRetryBackoff)
 
 	// Pre-closed initial doneCh so Stop() before Start() returns immediately.
 	initialDone := make(chan struct{})
@@ -209,8 +220,13 @@ func (r *Runner) Start(ctx context.Context) error {
 	thisDone := make(chan struct{})
 	r.cancel = stopCancel
 	r.doneCh = thisDone
-	r.readyCh = make(chan struct{})
-	r.readyOnce = sync.Once{}
+	// Replace readyCh only once the previous cycle has closed it: a caller
+	// doing `go runner.Start(ctx); <-runner.Ready()` may already hold the
+	// current channel, and it must be the one this cycle closes.
+	if r.readyClosed {
+		r.readyCh = make(chan struct{})
+		r.readyClosed = false
+	}
 	r.mu.Unlock()
 	defer stopCancel() // always release stopCtx resources when Start() exits
 
@@ -340,7 +356,12 @@ func (r *Runner) pollOnce(ctx context.Context) (hadError bool) {
 		return true
 	}
 	// First successful (or empty) poll: signal readiness for health probes.
-	r.readyOnce.Do(func() { close(r.readyCh) })
+	r.mu.Lock()
+	if !r.readyClosed {
+		close(r.readyCh)
+		r.readyClosed = true
+	}
+	r.mu.Unlock()
 	return false
 }
 
@@ -441,7 +462,10 @@ func (r *Runner) PrunePublished(ctx context.Context, olderThan time.Duration, li
 
 // Stop signals the runner to stop and waits up to DrainTimeout for the current
 // poll cycle to finish. Returns an error if the drain timeout is exceeded.
-// Safe to call multiple times and safe to call before Start.
+// Safe to call multiple times and safe to call before Start. Stop affects only
+// a Start that is already running — a Stop that races ahead of a Start in
+// another goroutine is a no-op — so shut down by cancelling the ctx passed to
+// Start and then calling Stop to wait for the drain.
 func (r *Runner) Stop() error {
 	r.mu.Lock()
 	r.cancel()

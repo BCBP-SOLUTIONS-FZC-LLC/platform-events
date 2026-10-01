@@ -55,19 +55,18 @@ func ApplySchema(ctx context.Context, runner *migrate.Runner) error {
 	return outboxRunner.Up(ctx)
 }
 
-// dsnWithMigrationsTable injects x-migrations-table=table into the DSN query
-// string so that golang-migrate's pgx/v5 driver uses an isolated tracking table
-// instead of the default "schema_migrations". Does not override a value already
-// present in the DSN.
+// dsnWithMigrationsTable sets x-migrations-table=table on the DSN so that
+// golang-migrate's pgx/v5 driver tracks the outbox schema in its own table. An
+// explicit value already in the DSN (typically the service's own tracking
+// table) is replaced: sharing it would make outbox versions 1–8 collide with
+// the service's migration versions. Same rule as inbox.ApplySchema.
 func dsnWithMigrationsTable(dsn, table string) (string, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
 		return "", err
 	}
 	q := u.Query()
-	if !q.Has("x-migrations-table") {
-		q.Set("x-migrations-table", table)
-		u.RawQuery = q.Encode()
-	}
+	q.Set("x-migrations-table", table)
+	u.RawQuery = q.Encode()
 	return u.String(), nil
 }

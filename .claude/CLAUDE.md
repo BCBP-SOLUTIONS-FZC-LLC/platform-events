@@ -199,17 +199,19 @@ pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx p
   "id":             "01926e4f-...",     // UUID v7 — sortable, unique per event
   "type":           "iam.user.created", // <domain>.<entity>.<past-tense-verb>[.v<N>]
   "source":         "platform-iam",    // emitting service name
-  "schema_version": "1",               // optional; omitted = treat as "1"
+  "specversion":    "1",               // SchemaVersion — optional; omitted = treat as "1"
   "tenant_id":      "acme",
   "trace_id":       "4bf92f3577...",   // OTel trace ID (hex, 32 chars) or empty
   "correlation_id": "...",             // optional: ties events in a saga/workflow
   "subject":        "users/01926e4f-...", // optional: resource the event is about; also an SNS filter attribute
   "actor":          "admin@acme.com",  // optional: identity that caused the event (audit trail)
-  "schema_id":      "550e8400-...",    // optional: Glue Schema Registry UUID — distinct from schema_version
-  "timestamp":      "2026-05-27T...",  // RFC3339Nano, UTC
-  "payload":        { ... }            // typed T, inlined (not base64)
+  "dataschema":     "550e8400-...",    // SchemaID — optional: Glue Schema Registry UUID, distinct from specversion
+  "time":           "2026-05-27T...",  // Timestamp — RFC3339Nano, UTC
+  "data":           { ... }            // Payload — typed T, inlined (not base64)
 }
 ```
+
+The JSON keys follow CloudEvents naming (`specversion`, `dataschema`, `time`, `data`); the Go fields keep their descriptive names (`SchemaVersion`, `SchemaID`, `Timestamp`, `Payload`). `ip_address` / `user_agent` are optional audit fields.
 
 `event_type` convention: `<domain>.<entity>.<past-tense-verb>[.v<N>]` (e.g. `iam.user.created`, `billing.invoice.settled`). The `.v<N>` suffix only appears for breaking payload changes — v1 is implicit (no suffix). Consumers match on prefix with `strings.HasPrefix` or exact equality — no glob or regex routing in the base library.
 
@@ -243,9 +245,9 @@ Start() →
 ```
 
 - **Visibility extension** — if a handler runs longer than `VisibilityTimeout/2`, the consumer automatically calls `ChangeMessageVisibility` to extend by `VisibilityTimeout` until the handler returns.
-- **Dead-letter handler** — messages that have exceeded `MaxReceiveCount` (configured at the SQS level) are routed to `WithDeadLetterHandler` if set; otherwise they are logged at `ERROR` and deleted.
+- **Dead-letter handler** — with `WithDeadLetterHandler` and/or `WithDLQForwarding`, a message whose `ApproximateReceiveCount` exceeds `WithMaxReceiveCount` (default 5; keep it below the queue's RedrivePolicy `maxReceiveCount`) goes to the handler, then — unless the handler already forwarded it with `SendToDLQ` — is forwarded to the DLQ, and is deleted once both succeed. Without either option there is no consumer-side threshold: SQS's own redrive policy moves the message.
 - **Graceful shutdown** — `Stop()` cancels the receive loop, waits for all in-flight handlers to complete (up to `DrainTimeout`, default 30 s), then returns.
-- **OTel** — each message dispatch creates a child span `sqs.receive` with `messaging.system=aws_sqs`, `messaging.destination`, `messaging.message_id`, `messaging.operation=process`. The span is linked to the publisher's trace via `Envelope.TraceID`, giving end-to-end visibility across the SNS/SQS boundary in Tempo/Grafana. OTel must be initialised by the consuming service via `gincommon.InitTracingFromEnv()` before starting the consumer.
+- **OTel** — each message dispatch creates a child span `sqs.receive` with `messaging.system=aws_sqs`, `messaging.destination`, `messaging.message_id`, `messaging.operation=process`. The span starts a new trace with a span **link** to the producer span, extracted from the W3C `traceparent` message attribute the SNS publisher injects (baggage is propagated into the handler ctx too), giving end-to-end visibility across the SNS/SQS boundary in Tempo/Grafana. OTel must be initialised by the consuming service via `gincommon.InitTracingFromEnv()` before starting the consumer.
 - **RLS GUC propagation** — the handler `ctx` has `env.TenantID` and `env.TraceID` injected so that `pgcommon.Pool` GUC injection (via `platform-pgcommon`'s `RLSMiddleware` / `GUCProvider`) correctly scopes all DB queries inside the handler to the event's tenant without any extra wiring by the caller.
 
 ### Codec (optional schema-registry hook)
@@ -272,7 +274,7 @@ The outbox pattern eliminates the dual-write problem: services write the event *
 **Poll cycle:**
 1. `SELECT ... FOR UPDATE SKIP LOCKED` — claim up to `BatchSize` unpublished records with no published_at.
 2. For each record: call `Publisher.Publish`; on success set `published_at = NOW()`.
-3. On failure: increment `attempts`; set `last_error`; if `attempts >= MaxAttempts` move to dead-letter table (`outbox_dead_letters`).
+3. On a permanent failure: increment `attempts`; set `last_error`; retry after `RetryBackoff·2^(attempts-1)` (default 1s, capped at `MaxRetryBackoff` 5m, jittered); if `attempts >= MaxAttempts` move to dead-letter table (`outbox_dead_letters`). Transient failures (transport, throttling, timeouts) and shutdown use `ReleaseLease` — no attempt counted; transient ones back off on one shared schedule that resets on the next successful publish, so an SNS outage builds a backlog instead of dead-lettering it.
 4. Commit; sleep `PollInterval` (default `5s`).
 
 **Idempotency** — `Envelope.ID` (UUID v7) is forwarded as the SNS `MessageDeduplicationID` on FIFO topics and as a message attribute on standard topics. Consumers should use `Envelope.ID` as their idempotency key.
@@ -333,6 +335,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 | `OUTBOX_POLL_INTERVAL` | `5s` | Parsed as `time.Duration` |
 | `OUTBOX_BATCH_SIZE` | `50` | Records per poll cycle |
 | `OUTBOX_MAX_ATTEMPTS` | `5` | Before moving to dead-letter |
+| `OUTBOX_RETRY_BACKOFF` / `OUTBOX_MAX_RETRY_BACKOFF` | `1s` / `5m` | Per-record retry delay base·2^(n-1), capped; also the shared transient-failure backoff |
 | `APP_ENV` → `ENVIRONMENT` | `dev` | Metrics `environment` label when `MetricsIdentity.Environment` is empty (same precedence as platform-pgcommon) |
 | `APP_NAME` | — | Metrics `service` via `events.MetricsIdentityFromEnv` |
 | `OTEL_*` | — | **Not read by this library.** Read by platform-gincommon's `InitTracingFromEnv` in the consuming service; platform-events only uses the global tracer provider/propagator it installs. `config.LoadOTel` is deprecated (its parsing diverges from gincommon's). |
@@ -387,7 +390,7 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 **HMAC key length enforced at call time** — `Sign` returns `("", ErrKeyTooShort)` for keys < 32 bytes rather than silently using a weak key. Callers that ignore the error emit an empty signature, which `Verify` will reject (constant-time) — the system degrades safely.
 
-**OTel trace context propagated via Envelope** — `Envelope.TraceID` carries the OTel trace ID from the publishing service. On the consumer side, `NewSQSConsumer` reconstructs a remote span context from `TraceID` and sets it as the parent of the `sqs.receive` span, enabling cross-service trace continuity without relying on SNS/SQS message attributes for propagation.
+**OTel trace context propagated via message attributes** — the SNS publisher injects the W3C `traceparent` (and baggage) as message attributes. The consumer links its `sqs.receive` span to that producer span (async consumers start a new trace with a link rather than a parent) and puts the baggage in the handler ctx. `Envelope.TraceID` is carried separately for log correlation and RLS-style context (`events.TraceIDFromContext`).
 
 **`PublishBatch` splits automatically at 10** — SNS hard limit is 10 messages per `PublishBatch` call. The adapter splits silently rather than returning an error, so callers can pass arbitrarily-sized slices. Partial failures return a `BatchError` listing per-message errors; successful messages within the same batch are not retried.
 

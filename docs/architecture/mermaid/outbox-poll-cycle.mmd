@@ -9,14 +9,14 @@ flowchart TD
     C -- rows --> L["UPDATE scheduled_at = NOW() + ClaimLeaseDuration\nWHERE id = ANY(ids)\n— lease prevents re-claim by other runners —"]
     L --> D[for each OutboxRecord]
     D --> E[json.Unmarshal Payload → Envelope]
-    E -- unmarshal error --> F["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\nif attempts ≥ MaxAttempts → dead-letter"]
+    E -- unmarshal error --> F["MarkFailed attempts++, last_error\nscheduled_at = NOW() + backoff\nif attempts ≥ MaxAttempts → dead-letter"]
     F --> D
     E -- ok --> G[Publisher.Publish]
     G -- success --> H["MarkPublished\npublished_at = NOW()\noutbox_published_total{success}++"]
     H --> D
-    G -- retryable error\n(Throttling · ServiceUnavailable\n· InternalFailure · RequestTimeout) --> RI["MarkFailed threshold = MaxAttempts+1\n(does NOT exhaust MaxAttempts —\nno dead-letter on transient failure)"]
+    G -- transient error\n(Throttling · ServiceUnavailable\n· InternalFailure · RequestTimeout · timeout) --> RI["ReleaseLease — attempts unchanged\nscheduled_at = NOW() + shared backoff\n(an SNS outage never dead-letters)"]
     RI --> D
-    G -- permanent error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\noutbox_published_total{error}++"]
+    G -- permanent error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() + RetryBackoff·2^(n-1)\noutbox_published_total{error}++"]
     I --> J{attempts ≥ MaxAttempts?}
     J -- yes --> K["INSERT outbox_dead_letters\nDELETE outbox_events\nplatform_dlq_messages_total{operation=outbox_publish}++"]
     J -- no  --> D

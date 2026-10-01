@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -33,6 +35,11 @@ const (
 	// maxLastErrorLen caps the last_error column length stored in outbox_events to
 	// prevent unbounded table bloat from verbose AWS SDK or network error messages.
 	maxLastErrorLen = 512
+
+	// DefaultRetryBackoff and DefaultMaxRetryBackoff bound the delay before a
+	// failed record is retried: base·2^(attempt-1), capped, with jitter.
+	DefaultRetryBackoff    = 1 * time.Second
+	DefaultMaxRetryBackoff = 5 * time.Minute
 )
 
 // OutboxService handles the transactional outbox publish cycle.
@@ -45,6 +52,15 @@ type OutboxService struct {
 	maxAttempts        int
 	publishConcurrency int
 	publishTimeout     time.Duration
+	retryBackoff       time.Duration
+	maxRetryBackoff    time.Duration
+
+	// transientStreak counts consecutive transient publish failures (transport
+	// errors, throttling, timeouts) across records. Those failures describe
+	// the publisher, not a record, so they back off together — an SNS outage
+	// slows every retry instead of hammering SNS each poll — and reset on the
+	// next successful publish.
+	transientStreak atomic.Int32
 }
 
 // NewOutboxService creates an OutboxService with all required dependencies.
@@ -73,7 +89,39 @@ func NewOutboxService(
 		maxAttempts:        maxAttempts,
 		publishConcurrency: publishConcurrency,
 		publishTimeout:     publishTimeout,
+		retryBackoff:       DefaultRetryBackoff,
+		maxRetryBackoff:    DefaultMaxRetryBackoff,
 	}
+}
+
+// SetRetryBackoff sets the retry delay policy: a record's n-th failure delays
+// its next attempt by base·2^(n-1), capped at maxBackoff, with jitter.
+// Non-positive values keep the defaults (1s, 5m).
+func (s *OutboxService) SetRetryBackoff(base, maxBackoff time.Duration) {
+	if base > 0 {
+		s.retryBackoff = base
+	}
+	if maxBackoff > 0 {
+		s.maxRetryBackoff = maxBackoff
+	}
+	if s.maxRetryBackoff < s.retryBackoff {
+		s.maxRetryBackoff = s.retryBackoff
+	}
+}
+
+// backoff returns base·2^(n-1) capped at the maximum, with "equal jitter"
+// (uniform in [d/2, d]) so records that failed together do not retry in
+// lock-step.
+func (s *OutboxService) backoff(n int) time.Duration {
+	d := s.retryBackoff
+	for i := 1; i < n && d < s.maxRetryBackoff; i++ {
+		d *= 2
+	}
+	d = min(d, s.maxRetryBackoff)
+	if half := d / 2; half > 0 {
+		d = half + time.Duration(rand.Int64N(int64(half)+1))
+	}
+	return d
 }
 
 // SetOutboxMetrics injects the metrics observer. Call once after construction
@@ -171,9 +219,8 @@ func (s *OutboxService) PublishBatch(ctx context.Context, batchSize int) error {
 
 	for _, rec := range records {
 		if ctx.Err() != nil {
-			// Context already cancelled — release claim lease without publishing.
-			// maxAttempts+1 ensures a routine shutdown never alone triggers
-			// dead-lettering for a record that is at maxAttempts-1.
+			// Context already cancelled — release the claim lease without
+			// publishing or counting an attempt.
 			s.releaseStranded(bookkeepCtx, rec, "batch interrupted by context cancellation")
 			continue
 		}
@@ -198,16 +245,9 @@ func (s *OutboxService) PublishBatch(ctx context.Context, batchSize int) error {
 							"stack":      string(debug.Stack()),
 						})
 					}
-					// Release the claim lease so the next poll cycle can retry.
-					// Use maxAttempts (not +1) — a panic is a programming error that
-					// must count toward the retry budget to prevent infinite lease holds.
-					if markErr := s.store.MarkFailed(bookkeepCtx, rec, fmt.Sprintf("panic: %v", r), s.maxAttempts); markErr != nil {
-						if s.logger != nil {
-							s.logger.Error("outbox: failed to mark record failed after panic", map[string]any{
-								"id": rec.ID, "error": markErr.Error(),
-							})
-						}
-					}
+					// A panic is a programming error: it counts toward the retry
+					// budget so a poison record cannot hold a lease forever.
+					s.markFailed(bookkeepCtx, rec, fmt.Sprintf("panic: %v", r))
 				}
 			}()
 			s.publishRecord(ctx, bookkeepCtx, rec)
@@ -269,7 +309,7 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 					})
 				}
 				for _, it := range items {
-					s.markFailed(bookkeepCtx, it.rec, fmt.Sprintf("panic: %v", r), s.maxAttempts)
+					s.markFailed(bookkeepCtx, it.rec, fmt.Sprintf("panic: %v", r))
 				}
 				err = &panicErr{msg: fmt.Sprintf("panic: %v", r)}
 			}
@@ -277,6 +317,7 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 		err = s.publisher.PublishBatch(pubCtx, envs)
 	}()
 	if err == nil {
+		s.transientStreak.Store(0)
 		for _, it := range items {
 			s.markPublished(bookkeepCtx, it.rec, it.env)
 		}
@@ -291,34 +332,84 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 	if errors.As(err, &batchErr) {
 		type failInfo struct {
 			msg       string
-			threshold int
+			transient bool
 		}
 		failed := make(map[string]failInfo, len(batchErr.Failures))
+		anyTransient := false
 		for _, f := range batchErr.Failures {
 			// "TransportError" is the code used by publishChunk for transport-level
-			// failures (ThrottlingException, ServiceUnavailable, etc.). Treat it as
-			// retryable so it does not consume a retry slot prematurely.
-			threshold := s.maxAttempts
-			if f.Code == "TransportError" {
-				threshold = s.maxAttempts + 1
-			}
-			failed[f.ID] = failInfo{msg: f.Message, threshold: threshold}
+			// failures (ThrottlingException, ServiceUnavailable, etc.): retried
+			// without consuming an attempt.
+			transient := f.Code == "TransportError"
+			anyTransient = anyTransient || transient
+			failed[f.ID] = failInfo{msg: truncateError(f.Message), transient: transient}
+		}
+		if len(failed) < len(items) {
+			s.transientStreak.Store(0) // something got through
+		}
+		var transientDelay time.Duration
+		if anyTransient {
+			transientDelay = s.nextTransientDelay()
 		}
 		for _, it := range items {
-			if fi, ok := failed[it.rec.ID]; ok {
-				s.markFailed(bookkeepCtx, it.rec, fi.msg, fi.threshold)
-			} else {
+			fi, ok := failed[it.rec.ID]
+			switch {
+			case !ok:
 				s.markPublished(bookkeepCtx, it.rec, it.env)
+			case fi.transient:
+				s.releaseLease(bookkeepCtx, it.rec, fi.msg, transientDelay)
+			default:
+				s.markFailed(bookkeepCtx, it.rec, fi.msg)
 			}
 		}
 		return ctx.Err()
 	}
 
-	threshold := s.failureThreshold(err)
-	for _, it := range items {
-		s.markFailed(bookkeepCtx, it.rec, truncateError(err.Error()), threshold)
-	}
+	s.handlePublishError(ctx, bookkeepCtx, err, recordsOf(items, func(it item) domain.OutboxRecord { return it.rec }))
 	return ctx.Err()
+}
+
+func recordsOf[T any](items []T, rec func(T) domain.OutboxRecord) []domain.OutboxRecord {
+	out := make([]domain.OutboxRecord, len(items))
+	for i, it := range items {
+		out[i] = rec(it)
+	}
+	return out
+}
+
+// handlePublishError settles records whose publish failed with err. Shutdown
+// releases the lease immediately; transient failures (timeouts, ErrRetryable)
+// release it after the shared transient backoff; anything else counts an
+// attempt and backs off per record.
+func (s *OutboxService) handlePublishError(ctx, bookkeepCtx context.Context, err error, recs []domain.OutboxRecord) {
+	msg := truncateError(err.Error())
+	switch {
+	case ctx.Err() != nil:
+		for _, rec := range recs {
+			s.releaseStranded(bookkeepCtx, rec, "publish interrupted by shutdown: "+msg)
+		}
+	case isTransient(err):
+		d := s.nextTransientDelay()
+		for _, rec := range recs {
+			s.releaseLease(bookkeepCtx, rec, msg, d)
+		}
+	default:
+		for _, rec := range recs {
+			s.markFailed(bookkeepCtx, rec, msg)
+		}
+	}
+}
+
+// isTransient reports whether a publish error describes the publisher (timeout,
+// throttling, outage) rather than the record.
+func isTransient(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, domain.ErrRetryable)
+}
+
+// nextTransientDelay advances the shared transient-failure streak and returns
+// its backoff.
+func (s *OutboxService) nextTransientDelay() time.Duration {
+	return s.backoff(int(s.transientStreak.Add(1)))
 }
 
 func (s *OutboxService) newBookkeepCtx(recordCount int) (context.Context, context.CancelFunc) {
@@ -333,10 +424,16 @@ func (s *OutboxService) newBookkeepCtx(recordCount int) (context.Context, contex
 	return context.WithTimeout(context.Background(), bookkeepTimeout)
 }
 
+// releaseStranded hands a claimed-but-unpublished record back on shutdown:
+// claimable immediately, no attempt counted.
 func (s *OutboxService) releaseStranded(bookkeepCtx context.Context, rec domain.OutboxRecord, reason string) {
-	if markErr := s.store.MarkFailed(bookkeepCtx, rec, reason, s.maxAttempts+1); markErr != nil && s.logger != nil {
-		s.logger.Error("outbox: failed to release stranded record lease on shutdown", map[string]any{
-			"id": rec.ID, "error": markErr.Error(),
+	s.releaseLease(bookkeepCtx, rec, reason, 0)
+}
+
+func (s *OutboxService) releaseLease(bookkeepCtx context.Context, rec domain.OutboxRecord, reason string, retryAfter time.Duration) {
+	if err := s.store.ReleaseLease(bookkeepCtx, rec.ID, reason, retryAfter); err != nil && s.logger != nil {
+		s.logger.Error("outbox: failed to release record lease", map[string]any{
+			"id": rec.ID, "error": err.Error(),
 		})
 	}
 }
@@ -350,11 +447,7 @@ func (s *OutboxService) handleUnmarshalError(bookkeepCtx context.Context, rec do
 			"id": rec.ID, "event_type": rec.EventType, "error": err.Error(),
 		})
 	}
-	if markErr := s.store.MarkFailed(bookkeepCtx, rec, truncateError(err.Error()), s.maxAttempts); markErr != nil && s.logger != nil {
-		s.logger.Error("outbox: failed to mark record failed", map[string]any{
-			"id": rec.ID, "error": markErr.Error(),
-		})
-	}
+	s.markFailed(bookkeepCtx, rec, truncateError(err.Error()))
 }
 
 func (s *OutboxService) markPublished(bookkeepCtx context.Context, rec domain.OutboxRecord, env domain.Envelope[json.RawMessage]) {
@@ -370,20 +463,14 @@ func (s *OutboxService) markPublished(bookkeepCtx context.Context, rec domain.Ou
 	}
 }
 
-func (s *OutboxService) markFailed(bookkeepCtx context.Context, rec domain.OutboxRecord, msg string, threshold int) {
-	if markErr := s.store.MarkFailed(bookkeepCtx, rec, msg, threshold); markErr != nil && s.logger != nil {
+// markFailed counts a failed attempt; the record is retried after its
+// per-record backoff or dead-lettered at maxAttempts.
+func (s *OutboxService) markFailed(bookkeepCtx context.Context, rec domain.OutboxRecord, msg string) {
+	if markErr := s.store.MarkFailed(bookkeepCtx, rec, msg, s.maxAttempts, s.backoff(rec.Attempts+1)); markErr != nil && s.logger != nil {
 		s.logger.Error("outbox: failed to mark record failed", map[string]any{
 			"id": rec.ID, "error": markErr.Error(),
 		})
 	}
-}
-
-func (s *OutboxService) failureThreshold(err error) int {
-	threshold := s.maxAttempts
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, domain.ErrRetryable) {
-		threshold = s.maxAttempts + 1
-	}
-	return threshold
 }
 
 // publishRecord handles a single outbox record: unmarshal → publish → mark.
@@ -416,13 +503,11 @@ func (s *OutboxService) publishRecord(ctx, bookkeepCtx context.Context, rec doma
 				"id": rec.ID, "error": err.Error(),
 			})
 		}
-		// Use maxAttempts+1 when the failure is caused by context cancellation
-		// (graceful shutdown) so a record at its last permitted attempt is not
-		// prematurely dead-lettered — matching the pre-publish cancellation guard.
-		s.markFailed(bookkeepCtx, rec, truncateError(err.Error()), s.failureThreshold(err))
+		s.handlePublishError(ctx, bookkeepCtx, err, []domain.OutboxRecord{rec})
 		return
 	}
 
+	s.transientStreak.Store(0)
 	s.markPublished(bookkeepCtx, rec, env)
 }
 

@@ -100,16 +100,19 @@ func InitMetrics(id MetricsIdentity, reg prometheus.Registerer, opts ...MetricsO
 	if reg == nil {
 		reg = prometheus.DefaultRegisterer
 	}
-	metrics.SetEventTypeLimit(o.eventTypeLimit)
 	source := ""
 	if id.Environment == "" {
 		id.Environment, source = metrics.Environment()
 	}
 	warnings, err := metrics.InitWithIdentity(id, reg, o.legacy)
-	if err != nil && source != "" && source != "default" {
-		err = fmt.Errorf("%w (environment %q was read from %s)", err, id.Environment, source)
+	if err != nil {
+		if source != "" && source != "default" {
+			err = fmt.Errorf("%w (environment %q was read from %s)", err, id.Environment, source)
+		}
+		return warnings, err // nothing changed, including the event_type cap
 	}
-	return warnings, err
+	metrics.SetEventTypeLimit(o.eventTypeLimit)
+	return warnings, nil
 }
 
 // MetricsEnvironmentFromEnv returns the deployment environment from the

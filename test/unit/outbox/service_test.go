@@ -37,6 +37,7 @@ type mockStore struct {
 	records   []domain.OutboxRecord
 	published map[string]bool
 	failed    map[string]string
+	released  map[string]string
 	err       error
 }
 
@@ -44,6 +45,7 @@ func newMockStore() *mockStore {
 	return &mockStore{
 		published: make(map[string]bool),
 		failed:    make(map[string]string),
+		released:  make(map[string]string),
 	}
 }
 
@@ -79,10 +81,19 @@ func (s *mockStore) MarkPublished(_ context.Context, id string) error {
 	return nil
 }
 
-func (s *mockStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, _ int) error {
+func (s *mockStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, _ int, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failed[rec.ID] = lastError
+	return nil
+}
+
+// ReleaseLease records lease releases (shutdown, transient failures) — no
+// attempt counted, so they are kept apart from failed.
+func (s *mockStore) ReleaseLease(_ context.Context, id, lastError string, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.released[id] = lastError
 	return nil
 }
 
@@ -184,11 +195,11 @@ func TestOutboxService_PublishBatch_Sequential_PartialBatchError(t *testing.T) {
 	assert.Contains(t, store.failed, envFail.ID)
 }
 
-// TestOutboxService_PublishBatch_Sequential_TransportError_UsesMaxAttemptsPlus1 verifies
-// that a BatchError failure with Code="TransportError" (e.g. SNS throttle wrapped by
-// publishChunk) uses maxAttempts+1 as the MarkFailed threshold so transient transport
-// failures do not consume a retry slot and prematurely dead-letter healthy records.
-func TestOutboxService_PublishBatch_Sequential_TransportError_UsesMaxAttemptsPlus1(t *testing.T) {
+// TestOutboxService_PublishBatch_Sequential_TransportError_ReleasesWithoutAttempt
+// verifies that a BatchError failure with Code="TransportError" (e.g. SNS throttle
+// wrapped by publishChunk) releases the lease without counting an attempt, so an
+// SNS outage can never dead-letter healthy records.
+func TestOutboxService_PublishBatch_Sequential_TransportError_ReleasesWithoutAttempt(t *testing.T) {
 	const maxAttempts = 5
 	var capturedThresholds []int
 	capture := &captureMaxAttemptsStore{
@@ -215,9 +226,8 @@ func TestOutboxService_PublishBatch_Sequential_TransportError_UsesMaxAttemptsPlu
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err)
 
-	require.Len(t, capturedThresholds, 1, "MarkFailed must be called exactly once")
-	assert.Equal(t, maxAttempts+1, capturedThresholds[0],
-		"TransportError must use maxAttempts+1 to avoid consuming a retry slot")
+	assert.Empty(t, capturedThresholds, "TransportError must not count an attempt")
+	assert.Equal(t, "ThrottlingException", capture.released[env.ID], "lease released with the error recorded")
 }
 
 func TestOutboxService_PublishBatch_Success(t *testing.T) {
@@ -478,8 +488,13 @@ type markFailedErrorStore struct {
 	mfErr error
 }
 
-func (s *markFailedErrorStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int) error {
-	_ = s.mockStore.MarkFailed(context.Background(), rec, lastError, maxAttempts)
+func (s *markFailedErrorStore) ReleaseLease(_ context.Context, id, lastError string, retryAfter time.Duration) error {
+	_ = s.mockStore.ReleaseLease(context.Background(), id, lastError, retryAfter)
+	return s.mfErr
+}
+
+func (s *markFailedErrorStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int, retryAfter time.Duration) error {
+	_ = s.mockStore.MarkFailed(context.Background(), rec, lastError, maxAttempts, retryAfter)
 	return s.mfErr
 }
 
@@ -616,8 +631,9 @@ func TestOutboxService_PublishBatch_CtxCancel_StrandedRecordsMarkedFailed(t *tes
 
 	// All 3 claimed records should have been released via MarkFailed so no
 	// runner needs to wait for the claim lease to expire.
-	assert.Len(t, store.failed, 3, "all stranded records should have MarkFailed called")
-	for id, reason := range store.failed {
+	assert.Len(t, store.released, 3, "all stranded records should have their lease released")
+	assert.Empty(t, store.failed, "shutdown must not count an attempt")
+	for id, reason := range store.released {
 		assert.Contains(t, reason, "context", "MarkFailed reason should mention context cancellation for %s", id)
 	}
 }
@@ -666,7 +682,8 @@ func TestOutboxService_PublishBatch_Parallel_CtxCancel_StrandedMarkedFailed(t *t
 
 	err := svc.PublishBatch(ctx, 10)
 	require.Error(t, err)
-	assert.Len(t, store.failed, 4, "all records should have MarkFailed called")
+	assert.Len(t, store.released, 4, "all records should have their lease released")
+	assert.Empty(t, store.failed, "shutdown must not count an attempt")
 }
 
 // ----------------------------
@@ -710,12 +727,14 @@ func TestOutboxService_PublishTimeout_Fires_MarksFailed(t *testing.T) {
 	err := svc.PublishBatch(context.Background(), 10)
 	require.NoError(t, err)
 
-	// Record should be marked failed because the publish timed out.
-	assert.Contains(t, store.failed, env.ID, "timed-out record should be marked failed")
+	// A publish timeout is transient: the lease is released (retried after the
+	// shared backoff) without counting an attempt.
+	assert.Contains(t, store.released, env.ID, "timed-out record should have its lease released")
+	assert.NotContains(t, store.failed, env.ID, "a timeout must not count an attempt")
 }
 
 // ----------------------------
-// Shutdown does not dead-letter at-maxAttempts-1 records (maxAttempts+1 fix)
+// Shutdown never counts an attempt
 // ----------------------------
 
 func TestOutboxService_CtxCancel_DoesNotDeadLetterAtMaxAttemptsMinusOne(t *testing.T) {
@@ -741,9 +760,8 @@ func TestOutboxService_CtxCancel_DoesNotDeadLetterAtMaxAttemptsMinusOne(t *testi
 
 	_ = svc.PublishBatch(ctx, 10)
 
-	require.Len(t, calls, 1)
-	// Cancellation must pass maxAttempts+1 (=6) so attempts=4 is never dead-lettered by shutdown alone.
-	assert.Equal(t, 6, calls[0].maxAttempts, "cancellation path must use maxAttempts+1")
+	assert.Empty(t, calls, "shutdown must release the lease, not count an attempt")
+	assert.Contains(t, store.released, env.ID)
 }
 
 type captureMaxAttemptsStore struct {
@@ -751,7 +769,7 @@ type captureMaxAttemptsStore struct {
 	onFail func(id string, maxAttempts int)
 }
 
-func (s *captureMaxAttemptsStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, _ string, maxAttempts int) error {
+func (s *captureMaxAttemptsStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, _ string, maxAttempts int, _ time.Duration) error {
 	s.onFail(rec.ID, maxAttempts)
 	s.failed[rec.ID] = "captured"
 	return nil
@@ -902,10 +920,10 @@ func TestOutboxService_PublishBatch_NormalFailure_PassesMaxAttempts(t *testing.T
 	require.NoError(t, err)
 
 	require.Len(t, calls, 1)
-	// Normal (non-retryable) failure must pass maxAttempts (not +1) so the record
-	// is eventually dead-lettered after exactly maxAttempts failures.
+	// Normal (non-retryable) failure counts an attempt against maxAttempts so
+	// the record is dead-lettered after exactly maxAttempts failures.
 	assert.Equal(t, maxAttempts, calls[0].maxAttempts,
-		"non-retryable publish failure must use maxAttempts (not maxAttempts+1)")
+		"non-retryable publish failure must use maxAttempts")
 }
 
 func TestOutboxService_ReprocessDeadLetters_Error(t *testing.T) {
@@ -1028,7 +1046,7 @@ func TestOutboxService_PublishBatch_CtxAlreadyCancelled(t *testing.T) {
 	assert.ErrorIs(t, err, context.Canceled, "cancelled context must propagate to return value")
 
 	assert.Empty(t, pub.Published(), "no records should be published with already-cancelled context")
-	assert.Len(t, store.failed, 3, "all records must be marked failed at loop top")
+	assert.Len(t, store.released, 3, "all records must have their lease released at loop top")
 }
 
 // ----------------------------
@@ -1377,7 +1395,7 @@ func TestOutboxService_PublishBatch_Parallel_Panic_MarkFailedError_WithLogger(t 
 
 	found := false
 	for _, e := range logger.Entries() {
-		if e.Level == "ERROR" && strings.Contains(e.Message, "failed to mark record failed after panic") {
+		if e.Level == "ERROR" && strings.Contains(e.Message, "failed to mark record failed") {
 			found = true
 			break
 		}

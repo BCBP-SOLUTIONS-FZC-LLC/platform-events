@@ -74,16 +74,17 @@ tests:
               description: "Messages have been delivered for 15 minutes without a single successful handler completion."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumerstalled"
 
-  # The first malformed message after a restart alerts (series pre-created at 0).
+  # The first malformed message after a restart alerts: the failed counter is
+  # pre-created at 0; the dead-letter series (keyed by event_type) is born at 1.
   - interval: 1m
     input_series:
       - series: 'platform_messages_failed_total{domain="iam",service="event-consumer",environment="prod",queue="orders",event_type="unknown",reason="malformed"}'
         values: '0 0 0 1 1 1'
       - series: 'platform_dlq_messages_total{domain="iam",service="event-consumer",environment="prod",operation="consume",event_type="unknown",reason="malformed"}'
-        values: '0 0 0 1 1 1'
+        values: '_ _ _ 1 1 1'
       # Intentional dead-lettering does not alert.
       - series: 'platform_dlq_messages_total{domain="iam",service="event-consumer",environment="prod",operation="consume",event_type="iam.user.created",reason="explicit"}'
-        values: '0 0 0 5 5 5'
+        values: '_ _ _ 5 5 5'
     alert_rule_test:
       - eval_time: 5m
         alertname: PlatformEventsMalformedMessages
@@ -161,3 +162,35 @@ tests:
               summary: "orders fails over 5% of publishes"
               description: "More than 5% of publishes have failed for 10 minutes."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventspublisherrors"
+
+  # A queue whose messages are all dead-lettered on purpose is not stalled.
+  - interval: 1m
+    input_series:
+      - series: 'platform_messages_received_total{domain="iam",service="event-consumer",environment="prod",queue="orders"}'
+        values: '0+10x40'
+      - series: 'platform_messages_processed_total{domain="iam",service="event-consumer",environment="prod",queue="orders",event_type="iam.user.created"}'
+        values: '0x40'
+      - series: 'platform_dlq_messages_total{domain="iam",service="event-consumer",environment="prod",operation="consume",event_type="iam.user.created",reason="explicit"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: PlatformEventsConsumerStalled
+        exp_alerts: []
+
+  # The first mark_published failure after a restart alerts (label-less legacy
+  # counter pre-created at 0 at init).
+  - interval: 1m
+    input_series:
+      - series: 'outbox_mark_published_errors_total{service="billing"}'
+        values: '0 0 0 1 1 1'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PlatformEventsOutboxDuplicateDeliveryRisk
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: billing
+            exp_annotations:
+              summary: "billing published outbox events it could not mark as published"
+              description: "Those events will be delivered again; consumers must be idempotent (inbox dedup)."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxduplicatedeliveryrisk"

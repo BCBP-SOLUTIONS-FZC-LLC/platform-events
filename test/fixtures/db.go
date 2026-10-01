@@ -119,6 +119,29 @@ func NewTestDB(ctx context.Context, t *testing.T) (*pgcommon.Pool, func()) {
 	return NewTestDBWithConfig(ctx, t, func(*pgcommon.Config) {})
 }
 
+// NewEmptyTestDB creates a fresh database with no schema on the shared
+// Postgres container and returns its DSN and a function that drops it.
+func NewEmptyTestDB(ctx context.Context, t *testing.T) (dsn string, drop func()) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test: -short flag is set (Docker not required)")
+	}
+	sharedPG.once.Do(startSharedPostgres)
+	if sharedPG.err != nil {
+		t.Fatalf("fixtures.NewEmptyTestDB: %v", sharedPG.err)
+	}
+	db := testDBName(t)
+	if err := adminExec(ctx, "CREATE DATABASE "+db); err != nil {
+		t.Fatalf("fixtures.NewEmptyTestDB: create database %s: %v", db, err)
+	}
+	drop = func() {
+		// FORCE (Postgres 13+) terminates connections a test left open, e.g.
+		// after deliberately closing its pool mid-test.
+		_ = adminExec(context.Background(), "DROP DATABASE IF EXISTS "+db+" WITH (FORCE)")
+	}
+	return sharedPG.base + "/" + db + "?sslmode=disable", drop
+}
+
 // NewTestDBWithConfig is NewTestDB with a Config that configure may mutate
 // (e.g. setting PGBouncerMode: true to reproduce SimpleProtocol exec-mode
 // behaviour) before connecting.
@@ -133,16 +156,7 @@ func NewTestDBWithConfig(ctx context.Context, t *testing.T, configure func(cfg *
 		t.Fatalf("fixtures.NewTestDBWithConfig: %v", sharedPG.err)
 	}
 
-	db := testDBName(t)
-	if err := adminExec(ctx, "CREATE DATABASE "+db); err != nil {
-		t.Fatalf("fixtures.NewTestDBWithConfig: create database %s: %v", db, err)
-	}
-	drop := func() {
-		// FORCE (Postgres 13+) terminates connections a test left open, e.g.
-		// after deliberately closing its pool mid-test.
-		_ = adminExec(context.Background(), "DROP DATABASE IF EXISTS "+db+" WITH (FORCE)")
-	}
-	dsn := sharedPG.base + "/" + db + "?sslmode=disable"
+	dsn, drop := NewEmptyTestDB(ctx, t)
 
 	runner := &migrate.Runner{DSN: dsn}
 	if err := outbox.ApplySchema(ctx, runner); err != nil {

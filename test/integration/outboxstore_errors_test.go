@@ -95,7 +95,7 @@ func TestOutboxStore_MarkFailed_ClosedPool_Error(t *testing.T) {
 	}
 	store, ctx := closedPoolStore(t)
 
-	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000002"}, "error", 5)
+	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000002"}, "error", 5, 0)
 	require.Error(t, err)
 }
 
@@ -110,7 +110,7 @@ func TestOutboxStore_MarkFailed_ClosedPool_AfterEnqueue_Error(t *testing.T) {
 	rec := enqueueRecord(t, store, pool)
 	pool.Close()
 
-	err := store.MarkFailed(ctx, rec, "publish failed", 5)
+	err := store.MarkFailed(ctx, rec, "publish failed", 5, 0)
 	require.Error(t, err)
 }
 

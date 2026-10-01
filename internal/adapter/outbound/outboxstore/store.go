@@ -205,10 +205,11 @@ func (s *Store) MarkPublished(ctx context.Context, id string) error {
 }
 
 // MarkFailed increments attempts and sets last_error.
-// If attempts >= maxAttempts, the record is moved to outbox_dead_letters.
+// If attempts >= maxAttempts, the record is moved to outbox_dead_letters;
+// otherwise it becomes claimable again after retryAfter (the caller's backoff).
 // rec carries the record's original fields so dead-letter insertion does not
 // require an additional DB read of the payload.
-func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int) error {
+func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int, retryAfter time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
 	defer cancel()
 	deadLettered := false
@@ -264,16 +265,16 @@ func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastErr
 				return err
 			}
 		} else {
-			// Reset scheduled_at = NOW() to release the claim lease immediately
-			// so the next poll cycle can retry this record without delay.
+			// Replace the claim lease with the retry backoff: the record is
+			// claimable again at NOW() + retryAfter.
 			// WHERE published_at IS NULL prevents a TOCTOU race: if MarkPublished
 			// committed between our SELECT and this UPDATE, the already-published
 			// row is not overwritten with stale attempt/error data.
 			_, err = tx.Exec(ctx, `
 				UPDATE outbox_events
-				SET attempts = $1, last_error = $2, scheduled_at = NOW()
+				SET attempts = $1, last_error = $2, scheduled_at = NOW() + make_interval(secs => $4)
 				WHERE id = $3 AND published_at IS NULL
-			`, newAttempts, lastError, rec.ID)
+			`, newAttempts, lastError, rec.ID, max(retryAfter, 0).Seconds())
 			if err != nil {
 				return err
 			}
@@ -291,6 +292,23 @@ func (s *Store) MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastErr
 		metrics.IncRetry("outbox_publish", rec.EventType)
 	}
 	return nil
+}
+
+// ReleaseLease makes a claimed record claimable again after retryAfter without
+// counting an attempt. Used for shutdown and transient (transport, throttling,
+// timeout) failures, which say nothing about the record itself and must never
+// push it towards the dead-letter table.
+func (s *Store) ReleaseLease(ctx context.Context, id, lastError string, retryAfter time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, defaultStoreQueryTimeout)
+	defer cancel()
+	return pgcommon.RunInTx(ctx, s.pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+		_, err := tx.Exec(ctx, `
+			UPDATE outbox_events
+			SET last_error = $2, scheduled_at = NOW() + make_interval(secs => $3)
+			WHERE id = $1 AND published_at IS NULL
+		`, id, lastError, max(retryAfter, 0).Seconds())
+		return err
+	})
 }
 
 // LeasedCount returns the number of records currently claimed by a runner
@@ -436,7 +454,7 @@ func (s *Store) ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQF
 			DELETE FROM outbox_dead_letters
 			WHERE id IN (
 				SELECT id FROM outbox_dead_letters%s
-				ORDER BY created_at ASC
+				ORDER BY failed_at ASC
 				LIMIT $%d
 			)
 			RETURNING id, event_type, payload, tenant_id, trace_id, created_at
@@ -518,7 +536,7 @@ func (s *Store) ReprocessDeadLetters(ctx context.Context, limit int) (int, error
 				DELETE FROM outbox_dead_letters
 				WHERE id IN (
 					SELECT id FROM outbox_dead_letters
-					ORDER BY created_at
+					ORDER BY failed_at
 					LIMIT $1
 				)
 				RETURNING id, event_type, payload, tenant_id, trace_id, created_at

@@ -22,10 +22,16 @@ type OutboxStore interface {
 	MarkPublished(ctx context.Context, id string) error
 
 	// MarkFailed increments attempts and sets last_error.
-	// If attempts >= maxAttempts, moves the record to the dead-letter table.
+	// If attempts >= maxAttempts, moves the record to the dead-letter table;
+	// otherwise the record becomes claimable again after retryAfter.
 	// rec carries the record's original fields for dead-letter insertion, avoiding
 	// a second DB read of the payload when moving to outbox_dead_letters.
-	MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int) error
+	MarkFailed(ctx context.Context, rec domain.OutboxRecord, lastError string, maxAttempts int, retryAfter time.Duration) error
+
+	// ReleaseLease makes a claimed record claimable again after retryAfter and
+	// records lastError, without counting an attempt. Used for shutdown and
+	// transient failures that say nothing about the record itself.
+	ReleaseLease(ctx context.Context, id, lastError string, retryAfter time.Duration) error
 
 	// PendingCount returns the number of records not yet published.
 	// Used to update the outbox_pending_total Prometheus gauge each poll cycle.
@@ -45,7 +51,9 @@ type OutboxStore interface {
 	ListDeadLetters(ctx context.Context, filter domain.DLQFilter, limit int) ([]domain.DeadLetterRecord, error)
 
 	// ReprocessDeadLettersWith moves up to limit records that match filter from
-	// outbox_dead_letters back to outbox_events, resetting attempts to 0.
+	// outbox_dead_letters back to outbox_events, resetting attempts to 0, in the
+	// same order as ListDeadLetters (failed_at ascending) so a list-then-replay
+	// with the same filter and limit replays exactly the inspected records.
 	// Returns the number of records re-queued.
 	ReprocessDeadLettersWith(ctx context.Context, filter domain.DLQFilter, limit int) (int, error)
 

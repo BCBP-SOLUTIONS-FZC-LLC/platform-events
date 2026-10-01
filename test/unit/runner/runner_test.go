@@ -30,6 +30,7 @@ type mockOutboxStore struct {
 	records   []domain.OutboxRecord
 	published map[string]bool
 	failed    map[string]string
+	released  map[string]string
 	claimErr  error
 	claims    int // ClaimBatch calls, for tests that watch the poll loop
 }
@@ -38,6 +39,7 @@ func newMockOutboxStore() *mockOutboxStore {
 	return &mockOutboxStore{
 		published: make(map[string]bool),
 		failed:    make(map[string]string),
+		released:  make(map[string]string),
 	}
 }
 
@@ -80,10 +82,17 @@ func (s *mockOutboxStore) MarkPublished(_ context.Context, id string) error {
 	return nil
 }
 
-func (s *mockOutboxStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, _ int) error {
+func (s *mockOutboxStore) MarkFailed(_ context.Context, rec domain.OutboxRecord, lastError string, _ int, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failed[rec.ID] = lastError
+	return nil
+}
+
+func (s *mockOutboxStore) ReleaseLease(_ context.Context, id, lastError string, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.released[id] = lastError
 	return nil
 }
 
@@ -609,8 +618,8 @@ func TestApplySchema_ValidDSN_CoversDSNManipulation(t *testing.T) {
 }
 
 func TestApplySchema_ValidDSN_AlreadyHasMigrationsTable(t *testing.T) {
-	// When the DSN already contains x-migrations-table, dsnWithMigrationsTable
-	// must not override the existing value (the !q.Has() == false branch).
+	// An explicit x-migrations-table in the DSN is replaced with
+	// outbox_migrations (sharing the service's table would collide versions).
 	runner := &migrate.Runner{DSN: "postgres://localhost:5432/testdb?x-migrations-table=custom_migrations"}
 	err := outbox.ApplySchema(context.Background(), runner)
 	require.Error(t, err) // DB connection fails — expected
@@ -1577,4 +1586,43 @@ func TestRunner_TickerPollFails_BackoffThenResumes(t *testing.T) {
 		defer store.mu.Unlock()
 		return store.claims >= before+3
 	}, 4*time.Second, 10*time.Millisecond, "polling resumes at the regular interval after the backoff")
+}
+
+// TestRunner_ReadyBeforeStart: the documented `go runner.Start(ctx);
+// <-runner.Ready()` pattern can call Ready before Start runs; that channel must
+// still be closed by the first poll.
+func TestRunner_ReadyBeforeStart(t *testing.T) {
+	r, err := outbox.NewRunner(outbox.Config{
+		Store:        newMockOutboxStore(),
+		Publisher:    &mockPublicPublisher{inner: &fixtures.MockPublisher{}},
+		PollInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	ready := r.Ready() // before Start
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = r.Start(ctx) }()
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ready channel obtained before Start was never closed")
+	}
+	cancel()
+	<-done
+
+	// A restart replaces the closed channel; the new cycle closes it too.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan struct{})
+	go func() { defer close(done2); _ = r.Start(ctx2) }()
+	require.Eventually(t, func() bool {
+		select {
+		case <-r.Ready():
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond)
+	cancel2()
+	<-done2
 }

@@ -160,7 +160,7 @@ The runner fires one poll immediately on startup, then once per `PollInterval` t
 1. `SELECT … FOR UPDATE SKIP LOCKED WHERE published_at IS NULL AND scheduled_at <= NOW()` — claim up to `BatchSize` records. Safe for horizontal scale; concurrent runners claim disjoint batches.
 2. **Lease:** push `scheduled_at` forward by `ClaimLeaseDuration` (default 10 min) so other runners cannot re-claim the same records while publishing is in progress.
 3. For each outbox record: call `Publisher.Publish`; on success set `published_at = NOW()`.
-4. On failure: increment `attempts`, reset `scheduled_at = NOW()` (releases the lease for immediate retry), set `last_error`. If `attempts >= MaxAttempts` move to `outbox_dead_letters`.
+4. On a permanent failure: increment `attempts`, set `last_error` and `scheduled_at = NOW() + RetryBackoff·2^(attempts-1)` (default 1s, capped at `MaxRetryBackoff` = 5m, jittered). If `attempts >= MaxAttempts` move to `outbox_dead_letters`. Transient failures (below) and shutdown release the lease without counting an attempt.
 5. Sleep `PollInterval`, then repeat.
 
 Horizontal scale is achieved by running multiple outbox runners — `FOR UPDATE SKIP LOCKED` ensures work is safely partitioned across instances.
@@ -226,7 +226,7 @@ log.Printf("discarded %d irrecoverable dead letters", n)
 | `TenantID` | `string` | Exact tenant match (`""` = all tenants) |
 | `FailedBefore` | `time.Time` | Only records where `failed_at < FailedBefore` (zero = no bound) |
 
-**Retryable failures** (SNS throttling: `ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`) do not count toward `MaxAttempts` — the outbox uses `threshold = MaxAttempts+1` for these errors. A period of SNS unavailability will not dead-letter records that are otherwise healthy.
+**Retryable failures** (SNS throttling: `ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`) and publish timeouts do not count toward `MaxAttempts`: the lease is released and the record retried after a backoff shared by all records (`RetryBackoff`, doubling up to `MaxRetryBackoff`), which resets on the next successful publish. A period of SNS unavailability builds a backlog (watch `PlatformEventsOutboxBacklog`) but never dead-letters healthy records.
 
 ### Idempotency
 

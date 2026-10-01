@@ -59,6 +59,11 @@ type OutboxConfigEnv struct {
 	PublishConcurrency   int
 	PublishTimeout       time.Duration
 	DrainTimeout         time.Duration
+	// RetryBackoff / MaxRetryBackoff: a record's n-th failed publish delays its
+	// next attempt by RetryBackoff·2^(n-1), capped at MaxRetryBackoff
+	// (OUTBOX_RETRY_BACKOFF, default 1s; OUTBOX_MAX_RETRY_BACKOFF, default 5m).
+	RetryBackoff    time.Duration
+	MaxRetryBackoff time.Duration
 	// Warnings is non-empty when one or more env vars were set to invalid values
 	// and defaults were applied. Log these at startup so operators can detect
 	// misconfiguration without relying on unstructured stderr output.
@@ -74,8 +79,8 @@ func (c OutboxConfigEnv) String() string {
 	if c.ClaimLeaseDuration == 0 {
 		claimLease = "0 (runner default: 10m)"
 	}
-	return fmt.Sprintf("{PollInterval:%s BatchSize:%d MaxAttempts:%d DatabaseURL:%s MigrationDatabaseURL:%s ClaimLeaseDuration:%s StartupJitter:%s PublishConcurrency:%d PublishTimeout:%s DrainTimeout:%s}",
-		c.PollInterval, c.BatchSize, c.MaxAttempts, masked, maskedMigration, claimLease, c.StartupJitter, c.PublishConcurrency, c.PublishTimeout, c.DrainTimeout)
+	return fmt.Sprintf("{PollInterval:%s BatchSize:%d MaxAttempts:%d DatabaseURL:%s MigrationDatabaseURL:%s ClaimLeaseDuration:%s StartupJitter:%s PublishConcurrency:%d PublishTimeout:%s DrainTimeout:%s RetryBackoff:%s MaxRetryBackoff:%s}",
+		c.PollInterval, c.BatchSize, c.MaxAttempts, masked, maskedMigration, claimLease, c.StartupJitter, c.PublishConcurrency, c.PublishTimeout, c.DrainTimeout, c.RetryBackoff, c.MaxRetryBackoff)
 }
 
 func maskDSN(dsn string) string {
@@ -260,6 +265,14 @@ func LoadOutbox() OutboxConfigEnv {
 	if w != "" {
 		warnings = append(warnings, w)
 	}
+	retryBackoff, w := envDurationOrDefault("OUTBOX_RETRY_BACKOFF", time.Second)
+	if w != "" {
+		warnings = append(warnings, w)
+	}
+	maxRetryBackoff, w := envDurationOrDefault("OUTBOX_MAX_RETRY_BACKOFF", 5*time.Minute)
+	if w != "" {
+		warnings = append(warnings, w)
+	}
 	// Database configuration is owned by platform-pgcommon: the same env vars,
 	// defaults and validation as every other service using pgcommon.NewPool.
 	db, dbWarnings := pgcommon.ConfigFromEnv()
@@ -278,6 +291,8 @@ func LoadOutbox() OutboxConfigEnv {
 		PublishConcurrency:   publishConcurrency,
 		PublishTimeout:       publishTimeout,
 		DrainTimeout:         drainTimeout,
+		RetryBackoff:         retryBackoff,
+		MaxRetryBackoff:      maxRetryBackoff,
 		Warnings:             warnings,
 	}
 }

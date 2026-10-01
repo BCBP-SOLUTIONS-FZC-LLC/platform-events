@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Outbox retries back off, and transient failures no longer count toward `MaxAttempts`.** A permanent publish failure now retries after `RetryBackoff·2^(attempt-1)` (default 1s, capped at `MaxRetryBackoff` = 5m, jittered) instead of on the next poll. With the defaults the first retries still land on the next poll (the backoff is shorter than the 5s `PollInterval`), so a poison record reaches `outbox_dead_letters` in about the same ~25s; larger `MaxAttempts` values now spread out up to 5m apart. Transport errors, throttling and timeouts release the lease without counting an attempt, so an SNS outage builds a backlog (watch `PlatformEventsOutboxBacklog`) instead of dead-lettering it. Tune with `outbox.Config.RetryBackoff` / `MaxRetryBackoff` or `OUTBOX_RETRY_BACKOFF` / `OUTBOX_MAX_RETRY_BACKOFF`.
+- **`outbox.ApplySchema` always tracks its migrations in `outbox_migrations`**, also when the DSN sets `x-migrations-table` (inbox already did this). A service that passed its own tracking table re-runs outbox migrations 001–008 into `outbox_migrations` once; every one is idempotent (`IF NOT EXISTS`).
+
+### Fixed
+
+- **Outbox:**
+  - A short SNS outage (≈30s with the defaults) moved the whole pending backlog to `outbox_dead_letters`: failed records were retried on every poll with no backoff, and transient failures still used up attempts (the old `MaxAttempts+1` threshold only bought one extra try). Records stranded by shutdown no longer count an attempt either (`port.OutboxStore.ReleaseLease`).
+  - `Runner.Ready()` called before `Start` (the documented `go runner.Start(ctx); <-runner.Ready()` pattern) could return a channel that was never closed.
+  - `ReprocessDeadLetters` / `ReprocessDeadLettersWith` replay in `failed_at` order, like `ListDeadLetters` / `DiscardDeadLetters`, so list-then-replay with the same filter and limit replays exactly the inspected records.
+- **SQS consumer:**
+  - A dead-letter handler that forwarded the message itself (`SendToDLQ`) with `WithDLQForwarding` also enabled put it in the DLQ twice and counted it twice.
+  - A `Stop()` during `Start`'s DLQ check (up to 10s) was lost and `Start` kept running.
+  - A panic in the dead-letter handler or `Codec.Decode` left the delivery with no outcome metric. It is now counted as failed (`dead_letter_error` / `decode_error`) and retried.
+  - Codec decode ran on the loop context, so `Stop()` turned in-flight decodes into spurious `decode_error`s. It now completes like the handler, bounded by the drain deadline.
+  - The visibility timeout is now extended during codec decode, the dead-letter handler and the DLQ forward, not just the handler, so slow dead-letter handling cannot be redelivered mid-flight.
+- **Metrics:**
+  - An `event_type` that is not valid UTF-8 made the Prometheus client panic inside `Publish`. It is now repaired (U+FFFD).
+  - Counters without variable labels (`outbox_mark_published_errors_total`, `events_oversized_event_type_label_total`, …) are exported at 0 on registration, so `increase()` alerts see their first increment after a restart.
+  - A failed `InitMetrics` (invalid identity) no longer resets the `event_type` cap.
+- **Alert rules:**
+  - `PlatformEventsMessagesDeadLettered` missed the first dead-letter of each `event_type` / reason per pod, because `platform_dlq_messages_total` series are born at 1. The recording rule now counts series born in the window.
+  - `PlatformEventsConsumerStalled` no longer fires on a service whose messages are all dead-lettered on purpose.
+  - The promtool tests now start those series absent instead of at 0, which had hidden the gap.
+- **CI:**
+  - The release image signature check only accepted tag refs, so a manual `workflow_dispatch` release failed after pushing the image. It now verifies the exact `release.yml@<ref>` identity.
+  - `PR summary` now runs (`always()`) when a gate fails, and reports the 97% coverage gate.
+  - Every third-party action and the interop reusable workflow (which receives a private token) are pinned by commit SHA.
+  - The lint exclusion for `test/smoke` used v1 syntax and was ignored. It now uses v2 `linters.exclusions.paths`.
+
+### Changed
+
+- AWS SDK for Go v2 upgraded: core v1.47.1, `service/sns` v1.47.2, `service/sqs` v1.52.1, `smithy-go` v1.28.2.
+
+### Docs
+
+- CLAUDE.md:
+  - The envelope JSON now uses the real keys (`specversion`, `dataschema`, `time`, `data`).
+  - The over-`MaxReceiveCount` routing and trace-link propagation descriptions now match the code.
+- `Stop()` godoc now describes the drain-timeout behaviour the consumer actually has.
+
 ### Tests
 
 - Merged coverage raised from 97.7% to 99.1%. New tests cover outbox/inbox store error paths (missing tables, Prune validation), SNS invalid-payload, batch marshal and codec failures, envelope `UnmarshalJSON` type errors, inbox `ApplySchema` DSN validation, outbox poll-failure backoff, queue-depth sampling interrupted by Stop, and baggage propagation into handlers.
@@ -62,7 +104,7 @@ Upgrading from 1.5.x. Everything else in this release is additive or a fix. This
 
 ### Changed
 
-- **CI parity with platform-pgcommon:** `actions/setup-go` v7.0.0, `actions/checkout` v7.0.1, govulncheck v1.8.0, and a coverage gate of **97%** (was 95%; the merged total is 97.7%). The disabled Dependabot config now lists all three Go modules, so it works as soon as it is re-enabled.
+- **CI parity with platform-pgcommon:** `actions/setup-go` v7.0.0, `actions/checkout` v7.0.1, govulncheck v1.8.0, and a coverage gate of **97%** (was 95%; the merged total was 97.7% at release, 99.1% after the Unreleased test additions). The disabled Dependabot config now lists all three Go modules, so it works as soon as it is re-enabled.
 - **pgcommon-only now covers tests too.** The last two pgx imports, both in unit-test `pgx.Tx` fakes, are gone: `noopTx` embeds `pgcommon.Tx`, and `stubTx` infers `Exec`'s result type from `pgcommon.Tx` itself (`newStubTx(pgcommon.Tx.Exec)`). The depguard `pgcommon-only` rule applies to every file and also rejects `golang-migrate`. No file in the repository imports pgx, `database/sql` or golang-migrate; pgx is only an indirect dependency through platform-pgcommon.
 - **Shared Postgres container per test package**, with a fresh database per `fixtures.NewTestDB` (both schemas applied, dropped `WITH (FORCE)` on cleanup) instead of a container per test. The integration suite drops from about 116s to about 15s.
 - **Shared floci resources are cleaned up per test:** `CreateTopic` / `CreateQueue` delete what they created when the test ends. Before this, a repeat run (`-count=2`) reused the previous run's queues and read their leftover messages. Found by running the suites twice in one process, which now pass, integration under `-race`.
@@ -98,7 +140,7 @@ Upgrading from 1.5.x. Everything else in this release is additive or a fix. This
 
 ### Removed
 
-- The unexported `internal/adapter/outbound/logger` zap adapter. No consuming module could import it, but the documented wiring (`logger.NewLogger(os.Getenv("APP_ENV"))`) told services to. Inject platform-gincommon's `ZapLogger` (or any `port.Logger`) instead. `go.uber.org/zap` is no longer a dependency of the library packages; it remains in `go.mod` only indirectly, through the golangci-lint tool. platform-pgcommon removed its equivalent adapter in v1.4.0.
+- The unexported `internal/adapter/outbound/logger` zap adapter. No consuming module could import it, but the documented wiring (`logger.NewLogger(os.Getenv("APP_ENV"))`) told services to. Inject platform-gincommon's `ZapLogger` (or any `port.Logger`) instead. `go.uber.org/zap` is no longer a dependency of the library packages; it is only in `tools/go.mod` (golangci-lint). platform-pgcommon removed its equivalent adapter in v1.4.0.
 
 ### Fixed
 

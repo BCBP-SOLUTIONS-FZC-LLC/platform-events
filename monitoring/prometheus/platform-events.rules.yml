@@ -24,9 +24,13 @@
 # plus the full queue URL / topic ARN. Aggregations below keep `service`
 # (and `queue` / `topic` where meaningful) so dashboards join cleanly.
 #
-# Counter note: platform-events pre-creates label-static counters at 0 (per
-# queue when a consumer starts, outbox error/operation counters at init), so
-# increase()-based alerts see the first event after a restart.
+# Counter note: increase() over a series that first appears at 1 returns 0,
+# so the first event after a restart would be missed. platform-events
+# pre-creates every counter whose labels are known up front at 0 — per queue
+# when a consumer starts, label-less and outbox error/operation counters at
+# init. Counters keyed by event_type (platform_dlq_messages_total) cannot be,
+# so their rules add the value of series that did not exist 15m ago
+# (`x unless x offset 15m`).
 
 groups:
   - name: platform_events.recording
@@ -57,8 +61,16 @@ groups:
             /
           sum by (domain, service, environment, queue) (rate(platform_messages_received_total[5m]))
 
+      # A series born in the window (the first dead-letter of an event_type /
+      # reason since the pod started) counts its whole value; increase() alone
+      # would report 0 for it.
       - record: platform_events:dlq_messages:increase15m
-        expr: sum by (domain, service, environment, operation, reason) (increase(platform_dlq_messages_total[15m]))
+        expr: |
+          sum by (domain, service, environment, operation, reason) (
+            (platform_dlq_messages_total unless platform_dlq_messages_total offset 15m)
+              or
+            increase(platform_dlq_messages_total[15m])
+          )
 
       # ── Producer / outbox (legacy, authoritative until ratification) ──
       # after ratification: platform_messages_published_total{outcome="error"} / platform_messages_published_total
@@ -101,11 +113,18 @@ groups:
           description: "Over 1.44% of messages received on {{ $labels.queue }} failed in both the last hour and the last 5 minutes."
           runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumererrorbudgetburn"
 
+      # Dead-lettering is progress too (a handler that SendToDLQs and returns
+      # nil is not "processed"). platform_dlq_messages_total has no queue
+      # label, so it suppresses the alert per service.
       - alert: PlatformEventsConsumerStalled
         expr: |
-          sum by (domain, service, environment, queue) (rate(platform_messages_received_total[10m])) > 0
-            unless
-          sum by (domain, service, environment, queue) (rate(platform_messages_processed_total[10m])) > 0
+          (
+            sum by (domain, service, environment, queue) (rate(platform_messages_received_total[10m])) > 0
+              unless
+            sum by (domain, service, environment, queue) (rate(platform_messages_processed_total[10m])) > 0
+          )
+            unless on (domain, service, environment)
+          sum by (domain, service, environment) (rate(platform_dlq_messages_total{operation="consume"}[10m])) > 0
         for: 15m
         labels:
           severity: critical

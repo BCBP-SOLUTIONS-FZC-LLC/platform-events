@@ -47,6 +47,11 @@ linters:
         - G404 # weak random — acceptable for jitter, not security-sensitive
     exhaustive:
       default-signifies-exhaustive: true
+  # Smoke tests (build tag "smoke") run against live AWS and are not linted.
+  # Paths are relative to this file, also when linting from test/.
+  exclusions:
+    paths:
+      - ^test/smoke/
 
 formatters:
   enable:
@@ -56,7 +61,3 @@ formatters:
     goimports:
       local-prefixes:
         - github.com/BCBP-SOLUTIONS-FZC-LLC
-
-issues:
-  exclude-dirs:
-    - test/smoke

@@ -127,7 +127,8 @@ func WithDrainTimeout(d time.Duration) ConsumerOption {
 // SNS subscription requirement: if this queue receives messages via an SNS
 // subscription, the subscription MUST have RawMessageDelivery=true. Without it,
 // SNS wraps each message in a notification envelope that the consumer cannot
-// parse — messages are permanently deleted as malformed with no retry.
+// parse — messages are treated as malformed: forwarded to the DLQ with
+// WithDLQPublisher, otherwise deleted, with no retry.
 type Config struct {
 	// QueueURL is required.
 	QueueURL    string
@@ -268,9 +269,6 @@ func NewWithClient(cfg Config, client SQSClientAPI, handler port.Handler, opts .
 // timeout has been exceeded). Stop() blocks until Start returns.
 // The consumer is fully restartable: Start() may be called again after Stop().
 func (c *sqsConsumer) Start(ctx context.Context) error {
-	if err := c.checkDLQ(ctx); err != nil {
-		return err
-	}
 	metrics.InitQueue(c.queueURL)
 
 	// Create a fresh doneCh for this cycle before entering the loop.
@@ -304,6 +302,12 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		c.mu.Unlock()
 		close(thisDoneCh)
 	}()
+
+	// Resolve the DLQ only once this cycle is registered, so a Stop() during
+	// the (up to 10s) check cancels it instead of being lost.
+	if err := c.checkDLQ(loopCtx); err != nil {
+		return err
+	}
 
 	// wg is local to this Start() cycle so that drain() can never mix in-flight
 	// handlers from a previous cycle (which would occur if wg were a struct field
@@ -496,14 +500,17 @@ func (c *sqsConsumer) checkDLQ(ctx context.Context) error {
 	}
 }
 
-// Stop cancels the receive loop and waits for all in-flight handlers to finish
-// (up to DrainTimeout). Returns an error if the drain timeout is exceeded.
-// When DrainTimeout is exceeded, Stop returns the error and signals handler
-// contexts with drainCancel(), but outstanding handler goroutines may still be
-// running — they are bounded by handler responsiveness, not killed immediately.
+// Stop cancels the receive loop and waits for Start to return. Start waits up
+// to DrainTimeout for in-flight handlers; past it, their contexts are
+// cancelled and Start returns without waiting further, so handler goroutines
+// that ignore ctx may still be running when Stop returns nil. Stop returns an
+// error only if Start has not returned within DrainTimeout+5s.
 // In Kubernetes, ensure your pod terminationGracePeriodSeconds > DrainTimeout
 // so the process does not receive SIGKILL before handlers exit.
-// Safe to call multiple times and safe to call before Start.
+// Safe to call multiple times and safe to call before Start. Stop affects only
+// a Start that is already running — a Stop that races ahead of a Start in
+// another goroutine is a no-op — so shut down by cancelling the ctx passed to
+// Start and then calling Stop to wait for the drain.
 func (c *sqsConsumer) Stop() error {
 	c.mu.Lock()
 	if c.cancelFn != nil {
@@ -539,8 +546,8 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	body := aws.ToString(msg.Body)
 	if err := json.Unmarshal([]byte(body), &env); err != nil {
 		// Log the body (truncated) so engineers can diagnose schema mismatches
-		// without losing the message content. Deleting is correct here — a
-		// malformed message will never parse successfully, so retrying is futile.
+		// without losing the message content. A malformed message will never
+		// parse successfully, so retrying is futile.
 		logBody := body
 		if len(logBody) > 512 {
 			logBody = logBody[:512] + "...[truncated]"
@@ -580,6 +587,11 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	handlerBase = port.WithSourceMessage(handlerBase, func() port.SourceMessage { return sourceMessage(c.queueURL, msg) })
 	receiveCount := approxReceiveCount(msg.Attributes)
 	overThreshold := c.maxReceiveCount > 0 && receiveCount > c.maxReceiveCount
+
+	// Keep the message hidden for everything dispatch does from here on —
+	// codec decode, the dead-letter handler and DLQ forward, and the handler —
+	// so slow work never lets it be redelivered (and processed twice).
+	defer c.extendVisibility(msg)()
 	// Propagation is creation → FIRST receipt; a redelivery's age would add
 	// retry delay. A missing receive count (0) is treated as a first receipt.
 	if receiveCount <= 1 {
@@ -595,7 +607,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	// MaxReceiveCount/redrive-policy mechanics rather than deleted immediately.
 	if env.SchemaID != "" {
 		decodeStart := time.Now()
-		decoded, decErr := decodeCodecPayload(loopCtx, c.codec, env.SchemaID, env.Payload)
+		decoded, decErr := c.decode(drainCtx, handlerBase, env.SchemaID, env.Payload)
 		dur := time.Since(decodeStart)
 		if c.codec != nil {
 			metrics.ObserveDependency("codec", "decode", decErr, dur)
@@ -648,12 +660,13 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			start := time.Now()
 			var dlhErr error
 			if c.deadLetterHandler != nil {
-				dlhErr = c.deadLetterHandler(dlhCtx, env)
+				dlhErr = c.runDeadLetterHandler(dlhCtx, env, msg)
 			}
 			// The DLH runs first so a failing DLH leaves the message on the
 			// source queue un-forwarded; a DLH that succeeded runs again if the
-			// forward then fails, so it must be idempotent.
-			if dlhErr == nil && c.dlq != nil {
+			// forward then fails, so it must be idempotent. A DLH that already
+			// forwarded the message itself (SendToDLQ) is not forwarded again.
+			if dlhErr == nil && c.dlq != nil && !dlhAttribution.Recorded() {
 				reason := fmt.Sprintf("receive count %d exceeded consumer max receive count %d", receiveCount, c.maxReceiveCount)
 				if !c.forwardToDLQ(drainCtx, handlerBase, msg, env.Type, "max_receive_count", reason) {
 					dlhErr = errDLQForwardFailed
@@ -756,57 +769,6 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		attribute.String("events.event_id", env.ID),
 	)
 
-	// Automatically extend the SQS visibility timeout so long-running handlers
-	// are not re-delivered while still processing. Fires every visibilityTimeout/2
-	// and stops when the handler returns (via extCancel).
-	if c.visibilityTimeout > 0 {
-		// Clamp to minimum 1s: int32 truncation would produce 0 for sub-second
-		// durations, which would make the message immediately re-visible.
-		secs := max(int32(c.visibilityTimeout.Seconds()), 1)
-		// extCtx is derived from context.Background() (not drainCtx) so visibility
-		// extensions continue until the handler completes, not until drain fires.
-		// The goroutine exits cleanly via extCancel() deferred below.
-		extCtx, extCancel := context.WithCancel(context.Background())
-		defer extCancel()
-		go func() {
-			half := max(c.visibilityTimeout/2, time.Second)
-			ticker := time.NewTicker(half)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					if msg.ReceiptHandle == nil {
-						return
-					}
-					visStart := time.Now()
-					_, err := c.client.ChangeMessageVisibility(extCtx, &sqs.ChangeMessageVisibilityInput{
-						QueueUrl:          aws.String(c.queueURL),
-						ReceiptHandle:     msg.ReceiptHandle,
-						VisibilityTimeout: secs,
-					})
-					if extCtx.Err() == nil { // not cancelled because the handler returned
-						metrics.ObserveDependency("sqs", "change_message_visibility", err, time.Since(visStart))
-					}
-					if err != nil {
-						metrics.RecordSQSVisibilityError(c.queueURL)
-						if c.logger != nil {
-							// A failed extension means the message may become visible again
-							// while the handler is still running, causing duplicate delivery.
-							// Handlers are required to be idempotent, so this is not fatal —
-							// but it is worth surfacing when debugging duplicate processing.
-							c.logger.Warn("sqs: failed to extend message visibility — possible duplicate delivery", map[string]any{
-								"message_id": aws.ToString(msg.MessageId),
-								"error":      err.Error(),
-							})
-						}
-					}
-				case <-extCtx.Done():
-					return
-				}
-			}
-		}()
-	}
-
 	start := time.Now()
 
 	// Wrap the handler call to capture panics inside this function where the span
@@ -860,6 +822,98 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	metrics.RecordConsume(c.queueURL, env.Type, status, dur.Seconds())
 }
 
+// extendVisibility keeps msg hidden while dispatch works on it: every
+// max(visibilityTimeout/2, 1s) it resets the visibility timeout. It returns the
+// function that stops the extension; call it when dispatch is done.
+func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) (stop func()) {
+	if c.visibilityTimeout <= 0 || msg.ReceiptHandle == nil {
+		return func() {}
+	}
+	// Clamp to minimum 1s: int32 truncation would produce 0 for sub-second
+	// durations, which would make the message immediately re-visible.
+	secs := max(int32(c.visibilityTimeout.Seconds()), 1)
+	// extCtx is derived from context.Background() (not drainCtx) so visibility
+	// extensions continue until dispatch completes, not until drain fires.
+	extCtx, extCancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(max(c.visibilityTimeout/2, time.Second))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				visStart := time.Now()
+				_, err := c.client.ChangeMessageVisibility(extCtx, &sqs.ChangeMessageVisibilityInput{
+					QueueUrl:          aws.String(c.queueURL),
+					ReceiptHandle:     msg.ReceiptHandle,
+					VisibilityTimeout: secs,
+				})
+				if extCtx.Err() != nil { // cancelled because dispatch finished
+					return
+				}
+				metrics.ObserveDependency("sqs", "change_message_visibility", err, time.Since(visStart))
+				if err != nil {
+					metrics.RecordSQSVisibilityError(c.queueURL)
+					if c.logger != nil {
+						// A failed extension means the message may become visible again
+						// while the handler is still running, causing duplicate delivery.
+						// Handlers are required to be idempotent, so this is not fatal —
+						// but it is worth surfacing when debugging duplicate processing.
+						c.logger.Warn("sqs: failed to extend message visibility — possible duplicate delivery", map[string]any{
+							"message_id": aws.ToString(msg.MessageId),
+							"error":      err.Error(),
+						})
+					}
+				}
+			case <-extCtx.Done():
+				return
+			}
+		}
+	}()
+	return func() {
+		extCancel()
+		<-done
+	}
+}
+
+// decode runs the codec on a context that keeps parent's values, survives
+// Stop() (an in-flight decode completes, like the handler) and is cancelled
+// by the drain deadline. A codec panic is returned as a decode error.
+func (c *sqsConsumer) decode(drainCtx, parent context.Context, schemaID string, payload json.RawMessage) (out json.RawMessage, err error) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	stopDrain := context.AfterFunc(drainCtx, cancel)
+	defer stopDrain()
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("codec decode panic: %v", r)
+			if c.logger != nil {
+				c.logger.Error("sqs: codec decode panic recovered", map[string]any{
+					"queue": c.queueURL, "panic": fmt.Sprintf("%v", r), "stack": string(debug.Stack()),
+				})
+			}
+		}
+	}()
+	return decodeCodecPayload(ctx, c.codec, schemaID, payload)
+}
+
+// runDeadLetterHandler calls the dead-letter handler, returning a panic as an
+// error so the message is counted as failed and left visible for retry.
+func (c *sqsConsumer) runDeadLetterHandler(ctx context.Context, env domain.Envelope[json.RawMessage], msg sqstypes.Message) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("dead-letter handler panic: %v", r)
+			if c.logger != nil {
+				c.logger.Error("sqs: dead-letter handler panic recovered", map[string]any{
+					"message_id": aws.ToString(msg.MessageId), "panic": fmt.Sprintf("%v", r), "stack": string(debug.Stack()),
+				})
+			}
+		}
+	}()
+	return c.deadLetterHandler(ctx, env)
+}
+
 // errDLQForwardFailed marks a dead-letter routing attempt whose DLQ forward
 // failed; forwardToDLQ has already logged the cause.
 var errDLQForwardFailed = errors.New("sqs: forward to DLQ failed")
@@ -868,9 +922,9 @@ var errDLQForwardFailed = errors.New("sqs: forward to DLQ failed")
 const maxDLQForwardTimeout = 30 * time.Second
 
 // dlqForwardTimeout returns the forward deadline: maxDLQForwardTimeout, capped
-// at half the configured visibility timeout (minimum 1s). Forwards run before
-// visibility extension starts, so a forward outliving the visibility timeout
-// would let the message be redelivered — and forwarded twice — mid-flight.
+// at half the configured visibility timeout (minimum 1s). A malformed message
+// is forwarded before visibility extension starts, so a forward outliving the
+// visibility timeout would let it be redelivered — and forwarded twice.
 func (c *sqsConsumer) dlqForwardTimeout() time.Duration {
 	if c.visibilityTimeout > 0 {
 		return max(min(maxDLQForwardTimeout, c.visibilityTimeout/2), time.Second)

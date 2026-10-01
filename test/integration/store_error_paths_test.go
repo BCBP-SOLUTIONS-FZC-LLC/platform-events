@@ -41,7 +41,7 @@ func TestOutboxStore_MissingOutboxTable_SurfacesErrors(t *testing.T) {
 	_, err := store.ClaimBatch(ctx, 10)
 	assert.Error(t, err, "ClaimBatch")
 	assert.Error(t, store.MarkPublished(ctx, uuid.NewString()), "MarkPublished")
-	err = store.MarkFailed(ctx, makeRecord("missing.table"), "boom", 5)
+	err = store.MarkFailed(ctx, makeRecord("missing.table"), "boom", 5, 0)
 	require.Error(t, err, "MarkFailed")
 	assert.Contains(t, err.Error(), "outboxstore: MarkFailed query failed")
 	_, err = store.PrunePublished(ctx, time.Hour, 100)
@@ -63,7 +63,7 @@ func TestOutboxStore_MissingDeadLetterTable_SurfacesErrors(t *testing.T) {
 	}))
 	dropTable(ctx, t, pool, "outbox_dead_letters")
 
-	assert.Error(t, store.MarkFailed(ctx, rec, "boom", 1), "MarkFailed → dead-letter insert")
+	assert.Error(t, store.MarkFailed(ctx, rec, "boom", 1, 0), "MarkFailed → dead-letter insert")
 	pending, err := store.PendingCount(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, int64(1), pending, "the failed dead-lettering rolled back")

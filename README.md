@@ -492,6 +492,7 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 | `OUTBOX_CLAIM_LEASE_DURATION` | `10m` (store default when unset) | How long a claimed record is hidden from other runners |
 | `OUTBOX_STARTUP_JITTER` | `0` | Use `5s`–`10s` with multiple replicas |
 | `OUTBOX_PUBLISH_CONCURRENCY` / `OUTBOX_PUBLISH_TIMEOUT` / `OUTBOX_DRAIN_TIMEOUT` | `1` / `10s` / `30s` | `1` uses SNS `PublishBatch`; per-record timeout; `Stop()` wait bound |
+| `OUTBOX_RETRY_BACKOFF` / `OUTBOX_MAX_RETRY_BACKOFF` | `1s` / `5m` | Delay before a failed record's next attempt: base·2^(attempt−1), capped, with jitter. Transport errors, throttling and timeouts never count toward `MAX_ATTEMPTS`; they back off together and reset on the next successful publish |
 | `DATABASE_URL` | — | Postgres DSN for the outbox runner. Read by platform-pgcommon's `ConfigFromEnv` (exposed as `config.LoadOutbox().DB`); alternatively `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DBNAME`/`PG_SSLMODE`. Pool tuning (`PG_MAX_CONNS`, `PG_STATEMENT_TIMEOUT`, `PG_LOCK_TIMEOUT`, `PG_BOUNCER_MODE`, …) per platform-pgcommon |
 | `MIGRATION_DATABASE_URL` | `DATABASE_URL` | DDL-role DSN for `ApplySchema`, connecting directly (not via PgBouncer) — `config.LoadOutbox().MigrationDatabaseURL` |
 | `APP_ENV` → `ENVIRONMENT` / `APP_NAME` | `dev` / — | Metrics `environment` / `service` labels when not set on `MetricsIdentity` (same as platform-pgcommon) |

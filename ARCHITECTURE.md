@@ -316,10 +316,10 @@ sequenceDiagram
         PUB -->>- R: nil, *BatchError, RetryableError or error
         alt published
             R ->> OB: MarkPublished — published_at = NOW()
-        else retryable (throttling, service unavailable)
-            R ->> OB: MarkFailed with threshold MaxAttempts+1 — never dead-letters
+        else transient (throttling, service unavailable, timeout) or shutdown
+            R ->> OB: ReleaseLease — attempts unchanged — retry after shared backoff (0 on shutdown)
         else permanent
-            R ->> OB: MarkFailed — attempts++ — at MaxAttempts move to outbox_dead_letters
+            R ->> OB: MarkFailed — attempts++ — retry after RetryBackoff·2^(n-1) — at MaxAttempts move to outbox_dead_letters
         end
     end
 ```
@@ -336,7 +336,7 @@ A numbered walkthrough of what happens between a domain mutation and a processed
 5. **Transaction commits** — both the domain write and the outbox row are durable. If the transaction rolls back, neither persists.
 6. **Outbox runner polls** `outbox_events` — immediately on startup, then every `PollInterval`. Claims a batch with `SELECT … FOR UPDATE SKIP LOCKED WHERE scheduled_at <= NOW()` and extends `scheduled_at` as a claim lease so concurrent runners do not re-claim the same records.
 7. **`Publisher.Publish` called** — SNS receives the event, sets `EventType`, `TenantID`, `Source`, `EventID`, and `Subject` (when non-empty) as message attributes for filter-policy routing.
-8. **Row marked published** (`published_at = NOW()`). On failure, `attempts` is incremented and `scheduled_at = NOW()` (releases the lease for next poll cycle retry); after `MaxAttempts` the row moves to `outbox_dead_letters`.
+8. **Row marked published** (`published_at = NOW()`). On a permanent failure, `attempts` is incremented and `scheduled_at = NOW() + RetryBackoff·2^(attempts-1)` (capped at `MaxRetryBackoff`, jittered); after `MaxAttempts` the row moves to `outbox_dead_letters`. Transient failures and shutdown release the lease without counting an attempt.
 
 > **Ordering:** no global ordering is guaranteed. Ordering is only preserved within the same SQS message group (FIFO queues with `WithMessageGroupID`). All other delivery is best-effort ordering.
 
@@ -358,14 +358,14 @@ flowchart TD
     C -- rows --> L["UPDATE scheduled_at = NOW() + ClaimLeaseDuration\nWHERE id = ANY(ids)\n— lease prevents re-claim by other runners —"]
     L --> D[for each OutboxRecord]
     D --> E[json.Unmarshal Payload → Envelope]
-    E -- unmarshal error --> F["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\nif attempts ≥ MaxAttempts → dead-letter"]
+    E -- unmarshal error --> F["MarkFailed attempts++, last_error\nscheduled_at = NOW() + backoff\nif attempts ≥ MaxAttempts → dead-letter"]
     F --> D
     E -- ok --> G[Publisher.Publish]
     G -- success --> H["MarkPublished\npublished_at = NOW()\noutbox_published_total{success}++"]
     H --> D
-    G -- retryable error\n(Throttling · ServiceUnavailable\n· InternalFailure · RequestTimeout) --> RI["MarkFailed threshold = MaxAttempts+1\n(does NOT exhaust MaxAttempts —\nno dead-letter on transient failure)"]
+    G -- transient error\n(Throttling · ServiceUnavailable\n· InternalFailure · RequestTimeout · timeout) --> RI["ReleaseLease — attempts unchanged\nscheduled_at = NOW() + shared backoff\n(an SNS outage never dead-letters)"]
     RI --> D
-    G -- permanent error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() (releases lease)\noutbox_published_total{error}++"]
+    G -- permanent error --> I["MarkFailed attempts++, last_error\nscheduled_at = NOW() + RetryBackoff·2^(n-1)\noutbox_published_total{error}++"]
     I --> J{attempts ≥ MaxAttempts?}
     J -- yes --> K["INSERT outbox_dead_letters\nDELETE outbox_events\nplatform_dlq_messages_total{operation=outbox_publish}++"]
     J -- no  --> D
@@ -567,16 +567,19 @@ t=5s  Outbox runner polls. Calls Publisher.Publish (SNS).
 
       ── SNS permanent error (invalid ARN, auth failure) ──────────────────
       attempts++ → outbox_events: { attempts: 1, last_error: "..." }
-      scheduled_at = NOW() (lease released; eligible next poll cycle)
+      scheduled_at = NOW() + ~1s (RetryBackoff·2^(attempts-1), jittered,
+      capped at MaxRetryBackoff)
 
-      ── SNS retryable error (ThrottlingException, ServiceUnavailable) ─────
-      attempts unchanged → threshold = MaxAttempts+1
-      Record rescheduled; NOT progressing toward dead-letter.
-      (A full SNS outage cannot dead-letter healthy records.)
+      ── SNS transient error (ThrottlingException, ServiceUnavailable, timeout) ──
+      ReleaseLease: attempts unchanged, retried after a backoff shared by all
+      records (1s, 2s, 4s … 5m) that resets on the next successful publish.
+      NOT progressing toward dead-letter: a full SNS outage builds a backlog
+      (PlatformEventsOutboxBacklog) instead of dead-lettering it.
 
-t=10s Runner polls again. Retries the record.
-t=15s ...
-t=30s attempts reaches MaxAttempts (default 5):
+t=10s Runner polls again; the ~1s backoff has expired, so it retries.
+      Each retry waits for the first poll after its backoff (1s, 2s, 4s, 8s …
+      doubling up to MaxRetryBackoff), so later retries spread out.
+t≈25s attempts reaches MaxAttempts (default 5) on permanent errors:
       → INSERT outbox_dead_letters (id, event_type, payload, tenant_id,
                                     trace_id, attempts, last_error, failed_at)
       → DELETE outbox_events
@@ -968,7 +971,7 @@ When goroutine 1 finishes:
 
 - **Claim** — `SELECT … FOR UPDATE SKIP LOCKED` over pending rows, then a lease `UPDATE scheduled_at = NOW() + ClaimLeaseDuration` in the same transaction. Concurrent runners claim disjoint batches with no distributed lock. `NewRunner` rejects a `ClaimLeaseDuration` too short for `BatchSize × PublishTimeout`, so a lease cannot expire while its batch is still publishing.
 - **`MarkFailed`** — reads `attempts` with `SELECT … FOR UPDATE` (deliberately **not** `SKIP LOCKED`: a second runner that re-claimed after lease expiry must block, not skip) so attempts can never be double-incremented and a record can never be dead-lettered early.
-- **Shutdown** — records stranded by context cancellation are released with threshold `MaxAttempts+1`, so a rolling restart alone never dead-letters a near-max record.
+- **Shutdown** — records stranded by context cancellation are released with `ReleaseLease` (claimable immediately, no attempt counted), so rolling restarts never push a record towards the dead-letter table.
 
 ### Idempotency
 
@@ -989,7 +992,7 @@ The inbox therefore reduces duplicate work; it does not make side effects exactl
 - **Consumer-side delete only on success** — a message is deleted only after the handler (or dead-letter handler) returns `nil`, a malformed body is detected, or a `DLQPublisher` forward the caller acknowledged. Everything else is left visible.
 
 **Failure invariants:**
-- **Transient AWS failures never exhaust retry budgets** — SNS throttling / service-unavailable / internal-failure / request-timeout and network timeouts are wrapped in `domain.RetryableError`; the outbox uses threshold `MaxAttempts+1` for them. The same classification is surfaced to DLQ callers as `events.ErrRetryable`.
+- **Transient AWS failures never exhaust retry budgets** — SNS throttling / service-unavailable / internal-failure / request-timeout and network timeouts are wrapped in `domain.RetryableError`; the outbox releases the lease for them without counting an attempt, behind a backoff shared across records that resets on the next successful publish. The same classification is surfaced to DLQ callers as `events.ErrRetryable`.
 - **A stalled dependency degrades throughput, not correctness** — receive errors back off 1 s → 30 s with jitter; outbox poll errors back off 1 s → 30 s; per-call timeouts bound `ReceiveMessage` (`WaitSeconds + 5 s`), `DeleteMessage` (10 s) and each publish (`PublishTimeout`).
 - **Poison messages cannot wedge a queue** — malformed JSON is counted and deleted (after being forwarded to the SQS DLQ when `WithDLQForwarding` is set); semantically poisoned messages are routed by `WithDeadLetterHandler` (and optionally forwarded by `DLQPublisher`) or redriven by SQS after `maxReceiveCount`.
 
@@ -1031,11 +1034,11 @@ The inbox therefore reduces duplicate work; it does not make side effects exactl
 | Graceful runner shutdown | `Runner.Stop()` waits up to `DrainTimeout` (30 s) for the in-flight batch, then returns a non-nil error; set Helm `terminationGracePeriodSeconds` > `DrainTimeout` |
 | Poll-failure backoff | On a failed poll cycle the runner backs off exponentially (1s→30s) instead of retrying every `PollInterval` |
 | Parallel publish bounded | `PublishConcurrency` caps concurrent publishes per batch (default 1 uses SNS `PublishBatch`, up to 10 per API call); values `> 1` use per-record `Publish` in parallel goroutines; per-record `PublishTimeout` (10s) prevents one hung call stalling the batch |
-| Shutdown ≠ dead-letter | Records stranded by context cancellation are released with `MaxAttempts+1` so a rolling restart never alone dead-letters a near-max record |
+| Shutdown ≠ dead-letter | Records stranded by context cancellation are released with `ReleaseLease` — no attempt counted — so rolling restarts never dead-letter a record |
 | `last_error` bounded | Error strings stored in `outbox_events`/`outbox_dead_letters` are truncated to 512 chars to prevent table bloat |
 | Envelope size bounded | `Enqueue` rejects serialised payloads > 240 KB (under the SNS 256 KB hard limit) |
 | `MarkFailed` serialized | The attempts read uses `SELECT … FOR UPDATE` so a lease-expiry re-claim cannot double-increment or dead-letter early |
-| Retryable errors don't exhaust attempts | SNS throttling/transient errors (`ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`) are wrapped in `domain.RetryableError`; `OutboxService` uses `threshold = MaxAttempts+1` so rolling SNS throttles cannot dead-letter healthy records |
+| Retryable errors don't exhaust attempts | SNS throttling/transient errors (`ThrottlingException`, `ServiceUnavailable`, `InternalFailure`, `RequestTimeout`) are wrapped in `domain.RetryableError`; `OutboxService` releases the lease without counting an attempt (shared backoff), so SNS throttling or an outage cannot dead-letter healthy records |
 | VisibilityTimeout bounded at 12h | `NewSQSConsumer` rejects `VisibilityTimeout > 12h` at construction — SQS API hard limit; prevents silent extension failures |
 | No SQS SDK import in consumer services | `events.DLQPublisher` is the only DLQ path; `mock.DLQPublisher` covers tests — services never need `aws-sdk-go-v2/service/sqs` |
 | DLQ forward never loses the original | `SendToDLQ` returns an error on any failure; callers return it so the source message stays visible. Invalid input is rejected before any AWS call |

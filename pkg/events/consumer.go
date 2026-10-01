@@ -35,7 +35,8 @@ type Handler func(ctx context.Context, env Envelope[json.RawMessage]) error
 // SNS subscription requirement: if this queue receives messages via an SNS
 // subscription, the subscription MUST be created with RawMessageDelivery=true.
 // Without raw delivery, SNS wraps each message in a notification envelope that
-// the consumer cannot parse — messages are permanently deleted as malformed.
+// the consumer cannot parse — messages are treated as malformed: forwarded to
+// the DLQ with WithDLQForwarding, otherwise permanently deleted.
 type SQSConfig struct {
 	// QueueURL is required.
 	QueueURL    string

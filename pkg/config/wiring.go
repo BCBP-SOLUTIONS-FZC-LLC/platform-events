@@ -112,5 +112,7 @@ func RunnerConfigFromEnv(env OutboxConfigEnv, pool *pgcommon.Pool, publisher eve
 		PublishConcurrency: env.PublishConcurrency,
 		PublishTimeout:     env.PublishTimeout,
 		DrainTimeout:       env.DrainTimeout,
+		RetryBackoff:       env.RetryBackoff,
+		MaxRetryBackoff:    env.MaxRetryBackoff,
 	}
 }

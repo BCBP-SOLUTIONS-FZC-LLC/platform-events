@@ -30,14 +30,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
           token: ${{ secrets.CI_REPO_READ_TOKEN || github.token }}
 
       - name: Set up Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache-dependency-path: |
@@ -133,7 +133,7 @@ jobs:
       - name: Vulnerability check
         run: |
           if ! make vuln-check; then
-            echo "::error file=go.mod,title=Vulnerability found::govulncheck detected vulnerabilities — run 'make vuln-check' locally to view details. Standard-library findings are fixed by bumping the go directive in go.mod."
+            echo "::error file=go.mod,title=Vulnerability found::govulncheck detected vulnerabilities — run 'make vuln-check' locally to view details. Standard-library findings are fixed by bumping the toolchain line in all three go.mod files (and the Dockerfile builder image)."
             exit 1
           fi
 

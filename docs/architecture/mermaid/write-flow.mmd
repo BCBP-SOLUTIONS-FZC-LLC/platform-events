@@ -37,9 +37,9 @@ sequenceDiagram
         PUB -->>- R: nil, *BatchError, RetryableError or error
         alt published
             R ->> OB: MarkPublished — published_at = NOW()
-        else retryable (throttling, service unavailable)
-            R ->> OB: MarkFailed with threshold MaxAttempts+1 — never dead-letters
+        else transient (throttling, service unavailable, timeout) or shutdown
+            R ->> OB: ReleaseLease — attempts unchanged — retry after shared backoff (0 on shutdown)
         else permanent
-            R ->> OB: MarkFailed — attempts++ — at MaxAttempts move to outbox_dead_letters
+            R ->> OB: MarkFailed — attempts++ — retry after RetryBackoff·2^(n-1) — at MaxAttempts move to outbox_dead_letters
         end
     end

@@ -19,6 +19,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/migrate"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon/pkg/pgcommon"
 )
 
@@ -121,7 +122,7 @@ func TestOutboxStore_MarkFailed_IncrementsAttempts(t *testing.T) {
 	require.NoError(t, err)
 
 	// Mark as failed (maxAttempts = 5, so we won't move to dead letter yet).
-	err = store.MarkFailed(ctx, rec, "publish error", 5)
+	err = store.MarkFailed(ctx, rec, "publish error", 5, 0)
 	require.NoError(t, err)
 
 	// Record should still be in outbox_events with attempts=1.
@@ -164,7 +165,7 @@ func TestOutboxStore_MarkFailed_MovesToDeadLetter(t *testing.T) {
 	require.NoError(t, err)
 
 	// Fail it maxAttempts times (maxAttempts=1 so it moves immediately).
-	err = store.MarkFailed(ctx, rec, "fatal error", 1)
+	err = store.MarkFailed(ctx, rec, "fatal error", 1, 0)
 	require.NoError(t, err)
 
 	// The dead-letter counter must have incremented by exactly one.
@@ -238,7 +239,7 @@ func TestOutboxStore_MarkFailed_DeadLetter_Idempotent(t *testing.T) {
 	require.NoError(t, err)
 
 	// Move to dead letter.
-	err = store.MarkFailed(ctx, rec, "error1", 1)
+	err = store.MarkFailed(ctx, rec, "error1", 1, 0)
 	require.NoError(t, err)
 
 	// Re-enqueue to test re-insertion to dead letter (ON CONFLICT DO NOTHING should not error).
@@ -247,7 +248,7 @@ func TestOutboxStore_MarkFailed_DeadLetter_Idempotent(t *testing.T) {
 		return store.Enqueue(ctx, tx, rec2)
 	})
 	require.NoError(t, err)
-	err = store.MarkFailed(ctx, rec2, "error2", 1)
+	err = store.MarkFailed(ctx, rec2, "error2", 1, 0)
 	require.NoError(t, err)
 
 	// Both records should be in dead letters.
@@ -276,7 +277,7 @@ func TestOutboxStore_MarkFailed_RecordNotFound(t *testing.T) {
 	// A valid UUID that does not exist in the table. MarkFailed now returns nil
 	// when the record is absent (it was already published or removed by a
 	// concurrent runner) — this is logged at WARN, not propagated as an error.
-	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000001"}, "error", 5)
+	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000001"}, "error", 5, 0)
 	require.NoError(t, err, "non-existent record should return nil — treated as already-handled")
 }
 
@@ -344,7 +345,7 @@ func TestOutboxStore_MarkFailed_NonExistentRecord_WithLogger(t *testing.T) {
 	store := outboxstore.New(pool, logger, 0)
 
 	// Call MarkFailed on a non-existent record — should log a warning, not error.
-	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000002"}, "test error", 5)
+	err := store.MarkFailed(ctx, domain.OutboxRecord{ID: "01926e4f-dead-7000-beef-000000000002"}, "test error", 5, 0)
 	require.NoError(t, err, "MarkFailed on a missing record must not error")
 
 	entries := logger.Entries()
@@ -438,6 +439,89 @@ func TestApplySchema_CreatesOutboxTables(t *testing.T) {
 	assert.True(t, trackingTableExists, "outbox_migrations tracking table should exist (not schema_migrations)")
 }
 
+// An explicit x-migrations-table in the DSN (typically the service's own
+// tracking table) is replaced: outbox versions must never share it.
+func TestApplySchema_IgnoresCallerMigrationsTable(t *testing.T) {
+	ctx := context.Background()
+	dsn, drop := fixtures.NewEmptyTestDB(ctx, t)
+	defer drop()
+
+	require.NoError(t, outbox.ApplySchema(ctx, &migrate.Runner{DSN: dsn + "&x-migrations-table=svc_migrations"}))
+
+	pool, err := pgcommon.NewPool(ctx, pgcommon.Config{DSN: dsn})
+	require.NoError(t, err)
+	defer pool.Close()
+	exists := func(table string) bool {
+		var ok bool
+		require.NoError(t, pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+			return conn.QueryRow(ctx, `SELECT EXISTS(SELECT FROM information_schema.tables WHERE table_name = $1)`, table).Scan(&ok)
+		}))
+		return ok
+	}
+	assert.True(t, exists(outbox.MigrationsTable), "outbox tracked in its own table")
+	assert.False(t, exists("svc_migrations"), "the service's tracking table is untouched")
+}
+
+// ReleaseLease hands a record back without counting an attempt; retryAfter
+// controls when it is claimable again. MarkFailed's retryAfter does the same
+// for a counted failure.
+func TestOutboxStore_ReleaseLeaseAndRetryBackoff(t *testing.T) {
+	ctx := context.Background()
+	store, pool, cleanup := setupOutboxTest(ctx, t)
+	defer cleanup()
+	enqueue := func(et string) domain.OutboxRecord {
+		rec := makeRecord(et)
+		require.NoError(t, pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context, tx pgcommon.Tx) error {
+			return store.Enqueue(ctx, tx, rec)
+		}))
+		claimed, err := store.ClaimBatch(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+		return rec
+	}
+	row := func(id string) (attempts int, lastError string) {
+		require.NoError(t, pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+			return conn.QueryRow(ctx, "SELECT attempts, last_error FROM outbox_events WHERE id = $1", id).Scan(&attempts, &lastError)
+		}))
+		return attempts, lastError
+	}
+	claimable := func() int {
+		recs, err := store.ClaimBatch(ctx, 10)
+		require.NoError(t, err)
+		return len(recs)
+	}
+
+	// Released immediately: claimable again, no attempt counted.
+	rec := enqueue("lease.release")
+	require.NoError(t, store.ReleaseLease(ctx, rec.ID, "shutdown", 0))
+	attempts, lastErr := row(rec.ID)
+	assert.Equal(t, 0, attempts)
+	assert.Equal(t, "shutdown", lastErr)
+	assert.Equal(t, 1, claimable(), "claimable again at once")
+
+	// Released with a delay: not claimable until it passes.
+	require.NoError(t, store.ReleaseLease(ctx, rec.ID, "throttled", time.Hour))
+	assert.Equal(t, 0, claimable(), "hidden for retryAfter")
+	attempts, _ = row(rec.ID)
+	assert.Equal(t, 0, attempts, "a transient failure never counts")
+
+	// A counted failure with backoff: attempts++ and hidden for retryAfter.
+	rec2 := enqueue("lease.markfailed")
+	require.NoError(t, store.MarkFailed(ctx, rec2, "bad request", 5, time.Hour))
+	attempts, _ = row(rec2.ID)
+	assert.Equal(t, 1, attempts)
+	assert.Equal(t, 0, claimable(), "hidden for the retry backoff")
+
+	// Releasing a record that is already published is a no-op.
+	require.NoError(t, pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
+		_, err := conn.Exec(ctx, "UPDATE outbox_events SET published_at = NOW(), last_error = '' WHERE id = $1", rec2.ID)
+		return err
+	}))
+	require.NoError(t, store.ReleaseLease(ctx, rec2.ID, "late", 0))
+	_, lastErr = row(rec2.ID)
+	assert.Empty(t, lastErr, "published row untouched")
+}
+
 // ----------------------------
 // LeasedCount
 // ----------------------------
@@ -500,7 +584,7 @@ func TestOutboxStore_ReprocessDeadLetters(t *testing.T) {
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.MarkFailed(ctx, rec, "permanent failure", 1 /* maxAttempts=1 */))
+	require.NoError(t, store.MarkFailed(ctx, rec, "permanent failure", 1 /* maxAttempts=1 */, 0))
 
 	// Verify record is now in dead_letters.
 	var dlCount int
@@ -552,7 +636,7 @@ func TestOutboxStore_ReprocessDeadLetters_Limit(t *testing.T) {
 			return store.Enqueue(ctx, tx, rec)
 		})
 		require.NoError(t, err)
-		require.NoError(t, store.MarkFailed(ctx, rec, "fatal", 1))
+		require.NoError(t, store.MarkFailed(ctx, rec, "fatal", 1, 0))
 	}
 
 	// Reprocess only 2.
@@ -640,7 +724,7 @@ func TestOutboxStore_MarkFailed_DeadLetterOnFirstAttempt(t *testing.T) {
 	require.NoError(t, err)
 
 	// With maxAttempts=1, attempts(0)+1=1 >= 1 → record moves to dead_letters immediately.
-	require.NoError(t, store.MarkFailed(ctx, rec, "permanent error", 1))
+	require.NoError(t, store.MarkFailed(ctx, rec, "permanent error", 1, 0))
 
 	var outboxCount int
 	err = pool.WithConn(ctx, func(ctx context.Context, conn *pgcommon.Conn) error {
@@ -845,7 +929,7 @@ func enqueueAndDeadLetter(ctx context.Context, t *testing.T, store *outboxstore.
 		return store.Enqueue(ctx, tx, rec)
 	})
 	require.NoError(t, err)
-	require.NoError(t, store.MarkFailed(ctx, rec, "forced to dead letter", 1))
+	require.NoError(t, store.MarkFailed(ctx, rec, "forced to dead letter", 1, 0))
 }
 
 // ----------------------------
@@ -1356,7 +1440,7 @@ func TestOutboxStore_PGBouncerMode_MarkFailed_MovesToDeadLetter(t *testing.T) {
 	// maxAttempts=1 moves the record straight to outbox_dead_letters, exercising
 	// the INSERT INTO outbox_dead_letters(..., payload, ...) path under
 	// SimpleProtocol as well.
-	err = store.MarkFailed(ctx, rec, "fatal error", 1)
+	err = store.MarkFailed(ctx, rec, "fatal error", 1, 0)
 	require.NoError(t, err, "MarkFailed dead-letter insert must not fail under SimpleProtocol exec mode")
 
 	var dlPayload []byte

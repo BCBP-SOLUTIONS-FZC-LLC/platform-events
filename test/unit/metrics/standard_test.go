@@ -33,6 +33,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -604,5 +605,59 @@ func TestStandard_EventTypeCardinalityCap(t *testing.T) {
 
 	assert.Equal(t, internalmetrics.EventTypeUnknown, internalmetrics.SanitizeEventType(""))
 	assert.Equal(t, internalmetrics.EventTypeOversized, internalmetrics.SanitizeEventType(strings.Repeat("x", 129)))
+	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
+}
+
+// TestStandard_InvalidUTF8EventType_DoesNotPanic: Prometheus panics on label
+// values that are not valid UTF-8; the sanitiser repairs them first.
+func TestStandard_InvalidUTF8EventType_DoesNotPanic(t *testing.T) {
+	isolatePlatform(t)
+	reg := prometheus.NewRegistry()
+	_, err := events.InitMetrics(testIdentity, reg)
+	require.NoError(t, err)
+	bad := "iam.user.\xff\xfecreated"
+	got := internalmetrics.SanitizeEventType(bad)
+	assert.True(t, utf8.ValidString(got))
+	assert.Equal(t, "iam.user.\uFFFDcreated", got)
+	assert.NotPanics(t, func() {
+		internalmetrics.IncProcessed(testQueueURL, bad)
+		internalmetrics.RecordPublish(testTopicARN, bad, "error", 0.01)
+	})
+	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
+}
+
+// TestStandard_InvalidIdentity_LeavesEventTypeCapUnchanged: a failed
+// InitMetrics changes nothing — including the event_type cap and the values
+// already admitted under it.
+func TestStandard_InvalidIdentity_LeavesEventTypeCapUnchanged(t *testing.T) {
+	isolatePlatform(t)
+	t.Cleanup(func() { internalmetrics.SetEventTypeLimit(0) })
+	_, err := events.InitMetrics(testIdentity, prometheus.NewRegistry(), events.WithEventTypeLimit(1), events.WithoutLegacyMetrics())
+	require.NoError(t, err)
+	assert.Equal(t, "a.b.first", internalmetrics.SanitizeEventType("a.b.first"))
+
+	_, err = events.InitMetrics(events.MetricsIdentity{}, prometheus.NewRegistry(), events.WithEventTypeLimit(100))
+	require.Error(t, err)
+	assert.Equal(t, internalmetrics.EventTypeOther, internalmetrics.SanitizeEventType("a.b.second"), "cap still 1, a.b.first still admitted")
+	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
+}
+
+// TestStandard_LabelLessCountersExportedAtZero: a counter without variable
+// labels is exported at 0 on registration, so increase() alerts catch its
+// first increment after a restart.
+func TestStandard_LabelLessCountersExportedAtZero(t *testing.T) {
+	isolatePlatform(t)
+	reg := prometheus.NewRegistry()
+	_, err := events.InitMetrics(testIdentity, reg)
+	require.NoError(t, err)
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	exported := map[string]bool{}
+	for _, f := range families {
+		exported[f.GetName()] = len(f.GetMetric()) > 0
+	}
+	for _, name := range []string{"outbox_mark_published_errors_total", "events_oversized_event_type_label_total", "outbox_poll_errors_total", "outbox_unmarshal_errors_total"} {
+		assert.True(t, exported[name], "%s exported at 0", name)
+	}
 	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }

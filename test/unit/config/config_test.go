@@ -147,9 +147,13 @@ func TestLoadOutbox_Defaults(t *testing.T) {
 	t.Setenv("OUTBOX_PUBLISH_CONCURRENCY", "")
 	t.Setenv("OUTBOX_PUBLISH_TIMEOUT", "")
 	t.Setenv("OUTBOX_DRAIN_TIMEOUT", "")
+	t.Setenv("OUTBOX_RETRY_BACKOFF", "")
+	t.Setenv("OUTBOX_MAX_RETRY_BACKOFF", "")
 	t.Setenv("DATABASE_URL", "")
 
 	cfg := config.LoadOutbox()
+	assert.Equal(t, time.Second, cfg.RetryBackoff)
+	assert.Equal(t, 5*time.Minute, cfg.MaxRetryBackoff)
 	assert.Equal(t, 5*time.Second, cfg.PollInterval)
 	assert.Equal(t, 50, cfg.BatchSize)
 	assert.Equal(t, 5, cfg.MaxAttempts)
@@ -223,9 +227,13 @@ func TestLoadOutbox_CustomValues(t *testing.T) {
 	t.Setenv("OUTBOX_PUBLISH_CONCURRENCY", "4")
 	t.Setenv("OUTBOX_PUBLISH_TIMEOUT", "5s")
 	t.Setenv("OUTBOX_DRAIN_TIMEOUT", "45s")
+	t.Setenv("OUTBOX_RETRY_BACKOFF", "2s")
+	t.Setenv("OUTBOX_MAX_RETRY_BACKOFF", "10m")
 	t.Setenv("DATABASE_URL", "postgres://user:pass@host/db")
 
 	cfg := config.LoadOutbox()
+	assert.Equal(t, 2*time.Second, cfg.RetryBackoff)
+	assert.Equal(t, 10*time.Minute, cfg.MaxRetryBackoff)
 	assert.Equal(t, 2*time.Second, cfg.PollInterval)
 	assert.Equal(t, 25, cfg.BatchSize)
 	assert.Equal(t, 3, cfg.MaxAttempts)
@@ -546,4 +554,15 @@ func TestLoadOutbox_InvalidMaxAttempts_ProducesWarning(t *testing.T) {
 	}
 	assert.True(t, found, "expected a warning for invalid OUTBOX_MAX_ATTEMPTS")
 	assert.Equal(t, 5, cfg.MaxAttempts, "should fall back to default of 5")
+}
+
+func TestLoadOutbox_InvalidRetryBackoff_WarnsAndDefaults(t *testing.T) {
+	t.Setenv("OUTBOX_RETRY_BACKOFF", "soon")
+	t.Setenv("OUTBOX_MAX_RETRY_BACKOFF", "later")
+	cfg := config.LoadOutbox()
+	assert.Equal(t, time.Second, cfg.RetryBackoff)
+	assert.Equal(t, 5*time.Minute, cfg.MaxRetryBackoff)
+	joined := strings.Join(cfg.Warnings, "\n")
+	assert.Contains(t, joined, "OUTBOX_RETRY_BACKOFF")
+	assert.Contains(t, joined, "OUTBOX_MAX_RETRY_BACKOFF")
 }

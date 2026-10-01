@@ -163,14 +163,20 @@ func SetEventTypeLimit(n int) {
 }
 
 // SanitizeEventType bounds an event_type label value: "unknown" for an empty
-// value, "__oversized__" for one over 128 bytes, and "__other__" once the
+// value, invalid UTF-8 replaced with U+FFFD, "__oversized__" for one over 128
+// bytes, and "__other__" once the
 // process has already admitted its limit of distinct values (default 200).
 // Every replacement is counted in platform_telemetry_label_overflow_total
 // (and the legacy events_oversized_event_type_label_total for oversized ones),
 // so a misconfigured or adversarial producer cannot explode cardinality.
 func SanitizeEventType(s string) string {
-	if utf8.RuneCountInString(s) == 0 {
+	if s == "" {
 		return EventTypeUnknown
+	}
+	// Prometheus panics on a label value that is not valid UTF-8; an event
+	// type built from raw bytes must not crash the caller's publish.
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "\uFFFD")
 	}
 	if len(s) > maxEventTypeLabelLen {
 		recordLabelOverflow(true)
@@ -324,6 +330,15 @@ func (l *legacySet) install() {
 	OversizedEventTypeLabelTotal = l.oversizedEventTypeCounter
 }
 
+// precreate exports a counter without variable labels at 0 as soon as it is
+// registered, so increase()/rate() alerts see its first increment after a
+// restart (a series that first appears at 1 has no increase).
+func precreate(c *prometheus.CounterVec, labels []string) {
+	if c != nil && len(labels) == 0 {
+		c.WithLabelValues()
+	}
+}
+
 const deprecatedHelp = " Deprecated: superseded by a platform_* metric (see docs/observability/metrics-registry.md)."
 
 func registerLegacy(r *registrar, serviceName, buildVersion string) (*legacySet, error) {
@@ -335,6 +350,7 @@ func registerLegacy(r *registrar, serviceName, buildVersion string) (*legacySet,
 			return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help + deprecatedHelp, ConstLabels: cl}, labels)
 		})
 		errs = append(errs, err)
+		precreate(c, labels)
 		return c
 	}
 	histogram := func(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
@@ -414,6 +430,7 @@ func registerPlatform(r *registrar, id Identity) (*Platform, []RegistrationWarni
 			return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help(name), ConstLabels: cl}, labels)
 		})
 		warn(name, err)
+		precreate(c, labels)
 		return c
 	}
 	histogram := func(name string, buckets []float64, labels ...string) *prometheus.HistogramVec {
