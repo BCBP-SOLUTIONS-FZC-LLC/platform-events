@@ -32,6 +32,15 @@ const MigrationsTable = "outbox_migrations"
 //	    log.Fatal(err)
 //	}
 //	// migrateRunner.FS is unchanged — safe to reuse for domain migrations.
+//
+// The schema version recorded in the tracking table must exist in this
+// library's embedded migrations: since platform-pgcommon v1.4.1, a database
+// migrated by a newer platform-events (e.g. after rolling a service back to
+// an older image) makes ApplySchema fail with migrate.ErrVersionNotInSource,
+// and an interrupted migration with migrate.ErrMigrationDirty
+// (errors.Is works on the returned error). Roll back by migrating the outbox
+// schema down first, or run ApplySchema as a separate migration job rather
+// than at service startup.
 func ApplySchema(ctx context.Context, runner *migrate.Runner) error {
 	if runner == nil {
 		return fmt.Errorf("outbox: ApplySchema requires a non-nil migrate.Runner")

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 
+- **platform-pgcommon v1.4.1 is inherited** (from v1.4.0). From its upgrade notes, the ones that matter here:
+  - `outbox.ApplySchema` / `inbox.ApplySchema` now fail with `migrate.ErrVersionNotInSource` when the database was migrated by a newer platform-events, and with `migrate.ErrMigrationDirty` after an interrupted migration. Services that apply the schema at startup will refuse to start an older image after a newer one migrated — and this release adds outbox migrations `009` and `010`. Roll back by migrating the outbox schema down first (tracking table `outbox_migrations`), or run `ApplySchema` as a separate migration job.
+  - The migration lock wait is the full `lock_timeout` (30s by default) instead of 15s.
+  - `NewPool` rejects negative pool durations, and DSN `pool_*` parameters are now honoured.
+  - pgcommon query metrics count the caller's statements only (internal `set_config` / BEGIN / COMMIT are excluded unless they fail), so query rates drop and error ratios rise to their true values.
+  - Span errors carry only the SQLSTATE unless full statements are allowed.
+
 - **`outbox.Enqueue` requires the canonical lowercase UUID form for the envelope ID** (what `events.NewEnvelope` produces). Uppercase, braced or unhyphenated IDs are rejected: Postgres stores the ID canonicalised, and the mismatch with the payload's ID made a failed batch publish look delivered.
 - **The outbox does not preserve publish order by default** — not even per aggregate on a FIFO topic (a failed or backed-off record is published after later ones; replicas publish concurrently). The docs previously said a FIFO `MessageGroupID` was enough. Use the new opt-in per-key ordering (`outbox.EnqueueOrdered`) or a per-aggregate sequence number.
 - **SQS consumer:** a JSON body without `id` / `type` / `source` (e.g. an SNS notification wrapper) is now malformed — forwarded to the DLQ or deleted — instead of reaching the handler with an empty envelope. Malformed bodies are no longer logged by default (size and SHA-256 only; opt back in with `WithMalformedBodyLogging`).
@@ -87,6 +94,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` v1.4.0 → **v1.4.1** (root and `test/` modules); pgx stays v5.11.0. No code change was needed: all suites pass unchanged.
+- Release workflow parity with platform-pgcommon v1.4.1:
+  - `verify-release-tag.sh` refuses a `workflow_dispatch` from a ref other than `main` or the tag, and a tag not reachable from `origin/main`.
+  - `release-image-tags.sh`: the floating image tags `X.Y` / `X` / `latest` only move forward, so a hotfix of an older line no longer re-points `latest`, and pre-releases never move them.
+  - `changelog-section.sh`: a release candidate may use its base version's CHANGELOG section.
 - AWS SDK for Go v2 upgraded: core v1.47.1, `service/sns` v1.47.2, `service/sqs` v1.52.1, `smithy-go` v1.28.2.
 
 ### Docs
