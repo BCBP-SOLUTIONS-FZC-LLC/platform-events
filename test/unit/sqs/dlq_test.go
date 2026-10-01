@@ -449,14 +449,21 @@ func TestSendToDLQ_FIFODLQ(t *testing.T) {
 	require.NoError(t, p.SendToDLQ(context.Background(), dlqSourceURL+".fifo", body, nil, "r"))
 	in := client.lastSent(t)
 	assert.Equal(t, env.ID, aws.ToString(in.MessageGroupId))
-	assert.Equal(t, env.ID, aws.ToString(in.MessageDeduplicationId))
+	firstDedup := aws.ToString(in.MessageDeduplicationId)
+	require.NotEmpty(t, firstDedup)
 
-	// Non-envelope body: identity falls back to a stable content hash.
+	// The same event forwarded again (another source queue sharing this DLQ,
+	// or a redriven message that failed again) must not be deduplicated away.
+	require.NoError(t, p.SendToDLQ(context.Background(), dlqSourceURL+".fifo", body, nil, "r"))
+	assert.Equal(t, env.ID, aws.ToString(client.lastSent(t).MessageGroupId))
+	assert.NotEqual(t, firstDedup, aws.ToString(client.lastSent(t).MessageDeduplicationId))
+
+	// Non-envelope body: the group falls back to a stable content hash.
 	require.NoError(t, p.SendToDLQ(context.Background(), dlqSourceURL+".fifo", []byte("raw"), nil, "r"))
-	first := aws.ToString(client.lastSent(t).MessageDeduplicationId)
+	first := aws.ToString(client.lastSent(t).MessageGroupId)
 	require.NoError(t, p.SendToDLQ(context.Background(), dlqSourceURL+".fifo", []byte("raw"), nil, "r"))
 	assert.Len(t, first, 64)
-	assert.Equal(t, first, aws.ToString(client.lastSent(t).MessageDeduplicationId))
+	assert.Equal(t, first, aws.ToString(client.lastSent(t).MessageGroupId))
 }
 
 func TestSendToDLQ_SendMessageFailure(t *testing.T) {
@@ -920,7 +927,7 @@ func TestSendToDLQ_FIFO_OversizedEnvelopeIDFallsBackToHash(t *testing.T) {
 	in := client.lastSent(t)
 	sum := sha256.Sum256(body)
 	assert.Equal(t, hex.EncodeToString(sum[:]), aws.ToString(in.MessageGroupId), "SQS caps group/dedup IDs at 128 chars")
-	assert.Equal(t, aws.ToString(in.MessageGroupId), aws.ToString(in.MessageDeduplicationId))
+	assert.LessOrEqual(t, len(aws.ToString(in.MessageDeduplicationId)), 128)
 }
 
 func TestSendToDLQ_ReusesCachedResolution(t *testing.T) {

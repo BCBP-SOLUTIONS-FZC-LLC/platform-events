@@ -129,3 +129,16 @@ func TestSQSConfigFromEnv_MapsFields(t *testing.T) {
 	assert.Equal(t, env.WaitSeconds, cfg.WaitSeconds)
 	assert.Nil(t, cfg.Logger)
 }
+
+func TestSQSDrainTimeout_LoadedAndWired(t *testing.T) {
+	t.Setenv("SQS_DRAIN_TIMEOUT", "45s")
+	env := config.LoadSQS()
+	assert.Equal(t, 45*time.Second, env.DrainTimeout)
+	base := config.SQSConsumerOptions(config.SQSConfigEnv{Concurrency: 1})
+	assert.Len(t, config.SQSConsumerOptions(config.SQSConfigEnv{Concurrency: 1, DrainTimeout: 45 * time.Second}), len(base)+1)
+
+	t.Setenv("SQS_DRAIN_TIMEOUT", "soon")
+	env = config.LoadSQS()
+	assert.Zero(t, env.DrainTimeout)
+	assert.NotEmpty(t, env.Warnings)
+}

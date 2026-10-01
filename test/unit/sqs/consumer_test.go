@@ -2274,10 +2274,12 @@ func TestDispatch_WithCodec_DecodeError_LeavesMessageVisible(t *testing.T) {
 }
 
 func TestDispatch_WithCodec_MalformedCodecPayload_LeavesMessageVisible(t *testing.T) {
-	// SchemaID is set (codec-encoded), but Payload is not a base64 JSON string
-	// (e.g. a corrupted message) — this must be treated as a decode failure,
-	// exercising the UnwrapCodecPayload error branch of decodeCodecPayload.
-	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`{"x":1}`))
+	// SchemaID is set and Payload is a JSON string (the codec wire format) that
+	// is not valid base64 (e.g. a corrupted message) — this must be treated as
+	// a decode failure, exercising the UnwrapCodecPayload error branch of
+	// decodeCodecPayload. (A dataschema on a JSON object is passed through —
+	// TestDataschemaOnPlainJSONPayload_PassedThrough.)
+	env := domain.NewEnvelope("test.event", "svc", json.RawMessage(`"not base64!!"`))
 	env.SchemaID = "fake-schema-v1"
 	msg := makeSQSMessage(env)
 

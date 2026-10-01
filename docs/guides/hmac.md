@@ -19,7 +19,7 @@ HMAC-SHA256 provides **message authenticity and integrity** — proof that the p
 | Events signed by the outbox runner and delivered to an SQS queue you own | **No** | The publisher (outbox runner) is operating under your service's IRSA role; IAM controls who may publish |
 
 **Rules:**
-- Always use `VerifyEnvelope` (not `Verify`) when checking a full envelope — it normalises the JSON to canonical form before hashing, preventing hash-mismatch from field reordering.
+- Always use `VerifyEnvelope` (not `Verify`) when checking a full envelope — it re-serialises the envelope fields in a fixed order before hashing, so envelope field order on the wire does not matter. The `data` payload is only compacted, not key-sorted: a hop that re-serialises the payload with a different key order breaks the signature.
 - Do not verify HMAC in a separate goroutine or after the handler context has branched — a failed verify must reject the message before any side effects occur.
 - Rotate keys by accepting both the current and previous key for a short window (one deploy cycle), then dropping the old key.
 - Keys must be ≥ 32 bytes. Store them in AWS Secrets Manager or SSM Parameter Store; never in environment variables checked into source control.

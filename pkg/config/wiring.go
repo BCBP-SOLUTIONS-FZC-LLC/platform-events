@@ -96,6 +96,9 @@ func SQSConsumerOptions(env SQSConfigEnv) []events.ConsumerOption {
 	if env.HandlerTimeout > 0 {
 		opts = append(opts, events.WithHandlerTimeout(env.HandlerTimeout))
 	}
+	if env.DrainTimeout > 0 {
+		opts = append(opts, events.WithDrainTimeout(env.DrainTimeout))
+	}
 	return opts
 }
 

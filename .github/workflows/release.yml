@@ -102,18 +102,22 @@ jobs:
     name: Validate / Test
     needs: verify
     uses: ./.github/workflows/validate-test.yml
-    secrets: inherit
     with:
       ref: ${{ github.event.inputs.tag || github.ref }}
+    secrets:
+      CI_REPO_READ_TOKEN: ${{ secrets.CI_REPO_READ_TOKEN }}
+      GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
 
   # ── same as ci.yml ────────────────────────────────────────────────────────
   validate-quality:
     name: Validate / Quality
     needs: verify
     uses: ./.github/workflows/validate-quality.yml
-    secrets: inherit
     with:
       ref: ${{ github.event.inputs.tag || github.ref }}
+    secrets:
+      CI_REPO_READ_TOKEN: ${{ secrets.CI_REPO_READ_TOKEN }}
+      GO_PRIVATE_TOKEN: ${{ secrets.GO_PRIVATE_TOKEN }}
 
   # ── same as ci.yml: Hadolint first, then build into the cache ────────────
   build-image:
@@ -214,11 +218,17 @@ jobs:
           secrets: |
             go_private_token=${{ secrets.GO_PRIVATE_TOKEN }}
 
+      # A dated key: an exact-match key is saved once and never updated, so a
+      # fixed key would pin the DB to its first download.
+      - name: Trivy DB cache key
+        id: trivy-day
+        run: bash .github/scripts/utc-date.sh
+
       - name: Cache Trivy DB
         uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: /tmp/trivy-cache
-          key: trivy-db-${{ runner.os }}
+          key: trivy-db-${{ runner.os }}-${{ steps.trivy-day.outputs.day }}
           restore-keys: |
             trivy-db-${{ runner.os }}-
 

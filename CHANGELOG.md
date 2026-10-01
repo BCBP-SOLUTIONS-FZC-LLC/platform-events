@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **platform-pgcommon v1.5.1 is inherited** (from v1.4.3) — read its upgrade notes. The ones that matter here:
+  - `RunInTx` / `WithTx` roll back and return `pgcommon.ErrTxEndedInCallback` when the callback ends its own transaction. That includes an `inbox.Store.Process` `fn` that calls `tx.Commit` / `tx.Rollback` or runs `COMMIT` / `ROLLBACK`: the message is now retried instead of committing `fn`'s writes without the claim.
+  - `GUCSet.Validate` rejects a NUL or invalid UTF-8 (`domain.ErrInvalidGUCValue`). The SQS consumer now treats an envelope whose `tenant_id` or `trace_id` contains NUL as malformed (DLQ forward or delete) instead of failing every database call of the handler on every delivery.
+  - `ConfigFromEnv` warns when `DATABASE_URL` sets no `sslmode` (pgx would use `prefer`); the warning reaches `config.LoadOutbox().Warnings`.
+  - A cancelled retry wait wraps both `ctx.Err()` and the last error; migrate `Up` fails on a source without top-level migrations (`outbox.ApplySchema` / `inbox.ApplySchema` are unaffected — they pass the `migrations` subdirectory).
+- **New outbox migration `011`** replaces the dead-letter index `idx_outbox_dead_letters_failed_at (failed_at DESC)` with `idx_outbox_dead_letters_failed_at_id (failed_at, id)` — the order list, replay and discard use. Rolling back past it needs `migrate down` first (see 1.6.0's `ErrVersionNotInSource` note).
+- **FIFO source queues are now processed per message group, in order.** A `.fifo` queue's batch is split by `MessageGroupId`; each group runs on one worker in receive order, and a message that is not settled (handler error, failed decode or DLQ forward, panic) hands the group's later messages of that batch back unprocessed. FIFO consumers lose cross-message parallelism within a group (at most one message per group in flight per replica; groups still run in parallel up to `WithConcurrency`) — set `WithVisibilityTimeout` so queued group messages are extended while they wait. Without a visibility timeout a FIFO consumer receives one message per call. A failed `DeleteMessage` also stops the group.
+- **`outbox.Enqueue` rejects a NUL character** (`\u0000`) anywhere in the envelope, and in `TenantID` / `TraceID`: Postgres `jsonb` cannot store it, so the INSERT failed — and rolled back the business transaction — on every retry. Strip NULs from user input before enqueueing.
+- **`AWS_REGION` falls back to `AWS_DEFAULT_REGION`** (then `us-east-1`) in `config.LoadSNS` / `LoadSQS`.
+- **`mock.Consumer.Inject` behaves like the SQS consumer:** it returns `mock.ErrMalformedEnvelope` without calling the handler for an envelope missing id / type / source, round-trips the envelope through JSON, and decodes codec-encoded payloads with the new `Codec` field (an error when none is set). Service tests that injected such envelopes need updating.
+- **A `dataschema` on a plain-JSON `data` is passed through undecoded.** Only a JSON-string `data` (the codec wire format) is decoded. Consumers on 1.6.0 or older still dead-letter such messages, so do not use `WithSchemaID` as an informational tag.
+
+### Fixed
+
+- **SQS consumer:**
+  - FIFO queues lost per-group order: messages of one group ran in parallel, and after a failure the group's later messages were still processed and deleted.
+  - A message dispatched right at its waiting deadline (`WithHandlerTimeout`) could stop being extended before processing and be delivered twice.
+  - `Stop` could return before the queue-depth sampler goroutine had exited.
+  - A visibility-extension call could race `DeleteMessage`, logging a spurious "possible duplicate delivery" warning and counting a dependency error.
+  - A `dataschema` on a JSON-object `data` failed decode on every delivery and dead-lettered the message.
+  - (Found in review of the FIFO change, never released) with `WithHandlerTimeout`, a FIFO group's later messages hit their waiting deadline while the earlier ones ran and were handed back again and again until they dead-lettered unprocessed; they now get the running message's budget and are re-armed as each one is dispatched. Without a visibility timeout a group's later messages waited unextended and could be taken by another consumer out of order; a failed delete let the group continue and reorder.
+- **SNS publisher:** OTel `baggage` / `tracestate` counted toward SNS's 10-attribute limit, so whether a publish succeeded depended on the caller's request context (outbox records dead-lettered); they are now dropped first (logged once) — `traceparent` and the routing attributes are kept.
+- **DLQ publisher:** a FIFO DLQ deduplicated a second forward of the same event within 5 minutes (two queues sharing one DLQ, a redriven message failing again) while reporting success, so the source message was deleted and the dead-letter lost. `MessageDeduplicationId` is now unique per forward.
+- **Outbox:**
+  - Rolling migration `010` back stranded ordered records waiting at `scheduled_at = 'infinity'` (never claimed by the older code); `010` down now makes them due first.
+  - Migration `003` dropped and rebuilt `idx_outbox_events_pending` under an `ACCESS EXCLUSIVE` lock on every run — including the one-time re-run 1.6.0 causes for services that passed their own `x-migrations-table`. It now rebuilds only when the index has a different shape.
+  - A shutdown during `PublishBatch` released the unsent records with the shared transient backoff (up to `MaxRetryBackoff`), hiding them from other replicas and advancing the backoff; they are now released at once.
+  - A dead letter whose ID was re-enqueued into `outbox_events` failed every `ReprocessDeadLetters` call on the primary key (it is always selected first); it is now left in place and logged.
+  - `MarkFailed` on a record another runner had already published or dead-lettered counted `platform_retry_total`.
+  - Dead-letter replay inserts first and deletes only what was inserted (`ON CONFLICT DO NOTHING`), so an application enqueueing the same ID concurrently no longer fails the replay; the "left in place" count runs after the commit, best-effort.
+  - Migration `003` also rebuilds an INVALID `idx_outbox_events_pending` (a failed `CREATE INDEX CONCURRENTLY`).
+- **Metrics:** `InitMetrics` left the legacy collectors it had registered on the registerer when a later legacy registration failed, so they were exported at zero ("healthy") rather than absent.
+- **`GlueDecodeCodec`** passed a non-JSON (e.g. Avro-format or empty) payload to the handler; it now returns a decode error.
+- **Config:** `OutboxConfigEnv.String()` did not mask `sslpassword`, and `%#v` printed the raw DSN (new `GoString`).
+
+### Added
+
+- `SQS_DRAIN_TIMEOUT` (`config.SQSConfigEnv.DrainTimeout`, wired by `SQSConsumerOptions`).
+
+### Changed
+
+- CI (parity with platform-pgcommon v1.5.1): `ci.yml` no longer uses `paths-ignore`. A `changes` job (`.github/scripts/detect-changes.sh`, regression-tested by the new `make ci-scripts-test`) decides docs-only, and the jobs behind required checks are skipped by `if:` (the reusable validate workflows take a `skip` input), so a docs-only PR's required checks report success instead of never reporting. Reusable workflows receive `CI_REPO_READ_TOKEN` / `GO_PRIVATE_TOKEN` explicitly instead of `secrets: inherit`; on `main` every push gets its own concurrency group, so a pending code commit's run is never cancelled by a later push.
+- `BatchError.Error()` names the first failure (`… (first: <id> <code>: <message>)`).
+- The reference CLI prints the effective `MaxMessages` / `WaitSeconds` and the drain timeout.
+- `make toolchain-check` recognises any `FROM … golang:<version>` form.
+
+- Each visibility-extension `ChangeMessageVisibility` call is bounded by `min(max(VisibilityTimeout/2, 1s), 10s)`.
+- FIFO receives carry a fresh `ReceiveRequestAttemptId`, so an SDK-retried receive does not block its message groups until the visibility timeout.
+- Monitoring: legacy recording rules and alerts aggregate by `namespace` too, and the KEDA example selects it, so one Prometheus scraping several environments does not mix them. Alert descriptions of `PlatformEventsOutboxPollFailing` and `PlatformEventsConsumerStalled` match their windows; `identityOwner` removed from the KEDA SQS trigger.
+- CI: pull requests no longer write the registry build cache the signed `main` / release images are built from; the private-module token is deleted right after `go mod download`; the Trivy DB cache key rolls daily; new `make toolchain-check` (in `make ci` and `Validate / Quality`) keeps the Go toolchain identical across the three `go.mod` files and the Dockerfile.
+
+### Docs
+
+- `SystemTenantID` / `WithSystemTenant`: a `"system"` tenant does **not** disable RLS — the consumer sets `app.tenant_id = 'system'`; global-event handlers need an RLS-bypassing pool or role. `ParseEnvelope` documents that it is stricter than the consumer (it requires `time`).
+- HMAC: canonicalisation fixes the envelope field order but does not re-sort payload keys (CLAUDE.md said it did); `WithoutLegacyMetrics` warns that it silences the producer alerts until the successors are ratified; close the pool only after `runner.Stop()` returns nil; LLD rev 2.5 (FIFO consumer, migrations 003 / 010 / 011, replay collision, known limitations L-6 / L-7).
+
+### Tests
+
+- FIFO busy group under `WithHandlerTimeout` not released, failed delete stops the group, one message per receive without a visibility timeout; SNS trace-attribute shedding; `Enqueue` NUL rejection; INVALID-index rebuild; region fallback; `SQS_DRAIN_TIMEOUT`; production-faithful `mock.Consumer`; `BatchError` message; envelope unmarshal reuse.
+- FIFO group order and failure hold, FIFO receive input, no extension after delete, `dataschema` pass-through; shutdown mid-batch release; migration `010` down, `003` no-rebuild, `011` index, replay collision, `MarkFailed` on a published record; metrics rollback; Glue non-JSON; `sslpassword` / `%#v` masking; promtool tests for `OutboxPollFailing`, `SQSReceiveFailing`, `OversizedEventType`.
+
 ## [1.6.0] - 2026-10-01
 
 ### Upgrade notes (action required)

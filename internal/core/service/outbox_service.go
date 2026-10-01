@@ -364,8 +364,13 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 		if len(failed) < len(items) {
 			s.resetTransient() // something got through
 		}
+		// Shutdown mid-batch: the publisher reports the chunks it could not
+		// send as retryable failures. They say nothing about SNS, so hand
+		// them back at once (as handlePublishError does) instead of hiding
+		// them from other replicas for the transient backoff and advancing it.
+		shuttingDown := ctx.Err() != nil
 		var transientDelay time.Duration
-		if anyTransient {
+		if anyTransient && !shuttingDown {
 			transientDelay = s.nextTransientDelay()
 		}
 		for _, it := range items {
@@ -373,6 +378,8 @@ func (s *OutboxService) publishClaimedSequential(ctx context.Context, records []
 			switch {
 			case !ok:
 				s.markPublished(bookkeepCtx, it.rec, it.env)
+			case fi.transient && shuttingDown:
+				s.releaseStranded(bookkeepCtx, it.rec, "publish interrupted by shutdown: "+fi.msg)
 			case fi.transient:
 				s.releaseLease(bookkeepCtx, it.rec, fi.msg, transientDelay)
 			default:

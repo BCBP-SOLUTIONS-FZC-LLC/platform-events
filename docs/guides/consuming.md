@@ -224,7 +224,7 @@ The lookup is cached per source queue for `DLQConfig.CacheTTL` (default 15 min; 
 | `FailedAt` | RFC 3339 UTC timestamp |
 | `ConsumerName` | `DLQConfig.ConsumerName`, when set |
 
-Standard attributes override caller values of the same name. SQS allows 10 attributes per message, so callers get at most 6 (5 when `ConsumerName` is set). Excess caller attributes are **dropped** before validation (so a dropped attribute cannot fail the send), lowest priority first (kept first: `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical order) and logged at WARN; set `DLQConfig.StrictAttributes` to reject with `ErrDLQInvalidMessage` instead. A FIFO DLQ (`.fifo`) gets `MessageGroupId` and `MessageDeduplicationId` set to the envelope ID (a SHA-256 of the body when it is not an envelope or the ID is not a valid FIFO identifier).
+Standard attributes override caller values of the same name. SQS allows 10 attributes per message, so callers get at most 6 (5 when `ConsumerName` is set). Excess caller attributes are **dropped** before validation (so a dropped attribute cannot fail the send), lowest priority first (kept first: `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical order) and logged at WARN; set `DLQConfig.StrictAttributes` to reject with `ErrDLQInvalidMessage` instead. A FIFO DLQ (`.fifo`) gets `MessageGroupId` set to the envelope ID (a SHA-256 of the body when it is not an envelope or the ID is not a valid FIFO identifier) and a `MessageDeduplicationId` unique per forward, so forwarding the same event twice (two queues sharing a DLQ, a redrive that fails again) never deduplicates a dead-letter away.
 
 Each forward emits an `sqs.dlq_forward` span (`SpanKindProducer`), counts the message once in `platform_dlq_messages_total{operation="consume",reason}` (legacy `events_dlq_forwarded_total`), and times its SQS calls in `platform_dependency_request_seconds`.
 
@@ -350,7 +350,7 @@ events.WithDeadLetterHandler(fn)      // receives SQS messages exceeding MaxRece
 |---|---|
 | Detect which of two events from the **same service** is newer | Compare `Envelope.Timestamp` — same-host clock skew is negligible; treat equal-timestamp events as unordered |
 | Detect ordering **across different services** | Do not use `Envelope.Timestamp` — use FIFO with a shared `MessageGroupID`, or store a sequence number in the payload from a single authoritative source |
-| Enforce strict processing order within an aggregate | FIFO topic + stable `MessageGroupID` (e.g. `AggregateID`) |
+| Enforce strict processing order within an aggregate | FIFO topic + stable `MessageGroupID` (e.g. `AggregateID`), a FIFO queue, and `WithVisibilityTimeout` — the consumer runs each message group on one worker in order and holds the group when a message fails; on the producer side enqueue with `outbox.EnqueueOrdered` |
 | Reconstruct a timeline for audit/display | Sort by `Envelope.Timestamp` after collection — acceptable for human-readable display; document that ±100 ms accuracy is the practical bound |
 | React only to the latest state (last-write-wins) | Check stored `processed_at` timestamp before applying; skip if `env.Timestamp` ≤ stored value — valid only when both events originate from the same service |
 
@@ -433,7 +433,7 @@ handler := func(ctx context.Context, env events.Envelope[json.RawMessage]) error
 }
 ```
 
-A failing `fn` rolls back the claim, so SQS retries; a duplicate returns nil without calling `fn` and is counted in `platform_duplicate_messages_total`. A handler that dead-letters the message (`SendToDLQ`, then nil) is not recorded, so redriving the DLQ processes it. `inbox.Handler(store, next)` is the wrapper for handlers whose effects are not Postgres writes; it uses separate transactions, so the handler must still be idempotent.
+A failing `fn` rolls back the claim, so SQS retries; a duplicate returns nil without calling `fn` and is counted in `platform_duplicate_messages_total`. A handler that dead-letters the message (`SendToDLQ`, then nil) is not recorded, so redriving the DLQ processes it. `fn` must not end `tx` itself (`tx.Commit`, `COMMIT`, …): platform-pgcommon (≥ v1.5.1) rolls back and returns `pgcommon.ErrTxEndedInCallback`, and the message is retried. `inbox.Handler(store, next)` is the wrapper for handlers whose effects are not Postgres writes; it uses separate transactions, so the handler must still be idempotent.
 
 #### Pattern 1 — Postgres unique constraint (hand-rolled)
 

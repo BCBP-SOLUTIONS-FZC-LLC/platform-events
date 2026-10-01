@@ -124,3 +124,45 @@ func TestConsumerOptions_HandlerTimeoutAndBodyLogging(t *testing.T) {
 		events.WithHandlerTimeout(time.Minute), events.WithMalformedBodyLogging())
 	require.NoError(t, err)
 }
+
+// upperCodec decodes by upper-casing — enough to see that Inject decoded.
+type upperCodec struct{}
+
+func (upperCodec) Encode(context.Context, string, json.RawMessage) ([]byte, string, error) {
+	return nil, "", nil
+}
+func (upperCodec) Decode(_ context.Context, _ string, b []byte) (json.RawMessage, error) {
+	return json.RawMessage(`{"decoded":"` + string(b) + `"}`), nil
+}
+
+// Inject behaves like the SQS consumer: a malformed envelope never reaches
+// the handler, and a codec-encoded payload is decoded first (an error without
+// a Codec); a dataschema on a plain JSON object is passed through.
+func TestConsumer_Inject_ValidatesAndDecodesLikeProduction(t *testing.T) {
+	var got []json.RawMessage
+	c := &mock.Consumer{}
+	c.SetHandler(func(_ context.Context, env events.Envelope[json.RawMessage]) error {
+		got = append(got, env.Payload)
+		return nil
+	})
+
+	bad := events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`))
+	bad.Source = ""
+	require.ErrorIs(t, c.Inject(bad), mock.ErrMalformedEnvelope)
+	assert.Empty(t, got, "the handler must not see a malformed envelope")
+	nul := events.NewEnvelope("x.y", "svc", json.RawMessage(`{}`), events.WithTenantID("t\x00"))
+	require.ErrorIs(t, c.Inject(nul), mock.ErrMalformedEnvelope, "a NUL tenant is unusable as the RLS GUC")
+
+	encoded := events.NewEnvelope("x.y", "svc", json.RawMessage(`"aGVsbG8="`), events.WithSchemaID("schema-1")) // base64("hello")
+	require.Error(t, c.Inject(encoded), "no Codec configured: decode fails as in production")
+	assert.Empty(t, got)
+
+	c.Codec = upperCodec{}
+	require.NoError(t, c.Inject(encoded))
+	require.Len(t, got, 1)
+	assert.JSONEq(t, `{"decoded":"hello"}`, string(got[0]))
+
+	tagged := events.NewEnvelope("x.y", "svc", json.RawMessage(`{"a":1}`), events.WithSchemaID("schema-1"))
+	require.NoError(t, c.Inject(tagged))
+	assert.JSONEq(t, `{"a":1}`, string(got[1]), "a dataschema on a JSON object is informational")
+}

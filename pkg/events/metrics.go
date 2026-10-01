@@ -52,6 +52,13 @@ type metricsOptions struct {
 // sqs_* metrics. Use it once a service has migrated its dashboards, alerts,
 // recording rules, SLOs and HPA references to the platform_* metrics
 // (Backward Compatibility steps 7–8).
+//
+// Until the Proposed platform_* successors are ratified, the reference alerts
+// (monitoring/prometheus) for the producer side — outbox backlog, pending
+// unknown, poll failing, duplicate-delivery risk, publish errors and SQS
+// receive failing — query the legacy metrics, because alerting on a Proposed
+// metric is forbidden. Dropping them silences those alerts with no
+// replacement, so keep legacy metrics on while you rely on them.
 func WithoutLegacyMetrics() MetricsOption {
 	return func(o *metricsOptions) { o.legacy = false }
 }

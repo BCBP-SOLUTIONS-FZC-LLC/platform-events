@@ -90,7 +90,7 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | Symbol | Purpose |
 |---|---|
 | `mock.Publisher` | `Published()`, `SetError()`, `SetBatchError()` (partial / `Retryable` batch failures), `Reset()`; rejects envelopes without ID, Type or Source like the SNS publisher |
-| `mock.Consumer` | `Inject(env)` delivers synchronously with the real consumer's handler context: tenant GUC (RLS), trace ID, source message, dead-letter attribution |
+| `mock.Consumer` | `Inject(env)` delivers synchronously with the real consumer's handler context: tenant GUC (RLS), trace ID, source message, dead-letter attribution; rejects malformed envelopes (`ErrMalformedEnvelope`) and decodes codec payloads with `Codec`, as production does |
 | `mock.DLQPublisher` | `Sent()`, `SetError()`, `Reset()`; `ResolveDLQ` returns `DLQURL`; counts the forward and marks the attribution like the SQS publisher (so inbox skips dead-lettered messages in tests too) |
 
 ### `pkg/outbox` — transactional outbox
@@ -102,7 +102,7 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | `NewRunner(Config)`, `Runner.Start` / `Stop` / `Ready` | Poll → claim (`SKIP LOCKED` + lease) → publish → mark; per-record retry backoff (`RetryBackoff` / `MaxRetryBackoff`), transient failures never count toward `MaxAttempts`; re-polls while batches publish |
 | `Runner.ListDeadLetters` / `ReprocessDeadLetters` / `ReprocessDeadLettersWith` / `DiscardDeadLetters` | Inspect / replay / discard `outbox_dead_letters` (`DLQFilter`, `DeadLetterRecord`) |
 | `Runner.PrunePublished(ctx, olderThan, limit)` | Batched delete of old published rows |
-| `ApplySchema(ctx, migrateRunner)`, `MigrationsTable` | Embedded migrations `001`–`010`, isolated `outbox_migrations` tracking table |
+| `ApplySchema(ctx, migrateRunner)`, `MigrationsTable` | Embedded migrations `001`–`011`, isolated `outbox_migrations` tracking table |
 
 ### `pkg/inbox` — consumer-side deduplication
 
@@ -154,7 +154,7 @@ if err := dlq.SendToDLQ(ctx, queueURL, body, nil, reason); err != nil {
 |---|---|
 | `TopicARN` must be an SNS ARN | `NewSNSPublisher` rejects empty values and anything without an `arn:aws:sns:` / `arn:aws-cn:sns:` / `arn:aws-us-gov:sns:` prefix |
 | `VisibilityTimeout` ≤ 12 h | `NewSQSConsumer` rejects larger values (SQS hard limit) |
-| Outbox payload ≤ 240 KB | `outbox.Enqueue` rejects larger envelopes (the SNS limit is 256 KB) and null bytes in string fields |
+| Outbox payload ≤ 240 KB | `outbox.Enqueue` rejects larger envelopes (the SNS limit is 256 KB) and NUL characters anywhere (Postgres `jsonb` cannot store `\u0000`) |
 | Malformed message bodies are not retried | Counted as `platform_messages_failed_total{reason="malformed"}` (legacy `events_consumed_total{status="malformed"}`); forwarded verbatim to the queue's DLQ with `WithDLQForwarding`, otherwise deleted immediately |
 | `WithMaxReceiveCount(n)` must be **lower** than the queue's `RedrivePolicy` `maxReceiveCount` | Otherwise SQS moves the message before the dead-letter handler runs — see [Forwarding to the SQS DLQ](docs/guides/consuming.md#forwarding-to-the-sqs-dlq) |
 | DLQ forwards carry authoritative metadata | `DLQReason`, `OriginalQueue`, `FailedAt`, `ConsumerName` override caller values; `DLQReason` capped at 1 KiB |
@@ -172,7 +172,7 @@ platform-events/
 ├── pkg/                               # Public API — the only packages services may import
 │   ├── events/                        # Envelope, Publisher, Consumer, DLQPublisher, Codec, GlueDecodeCodec, HMAC, InitMetrics / MetricsRegistry
 │   │   └── mock/                      # mock.Publisher, mock.Consumer, mock.DLQPublisher
-│   ├── outbox/                        # Enqueue, EnqueueOrdered, Runner, dead-letter API, ApplySchema + embedded migrations/ (001–010)
+│   ├── outbox/                        # Enqueue, EnqueueOrdered, Runner, dead-letter API, ApplySchema + embedded migrations/ (001–011)
 │   ├── inbox/                         # processed_events ledger (Store.Process, Handler), ApplySchema + migrations/
 │   └── config/                        # Env loaders + wiring helpers
 ├── internal/
@@ -217,7 +217,7 @@ The layer rules are a convention checked in review; CI enforces the depguard rul
 | Concern | Technology | Notes |
 |---|---|---|
 | **Outbound events** | AWS SNS (standard or FIFO) | Attributes `EventType` · `TenantID` · `Source` · `EventID` · `Subject` for filter policies; `PublishBatch` splits at 10 entries and 256 KiB per request |
-| **Inbound events** | AWS SQS | Long poll (≤ 20 s), visibility extended from receipt, `ApproximateReceiveCount`-based dead-letter routing; `RawMessageDelivery=true` required on SNS subscriptions |
+| **Inbound events** | AWS SQS (standard or FIFO) | Long poll (≤ 20 s), visibility extended from receipt, `ApproximateReceiveCount`-based dead-letter routing; FIFO message groups processed in order (one worker per group, a failure or failed delete holds the group; one in flight per group per replica); `RawMessageDelivery=true` required on SNS subscriptions |
 | **Dead letters (producer)** | Postgres `outbox_dead_letters` | Records that exhausted `MaxAttempts`; managed via the `Runner` DLQ API |
 | **Dead letters (consumer)** | The queue's SQS DLQ | Via `RedrivePolicy`, or forwarded explicitly with `DLQPublisher` |
 | **Outbox / inbox** | PostgreSQL via `platform-pgcommon` | `outbox_events` (with optional per-key ordering), `outbox_dead_letters`, `processed_events`; own migration tracking tables |
@@ -227,7 +227,7 @@ The layer rules are a convention checked in review; CI enforces the depguard rul
 
 | Library | Version | Purpose |
 |---|---|---|
-| `platform-pgcommon` | v1.4.3 | `pgcommon.Pool`, `RunInTx`, `ConfigFromEnv`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas, `Tx`/`Conn`/`Rows` aliases (pgx is never imported directly) |
+| `platform-pgcommon` | v1.5.1 | `pgcommon.Pool`, `RunInTx`, `ConfigFromEnv`, RLS `GUCSet` injection, `migrate.Runner` for the outbox/inbox schemas, `Tx`/`Conn`/`Rows` aliases (pgx is never imported directly) |
 | `platform-gincommon` | — (not a dependency) | Interface-compatible only: its `ZapLogger` satisfies `port.Logger`, and its `RequestContext` supplies `TenantID` / `TraceID` for envelopes |
 
 ---
@@ -276,7 +276,7 @@ To keep a poison message rather than drop it, forward it with `DLQPublisher.Send
 
 ### 6. Schema registry (optional)
 
-Producers pass `WithCodec`; consumers of Glue-encoded events pass `WithConsumerCodec(events.GlueDecodeCodec{})`. Envelopes with an empty `dataschema` never reach a codec, so mixed traffic is safe — [Codec](docs/guides/codec.md).
+Producers pass `WithCodec`; consumers of Glue-encoded events pass `WithConsumerCodec(events.GlueDecodeCodec{})`. Envelopes with an empty `dataschema` (or a `dataschema` on a non-string `data`) never reach a codec, so mixed traffic is safe — [Codec](docs/guides/codec.md).
 
 ### 7. Wire format
 
@@ -339,6 +339,8 @@ Three Go modules, the same layout as platform-pgcommon, so consuming services in
 | `make metrics-doc` | Regenerate `docs/observability/metrics-registry.md` from the metrics registry |
 | `make rules-check` | `promtool check rules` + alert unit tests for `monitoring/prometheus/` (Docker) |
 | `make dashboards-check` | PromQL syntax gate for `monitoring/grafana/*.json`: every panel and variable query checked with promtool (Docker, jq) |
+| `make ci-scripts-test` | Regression tests for `detect-changes.sh` (the docs-only decision of `ci.yml`) |
+| `make toolchain-check` | The Go toolchain is identical in the three `go.mod` files and the Dockerfile builder image |
 | `make docs-check` | Diagram drift gate: every `docs/architecture/mermaid/*.mmd` embedded byte-identically in `ARCHITECTURE.md` |
 | `make pin-base-images` | Re-pin every image this repository runs by digest: Dockerfile, promtool, docker-compose, testcontainers fixtures (recorded in `.docker-digests`) |
 | `make mod-verify` | `go mod verify` |
@@ -470,12 +472,14 @@ docker compose exec postgres psql -U postgres -d platform_events_dev -c \
 - **`test/e2e/outbox_test.go`** — the full outbox pipeline end to end, including `TestOutbox_RollbackDoesNotPublish`: a rolled-back transaction's event must never be published.
 - **`test/integration/outboxstore_test.go`** — claiming, attempt counting and dead-lettering against real Postgres.
 - **`test/unit/sqs/consumer_test.go`** — consumer-loop semantics: retry-vs-delete, visibility extension, drain, and dead-letter routing on `ApproximateReceiveCount > n`.
+- **`test/unit/sqs/consumer_fifo_test.go`** — FIFO group order, a failure or failed delete holding the group, the handler-timeout budget of a busy group.
+- **`test/integration/migrations_review_test.go`** — migration 010 rolls back without stranding ordered records; 003 rebuilds only a wrong-shape or INVALID index.
 - **`test/unit/sqs/dlq_test.go`** + **`test/integration/dlq_test.go`** — `RedrivePolicy` parsing, ARN resolution, caching, error classification, and a real forward against floci.
 - **Interop** — `platform-interop-tests` checks `Envelope` JSON and HMAC canonicalisation byte-for-byte against the Python library.
 
 ### Coverage
 
-CI (`Validate / Test`: `make test-ci`, then `.github/scripts/coverage-gate.sh`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **99.0%** (verified 2026-10-01).
+CI (`Validate / Test`: `make test-ci`, then `.github/scripts/coverage-gate.sh`) fails below **97%** total (the same gate as platform-pgcommon), measured over `./internal/...` + `./pkg/...` (`COVER_PKG_LIST`). Tests live in the separate `test/` module, so every run uses `-coverpkg`. `make test-ci` merges the root (white-box) / unit / integration / e2e profiles with `scripts/merge_coverage.py` (max-count). The current merged total is **98.5%** (verified 2026-10-01).
 
 ---
 
@@ -485,7 +489,7 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AWS_REGION` | `us-east-1` | SNS and SQS clients |
+| `AWS_REGION` (then `AWS_DEFAULT_REGION`) | `us-east-1` | SNS and SQS clients |
 | `AWS_ENDPOINT_URL` | — | `http://localhost:4574` for the local floci stack |
 | `SNS_TOPIC_ARN` | — | Required for the SNS publisher |
 | `SQS_QUEUE_URL` | — | Required for the SQS consumer |
@@ -493,6 +497,7 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | ≥ 2× p99 handler duration; ≤ 12 h |
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
 | `SQS_MAX_RECEIVE_COUNT` | `0` (unset) | `WithMaxReceiveCount`; must be **below** the queue's `RedrivePolicy` `maxReceiveCount`. Takes effect with `WithDeadLetterHandler` and/or `WithDLQForwarding`, either of which defaults it to 5 when unset |
+| `SQS_DRAIN_TIMEOUT` | `30s` | `WithDrainTimeout`: how long `Stop` waits for in-flight handlers; keep it below the pod's `terminationGracePeriodSeconds` |
 | `SQS_HANDLER_TIMEOUT` | — (off) | `WithHandlerTimeout`: cancels a handler's context after this long and stops extending its message's visibility, so a hung handler's message is redelivered instead of held forever |
 | `OUTBOX_GAUGE_INTERVAL` | `15s` | How often the runner refreshes the backlog gauges (two `COUNT` queries capped at 100k rows), independent of `OUTBOX_POLL_INTERVAL` |
 | `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | `WithQueueDepthMetrics`: samples `platform_queue_depth` / `platform_dlq_depth` every interval (min 10s). Needs `sqs:GetQueueAttributes` on the queue and its DLQ; skipped when `InitMetrics` hasn't run |
@@ -572,10 +577,10 @@ git push origin v1.6.0     # triggers release.yml
 
 Five workflow files, mirroring `iam-org-membership` — the org's reference pipeline, whose job names are the required status checks on `main`:
 
-- **`docs.yml`** — on docs-only changes to `ARCHITECTURE.md` / `docs/architecture/**` (which `ci.yml` skips): the diagram sync check.
-- **`ci.yml`** — orchestrator on push / PR to `main`. `Validate / Test`, `Validate / Quality` and `Build image (cache)` run in parallel; `Trivy CVE scan` and `Smoke tests` gate on the test job and the image; `Cross-language compatibility` (`platform-interop-tests`) gates on the test job; `PR summary` posts one status comment per PR; on push to `main`, `Push image → GHCR` publishes and Cosign-signs the reference-CLI image. Docs-only commits (`**.md`, `docs/architecture/**`, `docs/guides/**`) skip the pipeline.
+- **`docs.yml`** — on changes to `ARCHITECTURE.md` / `docs/architecture/**`: the diagram sync check.
+- **`ci.yml`** — orchestrator on push / PR to `main`. `Validate / Test`, `Validate / Quality` and `Build image (cache)` run in parallel; `Trivy CVE scan` and `Smoke tests` gate on the test job and the image; `Cross-language compatibility` (`platform-interop-tests`) gates on the test job; `PR summary` posts one status comment per PR; on push to `main`, `Push image → GHCR` publishes and Cosign-signs the reference-CLI image. The workflow always runs: a `changes` job (`detect-changes.sh`, as in platform-pgcommon v1.5.1) decides docs-only (`*.md`, `docs/architecture/*.mmd`, never `docs/observability/**`), and the expensive jobs are skipped by `if:` — skipped required checks report success, so docs-only PRs can merge. Secrets reach the reusable validate workflows explicitly (no `secrets: inherit`).
 - **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → coverage gate (**≥ 97%**, `.github/scripts/coverage-gate.sh`) → uploads `coverage.out`.
-- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make dashboards-check` (dashboard PromQL) → `make docs-check` (diagram sync) → `make vuln-check` → digest-pinning check (Dockerfile, docker-compose and the testcontainers images).
+- **`validate-quality.yml`** (reusable) — `go mod verify` → HTML-entity check on workflow files → RLS-6 check (no non-`LOCAL` `SET app.tenant_id`) → `gofmt` → `go mod tidy` drift → `make vet` → `make lint` (both with the `integration,e2e` tags) → `make metrics-lint` (Observability Standard conformance) → `make rules-check` (promtool) → `make dashboards-check` (dashboard PromQL) → `make docs-check` (diagram sync) → `make toolchain-check` → `make vuln-check` → digest-pinning check (Dockerfile, docker-compose and the testcontainers images).
 - **`changelog-check.yml`** — fails a PR touching `internal/`, `pkg/` or `cmd/` without a `CHANGELOG.md` update.
 - **`release.yml`** — on `v*.*.*` tags: the same job graph as `ci.yml` plus verify / binaries / publish — see [Releasing](#releasing).
 

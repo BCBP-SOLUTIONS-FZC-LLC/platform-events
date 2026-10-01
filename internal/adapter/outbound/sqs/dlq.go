@@ -21,6 +21,7 @@ import (
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -198,9 +199,10 @@ func (p *DLQPublisher) ResolveDLQ(ctx context.Context, sourceQueueURL string) (s
 // SQS-allowed set, invalid attribute names, or more than 1 MiB of body plus
 // attributes — fails with ErrDLQInvalidMessage before any AWS call.
 //
-// For a FIFO DLQ, MessageGroupId and MessageDeduplicationId are both set to
-// the envelope ID, or to a SHA-256 of the body when it is not an envelope (or
-// its ID is not a valid FIFO identifier).
+// For a FIFO DLQ, MessageGroupId is the envelope ID, or a SHA-256 of the body
+// when it is not an envelope (or its ID is not a valid FIFO identifier), and
+// MessageDeduplicationId is unique per call, so a repeated forward of the same
+// event is never deduplicated away.
 func (p *DLQPublisher) SendToDLQ(ctx context.Context, sourceQueueURL string, body []byte, attrs map[string]string, reason string) error {
 	eventType := p.eventTypeFor(body, attrs)
 	ctx, span := otel.Tracer("platform-events").Start(ctx, "sqs.dlq_forward", oteltrace.WithSpanKind(oteltrace.SpanKindProducer))
@@ -312,9 +314,15 @@ func (p *DLQPublisher) send(ctx context.Context, span oteltrace.Span, sourceQueu
 		MessageAttributes: msgAttrs,
 	}
 	if target.fifo {
-		id := messageIdentity(body)
-		input.MessageGroupId = aws.String(id)
-		input.MessageDeduplicationId = aws.String(id)
+		input.MessageGroupId = aws.String(messageIdentity(body))
+		// A fresh deduplication ID per SendToDLQ call. A content-derived one
+		// (the envelope ID) made SQS silently drop the second forward of the
+		// same event within its 5-minute window — two source queues sharing
+		// one DLQ, or a redriven message that fails again — while reporting
+		// success, so the caller deleted the source message: a lost
+		// dead-letter. SDK retries of this call reuse the input, so they
+		// still deduplicate.
+		input.MessageDeduplicationId = aws.String(uuid.NewString())
 	}
 
 	sendStart := time.Now()
@@ -629,7 +637,7 @@ func classifySQSError(err error) error {
 
 // messageIdentity returns the envelope ID of body, or a SHA-256 hex digest of
 // body when it is not an envelope or its ID is not a valid FIFO identifier.
-// Used for FIFO group and dedup IDs.
+// Used for the FIFO group ID.
 func messageIdentity(body []byte) string {
 	if h, ok := parseEnvelopeHeader(body); ok && validFIFOID(h.ID) {
 		return h.ID

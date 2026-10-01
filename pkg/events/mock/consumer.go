@@ -3,11 +3,15 @@ package mock
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/google/uuid"
 
 	internalsqs "github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/adapter/outbound/sqs"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/port"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
@@ -25,9 +29,17 @@ const MockQueueURL = "https://sqs.us-east-1.amazonaws.com/000000000000/mock-queu
 // QueueURL) and the dead-letter attribution that makes a handler's SendToDLQ
 // count as dead-lettered — so inbox.Handler and Store.Process skip it, as in
 // production.
+//
+// Like the SQS consumer, Inject never calls the handler for an envelope
+// without id, type or source (production deletes or dead-letters it), and
+// decodes a codec-encoded payload (dataschema + JSON-string data) with Codec
+// first — returning the decode error, as production leaves the message for
+// retry. The envelope is round-tripped through JSON as on the wire.
 type Consumer struct {
 	// QueueURL is reported as the source message's queue (MockQueueURL when empty).
 	QueueURL string
+	// Codec decodes codec-encoded payloads, as WithConsumerCodec does.
+	Codec events.Codec
 
 	mu      sync.Mutex
 	handler events.Handler
@@ -72,9 +84,33 @@ func (m *Consumer) Inject(env events.Envelope[json.RawMessage]) error {
 	if queueURL == "" {
 		queueURL = MockQueueURL
 	}
+	if env.ID == "" || env.Type == "" || env.Source == "" ||
+		strings.ContainsRune(env.TenantID, '\x00') || strings.ContainsRune(env.TraceID, '\x00') {
+		return fmt.Errorf("%w: id, type and source are required, and tenant_id / trace_id must not contain NUL — the SQS consumer deletes or dead-letters such a message without calling the handler", ErrMalformedEnvelope)
+	}
 	body, err := env.JSON()
 	if err != nil {
 		return err
+	}
+	// As on the wire: the handler sees the envelope parsed from its JSON.
+	var wire events.Envelope[json.RawMessage]
+	if err := json.Unmarshal(body, &wire); err != nil {
+		return fmt.Errorf("%w: %w", ErrMalformedEnvelope, err)
+	}
+	env = wire
+	if env.SchemaID != "" && isJSONString(env.Payload) {
+		if m.Codec == nil {
+			return fmt.Errorf("mock: message has dataschema %q but no Codec is configured — the SQS consumer fails decode and leaves it for retry", env.SchemaID)
+		}
+		raw, err := domain.UnwrapCodecPayload(env.Payload)
+		if err != nil {
+			return err
+		}
+		decoded, err := m.Codec.Decode(context.Background(), env.SchemaID, raw)
+		if err != nil {
+			return fmt.Errorf("mock: codec Decode failed: %w", err)
+		}
+		env.Payload = decoded
 	}
 	messageID := uuid.NewString()
 	ctx := internalsqs.HandlerContext(context.Background(), env.TenantID, env.TraceID, func() port.SourceMessage {
@@ -90,6 +126,22 @@ func (m *Consumer) Inject(env events.Envelope[json.RawMessage]) error {
 	})
 	ctx, _ = port.WithDLQAttribution(ctx, "explicit")
 	return h(ctx, env)
+}
+
+// ErrMalformedEnvelope is returned by Inject for an envelope the SQS consumer
+// would treat as malformed (never passed to the handler).
+var ErrMalformedEnvelope = errors.New("mock: malformed envelope")
+
+// isJSONString reports whether payload is a JSON string — the codec wire format.
+func isJSONString(payload json.RawMessage) bool {
+	for _, b := range payload {
+		switch b {
+		case ' ', '\t', '\n', '\r':
+			continue
+		}
+		return b == '"'
+	}
+	return false
 }
 
 // IsRunning reports whether Start has been called without a matching Stop.

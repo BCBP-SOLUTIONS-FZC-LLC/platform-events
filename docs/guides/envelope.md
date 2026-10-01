@@ -75,7 +75,7 @@ env := events.NewEnvelope("billing.invoices.generated", "billing-worker",
 ```
 
 > ⚠️ **Use `WithSystemTenant()` only when the event genuinely has no tenant scope** — scheduled batch jobs, cross-tenant reconciliation, or platform-level operational events. Do not use it to avoid looking up a tenant ID, to simplify a code path, or because the tenant is "unknown at call time" (that last case means the upstream context is missing and should be fixed, not papered over).
-> Misuse bypasses the tenant isolation that `platform-pgcommon`'s RLS policies enforce on the consumer side. A consumer handler that receives a `system` tenant ID will execute DB queries without a tenant GUC set, which causes RLS policies to either reject the query or return the wrong row set, depending on your policy definition. The failure is silent at the event level and only surfaces as incorrect data in the consuming service.
+> Misuse bypasses the tenant isolation that `platform-pgcommon`'s RLS policies enforce on the consumer side. A consumer handler that receives a `system` tenant ID runs its DB queries with `app.tenant_id = 'system'` (RLS is **not** disabled), so tenant-scoped policies match no rows and reject inserts. Handlers for genuine global events need a separate pool or role that bypasses RLS, or policies that admit `'system'`. The failure is silent at the event level and only surfaces as incorrect data in the consuming service.
 
 **`source` field contract:** identifies the producing service. Rules:
 

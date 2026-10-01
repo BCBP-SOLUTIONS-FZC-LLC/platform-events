@@ -122,7 +122,11 @@ func TestRules_RegistryCompliance(t *testing.T) {
 			for _, r := range g.Rules {
 				name := r.Record + r.Alert
 				t.Run(file+"/"+name, func(t *testing.T) {
-					allowed := map[string]bool{"le": true}
+					// namespace is a scrape-target label (Kubernetes service
+					// discovery), not a metric label: legacy rules keep it so
+					// one Prometheus scraping several environments does not
+					// mix them (legacy metrics have no environment label).
+					allowed := map[string]bool{"le": true, "namespace": true}
 					var refs []string
 					for _, ref := range metricRefs(r.Expr) {
 						m := baseMetric(ref)

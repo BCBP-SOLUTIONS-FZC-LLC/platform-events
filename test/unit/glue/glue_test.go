@@ -28,6 +28,8 @@ func TestGlueDecodeCodec(t *testing.T) {
 		"short":      {0x03},
 		"version":    framed(0x02, 0x00, `{}`),
 		"compressed": framed(0x03, 0x05, `{}`),
+		"avro":       framed(0x03, 0x00, "\x02\x06abc"),
+		"empty":      framed(0x03, 0x00, ""),
 	} {
 		_, err := c.Decode(ctx, "T", in)
 		assert.Error(t, err, name)

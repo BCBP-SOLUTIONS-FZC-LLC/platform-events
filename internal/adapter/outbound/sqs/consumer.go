@@ -20,6 +20,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	sqstypes "github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
@@ -189,6 +190,9 @@ type sqsConsumer struct {
 	handlerTimeout time.Duration
 	// logMalformedBodies includes a body excerpt in the malformed-message log.
 	logMalformedBodies bool
+	// fifo is set for a FIFO queue (URL ending in .fifo): each message group
+	// of a batch is processed by one worker, in order (see processGroup).
+	fifo bool
 
 	maxReceiveCount int
 	cancelFn        context.CancelFunc
@@ -273,6 +277,7 @@ func NewWithClient(cfg Config, client SQSClientAPI, handler port.Handler, opts .
 		concurrency:  1,
 		drainTimeout: defaultDrainTimeout,
 		doneCh:       initialDone,
+		fifo:         strings.HasSuffix(cfg.QueueURL, ".fifo"),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -322,20 +327,22 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 	c.doneCh = thisDoneCh
 	c.mu.Unlock()
 
+	// Reset running and signal Stop() when this Start() goroutine exits.
+	// Registered first so it runs last — after the queue-depth poller below
+	// has exited, so Stop() never returns while that goroutine still runs.
+	defer func() {
+		c.mu.Lock()
+		c.running = false
+		c.mu.Unlock()
+		close(thisDoneCh)
+	}()
+
 	// Queue-depth sampler (opt-in): stops with loopCtx; Start does not return
 	// until it has exited.
 	waitDepthPoller := c.startQueueDepthPoller(loopCtx)
 	defer func() {
 		cancel()
 		waitDepthPoller()
-	}()
-
-	// Reset running and signal Stop() when this Start() goroutine exits.
-	defer func() {
-		c.mu.Lock()
-		c.running = false
-		c.mu.Unlock()
-		close(thisDoneCh)
 	}()
 
 	// Resolve the DLQ only once this cycle is registered, so a Stop() during
@@ -413,6 +420,10 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 	if c.visibilityTimeout > 0 {
 		receiveInput.VisibilityTimeout = max(int32(c.visibilityTimeout.Seconds()), 1)
 	}
+	if c.fifo {
+		receiveInput.MessageSystemAttributeNames = append(receiveInput.MessageSystemAttributeNames,
+			sqstypes.MessageSystemAttributeNameMessageGroupId)
+	}
 
 	for {
 		select {
@@ -430,7 +441,16 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		// on Stop(), even before the per-call deadline fires.
 		rcvCtx, rcvCancel := context.WithTimeout(loopCtx, time.Duration(int(c.waitSeconds)+5)*time.Second)
 		rcvStart := time.Now()
-		out, err := c.client.ReceiveMessage(rcvCtx, c.receiveInput(receiveInput, sem, loopCtx))
+		in := c.receiveInput(receiveInput, sem, loopCtx)
+		if c.fifo {
+			// One attempt ID per logical receive: an SDK retry of a receive
+			// whose response was lost gets the same messages back instead of
+			// leaving their groups blocked until the visibility timeout.
+			attempt := *in
+			attempt.ReceiveRequestAttemptId = aws.String(uuid.NewString())
+			in = &attempt
+		}
+		out, err := c.client.ReceiveMessage(rcvCtx, in)
 		rcvDur := time.Since(rcvStart)
 		rcvCancel()
 		if err != nil {
@@ -478,12 +498,25 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 		exts := make([]*visibilityExtender, len(out.Messages))
 		for i, msg := range out.Messages {
 			exts[i] = c.extendVisibility(msg)
-			if c.handlerTimeout > 0 {
-				exts[i].SetDeadline(time.Now().Add(c.handlerTimeout))
+		}
+		// A unit is what one worker processes: one message, or — on a FIFO
+		// queue — one message group's messages of this batch, in order.
+		units := c.workUnits(out.Messages)
+		if c.handlerTimeout > 0 {
+			now := time.Now()
+			for _, unit := range units {
+				// The unit's first message may wait one handler timeout for a
+				// worker. A FIFO group's later messages also wait for the
+				// messages ahead of them by design, so they get the head's
+				// waiting and processing budget; processGroup re-arms them as
+				// each message is dispatched.
+				exts[unit[0]].SetDeadline(now.Add(c.handlerTimeout))
+				for _, i := range unit[1:] {
+					exts[i].SetDeadline(now.Add(2 * c.handlerTimeout))
+				}
 			}
 		}
-		for i, msg := range out.Messages {
-			ext := exts[i]
+		for u, unit := range units {
 			// Interruptible semaphore acquire: if loopCtx is cancelled while all
 			// concurrency slots are busy the blocking send would hold Start() forever,
 			// preventing drain() from ever being called and deadlocking Stop().
@@ -492,39 +525,144 @@ func (c *sqsConsumer) Start(ctx context.Context) error {
 			case <-loopCtx.Done():
 				// Undispatched messages: hand them back to the queue at once
 				// (visibility 0) so another consumer can take them.
-				for _, e := range exts[i:] {
-					e.Release()
+				for _, rest := range units[u:] {
+					for _, i := range rest {
+						exts[i].Release()
+					}
 				}
 				drain()
 				return nil
 			}
-			// The message waited past its deadline and was handed back.
-			if !ext.Claim() {
-				<-sem
+			if len(unit) == 1 {
+				i := unit[0]
+				// Reset the deadline before claiming: once claimed, the
+				// extender no longer releases the message, so a waiting
+				// deadline that passes in the gap before dispatch sets its own
+				// would end the extension early.
+				c.resetDeadline(exts[i])
+				// The message waited past its deadline and was handed back.
+				if !exts[i].Claim() {
+					<-sem
+					continue
+				}
+				wg.Go(func() {
+					defer func() { <-sem }()
+					c.runOne(drainCtx, loopCtx, out.Messages[i], exts[i], &inflight)
+				})
 				continue
 			}
-			inflight.Add(1)
-			metrics.AddInFlight(c.queueURL, 1)
 			wg.Go(func() {
-				defer metrics.AddInFlight(c.queueURL, -1)
-				defer inflight.Add(-1)
 				defer func() { <-sem }()
-				defer func() {
-					if r := recover(); r != nil {
-						if c.logger != nil {
-							c.logger.Error("sqs: handler panic recovered", map[string]any{
-								"message_id": aws.ToString(msg.MessageId),
-								"panic":      fmt.Sprintf("%v", r),
-								"stack":      string(debug.Stack()),
-							})
-						}
-					}
-				}()
-				defer ext.Stop()
-				c.dispatch(drainCtx, loopCtx, msg, ext)
+				c.processGroup(drainCtx, loopCtx, out.Messages, exts, unit, &inflight)
 			})
 		}
 	}
+}
+
+// workUnits splits a received batch into the units one worker processes: a
+// unit per message on a standard queue; on a FIFO queue one unit per message
+// group, holding that group's messages in receive (= group) order.
+func (c *sqsConsumer) workUnits(msgs []sqstypes.Message) [][]int {
+	units := make([][]int, 0, len(msgs))
+	if !c.fifo {
+		for i := range msgs {
+			units = append(units, []int{i})
+		}
+		return units
+	}
+	byGroup := make(map[string]int, len(msgs))
+	for i, msg := range msgs {
+		g := msg.Attributes[string(sqstypes.MessageSystemAttributeNameMessageGroupId)]
+		if u, ok := byGroup[g]; ok {
+			units[u] = append(units[u], i)
+			continue
+		}
+		byGroup[g] = len(units)
+		units = append(units, []int{i})
+	}
+	return units
+}
+
+// processGroup processes one FIFO message group's messages of a batch in
+// order. A message that is not settled (handler error, failed decode or DLQ
+// forward, panic, or one that waited past its deadline) stops the group: the
+// later messages are handed back unprocessed — SQS redelivers them only after
+// the earlier one, so the group's order holds. Stop hands the rest back too.
+func (c *sqsConsumer) processGroup(drainCtx, loopCtx context.Context, msgs []sqstypes.Message, exts []*visibilityExtender, unit []int, inflight *atomic.Int32) {
+	for k, i := range unit {
+		if loopCtx.Err() != nil {
+			c.releaseGroupTail(msgs, exts, unit[k:], "consumer stopping")
+			return
+		}
+		c.resetDeadline(exts[i])
+		if !exts[i].Claim() {
+			c.releaseGroupTail(msgs, exts, unit[k+1:], "message waited past the handler timeout")
+			return
+		}
+		// The rest of the group waits while this message runs: give each one
+		// this message's processing budget plus its own waiting budget, so a
+		// busy group is never released — only one whose message hangs.
+		if c.handlerTimeout > 0 {
+			rest := time.Now().Add(2 * c.handlerTimeout)
+			for _, j := range unit[k+1:] {
+				exts[j].SetDeadline(rest)
+			}
+		}
+		if !c.runOne(drainCtx, loopCtx, msgs[i], exts[i], inflight) {
+			c.releaseGroupTail(msgs, exts, unit[k+1:], "message not settled")
+			return
+		}
+	}
+}
+
+// releaseGroupTail hands a FIFO group's remaining messages of this batch back
+// unprocessed; SQS redelivers them after the message that stopped the group.
+func (c *sqsConsumer) releaseGroupTail(msgs []sqstypes.Message, exts []*visibilityExtender, idx []int, reason string) {
+	if len(idx) == 0 {
+		return
+	}
+	for _, i := range idx {
+		exts[i].Release()
+	}
+	if c.logger != nil {
+		c.logger.Warn("sqs: FIFO group stopped — its later messages were handed back unprocessed", map[string]any{
+			"queue":            c.queueURL,
+			"message_group_id": msgs[idx[0]].Attributes[string(sqstypes.MessageSystemAttributeNameMessageGroupId)],
+			"released":         len(idx),
+			"reason":           reason,
+		})
+	}
+}
+
+// resetDeadline restarts a waiting message's WithHandlerTimeout deadline just
+// before it is claimed (dispatch then sets the processing deadline).
+func (c *sqsConsumer) resetDeadline(ext *visibilityExtender) {
+	if c.handlerTimeout > 0 {
+		ext.SetDeadline(time.Now().Add(c.handlerTimeout))
+	}
+}
+
+// runOne dispatches one claimed message, recovering a panic, and reports
+// whether the message was settled (deleted or moved to the DLQ).
+func (c *sqsConsumer) runOne(drainCtx, loopCtx context.Context, msg sqstypes.Message, ext *visibilityExtender, inflight *atomic.Int32) (settled bool) {
+	inflight.Add(1)
+	metrics.AddInFlight(c.queueURL, 1)
+	defer metrics.AddInFlight(c.queueURL, -1)
+	defer inflight.Add(-1)
+	defer func() {
+		if r := recover(); r != nil {
+			settled = false
+			if c.logger != nil {
+				c.logger.Error("sqs: handler panic recovered", map[string]any{
+					"message_id": aws.ToString(msg.MessageId),
+					"panic":      fmt.Sprintf("%v", r),
+					"stack":      string(debug.Stack()),
+				})
+			}
+		}
+	}()
+	defer ext.Stop()
+	return c.dispatch(drainCtx, loopCtx, msg, ext)
 }
 
 // dlqStartupCheckTimeout bounds the DLQ resolution Start performs when DLQ
@@ -600,7 +738,9 @@ func (c *sqsConsumer) Stop() error {
 //     so in-flight handlers can be signalled when the drain deadline fires.
 //   - loopCtx: the receive-loop context cancelled by Stop(); used for
 //     visibility-timeout extension (which must stop when the loop stops).
-func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.Message, ext *visibilityExtender) {
+//
+// It reports whether the message was settled — deleted or moved to the DLQ.
+func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.Message, ext *visibilityExtender) (settled bool) {
 	tracer := otel.Tracer("platform-events")
 	receivedAt := time.Now()
 	metrics.ObserveReceived(c.queueURL)
@@ -617,8 +757,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		parseErr = missingEnvelopeFields(env)
 	}
 	if parseErr != nil {
-		c.handleMalformed(drainCtx, msg, body, parseErr)
-		return
+		return c.handleMalformed(drainCtx, msg, ext, body, parseErr)
 	}
 
 	// Derive handlerCtx WITHOUT propagating loopCtx cancellation. When Stop()
@@ -664,7 +803,10 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	// handler error, NOT like the malformed-JSON case above: it may be
 	// transient, so the message is left visible for retry via SQS's own
 	// MaxReceiveCount/redrive-policy mechanics rather than deleted immediately.
-	if env.SchemaID != "" {
+	// Only a JSON-string payload can be codec-encoded (WrapCodecPayload); a
+	// dataschema on a plain JSON object or array is informational, and
+	// decoding it would fail on every delivery and dead-letter the message.
+	if env.SchemaID != "" && isJSONString(env.Payload) {
 		decodeStart := time.Now()
 		decoded, decErr := c.decode(drainCtx, handlerBase, env.SchemaID, env.Payload)
 		dur := time.Since(decodeStart)
@@ -690,8 +832,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			// failing to decode: forward the undecoded original to the DLQ.
 			if c.dlq != nil && overThreshold &&
 				c.forwardToDLQ(drainCtx, handlerBase, msg, env.Type, "decode_error", "codec decode failed: "+decErr.Error()) {
-				c.deleteMessage(msg)
-				return
+				return c.settle(msg, ext)
 			}
 			metrics.IncRetry("consume", env.Type)
 			return
@@ -780,8 +921,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 			if c.dlq == nil && !dlhAttribution.Recorded() {
 				metrics.IncDLQ("consume", env.Type, "max_receive_count")
 			}
-			c.deleteMessage(msg)
-			return
+			return c.settle(msg, ext)
 		}
 	}
 
@@ -880,7 +1020,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 		metrics.IncRetry("consume", env.Type)
 	} else {
 		span.SetStatus(codes.Ok, "")
-		c.deleteMessage(msg)
+		settled = c.settle(msg, ext)
 		if !handlerAttribution.Recorded() {
 			metrics.IncProcessed(c.queueURL, env.Type)
 		}
@@ -888,6 +1028,7 @@ func (c *sqsConsumer) dispatch(drainCtx, loopCtx context.Context, msg sqstypes.M
 	metrics.ObserveProcessingDuration(c.queueURL, env.Type, dur)
 
 	metrics.RecordConsume(c.queueURL, env.Type, status, dur.Seconds())
+	return settled
 }
 
 // Extender states: a received message is waiting for a worker, dispatched
@@ -1011,11 +1152,15 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) *visibilityExtender
 					return
 				}
 				visStart := time.Now()
-				_, err := c.client.ChangeMessageVisibility(extCtx, &sqs.ChangeMessageVisibilityInput{
+				// Bound each call below the tick so one hung call cannot let
+				// the visibility lapse before the next attempt.
+				callCtx, callCancel := context.WithTimeout(extCtx, extendCallTimeout(c.visibilityTimeout))
+				_, err := c.client.ChangeMessageVisibility(callCtx, &sqs.ChangeMessageVisibilityInput{
 					QueueUrl:          aws.String(c.queueURL),
 					ReceiptHandle:     msg.ReceiptHandle,
 					VisibilityTimeout: secs,
 				})
+				callCancel()
 				if extCtx.Err() != nil { // cancelled because dispatch finished
 					return
 				}
@@ -1041,6 +1186,12 @@ func (c *sqsConsumer) extendVisibility(msg sqstypes.Message) *visibilityExtender
 	return ext
 }
 
+// extendCallTimeout bounds one ChangeMessageVisibility extension call: below
+// the extension tick (max(VT/2, 1s)), and at most 10s.
+func extendCallTimeout(visibilityTimeout time.Duration) time.Duration {
+	return min(max(visibilityTimeout/2, time.Second), 10*time.Second)
+}
+
 // receiveInput returns the ReceiveMessage input for the next call. Without a
 // visibility timeout there is no extension, so a message received while every
 // worker is busy would wait on the queue's own visibility timeout and could
@@ -1059,6 +1210,12 @@ func (c *sqsConsumer) receiveInput(base *sqs.ReceiveMessageInput, sem chan struc
 	}
 	input := *base
 	input.MaxNumberOfMessages = min(c.maxMessages, int32(cap(sem)-len(sem)))
+	if c.fifo {
+		// A FIFO group's later messages wait on one worker for the earlier
+		// ones; without extension they could reappear and be taken (out of
+		// order) by another consumer. One message per receive never waits.
+		input.MaxNumberOfMessages = 1
+	}
 	return &input
 }
 
@@ -1124,6 +1281,12 @@ func missingEnvelopeFields(env domain.Envelope[json.RawMessage]) error {
 		missing = append(missing, "source")
 	}
 	if len(missing) == 0 {
+		// The tenant and trace ID become the handler's pgcommon GUC set,
+		// which rejects a NUL (pgcommon v1.5.1 ErrInvalidGUCValue): every
+		// database call of the handler would fail on every delivery.
+		if strings.ContainsRune(env.TenantID, '\x00') || strings.ContainsRune(env.TraceID, '\x00') {
+			return errors.New("invalid event envelope: tenant_id or trace_id contains a NUL character")
+		}
 		return nil
 	}
 	return fmt.Errorf("not an event envelope: missing %s (an SNS subscription without RawMessageDelivery delivers a notification wrapper)", strings.Join(missing, ", "))
@@ -1134,7 +1297,7 @@ func missingEnvelopeFields(env domain.Envelope[json.RawMessage]) error {
 // configured (deleted only once the forward succeeds), otherwise deleted to
 // avoid an infinite retry loop. The body is logged only as its size and
 // SHA-256 unless WithMalformedBodyLogging is set — it may carry tenant data.
-func (c *sqsConsumer) handleMalformed(drainCtx context.Context, msg sqstypes.Message, body string, parseErr error) {
+func (c *sqsConsumer) handleMalformed(drainCtx context.Context, msg sqstypes.Message, ext *visibilityExtender, body string, parseErr error) bool {
 	if c.logger != nil {
 		sum := sha256.Sum256([]byte(body))
 		fields := map[string]any{
@@ -1157,9 +1320,18 @@ func (c *sqsConsumer) handleMalformed(drainCtx context.Context, msg sqstypes.Mes
 	metrics.IncFailed(c.queueURL, "unknown", "malformed")
 	if c.dlq != nil && !c.forwardToDLQ(drainCtx, context.Background(), msg, "unknown", "malformed", "malformed message body: "+parseErr.Error()) {
 		metrics.IncRetry("consume", "unknown")
-		return
+		return false
 	}
-	c.deleteMessage(msg)
+	return c.settle(msg, ext)
+}
+
+// settle stops msg's visibility extension — so no extension call races the
+// delete — and deletes it. It reports whether the delete succeeded: a failed
+// delete (logged) leaves the message to be redelivered, so on a FIFO queue
+// its group must stop — running the next message now would reorder them.
+func (c *sqsConsumer) settle(msg sqstypes.Message, ext *visibilityExtender) bool {
+	ext.Stop()
+	return c.deleteMessage(msg) == nil
 }
 
 // errDLQForwardFailed marks a dead-letter routing attempt whose DLQ forward
@@ -1250,6 +1422,19 @@ func decodeCodecPayload(ctx context.Context, codec port.Codec, schemaID string, 
 	return decoded, nil
 }
 
+// isJSONString reports whether payload is a JSON string (its first
+// non-whitespace byte is a quote) — the codec wire format.
+func isJSONString(payload json.RawMessage) bool {
+	for _, b := range payload {
+		switch b {
+		case ' ', '\t', '\n', '\r':
+			continue
+		}
+		return b == '"'
+	}
+	return false
+}
+
 // approxReceiveCount parses the ApproximateReceiveCount system attribute from SQS.
 func approxReceiveCount(attrs map[string]string) int {
 	s, ok := attrs[string(sqstypes.MessageSystemAttributeNameApproximateReceiveCount)]
@@ -1264,14 +1449,14 @@ const deleteMessageTimeout = 10 * time.Second
 
 // deleteMessage deletes a processed message from SQS. It uses its own bounded
 // context so a network partition cannot hold a goroutine slot indefinitely.
-func (c *sqsConsumer) deleteMessage(msg sqstypes.Message) {
+func (c *sqsConsumer) deleteMessage(msg sqstypes.Message) error {
 	if msg.ReceiptHandle == nil {
 		if c.logger != nil {
 			c.logger.Error("sqs: cannot delete message with nil ReceiptHandle — skipping", map[string]any{
 				"message_id": aws.ToString(msg.MessageId),
 			})
 		}
-		return
+		return errors.New("sqs: message has no receipt handle")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), deleteMessageTimeout)
 	defer cancel()
@@ -1290,4 +1475,5 @@ func (c *sqsConsumer) deleteMessage(msg sqstypes.Message) {
 			})
 		}
 	}
+	return err
 }

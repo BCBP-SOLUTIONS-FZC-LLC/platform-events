@@ -66,6 +66,10 @@ func (e *Envelope[T]) UnmarshalJSON(b []byte) error {
 	e.UserAgent = raw.UserAgent
 	e.SchemaID = raw.SchemaID
 	e.Timestamp = raw.Timestamp
+	// Reset first: decoding into a reused Envelope whose JSON has no data
+	// must not keep the previous message's payload.
+	var zero T
+	e.Payload = zero
 	if len(raw.Data) > 0 {
 		return json.Unmarshal(raw.Data, &e.Payload)
 	}
@@ -121,6 +125,10 @@ const SystemTenantID = domain.SystemTenantID
 // WithSystemTenant marks the envelope as a system-level event with no tenant
 // scope. Use for background jobs and scheduled tasks that publish across tenants
 // or are not associated with any specific tenant.
+//
+// Consumers receive TenantID "system" and the SQS consumer sets it as the RLS
+// tenant (app.tenant_id = 'system'): RLS is not disabled, so handlers of such
+// events need a pool or role that bypasses RLS, or policies admitting 'system'.
 func WithSystemTenant() EnvelopeOpt {
 	return WithTenantID(SystemTenantID)
 }
@@ -164,8 +172,13 @@ func WithUserAgent(ua string) EnvelopeOpt {
 // SchemaID is normally set automatically by the SNS publisher from the
 // codec's Encode return value — do not call WithSchemaID yourself in that
 // case, since the encode step overwrites it at publish time. WithSchemaID
-// remains useful for manual/advanced construction (e.g. republishing an
-// already-encoded payload) or non-codec informational tagging.
+// remains useful for manual/advanced construction, e.g. republishing an
+// already-encoded payload (a base64 JSON string).
+//
+// Do not use it as an informational tag on a plain-JSON payload: consumers
+// treat a dataschema with a JSON-string payload as codec-encoded. (Since
+// v1.6.1 the SQS consumer passes a non-string payload through undecoded, but
+// older consumers dead-letter it.)
 func WithSchemaID(id string) EnvelopeOpt {
 	return func(c *envelopeConfig) { c.schemaID = id }
 }
@@ -214,7 +227,15 @@ func TraceIDFromContext(ctx context.Context) string {
 }
 
 // ParseEnvelope deserialises and validates a JSON-encoded envelope.
-// Returns errors for missing required fields (ID, Type, Source).
+// Returns ErrEnvelopeIDRequired / ErrEnvelopeTypeRequired /
+// ErrEnvelopeSourceRequired for a missing id / type / source, and an error for
+// a missing time.
+//
+// It is deliberately stricter than the SQS consumer, which requires only id,
+// type and source and passes an envelope without time to the handler (time
+// only feeds the propagation metric) — so a producer in another language that
+// omits time still has its events delivered. Producers must always set time
+// (NewEnvelope does).
 func ParseEnvelope[T any](data []byte) (Envelope[T], error) {
 	var env Envelope[T]
 	if err := json.Unmarshal(data, &env); err != nil {

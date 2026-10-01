@@ -363,6 +363,7 @@ func registerLegacy(r *registrar, serviceName, buildVersion string) (*legacySet,
 	constLabels := prometheus.Labels{LabelService: serviceName}
 	droppable := []string{LabelService}
 	var errs []error
+	mark := len(r.added)
 	counter := func(name, help string, labels ...string) *prometheus.CounterVec {
 		c, err := register(r, constLabels, droppable, func(cl prometheus.Labels) *prometheus.CounterVec {
 			return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help + deprecatedHelp, ConstLabels: cl}, labels)
@@ -425,6 +426,10 @@ func registerLegacy(r *registrar, serviceName, buildVersion string) (*legacySet,
 		oversizedEventTypeCounter: counter("events_oversized_event_type_label_total", "Total event_type values replaced with __oversized__."),
 	}
 	if err := errors.Join(errs...); err != nil {
+		// Leave nothing behind: collectors registered here would otherwise
+		// stay exported at zero (reading "healthy" rather than absent) after
+		// the caller sees the error — e.g. and retries WithoutLegacyMetrics.
+		r.rollback(mark)
 		return nil, err
 	}
 	buildInfo.WithLabelValues(buildVersion).Set(1)

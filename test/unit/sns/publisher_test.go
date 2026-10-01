@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -1479,4 +1480,55 @@ func TestWithCodec_PublishBatch_PerEntryCodecFailureIsolated(t *testing.T) {
 	require.Len(t, batchErr.Failures, 1)
 	assert.Equal(t, "CodecEncodeError", batchErr.Failures[0].Code)
 	assert.Equal(t, 2, callCount)
+}
+
+// Optional trace context (baggage, then tracestate) is dropped to fit the
+// SNS limit of 10 attributes, so a publish never fails because of the baggage
+// the caller's request carried; traceparent and routing attributes are kept.
+func TestPublish_OverLimit_DropsOptionalTraceAttributes(t *testing.T) {
+	var captured *sns.PublishInput
+	client := &mockSNSClient{
+		publishFn: func(_ context.Context, params *sns.PublishInput, _ ...func(*sns.Options)) (*sns.PublishOutput, error) {
+			captured = params
+			return &sns.PublishOutput{MessageId: aws.String("x")}, nil
+		},
+	}
+	logger := &fixtures.MockLogger{}
+	// 4 reserved + Subject + 4 extra + traceparent = 10; tracestate and
+	// baggage would make 12.
+	pub, err := internalsns.NewWithClient("arn:aws:sns:us-east-1:123:test", client, logger,
+		internalsns.WithAttributes(map[string]string{"a1": "1", "a2": "2", "a3": "3", "a4": "4"}))
+	require.NoError(t, err)
+
+	tp := trace.NewTracerProvider()
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	t.Cleanup(func() { otel.SetTextMapPropagator(propagation.TraceContext{}) })
+
+	ctx := propagation.TraceContext{}.Extract(context.Background(), propagation.MapCarrier{
+		"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		"tracestate":  "vendor=value",
+	})
+	ctx = propagation.Baggage{}.Extract(ctx, propagation.MapCarrier{"baggage": "user=alice"})
+	ctx, span := tp.Tracer("test").Start(ctx, "publish")
+	defer span.End()
+
+	env := makeEnv("trace.limit")
+	env.TenantID, env.Subject = "acme", "users/1"
+	require.NoError(t, pub.Publish(ctx, env))
+	require.NotNil(t, captured)
+	assert.Len(t, captured.MessageAttributes, 10)
+	assert.Contains(t, captured.MessageAttributes, "traceparent")
+	assert.Contains(t, captured.MessageAttributes, "Subject")
+	assert.NotContains(t, captured.MessageAttributes, "baggage")
+	assert.NotContains(t, captured.MessageAttributes, "tracestate")
+	warned := 0
+	for _, e := range logger.Entries() {
+		if strings.Contains(e.Message, "dropped optional trace attributes") {
+			warned++
+		}
+	}
+	require.NoError(t, pub.Publish(ctx, env))
+	assert.Equal(t, 1, warned, "logged once per publisher")
 }

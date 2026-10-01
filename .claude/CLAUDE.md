@@ -31,7 +31,7 @@ This library builds on two other BCBP platform libraries:
 | [`platform-gincommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon) | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-gincommon` | OTel tracing initialisation (`InitTracingFromEnv`, `EnsureTracing`); `port.Logger` interface (compatible — gincommon's `ZapLogger` can be injected directly); `RequestContext` carries `TraceID` / `TenantID` / `UserID` that populate `Envelope` fields |
 | [`platform-pgcommon`](https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon) | `github.com/BCBP-SOLUTIONS-FZC-LLC/platform-pgcommon` | Connection pool (`pgcommon.Pool`) used by the outbox store; `pgcommon.RunInTx` composes business logic + `outbox.Enqueue` atomically; `migrate.Runner` applies the outbox schema (`outbox_events`, `outbox_dead_letters`); `SlowQueryTracer` surfaces slow outbox queries |
 
-See [`ARCHITECTURE.md`](../ARCHITECTURE.md) for detailed flow diagrams and invariant tables, and [`docs/lld/platform-events-lld.md`](../docs/lld/platform-events-lld.md) for the low-level design (data model, API contract, flows, retry classification, configuration). Keep the LLD's revision history and §16 "Deployment stage" current when behaviour or release state changes.
+See [`ARCHITECTURE.md`](../ARCHITECTURE.md) for detailed flow diagrams and invariant tables, and [`docs/lld/platform-events-lld.md`](../docs/lld/platform-events-lld.md) for the low-level design (data model, API contract, flows, retry classification, configuration). Keep the LLD's revision history, §13.4 "Deployment stage" and the §16 open-questions register current when behaviour or release state changes.
 
 ## Common Commands
 
@@ -45,6 +45,8 @@ make lint            # golangci-lint
 make metrics-lint    # Observability standard gate (metric conformance, rule files, inventory drift)
 make metrics-doc     # Regenerate docs/observability/metrics-registry.md from the registry
 make rules-check     # promtool check + alert unit tests for monitoring/prometheus (Docker)
+make ci-scripts-test # regression tests for detect-changes.sh (ci.yml docs-only decision)
+make toolchain-check # Go toolchain identical in the three go.mod files and the Dockerfile
 make docs-check      # every docs/architecture/mermaid/*.mmd embedded verbatim in ARCHITECTURE.md
 make test            # All tests (unit + integration), excludes smoke
 make test-ci         # All tests with race detector (used in CI)
@@ -55,7 +57,7 @@ make race            # All tests with -race flag
 make build           # Compile reference CLI to bin/platform-events
 make cover           # Coverage HTML report (measures ./internal/... ./pkg/...)
 make cover-func      # Coverage summary by function (terminal)
-make ci              # tidy + mod-verify + fmt-check + vet + lint + docs-check + metrics-lint + rules-check + dashboards-check + test-ci + build (the same gates as CI)
+make ci              # tidy + mod-verify + toolchain-check + ci-scripts-test + fmt-check + vet + lint + docs-check + metrics-lint + rules-check + dashboards-check + test-ci + build (the same gates as CI)
 make docker-up       # Start floci (SNS/SQS, :4574) + floci-ui (http://localhost:4505) + Postgres (:5538); demo topology via scripts/init-floci.sh
 make docker-down     # Stop the local containers
 make clean           # Remove bin/ artefacts
@@ -84,7 +86,7 @@ pkg/                       ← public API surface (consumers import these)
                              HMAC helpers, InitMetrics / MetricsIdentity / MetricsRegistry
     mock/                  ← mock.Publisher, mock.Consumer, mock.DLQPublisher (production-faithful)
   outbox/                  ← Runner (NewRunner/Config), Enqueue, EnqueueOrdered, ApplySchema, DLQ management
-    migrations/            ← embedded 001–010 (outbox_events, outbox_dead_letters, ordering_key/ordering_seq)
+    migrations/            ← embedded 001–011 (outbox_events, outbox_dead_letters, ordering_key/ordering_seq, (failed_at, id) DLQ index)
   inbox/                   ← processed_events ledger: Store (Process, IsProcessed, MarkProcessed, Prune), Handler
     migrations/            ← embedded 001 (processed_events)
   config/                  ← env loading (LoadSNS/LoadSQS/LoadOutbox), RunnerConfigFromEnv, SQSConsumerOptions
@@ -113,7 +115,7 @@ test/                      ← separate Go module (replace … => ../)
 tools/                     ← separate Go module: golangci-lint via `go tool -modfile=tools/go.mod`
 
 External dependencies (private modules):
-  platform-pgcommon v1.4.3 → Pool, RunInTx, ConfigFromEnv, migrate.Runner, Tx/Conn/Rows aliases
+  platform-pgcommon v1.5.1 → Pool, RunInTx (ErrTxEndedInCallback), ConfigFromEnv (sslmode warnings), migrate.Runner, Tx/Conn/Rows aliases
   platform-gincommon       → not imported: port.Logger matches its ZapLogger; tracing initialised by the service
 ```
 
@@ -142,7 +144,7 @@ External dependencies (private modules):
   - `SQSConfig{QueueURL, Region, EndpointURL, MaxMessages, WaitSeconds, Logger}` — `QueueURL` required; `MaxMessages` default 10; `WaitSeconds` default 20. `Logger` accepts any `port.Logger` — pass `platform-gincommon`'s `ZapLogger` directly.
   - `Handler` — `func(ctx context.Context, env Envelope[json.RawMessage]) error`; returning a non-nil error skips deletion (message becomes visible again after visibility timeout). The `ctx` passed to each handler has a `platform-gincommon`-compatible `RequestContext` injected (populated from `env.TenantID`, `env.TraceID`) so downstream calls to pgcommon pool helpers (e.g. `pool.WithTx`) pick up the correct GUC values automatically.
   - `ConsumerOption` — `WithConcurrency(n)` (default 1), `WithVisibilityTimeout(d)`, `WithDeadLetterHandler(fn)` (nil ignored), `WithMaxReceiveCount(n)`, `WithDrainTimeout(d)`, `WithConsumerCodec(codec)` (schema-registry hook — see "Codec" below), `WithDLQForwarding(dlq)`, `WithHandlerTimeout(d)`, `WithQueueDepthMetrics(interval)`, `WithMalformedBodyLogging()`. `NewSQSConsumer` returns an error for a nil handler.
-  - `MockConsumer` (in `pkg/events/mock`) — in-memory queue; `Inject(env)` delivers messages synchronously
+  - `MockConsumer` (in `pkg/events/mock`) — in-memory queue; `Inject(env)` delivers messages synchronously, like production: `ErrMalformedEnvelope` (handler not called) without id / type / source, JSON round-trip, codec decode via its `Codec` field
 
 - **HMAC helpers**
   - `Sign(key []byte, payload []byte) (string, error)` — returns hex-encoded HMAC-SHA256 signature; `ErrKeyTooShort` for keys < 32 bytes
@@ -162,7 +164,7 @@ External dependencies (private modules):
 - `Runner.ReprocessDeadLettersWith(ctx, filter DLQFilter, limit int) (int, error)` — same as `ReprocessDeadLetters` but filters by `DLQFilter`; use for targeted replay without touching unrelated failures.
 - `Runner.DiscardDeadLetters(ctx, filter DLQFilter, limit int) (int64, error)` — permanently deletes up to `limit` matching dead-letter records; always call `ListDeadLetters` first to confirm selection; applies a 30 s internal DB timeout.
 - `Enqueue(ctx, tx pgcommon.Tx, env Envelope[json.RawMessage]) error` — insert a serialised envelope into the `outbox_events` table within the caller's transaction. No publish happens at insert time — the runner delivers asynchronously. Callers should pass the `pgcommon.Tx` obtained from `pgcommon.RunInTx` so the enqueue and the business-logic write commit or roll back as a single unit.
-- `ApplySchema(ctx, runner *migrate.Runner) error` — convenience wrapper that calls `platform-pgcommon`'s `migrate.Runner` to apply the embedded `pkg/outbox/migrations/` SQL files (`001`–`010`). Call once at service startup before `Runner.Start`.
+- `ApplySchema(ctx, runner *migrate.Runner) error` — convenience wrapper that calls `platform-pgcommon`'s `migrate.Runner` to apply the embedded `pkg/outbox/migrations/` SQL files (`001`–`011`). Call once at service startup before `Runner.Start`.
 - Schema: `outbox_events(id UUID PK, event_type TEXT, payload JSONB, tenant_id TEXT, trace_id TEXT, attempts INT DEFAULT 0, last_error TEXT, created_at TIMESTAMPTZ, scheduled_at TIMESTAMPTZ, published_at TIMESTAMPTZ)`
 
 **Typical wiring with platform-pgcommon:**
@@ -209,10 +211,15 @@ err = pgcommon.RunInTx(ctx, pool, pgcommon.TxOptions{}, func(ctx context.Context
     return outbox.Enqueue(ctx, tx, envelope) // event write — same transaction
 })
 
-// 6. On termination, drain the in-flight batch, then close the pool.
+// 6. On termination, drain the in-flight batch, then close the pool. If Stop
+//    times out, the batch's bookkeeping (detached context) may still be
+//    marking records published: closing the pool then makes them re-publish
+//    (at-least-once still holds) — so close it only after a nil Stop, or after
+//    a grace period.
 <-ctx.Done()
-_ = runner.Stop()
-pool.Close()
+if err := runner.Stop(); err == nil {
+    pool.Close()
+}
 ```
 
 ### Event Envelope Design
@@ -248,7 +255,7 @@ The JSON keys follow CloudEvents naming (`specversion`, `dataschema`, `time`, `d
 
 `NewSNSPublisher` wraps `aws-sdk-go-v2/service/sns`. Key behaviours:
 
-- **Message attributes** — `EventType`, `TenantID`, `Source`, `EventID`, and `Subject` (when non-empty) are set as SNS message attributes to enable SQS subscription filter policies without deserialising the body. `Actor` is not forwarded as an attribute — it is an audit-trail field, not a routing field.
+- **Message attributes** — at most 10 per message (SNS limit); over it, OTel `baggage` then `tracestate` are dropped (logged once) before the publish fails. `EventType`, `TenantID`, `Source`, `EventID`, and `Subject` (when non-empty) are set as SNS message attributes to enable SQS subscription filter policies without deserialising the body. `Actor` is not forwarded as an attribute — it is an audit-trail field, not a routing field.
 - **FIFO topics** — if `TopicARN` ends in `.fifo`, the publisher requires `MessageGroupID`; `MessageDeduplicationID` defaults to `Envelope.ID` (content-based deduplication must be disabled at the topic level).
 - **Batching** — `PublishBatch` uses `sns:PublishBatch` (max 10 per call); batches larger than 10 are automatically split.
 - **Retry** — caller is responsible for retry (the outbox runner handles this); the SNS adapter does not retry internally. `Publish` returns the AWS error, wrapped in `RetryableError` (`errors.Is(err, events.ErrRetryable)`) when transient: SNS throttling / internal codes (`Throttled`, `InternalError`, `KMSThrottling`, …) and any failure without an AWS API error (network, DNS, TLS, timeouts, credentials). `errors.As(err, &smithy.APIError)` still reaches the underlying error. `PublishBatch` failures carry `BatchFailure.Retryable` (and Code `TransportError` for a transient whole-request failure; a permanent one keeps its AWS code). Chunks are split by count (10) **and** by SNS's 256 KiB request size.
@@ -271,6 +278,7 @@ Start() →
 ```
 
 - **Batch receive, extended from receipt** — each `ReceiveMessage` takes up to `MaxMessages`; every received message's visibility is extended from receipt (while it waits for a worker, then while processed), so a batch queued behind slow handlers never reappears and is processed twice. Without a visibility timeout (no extension) a receive asks only for `min(MaxMessages, free workers)`. With `WithHandlerTimeout`, a message still waiting when the timeout passes is handed back (visibility 0); `Stop` hands back undispatched messages at once.
+- **FIFO queues** — on a `.fifo` queue the batch is split by `MessageGroupId`; each group runs on one worker in receive order, and a message that is not settled (handler error, failed decode / DLQ forward, panic) stops its group: the group's later messages are handed back unprocessed so SQS redelivers them after it. Receives carry a fresh `ReceiveRequestAttemptId`. Use `WithVisibilityTimeout` on FIFO queues. At most one message per group is in flight per replica; with `WithHandlerTimeout` a group's later messages get the running message's budget (re-armed per dispatch), so a busy group is never handed back. Without a visibility timeout a FIFO receive takes one message; a failed delete also stops the group.
 - **Envelope validation** — a body that is not JSON, or JSON without `id` / `type` / `source` (e.g. an SNS notification wrapper from a subscription without `RawMessageDelivery`), is malformed: forwarded to the DLQ with `WithDLQForwarding`, else deleted; never passed to the handler. Logged with `body_bytes` / `body_sha256` only (`WithMalformedBodyLogging` adds an excerpt — bodies may carry PII).
 - **Visibility extension** — from receipt until dispatch ends (decode, dead-letter handler, DLQ forward, handler), the consumer calls `ChangeMessageVisibility` every `max(VisibilityTimeout/2, 1s)`. `WithHandlerTimeout(d)` (`SQS_HANDLER_TIMEOUT`) is one deadline from when a worker picks the message up, for decode, dead-letter handler and handler contexts and for the extension, so a hung handler's message is redelivered.
 - **Dead-letter handler** — with `WithDeadLetterHandler` and/or `WithDLQForwarding`, a message whose `ApproximateReceiveCount` exceeds `WithMaxReceiveCount` (default 5; keep it below the queue's RedrivePolicy `maxReceiveCount`) goes to the handler, then — unless the handler already forwarded it with `SendToDLQ` — is forwarded to the DLQ, and is deleted once both succeed. Without either option there is no consumer-side threshold: SQS's own redrive policy moves the message.
@@ -290,7 +298,7 @@ type Codec interface {
 ```
 
 - **Wire format** — `Encode`'s output bytes are base64-encoded and marshalled as a JSON *string*, then substituted into `Envelope.Payload`; `SchemaID` is set to the returned `schemaID`. This keeps the envelope always-valid JSON (required for SNS's UTF-8-only `Message` field) regardless of the codec's native binary format.
-- **`SchemaID` is the decode signal** — empty means `Payload` is already plain JSON (legacy producer, `NoopCodec`, or `WithCodec` never configured on the publisher); the SQS consumer skips `Decode` entirely in that case. Non-empty means `Decode` runs before the message reaches the handler (and before `WithDeadLetterHandler` routing).
+- **`SchemaID` is the decode signal** — empty means `Payload` is already plain JSON (legacy producer, `NoopCodec`, or `WithCodec` never configured on the publisher); the SQS consumer skips `Decode` entirely in that case, and also when `Payload` is not a JSON string (a `dataschema` used as an informational tag). Non-empty means `Decode` runs before the message reaches the handler (and before `WithDeadLetterHandler` routing).
 - **Decode failures are treated like handler errors, not malformed JSON** — a schema-registry outage can be transient, so a decode failure leaves the message visible for SQS's own `MaxReceiveCount`/redrive-policy retry rather than deleting it immediately.
 - **No outbox involvement** — encoding happens transiently inside `Publish`/`PublishBatch`; `pkg/outbox` always stores the canonical plain-JSON envelope and is unaffected by `WithCodec`.
 - `NoopCodec` (in `pkg/events`, aliased from `port.NoopCodec`) is the identity reference implementation — `Encode` returns the payload unchanged with an empty `schemaID`.
@@ -311,7 +319,7 @@ The outbox pattern eliminates the dual-write problem: services write the event *
 
 ### HMAC Helpers
 
-`Sign` / `Verify` operate on raw bytes. `SignEnvelope` / `VerifyEnvelope` serialise the envelope to canonical JSON before signing, ensuring field-ordering is deterministic (sorted keys via `encoding/json` + a stable marshaller).
+`Sign` / `Verify` operate on raw bytes. `SignEnvelope` / `VerifyEnvelope` serialise the envelope to canonical JSON before signing: every envelope field, always emitted, in a fixed struct order (`hmacEnvelope`). The `data` payload is compacted but its keys are **not** re-sorted — a producer (in any language) that re-serialises the payload with a different key order produces a different signature, so sign and verify the payload bytes as sent.
 
 `Verify` uses `hmac.Equal` (constant-time) — not `==`. Never replace with string comparison. `VerifyEnvelope` returns `(false, nil)` on signature mismatch and `(false, err)` on malformed input — callers must check both return values.
 
@@ -354,7 +362,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 
 | Variable | Default | Notes |
 |----------|---------|-------|
-| `AWS_REGION` | `us-east-1` | Applies to both SNS and SQS clients |
+| `AWS_REGION` → `AWS_DEFAULT_REGION` | `us-east-1` | Applies to both SNS and SQS clients |
 | `SNS_TOPIC_ARN` | — | Required for SNS publisher |
 | `SQS_QUEUE_URL` | — | Required for SQS consumer |
 | `SQS_MAX_MESSAGES` | `10` | 1–10; SQS hard limit |
@@ -362,6 +370,7 @@ All metrics are **Tier 1 `platform_*`**. platform-events is a cross-domain platf
 | `SQS_VISIBILITY_TIMEOUT` | `30s` | Parsed as `time.Duration` |
 | `SQS_CONCURRENCY` | `1` | Parallel handler goroutines |
 | `SQS_QUEUE_DEPTH_INTERVAL` | — (off) | Enables `platform_queue_depth` / `platform_dlq_depth` sampling (min 10s) |
+| `SQS_DRAIN_TIMEOUT` | `30s` | `WithDrainTimeout`: how long `Stop` waits for in-flight handlers (below `terminationGracePeriodSeconds`) |
 | `SQS_HANDLER_TIMEOUT` | — (off) | `WithHandlerTimeout`: handler ctx deadline + stop extending visibility, so a hung handler's message is redelivered |
 | `OUTBOX_GAUGE_INTERVAL` | `15s` | Backlog-gauge refresh interval; counts capped at `outboxstore.MaxCountedRows` (100k) |
 | `OUTBOX_POLL_INTERVAL` | `5s` | Parsed as `time.Duration` |
@@ -394,14 +403,14 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 ## Test Layout
 
-- `test/unit/` — isolated unit tests per package: clock, config, domain, enqueue, envelope, glue, hmac, inbox, metrics (incl. the `make metrics-lint` conformance tests and inventory drift), mock (production fidelity), outbox, port, publisher, runner, sns (incl. failure classification), sqs (consumer, DLQ publisher, queue depth, visibility / timeout / shutdown paths)
-- `test/integration/` — floci (SNS round-trip, SQS consume loop, DLQ forwarding, codec) and Postgres (outbox store incl. per-key ordering and commit order, inbox `Store.Process`, error paths) — build tag `integration`
+- `test/unit/` — isolated unit tests per package: clock, config, domain, enqueue, envelope, glue, hmac, inbox, metrics (incl. the `make metrics-lint` conformance tests and inventory drift), mock (production fidelity), outbox, port, publisher, runner, sns (incl. failure classification), sqs (consumer, DLQ publisher, queue depth, visibility / timeout / shutdown paths, FIFO group semantics in `consumer_fifo_test.go`)
+- `test/integration/` — floci (SNS round-trip, SQS consume loop, DLQ forwarding, codec) and Postgres (outbox store incl. per-key ordering and commit order, inbox `Store.Process`, error paths, migration rules 003 / 010-down / 011 and replay collisions in `migrations_review_test.go`) — build tag `integration`
 - `test/e2e/` — publish → consume and outbox runner end to end — build tag `e2e`
 - `test/smoke/` — optional; requires live AWS resources (`SMOKE_SNS_TOPIC_ARN`, `SMOKE_SQS_QUEUE_URL`)
 - `test/fixtures/` — shared floci and Postgres containers (one per package; fresh database per `NewTestDB`, `NewEmptyTestDB` for schema tests), `MockLogger`, `FakeClock`
 - `test/testenv/` — loads `.env-example` for tests
 - White-box tests stay beside the sources in the root module (`internal/core/service/*_test.go`).
-- Merged coverage (root + unit + integration + e2e, `-race`) is **99.0%**; the CI gate is 97%.
+- Merged coverage (root + unit + integration + e2e, `-race`) is **98.5%**; the CI gate is 97%.
 
 ## Key Design Decisions
 
@@ -447,6 +456,8 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 
 **Outbox transactions compose with `pgcommon.RunInTx`** — `outbox.Enqueue` accepts a `pgcommon.Tx` (an alias of `pgx.Tx`) rather than a pool so callers control the transaction boundary. The idiomatic pattern is `pgcommon.RunInTx(ctx, pool, opts, fn)` where `fn` performs the business write and calls `outbox.Enqueue(ctx, tx, env)` — both commit or both roll back. This avoids a second `BEGIN` inside `Enqueue` and keeps the dual-write window at zero.
 
+**`dataschema` + JSON-string `data` is the decode signal** — the codec wire format is a base64 JSON string; a `dataschema` on a JSON object is informational and passed through undecoded (an older consumer would dead-letter it, so don't tag plain payloads).
+
 **`Codec` is optional and pluggable, not implemented in this library** — mirrors `port.Logger`: the interface and a `NoopCodec` identity reference live here; a consuming service implements it against its own schema-registry client (e.g. AWS Glue) and injects it via `WithCodec`/`WithConsumerCodec`. Absent, behaviour is byte-for-byte identical to pre-`Codec` releases — the encode/decode hooks are gated on `codec != nil` and `SchemaID != ""` respectively, both unreachable no-ops for existing callers.
 
 ## CI/CD
@@ -454,8 +465,8 @@ SMOKE_SNS_TOPIC_ARN, SMOKE_SQS_QUEUE_URL               # for smoke tests against
 GitHub Actions mirrors `iam-org-membership`'s pipeline — the org ruleset on `main` requires its job names (`Validate / Test / test`, `Validate / Quality / quality`, `Build image (cache)`, `Trivy CVE scan`, `Smoke tests`, `PR summary`), so **do not rename those jobs**. This is a **private module** with no production deployment; the Docker image is the reference CLI (`cmd/platform-events`), built only so CI can Trivy-scan and smoke-test the compiled binary.
 
 - **`validate-test.yml`** (reusable) — `make test-ci` (unit + integration + e2e in parallel, `-race`, merged coverage) → `.github/scripts/coverage-gate.sh` (≥ 97%).
-- **`validate-quality.yml`** (reusable) — `go mod verify`, HTML-entity check, RLS-6 grep, `gofmt`, tidy drift, `make vet` / `make lint` (each also with `-tags=integration,e2e`), `make metrics-lint` + `make rules-check` + `make dashboards-check` (Observability Standard), `make docs-check` (diagram sync), `make vuln-check`, Dockerfile digest-pinning check. `golangci-lint` runs via `go tool` (the `tool` directive in `go.mod` is not propagated to consumers).
-- **`docs.yml`** — docs-only changes (`ARCHITECTURE.md`, `docs/architecture/**`, skipped by `ci.yml`): `make docs-check`. **Edit a diagram in both places** — the `.mmd` source and its embedded copy in `ARCHITECTURE.md` must stay byte-identical.
+- **`validate-quality.yml`** (reusable) — `go mod verify`, HTML-entity check, RLS-6 grep, `gofmt`, tidy drift, `make vet` / `make lint` (each also with `-tags=integration,e2e`), `make metrics-lint` + `make rules-check` + `make dashboards-check` (Observability Standard), `make docs-check` (diagram sync), `make toolchain-check`, `make vuln-check`, Dockerfile digest-pinning check. Both validate jobs delete the private-module token right after `go mod download`; only push runs write the registry build cache. `golangci-lint` runs via `go tool` (the `tool` directive in `go.mod` is not propagated to consumers).
+- **`docs.yml`** — changes to `ARCHITECTURE.md` / `docs/architecture/**`: `make docs-check`. `ci.yml` itself always runs: its `changes` job (`.github/scripts/detect-changes.sh`, tested by `make ci-scripts-test`, same as platform-pgcommon v1.5.1) decides docs-only and skips the jobs behind required checks by `if:` (the reusable validate workflows take a `skip` input), so their checks report success — never reintroduce `paths-ignore`. Reusable workflows get `CI_REPO_READ_TOKEN` / `GO_PRIVATE_TOKEN` explicitly, never `secrets: inherit`. **Edit a diagram in both places** — the `.mmd` source and its embedded copy in `ARCHITECTURE.md` must stay byte-identical.
 - **`ci.yml`** (push/PR to main) — the two gates + `Build image (cache)` in parallel → `Trivy CVE scan` / `Smoke tests` → `Cross-language compatibility` → `PR summary`; on push, `Push image → GHCR` (Cosign-signed).
 - **`changelog-check.yml`** — PRs touching `internal/`, `pkg/`, `cmd/` must update `CHANGELOG.md`.
 - **`release.yml`** (`v*` tags) — **the same job graph as `ci.yml`** at the tag, behind a fail-fast `verify` job (tag on `main`, dispatch only from `main` or the tag, CHANGELOG section — a prerelease may use its base version's; floating image tags `X.Y`/`X`/`latest` only move forward, via `release-image-tags.sh`, same scripts as platform-pgcommon v1.4.1), plus 5-platform CLI binaries; the image is pushed (semver tags, signed, provenance) only after every gate passes, then the GitHub Release is published. Change a gate in `ci.yml` → change it in `release.yml` too. The Git tag is the **Go module release** consuming services pin with `go get github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events@vX.Y.Z`.

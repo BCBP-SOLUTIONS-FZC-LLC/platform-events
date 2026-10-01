@@ -24,7 +24,7 @@ graph TD
 
     subgraph infra["Infrastructure"]
         config_pkg["pkg/config\nLoadSNS · LoadSQS · LoadOutbox\nRunnerConfigFromEnv · SQSConsumerOptions"]
-        migs_pkg["pkg/outbox/migrations · pkg/inbox/migrations\nembed.FS (outbox 001–010, inbox 001)"]
+        migs_pkg["pkg/outbox/migrations · pkg/inbox/migrations\nembed.FS (outbox 001–011, inbox 001)"]
     end
 
     subgraph tests["Tests  —  test/"]

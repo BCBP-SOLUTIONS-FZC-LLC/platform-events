@@ -79,7 +79,11 @@ var errDeadLettered = errors.New("inbox: message dead-lettered")
 // like [Handler]'s duplicates. If fn fails, the claim rolls back with fn's
 // writes and the message is retried; if fn dead-letters the message
 // (SendToDLQ) and returns nil, the transaction is rolled back too, so a
-// redrive is processed. fn must do its database work through tx.
+// redrive is processed. fn must do its database work through tx and must not
+// end it (tx.Commit / tx.Rollback, or COMMIT / ROLLBACK statements): since
+// platform-pgcommon v1.5.1 RunInTx rolls back and returns
+// pgcommon.ErrTxEndedInCallback, so the message is retried — committing fn's
+// writes without the claim would break exactly-once.
 //
 //	consumer := events.NewSQSConsumer(cfg, func(ctx context.Context, env events.Envelope[json.RawMessage]) error {
 //	    return store.Process(ctx, env, func(ctx context.Context, tx pgcommon.Tx) error {

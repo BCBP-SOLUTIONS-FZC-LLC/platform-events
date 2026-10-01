@@ -35,6 +35,10 @@ type SQSConfigEnv struct {
 	// HandlerTimeout (SQS_HANDLER_TIMEOUT, e.g. "5m") bounds each handler call
 	// (events.WithHandlerTimeout); 0 (default) = unbounded.
 	HandlerTimeout time.Duration
+	// DrainTimeout (SQS_DRAIN_TIMEOUT, e.g. "45s") is how long Stop waits for
+	// in-flight handlers (events.WithDrainTimeout); 0 (default) = the
+	// consumer's 30s. Keep it below the pod's terminationGracePeriodSeconds.
+	DrainTimeout time.Duration
 	// Warnings is non-empty when one or more env vars were set to invalid values
 	// and defaults were applied. Log these at startup so operators can detect
 	// misconfiguration without relying on unstructured stderr output.
@@ -42,6 +46,10 @@ type SQSConfigEnv struct {
 }
 
 // OutboxConfigEnv holds environment-derived outbox runner configuration.
+//
+// Log it with %v / %s / %#v (String / GoString mask credentials). DB,
+// DatabaseURL and MigrationDatabaseURL carry the raw DSN: never log them, or
+// the struct through json.Marshal or a reflection-based logger field.
 type OutboxConfigEnv struct {
 	PollInterval time.Duration
 	BatchSize    int
@@ -89,6 +97,12 @@ func (c OutboxConfigEnv) String() string {
 		c.PollInterval, c.BatchSize, c.MaxAttempts, masked, maskedMigration, claimLease, c.StartupJitter, c.PublishConcurrency, c.PublishTimeout, c.DrainTimeout, c.RetryBackoff, c.MaxRetryBackoff, c.GaugeInterval)
 }
 
+// GoString masks credentials for %#v as String does for %v / %s. The DB field
+// (pgcommon.Config) is omitted: it carries the raw DSN and password.
+func (c OutboxConfigEnv) GoString() string {
+	return "config.OutboxConfigEnv" + c.String()
+}
+
 func maskDSN(dsn string) string {
 	const sep = "://"
 	idx := strings.Index(dsn, sep)
@@ -109,7 +123,8 @@ func maskDSN(dsn string) string {
 	return maskKeyValueDSN(dsn)
 }
 
-// maskQueryParams replaces the value of any key named "password" or "passwd" in
+// maskQueryParams replaces the value of any key named "password", "passwd" or
+// "sslpassword" (the client-key passphrase) in
 // an ampersand-delimited query string (e.g. "host=h&password=secret&sslmode=require").
 // Percent-decoded key names are compared so that %70assword=secret is also masked.
 func maskQueryParams(query string) string {
@@ -124,14 +139,14 @@ func maskQueryParams(query string) string {
 			key = decoded
 		}
 		switch strings.ToLower(key) {
-		case "password", "passwd":
+		case "password", "passwd", "sslpassword":
 			parts[i] = part[:eqIdx+1] + "***"
 		}
 	}
 	return strings.Join(parts, "&")
 }
 
-// maskKeyValueDSN masks password/passwd in a libpq keyword/value string
+// maskKeyValueDSN masks password/passwd/sslpassword in a libpq keyword/value string
 // ("host=h password='a b' dbname=d"). Values follow libpq's rules: spaces are
 // allowed around "=", and a value may be single-quoted with backslash escapes,
 // so a quoted password containing spaces or quotes is masked whole.
@@ -189,7 +204,7 @@ func maskKeyValueDSN(dsn string) string {
 			}
 		}
 		switch strings.ToLower(key) {
-		case "password", "passwd":
+		case "password", "passwd", "sslpassword":
 			out.WriteString(key + "=***")
 		default:
 			out.WriteString(key + "=" + dsn[valStart:j])
@@ -243,7 +258,7 @@ func (c OutboxConfigEnv) Validate() error {
 func LoadSNS() SNSConfigEnv {
 	return SNSConfigEnv{
 		TopicARN:    os.Getenv("SNS_TOPIC_ARN"),
-		Region:      envOrDefault("AWS_REGION", "us-east-1"),
+		Region:      awsRegion(),
 		EndpointURL: os.Getenv("AWS_ENDPOINT_URL"),
 	}
 }
@@ -279,9 +294,13 @@ func LoadSQS() SQSConfigEnv {
 	if w != "" {
 		warnings = append(warnings, w)
 	}
+	drainTimeout, w := envDurationOrDefault("SQS_DRAIN_TIMEOUT", 0)
+	if w != "" {
+		warnings = append(warnings, w)
+	}
 	return SQSConfigEnv{
 		QueueURL:           os.Getenv("SQS_QUEUE_URL"),
-		Region:             envOrDefault("AWS_REGION", "us-east-1"),
+		Region:             awsRegion(),
 		EndpointURL:        os.Getenv("AWS_ENDPOINT_URL"),
 		MaxMessages:        int32(maxMsg),
 		WaitSeconds:        int32(waitSec),
@@ -290,6 +309,7 @@ func LoadSQS() SQSConfigEnv {
 		MaxReceiveCount:    maxRecv,
 		QueueDepthInterval: depthInterval,
 		HandlerTimeout:     handlerTimeout,
+		DrainTimeout:       drainTimeout,
 		Warnings:           warnings,
 	}
 }
@@ -393,6 +413,16 @@ func LoadOTel() OTelConfigEnv {
 		Insecure:         insecure,
 		Warnings:         warnings,
 	}
+}
+
+// awsRegion resolves the region like the AWS SDK's environment chain:
+// AWS_REGION, then AWS_DEFAULT_REGION, then us-east-1. Passing us-east-1 when
+// only AWS_DEFAULT_REGION is set would point the client at the wrong region.
+func awsRegion() string {
+	if r := os.Getenv("AWS_REGION"); r != "" {
+		return r
+	}
+	return envOrDefault("AWS_DEFAULT_REGION", "us-east-1")
 }
 
 func envOrDefault(key, def string) string {

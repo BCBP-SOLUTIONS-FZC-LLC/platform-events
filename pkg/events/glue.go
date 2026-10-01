@@ -21,8 +21,8 @@ const (
 // lookup or AWS permission is needed. Plain-JSON envelopes (no dataschema)
 // never reach a codec, so it is safe for mixed traffic.
 //
-// Compressed payloads are rejected with a clear error (they would otherwise
-// fail later as unparseable JSON). Encode always fails: pair it only with a
+// Compressed and non-JSON (e.g. Avro-format) payloads are rejected with a
+// clear error (they would otherwise fail later as unparseable JSON). Encode always fails: pair it only with a
 // consumer, via [WithConsumerCodec].
 type GlueDecodeCodec struct{}
 
@@ -44,5 +44,12 @@ func (GlueDecodeCodec) Decode(_ context.Context, _ string, encoded []byte) (json
 	if encoded[1] != glueNoCompression {
 		return nil, fmt.Errorf("glue decode codec: unsupported compression byte 0x%02x — only uncompressed (0x00) payloads are supported", encoded[1])
 	}
-	return json.RawMessage(encoded[glueHeaderSize:]), nil
+	payload := encoded[glueHeaderSize:]
+	// An Avro-format Glue schema (or an empty payload) is not JSON; reject it
+	// here with a clear error instead of handing the handler bytes that fail
+	// later in json.Unmarshal / env.JSON().
+	if !json.Valid(payload) {
+		return nil, fmt.Errorf("glue decode codec: payload after the Glue header is not valid JSON (%d bytes) — only JSON-format Glue schemas are supported", len(payload))
+	}
+	return json.RawMessage(payload), nil
 }

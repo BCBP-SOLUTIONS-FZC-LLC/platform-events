@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,7 @@ import (
 func TestLoadSNS_Defaults(t *testing.T) {
 	t.Setenv("SNS_TOPIC_ARN", "arn:aws:sns:us-east-1:123:topic")
 	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
 	t.Setenv("AWS_ENDPOINT_URL", "")
 
 	cfg := config.LoadSNS()
@@ -64,6 +66,7 @@ func TestLoadSQS_Defaults(t *testing.T) {
 	t.Setenv("SQS_CONCURRENCY", "")
 	t.Setenv("SQS_MAX_RECEIVE_COUNT", "")
 	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
 
 	cfg := config.LoadSQS()
 	assert.Equal(t, int32(10), cfg.MaxMessages)
@@ -229,7 +232,8 @@ func TestLoadOutbox_CustomValues(t *testing.T) {
 	t.Setenv("OUTBOX_DRAIN_TIMEOUT", "45s")
 	t.Setenv("OUTBOX_RETRY_BACKOFF", "2s")
 	t.Setenv("OUTBOX_MAX_RETRY_BACKOFF", "10m")
-	t.Setenv("DATABASE_URL", "postgres://user:pass@host/db")
+	t.Setenv("DATABASE_URL", "postgres://user:pass@host/db?sslmode=verify-full")
+	t.Setenv("PGSSLMODE", "")
 
 	cfg := config.LoadOutbox()
 	assert.Equal(t, 2*time.Second, cfg.RetryBackoff)
@@ -242,7 +246,7 @@ func TestLoadOutbox_CustomValues(t *testing.T) {
 	assert.Equal(t, 4, cfg.PublishConcurrency)
 	assert.Equal(t, 5*time.Second, cfg.PublishTimeout)
 	assert.Equal(t, 45*time.Second, cfg.DrainTimeout)
-	assert.Equal(t, "postgres://user:pass@host/db", cfg.DatabaseURL)
+	assert.Equal(t, "postgres://user:pass@host/db?sslmode=verify-full", cfg.DatabaseURL)
 	assert.Empty(t, cfg.Warnings)
 }
 
@@ -289,8 +293,23 @@ func TestOutboxConfigEnv_String_MasksURLPassword(t *testing.T) {
 		BatchSize:    50,
 	}
 	s := cfg.String()
-	assert.NotContains(t, s, "supersecret")
+	assert.NotContains(t, s, "hunter2")
 	assert.Contains(t, s, "***")
+}
+
+// sslpassword (the client-key passphrase) is masked in URL and keyword forms,
+// and %#v masks like %v.
+func TestOutboxConfigEnv_MasksSSLPasswordAndGoString(t *testing.T) {
+	for _, dsn := range []string{
+		"postgres://app@db:5432/events?sslmode=verify-full&sslpassword=keyphrase",
+		"host=db user=app sslpassword=keyphrase dbname=events",
+	} {
+		cfg := config.OutboxConfigEnv{DatabaseURL: dsn, MigrationDatabaseURL: dsn} //nolint:gosec
+		for _, out := range []string{cfg.String(), fmt.Sprintf("%v", cfg), fmt.Sprintf("%#v", cfg)} {
+			assert.NotContains(t, out, "keyphrase", dsn)
+			assert.Contains(t, out, "sslpassword=***", dsn)
+		}
+	}
 }
 
 func TestOutboxConfigEnv_String_MasksKeyValuePassword(t *testing.T) {
@@ -612,4 +631,30 @@ func TestLoad_NewDurationVars(t *testing.T) {
 	assert.Equal(t, 15*time.Second, outboxCfg.GaugeInterval)
 	assert.Contains(t, strings.Join(sqsCfg.Warnings, "\n"), "SQS_HANDLER_TIMEOUT")
 	assert.Contains(t, strings.Join(outboxCfg.Warnings, "\n"), "OUTBOX_GAUGE_INTERVAL")
+}
+
+// AWS_DEFAULT_REGION is used when AWS_REGION is unset (the SDK's environment
+// chain); us-east-1 only when neither is set.
+func TestLoad_RegionFallsBackToAWSDefaultRegion(t *testing.T) {
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "eu-west-1")
+	assert.Equal(t, "eu-west-1", config.LoadSNS().Region)
+	assert.Equal(t, "eu-west-1", config.LoadSQS().Region)
+
+	t.Setenv("AWS_REGION", "ap-south-1")
+	assert.Equal(t, "ap-south-1", config.LoadSNS().Region, "AWS_REGION wins")
+
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	assert.Equal(t, "us-east-1", config.LoadSQS().Region)
+}
+
+// platform-pgcommon's configuration warnings (since v1.5.1: a DATABASE_URL
+// without sslmode, which pgx would run as "prefer") reach OutboxConfigEnv.
+func TestLoadOutbox_ForwardsPgcommonSSLModeWarning(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://user:pass@db.internal/app")
+	t.Setenv("PGSSLMODE", "")
+	cfg := config.LoadOutbox()
+	assert.Contains(t, strings.Join(cfg.Warnings, "\n"), "platform-pgcommon: DATABASE_URL")
+	assert.Contains(t, strings.Join(cfg.Warnings, "\n"), "sslmode")
 }

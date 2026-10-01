@@ -74,23 +74,26 @@ groups:
           )
 
       # ── Producer / outbox (legacy, authoritative until ratification) ──
+      # Legacy metrics carry only a service label, so these keep the scrape
+      # target's namespace too: one Prometheus scraping staging and prod must
+      # not mix their backlogs.
       # after ratification: platform_messages_published_total{outcome="error"} / platform_messages_published_total
       - record: platform_events:publish_error_ratio:rate5m
         expr: |
-          sum by (service, topic) (rate(events_published_total{status="error"}[5m]))
+          sum by (namespace, service, topic) (rate(events_published_total{status="error"}[5m]))
             /
-          sum by (service, topic) (rate(events_published_total[5m]))
+          sum by (namespace, service, topic) (rate(events_published_total[5m]))
 
       # after ratification: max by (domain, service) (platform_outbox_pending_events)
       - record: platform_events:outbox_pending:max
-        expr: max by (service) (outbox_pending_total)
+        expr: max by (namespace, service) (outbox_pending_total)
 
       # after ratification: platform_outbox_publish_attempts_total{outcome="error"} / platform_outbox_publish_attempts_total
       - record: platform_events:outbox_publish_error_ratio:rate5m
         expr: |
-          sum by (service) (rate(outbox_published_total{status="error"}[5m]))
+          sum by (namespace, service) (rate(outbox_published_total{status="error"}[5m]))
             /
-          sum by (service) (rate(outbox_published_total[5m]))
+          sum by (namespace, service) (rate(outbox_published_total[5m]))
 
   - name: platform_events.alerts
     rules:
@@ -138,7 +141,7 @@ groups:
           severity: critical
         annotations:
           summary: "{{ $labels.service }} receives messages on {{ $labels.queue }} but processes none"
-          description: "Messages have been delivered for 15 minutes without a single successful handler completion."
+          description: "Messages have been delivered for about 25 minutes (a 10-minute window held for 15 minutes) without a single successful handler completion."
           runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsconsumerstalled"
 
       - alert: PlatformEventsMalformedMessages
@@ -206,18 +209,18 @@ groups:
 
       # after ratification: platform_outbox_errors_total{operation="poll"}
       - alert: PlatformEventsOutboxPollFailing
-        expr: sum by (service) (rate(outbox_poll_errors_total[5m])) > 0
+        expr: sum by (namespace, service) (rate(outbox_poll_errors_total[5m])) > 0
         for: 10m
         labels:
           severity: critical
         annotations:
           summary: "{{ $labels.service }}'s outbox runner cannot claim events"
-          description: "Every outbox poll cycle has been failing for 10 minutes; no outbox events are being delivered."
+          description: "Outbox poll cycles have kept failing for 10 minutes (at least one failure in every 5-minute window); outbox events may not be delivered."
           runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxpollfailing"
 
       # after ratification: platform_outbox_errors_total{operation="mark_published"}
       - alert: PlatformEventsOutboxDuplicateDeliveryRisk
-        expr: sum by (service) (increase(outbox_mark_published_errors_total[15m])) > 0
+        expr: sum by (namespace, service) (increase(outbox_mark_published_errors_total[15m])) > 0
         labels:
           severity: warning
         annotations:
@@ -227,7 +230,7 @@ groups:
 
       # after ratification: platform_dependency_request_seconds_count{dependency="sqs",operation="receive_message",outcome="error"}
       - alert: PlatformEventsSQSReceiveFailing
-        expr: sum by (service, queue) (rate(sqs_receive_errors_total[5m])) > 0
+        expr: sum by (namespace, service, queue) (rate(sqs_receive_errors_total[5m])) > 0
         for: 10m
         labels:
           severity: warning
@@ -238,7 +241,7 @@ groups:
 
       # after ratification: platform_telemetry_label_overflow_total
       - alert: PlatformEventsOversizedEventType
-        expr: sum by (service) (increase(events_oversized_event_type_label_total[1h])) > 0
+        expr: sum by (namespace, service) (increase(events_oversized_event_type_label_total[1h])) > 0
         labels:
           severity: info
         annotations:
