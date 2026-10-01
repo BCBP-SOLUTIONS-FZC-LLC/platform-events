@@ -1022,20 +1022,19 @@ func TestSendToDLQ_NilLoggerDoesNotPanic(t *testing.T) {
 
 func TestSendToDLQ_RecordsMetric(t *testing.T) {
 	// Metrics are process-global (initialised in TestMain), so assert deltas
-	// to stay correct under -count=N.
-	okQueue := dlqSourceURL + "-metric-ok"
-	errQueue := dlqSourceURL + "-metric-err"
-	okCounter := metrics.DLQForwardedTotal.WithLabelValues(okQueue, "order.created", "success")
-	errCounter := metrics.DLQForwardedTotal.WithLabelValues(errQueue, "order.created", "error")
-	okBefore, errBefore := testutil.ToFloat64(okCounter), testutil.ToFloat64(errCounter)
+	// to stay correct under -count=N. A direct SendToDLQ outside a consumer
+	// dispatch is attributed reason="explicit"; a rejected one is not counted.
+	p := metrics.CurrentPlatform()
+	require.NotNil(t, p)
+	counter := p.DLQMessages.WithLabelValues("consume", "order.created", "explicit")
+	before := testutil.ToFloat64(counter)
 
-	p := newTestDLQPublisher(t, &mockDLQClient{}, "")
-	require.NoError(t, p.SendToDLQ(context.Background(), okQueue, envelopeBody(t), nil, "r"))
-	require.NoError(t, p.SendToDLQ(context.Background(), okQueue, envelopeBody(t), nil, "r"))
-	require.Error(t, p.SendToDLQ(context.Background(), errQueue, envelopeBody(t), nil, ""))
+	pub := newTestDLQPublisher(t, &mockDLQClient{}, "")
+	require.NoError(t, pub.SendToDLQ(context.Background(), dlqSourceURL+"-metric-ok", envelopeBody(t), nil, "r"))
+	require.NoError(t, pub.SendToDLQ(context.Background(), dlqSourceURL+"-metric-ok", envelopeBody(t), nil, "r"))
+	require.Error(t, pub.SendToDLQ(context.Background(), dlqSourceURL+"-metric-err", envelopeBody(t), nil, ""))
 
-	assert.InDelta(t, 2, testutil.ToFloat64(okCounter)-okBefore, 0)
-	assert.InDelta(t, 1, testutil.ToFloat64(errCounter)-errBefore, 0)
+	assert.InDelta(t, 2, testutil.ToFloat64(counter)-before, 0)
 }
 
 func TestSendToDLQ_NilAttrsAndPlainTextBody(t *testing.T) {

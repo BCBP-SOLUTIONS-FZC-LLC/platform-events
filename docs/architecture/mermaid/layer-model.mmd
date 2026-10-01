@@ -1,6 +1,6 @@
 graph TD
     subgraph pub["Public API  —  pkg/"]
-        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nCodec · NoopCodec · GlueDecodeCodec · WithCodec · WithConsumerCodec\nSQSClientLike\nDLQPublisher · NewSQSDLQPublisher · DLQConfig · DLQClientLike · DLQAttr*\nDLQError · ErrDLQ* · ErrRetryable\nSign · Verify · SignEnvelope · VerifyEnvelope\nInitMetrics · MetricsIdentity · WithEventTypes · WithEventTypeLimit\nInit · InitWithRegisterer (deprecated)\nmock.Publisher · mock.Consumer · mock.DLQPublisher"]
+        events_pkg["pkg/events\nEnvelope[T] · NewEnvelope · ParseEnvelope\nSystemTenantID · WithSystemTenant · TraceIDFromContext\nWithSubject · WithActor · WithIPAddress · WithUserAgent · WithSchemaID\nPublisher · NewSNSPublisher · SNSConfig · PublisherOption\nConsumer · NewSQSConsumer · SQSConfig · ConsumerOption · Handler\nCodec · NoopCodec · GlueDecodeCodec · WithCodec · WithConsumerCodec\nSQSClientLike\nDLQPublisher · NewSQSDLQPublisher · DLQConfig · DLQClientLike · DLQAttr*\nDLQError · ErrDLQ* · ErrRetryable\nSign · Verify · SignEnvelope · VerifyEnvelope\nInitMetrics · MetricsIdentity · WithEventTypes · WithEventTypeLimit\nmock.Publisher · mock.Consumer · mock.DLQPublisher"]
         inbox_pkg["pkg/inbox\nHandler(ledger, next) · Ledger\nStore · NewStore · Process · IsProcessed · MarkProcessed · Prune · DefaultPruneBatch\nApplySchema · MigrationsTable (inbox_migrations)"]
         outbox_pkg["pkg/outbox\nRunner · Config · NewRunner · Start · Stop · Ready\nEnqueue · EnqueueOrdered · ApplySchema · MigrationsTable · PrunePublished\nListDeadLetters · ReprocessDeadLetters · ReprocessDeadLettersWith · DiscardDeadLetters"]
     end
@@ -13,7 +13,7 @@ graph TD
         sns_adp["sns\nsnsPublisher · Publish · PublishBatch\nBatchError · BatchFailure.Retryable · PublisherOption · WithCodec\nbatch split (10 entries / 256 KiB) · sendBatch\nencodeEnvelopePayload · wrapIfRetryable · requestFailure"]
         sqs_adp["sqs\nsqsConsumer · Start · Stop · dispatch · HandlerContext\nConsumerOption · WithHandlerTimeout · WithDLQPublisher\nvisibilityExtender (from receipt) · drain · hand-back\nenvelope validation · handleMalformed\nDLQPublisher · ResolveDLQ · SendToDLQ\nRedrivePolicy lookup + cache · classifySQSError\nqueue-depth sampler"]
         outboxstore_adp["outboxstore\nStore · InsertRecord · ClaimBatch\nMarkPublished · MarkFailed · ReleaseLease\nPendingCount · LeasedCount · BlockedCount · OldestPendingAge\nPromoteWaiting (per-key ordering) · PrunePublished\nListDeadLetters · ReprocessDeadLetters(With) · DiscardDeadLetters"]
-        metrics_adp["metrics\nregistry.go — Platform Observability Registry entry\nInitWithIdentity · Identity · SanitizeEventType (cap, UTF-8)\nTier 1 platform_* collectors (Canonical + Proposed)\nlegacy events_* / outbox_* / sqs_* collectors (Deprecated)"]
+        metrics_adp["metrics\nregistry.go — Platform Observability Registry entry\nInitWithIdentity · Identity · SanitizeEventType (cap, UTF-8)\nTier 1 platform_* collectors (Canonical + Proposed) — the only metrics"]
     end
 
     subgraph core["Core  —  internal/core/"]

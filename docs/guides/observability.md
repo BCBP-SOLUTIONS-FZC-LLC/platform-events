@@ -10,17 +10,17 @@ Both Prometheus metrics and OTel tracing are **optional**. The publisher, consum
 
 ### Prometheus metrics
 
-Metrics follow the **Enterprise Platform Observability Standard**. The model, wiring, migration plan and CI enforcement are described in [docs/observability](../observability/README.md). The full inventory, with every metric's labels, allowed values and ratification packet, is generated into [metrics-registry.md](../observability/metrics-registry.md). This section is a summary.
+Metrics follow the **Enterprise Platform Observability Standard**. The model, wiring and CI enforcement are described in [docs/observability](../observability/README.md). The full inventory, with every metric's labels, allowed values and ratification packet, is generated into [metrics-registry.md](../observability/metrics-registry.md). This section is a summary.
 
 Call once at startup, with the same registerer and identity as platform-pgcommon:
 
 ```go
 warnings, err := events.InitMetrics(events.MetricsIdentity{
-    Domain: "iam", Service: "event-consumer", Version: os.Getenv("BUILD_VERSION"),
+    Domain: "iam", Service: "event-consumer",
 }, registry) // Environment empty → APP_ENV, then ENVIRONMENT, else "dev"
 ```
 
-For isolated test registries, pass `prometheus.NewRegistry()`. `events.Init` / `events.InitWithRegisterer` are deprecated: they register only the legacy metrics.
+For isolated test registries, pass `prometheus.NewRegistry()`. The identity is mandatory — there is no metrics init without one — and these Tier 1 metrics are the only ones platform-events emits.
 
 **Tier 1 metrics** (every one carries `domain`, `service`, `environment`):
 
@@ -38,13 +38,13 @@ For isolated test registries, pass `prometheus.NewRegistry()`. `events.Init` / `
 | `platform_message_processing_duration_seconds` | Histogram | `queue`, `event_type` | Proposed | Handler / dead-letter handler time |
 | `platform_outbox_pending_events` / `platform_outbox_leased_events` | Gauge | — | Proposed | Outbox backlog / in flight |
 | `platform_outbox_publish_attempts_total` | Counter | `event_type`, `outcome` | Proposed | Runner publish attempts |
-| `platform_outbox_errors_total` | Counter | `operation` | Proposed | `poll` / `unmarshal` / `mark_published` / `pending_count` / `leased_count` |
+| `platform_outbox_errors_total` | Counter | `operation` | Proposed | `poll` / `unmarshal` / `mark_published` / `pending_count` / `leased_count` / `oldest_pending` / `blocked_count` |
 | `platform_outbox_dead_letter_operations_total` | Counter | `operation` | Proposed | Records reprocessed / discarded |
-| `platform_telemetry_label_overflow_total` | Counter | `label` | Proposed | `event_type` values over 128 bytes |
+| `platform_telemetry_label_overflow_total` | Counter | `label` | Proposed | `event_type` values over 128 bytes or beyond the per-process limit |
 | `platform_library_info` | Gauge | `library`, `library_version` | Proposed | Library version per service |
 
-- **Using the metrics.** Canonical metrics are safe for alerts, SLOs and HPA. Proposed metrics are shadow-emitted, so graph them but don't alert on them until governance ratifies them.
-- **Legacy metrics.** The pre-standard metrics are still emitted in parallel and marked Deprecated, until `events.WithoutLegacyMetrics()`: `events_published_total`, `events_consumed_total`, `outbox_pending_total`, `outbox_*`, `sqs_*_errors_total`, `events_codec_*`, `events_inbox_duplicates_total`, `events_dlq_forwarded_total`, `events_oversized_event_type_label_total`, `platform_events_build_info`. Each one's successor is listed in [metrics-registry.md](../observability/metrics-registry.md#deprecated-compatibility-period).
+- **Using the metrics.** Canonical metrics are safe for alerts, SLOs and HPA. Proposed metrics are emitted the same way but still await governance ratification: the reference alerts that use them live in the `*.proposed` rule groups and carry `metric_status: proposed`, and the reference KEDA trigger declares it with an annotation.
+- **No legacy metrics.** The pre-standard metrics were removed without a compatibility period (nothing emitting them was ever deployed); the [CHANGELOG](../../CHANGELOG.md) maps each to its successor.
 - **Reference rules.** Recording rules, the consumer SLO (99.9%, multi-window burn rate) and operational alerts are in [`monitoring/prometheus/platform-events.rules.yml`](../../monitoring/prometheus/platform-events.rules.yml), with a [runbook](../observability/runbook.md).
 
 ### OpenTelemetry

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -14,6 +14,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/internal/core/domain"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/outbox"
+	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/test/fixtures"
 )
 
 // batchErrEventPublisher is an events.Publisher that returns a fixed *events.BatchError.
@@ -57,8 +58,7 @@ var _ events.Publisher = (*transportErrPublisher)(nil)
 // with partial failures the bridge must record per-message status for failed vs succeeded
 // IDs and return a domain.BatchError to the caller.
 func TestPublisherBridge_PublishBatch_BatchError(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("bridge-batch-err-test", "v0.0.1", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	envA := domain.NewEnvelope("event.a", "svc", json.RawMessage(`{}`))
 	envB := domain.NewEnvelope("event.b", "svc", json.RawMessage(`{}`))
@@ -82,13 +82,18 @@ func TestPublisherBridge_PublishBatch_BatchError(t *testing.T) {
 	var returned *domain.BatchError
 	require.ErrorAs(t, err, &returned, "bridge must return a *domain.BatchError")
 	assert.Len(t, returned.Failures, 2, "both failures must be present in returned error")
+
+	attempts := metrics.CurrentPlatform().OutboxAttempts
+	assert.InDelta(t, 1, testutil.ToFloat64(attempts.WithLabelValues("event.a", "error")), 0)
+	assert.InDelta(t, 1, testutil.ToFloat64(attempts.WithLabelValues("event.b", "error")), 0)
+	assert.InDelta(t, 1, testutil.ToFloat64(attempts.WithLabelValues("event.c", "success")), 0)
+	assert.Equal(t, 3, testutil.CollectAndCount(attempts), "one attempt per message, no other outcome")
 }
 
 // TestPublisherBridge_PublishBatch_TransportError exercises the transport-level error path
 // (non-BatchError) where all messages share the same "error" status.
 func TestPublisherBridge_PublishBatch_TransportError(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	metrics.InitWithRegisterer("bridge-batch-transport-err-test", "v0.0.2", reg)
+	fixtures.InitPlatformMetrics(t)
 
 	pub := &transportErrPublisher{err: errors.New("sns unavailable")}
 	bridge := outbox.NewPublisherBridge(pub)
@@ -96,4 +101,5 @@ func TestPublisherBridge_PublishBatch_TransportError(t *testing.T) {
 	envA := domain.NewEnvelope("event.a", "svc", json.RawMessage(`{}`))
 	err := bridge.PublishBatch(context.Background(), []domain.Envelope[json.RawMessage]{envA})
 	require.Error(t, err)
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CurrentPlatform().OutboxAttempts.WithLabelValues("event.a", "error")), 0)
 }

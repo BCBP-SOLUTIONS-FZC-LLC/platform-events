@@ -5,17 +5,19 @@ package metrics_test
 //
 //   - monitoring/grafana/*.json dashboards: every query references registered
 //     metrics (or recording rules from the rule files) and only labels in
-//     their vocabulary; a panel querying a Proposed metric must say
-//     "(Proposed)" in its title, one querying a Deprecated metric "(legacy)"
-//     — so no dashboard presents a shadow or legacy series as the contract.
-//   - monitoring/kubernetes/*.yaml autoscaling: HPA/KEDA must not scale on a
-//     Proposed metric (Backward Compatibility step 6; rules 11/12), and every
-//     scaling query uses only registered metrics and labels.
+//     their vocabulary (so no removed legacy name can come back); a panel
+//     querying a Proposed metric must say "(Proposed)" in its title, so no
+//     dashboard presents an unratified series as the contract.
+//   - monitoring/kubernetes/*.yaml autoscaling: every scaling query uses only
+//     registered metrics and labels, and a manifest whose live query uses a
+//     Proposed metric must declare it with the
+//     observability.platform/metric-status: proposed annotation (rules 11/12).
 
 import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -134,39 +136,41 @@ func TestMonitoring_DashboardsRegistryCompliance(t *testing.T) {
 				if slices.Contains(statuses, internalmetrics.StatusProposed) {
 					assert.Contains(t, panel.Title, "(Proposed)", "%s queries a Proposed metric; label it as a shadow panel", where)
 				}
-				if slices.Contains(statuses, internalmetrics.StatusDeprecated) {
-					assert.Contains(t, panel.Title, "(legacy)", "%s queries a Deprecated metric; label it as legacy", where)
-				}
 			}
 		}
 		walk(d.Panels)
 	}
 }
 
-func TestMonitoring_AutoscalingNeverUsesProposedMetrics(t *testing.T) {
+// proposedAnnotation marks a manifest that scales on a Proposed metric.
+var proposedAnnotation = regexp.MustCompile(`(?m)^\s*observability\.platform/metric-status:\s*proposed\b`)
+
+func TestMonitoring_AutoscalingDeclaresProposedMetrics(t *testing.T) {
 	paths, err := filepath.Glob(filepath.Join(monitoringDir, "kubernetes", "*.yaml"))
 	require.NoError(t, err)
 	require.NotEmpty(t, paths, "no reference autoscaling manifests found")
-	mentions := 0
+	queries := 0
 	records := recordingRules(t)
 	for _, p := range paths {
 		raw, err := os.ReadFile(p) //nolint:gosec // paths come from a fixed glob in the repo
 		require.NoError(t, err)
+		usesProposed := false
 		for i, line := range strings.Split(string(raw), "\n") {
-			comment := strings.HasPrefix(strings.TrimSpace(line), "#")
-			if q, ok := strings.CutPrefix(strings.TrimSpace(line), "query:"); ok {
-				// A live scaling query: registered metrics and labels only.
-				checkExpr(t, filepath.Base(p)+" query", strings.TrimSpace(q), records)
-			}
 			for _, ref := range metricRefs(line) {
-				e, ok := internalmetrics.Lookup(baseMetric(ref))
-				require.True(t, ok, "%s:%d: %s is not in the metrics registry", filepath.Base(p), i+1, ref)
-				if e.Status == internalmetrics.StatusProposed {
-					mentions++
-					assert.True(t, comment, "%s:%d: autoscaling on Proposed metric %s — forbidden until ratified", filepath.Base(p), i+1, ref)
-				}
+				_, ok := internalmetrics.Lookup(baseMetric(ref))
+				assert.True(t, ok, "%s:%d: %s is not in the metrics registry", filepath.Base(p), i+1, ref)
 			}
+			q, ok := strings.CutPrefix(strings.TrimSpace(line), "query:")
+			if !ok {
+				continue
+			}
+			// A live scaling query: registered metrics and labels only.
+			queries++
+			statuses := checkExpr(t, filepath.Base(p)+" query", strings.TrimSpace(q), records)
+			usesProposed = usesProposed || slices.Contains(statuses, internalmetrics.StatusProposed)
 		}
+		assert.Equal(t, usesProposed, proposedAnnotation.Match(raw),
+			"%s: a manifest scaling on a Proposed metric must carry observability.platform/metric-status: proposed, and only such a manifest may", filepath.Base(p))
 	}
-	assert.Positive(t, mentions, "manifests should name each trigger's post-ratification successor in a comment")
+	assert.Positive(t, queries, "the reference manifests should scale on at least one metric query")
 }

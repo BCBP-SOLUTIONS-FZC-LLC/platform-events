@@ -17,6 +17,7 @@
 
 | Rev | Date | Change |
 |---|---|---|
+| 2.10 | 2026-10-02 | Unreleased: legacy (pre-standard) metrics removed with no compatibility period (nothing was ever deployed). Only Tier 1 `platform_*` metrics; identity mandatory (`events.Init`, `InitWithRegisterer`, `WithoutLegacyMetrics`, `MetricsIdentity.Version`, `MetricStatusDeprecated` removed; `MetricsIdentityFromEnv(domain, service)`); registry drops `Supersedes` / `SupersededBy` / `Sunset`. Reference rules, dashboard, KEDA and runbook moved to the successors; alerts on Proposed metrics live in `*.proposed` groups with `metric_status: proposed` (§11.2, D-11..D-14). |
 | 2.9 | 2026-10-02 | v1.6.1 released: CHANGELOG `[Unreleased]` → `[1.6.1]`; status, §13.4, OQ-9 closed. No design change. |
 | 2.8 | 2026-10-02 | platform-pgcommon v1.4.3 → v1.5.1 (§3.1, §13.4, §18.1): `Store.Process` callbacks must not end the transaction (`ErrTxEndedInCallback`); a NUL in `tenant_id` / `trace_id` makes an envelope malformed (§7.1, §10.3); `sslmode` warnings reach `OutboxConfigEnv.Warnings` (§12). CI: `changes` job replaces `paths-ignore` (OQ-11 closed), explicit reusable-workflow secrets, per-commit concurrency on `main`, `make ci-scripts-test` (§14). |
 | 2.7 | 2026-10-01 | Status alignment: §13.4 deployment stage (v1.6.1 pending on `fix/production-review`; `feat/observability-legacy-removal` waiting on it), OQ-7 closed, OQ-9…OQ-12 (v1.6.1 release, repository ruleset with stale required checks, docs-only PRs never reporting required checks, legacy-metric removal), §14 test inventory (`consumer_fifo_test.go`, `migrations_review_test.go`). No design change. |
@@ -111,7 +112,7 @@ Other documents and their roles:
 - **Inbox** — consumer-side deduplication ledger (`Handler`, `Store.Process`, `Prune`).
 - **Codec hook** — `Codec` interface, `NoopCodec`, decode-only `GlueDecodeCodec`.
 - **HMAC helpers** for webhook / cross-service signing.
-- **Observability** — Tier 1 `platform_*` metrics per the Enterprise Platform Observability Standard, legacy metrics during the compatibility period, OTel spans on the global provider, reference Prometheus rules, Grafana dashboard and KEDA example.
+- **Observability** — Tier 1 `platform_*` metrics per the Enterprise Platform Observability Standard (the only metrics; no legacy names), OTel spans on the global provider, reference Prometheus rules, Grafana dashboard and KEDA example.
 - **Test doubles** (`pkg/events/mock`) that reproduce the production handler context and metric accounting.
 - **Configuration loading** (`pkg/config`) for the env vars in §12.
 
@@ -172,7 +173,7 @@ internal/
     sns/                          SNS publisher (aws-sdk-go-v2)
     sqs/                          SQS consumer, DLQPublisher, queue-depth sampler, HandlerContext
     outboxstore/                  Postgres outbox store (via pgcommon Pool / RunInTx)
-    metrics/                      metrics registry, Tier 1 + legacy collectors, SanitizeEventType
+    metrics/                      metrics registry, Tier 1 collectors, SanitizeEventType
 pkg/
   events/                         public API: envelope, publisher, consumer, DLQ, codec, Glue, HMAC, metrics init
   events/mock/                    Publisher, Consumer, DLQPublisher test doubles
@@ -411,10 +412,10 @@ The library's tables carry `tenant_id` but **no RLS policy**: the runner reads a
 | D-8 | `Sign` / `Verify` | `Sign(key, payload []byte) (string, error)` (key ≥ 32 bytes); `Verify(key, payload []byte, sig string) bool` (constant time) |
 | D-9 | `SignEnvelope` / `VerifyEnvelope` | canonical-JSON signing; `VerifyEnvelope` returns `(false, nil)` on mismatch, `(false, err)` on malformed input |
 | D-10 | `InitMetrics` | `(id MetricsIdentity, reg prometheus.Registerer, opts ...MetricsOption) ([]RegistrationWarning, error)` |
-| D-11 | `MetricsOption` | `WithoutLegacyMetrics()`, `WithEventTypeLimit(n)`, `WithEventTypes(types...)` |
-| D-12 | Metrics helpers | `MetricsIdentityFromEnv`, `MetricsIdentityFromLabels`, `MetricsEnvironmentFromEnv`, `MetricsRegistry()` |
-| D-13 | `Init` / `InitWithRegisterer` | Deprecated — legacy metrics only; `InitWithRegisterer` is the test reset |
-| D-14 | Registry types | `MetricsRegistryEntry`, `MetricStatusCanonical` / `MetricStatusProposed` / `MetricStatusDeprecated` (returned by `MetricsRegistry()`) |
+| D-11 | `MetricsOption` | `WithEventTypeLimit(n)`, `WithEventTypes(types...)` |
+| D-12 | Metrics helpers | `MetricsIdentityFromEnv(domain, service)`, `MetricsIdentityFromLabels`, `MetricsEnvironmentFromEnv`, `MetricsRegistry()` |
+| D-13 | *(removed)* | `Init` / `InitWithRegisterer` (legacy-only init) — removed; `InitMetrics` with a `MetricsIdentity` is the only init path |
+| D-14 | Registry types | `MetricsRegistryEntry`, `MetricStatusCanonical` / `MetricStatusProposed` (returned by `MetricsRegistry()`) |
 | D-15 | Sentinels | `ErrEnvelopeIDRequired` / `ErrEnvelopeTypeRequired` / `ErrEnvelopeSourceRequired`, `ErrKeyTooShort`, `ErrInvalidSignature` (reserved) — see §17 |
 
 ### 5.6 Outbox (`pkg/outbox`)
@@ -486,12 +487,12 @@ The library holds no data cache: events, records and payloads are never cached. 
 
 - TTL expiry (`CacheTTL`).
 - `SendMessage` failing with a non-existent-queue code evicts the source queue's entry and returns `ErrDLQUnresolved`, so the next call re-reads the `RedrivePolicy` (DLQ deleted or retargeted).
-- The event-type set is reset only by `InitMetrics` / `InitWithRegisterer`.
+- The event-type set is reset only by `InitMetrics`.
 - The queue-depth sampler does **not** cache: it re-reads the `RedrivePolicy` on every sample.
 
 ### 6.4 Cache failure mode
 
-A resolution failure returns a typed `*DLQError` (`ErrDLQNotConfigured`, `ErrDLQInvalidRedrivePolicy`, `ErrDLQUnresolved`) and nothing is cached; the consumer leaves the message visible (`dead_letter_error`) so SQS retries. A full event-type set maps new values to `__other__` and counts the replacement — metrics degrade in precision, never in correctness. A failed gauge refresh increments `platform_outbox_errors_total{operation}` (`pending_count`, `leased_count`, `blocked_count`, `oldest_pending`); the Tier 1 gauge keeps its last value and the legacy pending gauge reports `-1` ("unknown", `PlatformEventsOutboxPendingUnknown`).
+A resolution failure returns a typed `*DLQError` (`ErrDLQNotConfigured`, `ErrDLQInvalidRedrivePolicy`, `ErrDLQUnresolved`) and nothing is cached; the consumer leaves the message visible (`dead_letter_error`) so SQS retries. A full event-type set maps new values to `__other__` and counts the replacement — metrics degrade in precision, never in correctness. A failed gauge refresh increments `platform_outbox_errors_total{operation}` (`pending_count`, `leased_count`, `blocked_count`, `oldest_pending`); the Tier 1 gauge keeps its last value (`PlatformEventsOutboxPendingUnknown` alerts on `operation="pending_count"`).
 
 ### 6.5 Cache invariants
 
@@ -577,7 +578,7 @@ Within `v1.x` the library only adds optional (`omitempty`) fields; it never remo
 |---|---|---|
 | Mechanism | `IsProcessed` → `next` → `MarkProcessed`, each its own transaction | `INSERT INTO processed_events … ON CONFLICT (event_id, consumer) DO NOTHING` claim + `fn(ctx, tx)` in one `RunInTx` |
 | Guarantee | Best-effort: crash after `next`, failed record, or concurrent copies can rerun `next` | Exactly-once Postgres writes; concurrent copies serialise on the claim |
-| Duplicate | ack + `platform_duplicate_messages_total` / `events_inbox_duplicates_total` | returns nil without calling `fn`, counted the same |
+| Duplicate | ack + `platform_duplicate_messages_total` | returns nil without calling `fn`, counted the same |
 | Dead-lettered by handler | not recorded (redrive is processed) | transaction rolled back (redrive is processed) |
 | Non-UUID envelope ID | error → message retried, then SQS redrive (never processed without dedup) | same |
 
@@ -789,7 +790,7 @@ The extender's state machine (`waiting` → `dispatched` → `released`; `Claim`
 | Dead-letter handler or forward fails (max-receive-count path) | failed `dead_letter_error` + retry | visible |
 | Forward fails (malformed / decode path) | failed `malformed` / `decode_error` + retry | visible |
 | Handler exceeds `WithHandlerTimeout` | context cancelled; `platform_message_timeouts_total{operation=handler}`; outcome per the handler's return | per outcome |
-| `DeleteMessage` fails | logged, `sqs_delete_errors_total` | redelivered (duplicate) |
+| `DeleteMessage` fails | logged, `platform_dependency_request_seconds{dependency=sqs,operation=delete_message,outcome=error}` | redelivered (duplicate) |
 
 #### 9.3.3 Scenario register
 
@@ -800,7 +801,7 @@ The extender's state machine (`waiting` → `dispatched` → `released`; `Claim`
 | SNS throttling / 5xx outage | `platform_outbox_publish_attempts_total{outcome}`, backlog and oldest-age gauges, `PlatformEventsOutboxBacklog` | `ReleaseLease` with shared backoff; no attempts burned; drains when SNS recovers |
 | Permanent publish error (e.g. topic policy) | `PlatformEventsPublishErrors`, `PlatformEventsMessagesDeadLettered` | Dead-letter after `MaxAttempts`; fix, then replay (§8.6) |
 | Postgres unavailable during claim | `platform_outbox_errors_total{operation=poll}`, `PlatformEventsOutboxPollFailing` | Claim backoff 1s → 30s; no records lost |
-| Postgres unavailable during count | Gauge refresh error; legacy pending gauge `-1`, `PlatformEventsOutboxPendingUnknown` | Next refresh |
+| Postgres unavailable during count | Gauge refresh error, `platform_outbox_errors_total{operation=pending_count}`, `PlatformEventsOutboxPendingUnknown` | Next refresh |
 | Head of an ordered key fails repeatedly | `platform_outbox_ordering_blocked_events` | Key waits until published or dead-lettered; then the next record is promoted |
 | Promotion after publish fails | Logged | `PromoteWaiting` sweep on the next gauge refresh |
 | Consumer handler hangs | `platform_message_timeouts_total`, `platform_messages_in_flight` | `WithHandlerTimeout` cancels; visibility extension stops at the deadline; SQS redelivers |
@@ -808,7 +809,7 @@ The extender's state machine (`waiting` → `dispatched` → `released`; `Claim`
 | DLQ deleted / `RedrivePolicy` removed | `*DLQError` (`ErrDLQUnresolved` / `ErrDLQNotConfigured`); `Start` fails when forwarding is configured | Cache evicted; fix infra; message stays visible meanwhile |
 | SQS receive failing | `PlatformEventsSQSReceiveFailing` | Receive loop backs off and retries |
 | Consumer pod killed mid-handler | — | Visibility timeout lapses; SQS redelivers; inbox dedups |
-| Producer floods distinct event types | `platform_telemetry_label_overflow_total`, `PlatformEventsOversizedEventType` | Overflow mapped to `__other__` / `__oversized__` |
+| Producer floods distinct event types | `platform_telemetry_label_overflow_total`, `PlatformEventsEventTypeLabelOverflow` | Overflow mapped to `__other__` / `__oversized__` |
 
 **Failure invariants:**
 
@@ -846,7 +847,7 @@ The extender's state machine (`waiting` → `dispatched` → `released`; `Claim`
 | # | Invariant |
 |---|-----------|
 | OPS-1 | **Outbox dead letters require human action** — nothing replays them automatically (§8.6, §20.2). |
-| OPS-2 | **Proposed metrics never back alerts, SLOs or autoscaling** until ratified; `make metrics-lint` enforces it on rules, dashboards and KEDA manifests. |
+| OPS-2 | **Proposed metrics back alerts and autoscaling only when declared**: rules depending on them live in `*.proposed` groups with `metric_status: proposed` on every alert, KEDA manifests carry `observability.platform/metric-status: proposed`, and no SLO is defined on them until ratified; `make metrics-lint` enforces it on rules, dashboards and KEDA manifests. With no legacy metrics left, they are the only producer / outbox / SQS-client signals. |
 | OPS-3 | **Restartable components.** Consumer and runner create fresh per-cycle state on `Start`; a `Ready()` channel obtained before `Start` still fires. |
 | OPS-4 | **Bounded cardinality.** `queue` / `topic` are names, never URLs / ARNs; `event_type` is sanitised (CACHE-3); prohibited labels are rejected by `make metrics-lint`. |
 
@@ -902,7 +903,7 @@ The library ships no SLO of its own; services define them on the Canonical metri
 |---|---|---|
 | Consumer success ratio | `platform_messages_processed_total` / `platform_messages_received_total` per `queue` | `PlatformEventsConsumerErrorBudgetBurn` implements a multi-window burn alert |
 | Dead-letter rate | `platform_dlq_messages_total` | Should be ~0; any sustained rate pages |
-| Outbox freshness | `platform_outbox_oldest_pending_age` | **Proposed** — not an SLO until ratified; use legacy `outbox_pending_total` meanwhile |
+| Outbox freshness | `platform_outbox_oldest_pending_age` | **Proposed** — not an SLO until ratified; graph it with `platform_outbox_pending_events` meanwhile |
 | End-to-end propagation | `platform_event_propagation_seconds` | **Proposed**; first receipt only |
 
 ### 11.2 Prometheus metrics
@@ -935,9 +936,9 @@ Registered by `events.InitMetrics` with `{domain, service, environment}` const l
 
 Label vocabulary: `reason` (failed) ∈ `malformed`, `decode_error`, `handler_error`, `handler_panic`, `dead_letter_error`; `reason` (DLQ) ∈ `malformed`, `decode_error`, `max_receive_count`, `explicit`, `max_attempts`; `operation` (flow) ∈ `consume`, `outbox_publish`; outbox errors ∈ `poll`, `unmarshal`, `mark_published`, `pending_count`, `leased_count`, `oldest_pending`, `blocked_count`; timeouts ∈ `decode`, `dead_letter_handler`, `handler`; dead-letter operations ∈ `reprocess`, `discard`; `outcome` ∈ `success`, `error`; `dependency` ∈ `sns` (`publish`, `publish_batch`), `sqs` (`receive_message`, `delete_message`, `change_message_visibility`, `send_message`, `get_queue_attributes`, `get_queue_url`), `codec` (`encode`, `decode`). `event_type` is sanitised: ≤ 128 bytes (`__oversized__`), ≤ 200 distinct per process (`__other__`; raise with `WithEventTypeLimit`, pre-register with `WithEventTypes`), invalid UTF-8 repaired, empty → `unknown`.
 
-Registration is fail-soft: a `platform_*` collector the registerer refuses (e.g. an IAM service already owns `platform_retry_total` with other labels) is disabled and reported as a `RegistrationWarning`; invalid identity or a legacy registration failure is an error and changes nothing.
+Registration is fail-soft: a `platform_*` collector the registerer refuses (e.g. an IAM service already owns `platform_retry_total` with other labels) is disabled and reported as a `RegistrationWarning`; an invalid or missing identity is an error and changes nothing.
 
-Legacy (Deprecated, emitted in parallel unless `WithoutLegacyMetrics`): `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info` — authoritative where the successor is Proposed. Every legacy metric has a Tier 1 successor (table in `docs/observability/metrics-registry.md` § Deprecated, e.g. `outbox_pending_total` → `platform_outbox_pending_events`, `outbox_{poll,unmarshal,mark_published}_errors_total` → `platform_outbox_errors_total`, `events_codec_*` / `sqs_*_errors_total` → `platform_dependency_request_seconds`). Sunset: not before the first release ≥ 2027-04-01, and only after every consumer has migrated dashboards, alerts, rules, SLOs and HPA.
+No legacy metrics: the pre-standard `events_*` / `outbox_*` / `sqs_*` names were removed without a compatibility period, since no release emitting them was ever deployed (old → new mapping in the CHANGELOG; the central Platform Observability Registry keeps them as `removed`). The producer, outbox and SQS-client successors are still **Proposed** and await governance ratification.
 
 Signal details: the depth sampler reads `ApproximateNumberOfMessages` only (in-flight messages are not counted; use `platform_messages_in_flight`), logs a failing queue once until it recovers (then one Info), and is disabled with a Warn when `InitMetrics` has not run or the client lacks `GetQueueAttributes`. Propagation clamps negative clock skew to 0 and skips envelopes with a zero `time`.
 
@@ -945,9 +946,9 @@ Signal details: the depth sampler reads `ApproximateNumberOfMessages` only (in-f
 
 | Artefact | Content |
 |---|---|
-| `monitoring/prometheus/platform-events.rules.yml` (+ `.test.yml`, promtool) | Recording rules (`platform_events:*`); alerts `ConsumerErrorBudgetBurn`, `ConsumerStalled`, `MalformedMessages`, `MessagesDeadLettered`, `PublishErrors`, `OutboxBacklog`, `OutboxPendingUnknown`, `OutboxPollFailing`, `OutboxDuplicateDeliveryRisk`, `SQSReceiveFailing`, `OversizedEventType` (all prefixed `PlatformEvents`); `OutboxDeliveryStalled` shipped commented out (Proposed metric) |
-| `monitoring/grafana/platform-events.json` | Reference dashboard (Proposed panels titled "(Proposed)", legacy "(legacy)") |
-| `monitoring/kubernetes/keda-scaledobject.example.yaml` | KEDA on `outbox_pending_total` (ignores `-1`, `ignoreNullValues: "false"`) + native SQS scaler |
+| `monitoring/prometheus/platform-events.rules.yml` (+ `.test.yml`, promtool) | Recording rules (`platform_events:*`); alerts `ConsumerErrorBudgetBurn`, `ConsumerStalled`, `MalformedMessages`, `MessagesDeadLettered`, `PublishErrors`, `OutboxBacklog`, `OutboxPendingUnknown`, `OutboxPollFailing`, `OutboxDuplicateDeliveryRisk`, `SQSReceiveFailing`, `EventTypeLabelOverflow` (all prefixed `PlatformEvents`). Rules depending on Proposed metrics (from `PublishErrors` on) live in the `platform_events.proposed.*` groups and their alerts carry `metric_status: proposed`; `OutboxDeliveryStalled` ships commented out |
+| `monitoring/grafana/platform-events.json` | Reference dashboard (Proposed panels titled "(Proposed)") |
+| `monitoring/kubernetes/keda-scaledobject.example.yaml` | KEDA on `platform_outbox_pending_events` (Proposed — `observability.platform/metric-status: proposed` annotation; `ignoreNullValues: "false"`) + native SQS scaler |
 | `docs/observability/runbook.md` | One section per active alert |
 
 ### 11.3 OpenTelemetry tracing
@@ -1036,7 +1037,7 @@ Constructor errors: empty `QueueURL` or nil handler; visibility timeout > 12h; `
 | Readiness | Gate on `runner.Ready()` |
 | Migration Job | `ApplySchema` with the DDL role before rolling out a new library version (§19) |
 | CronJobs | `PrunePublished`, `inbox Store.Prune`, dead-letter review / retention (§15) |
-| HPA / KEDA | Example `monitoring/kubernetes/keda-scaledobject.example.yaml`; scale on legacy `outbox_pending_total` (not on Proposed metrics, OPS-2) |
+| HPA / KEDA | Example `monitoring/kubernetes/keda-scaledobject.example.yaml`; scales the outbox on `platform_outbox_pending_events` (Proposed — declared with the `observability.platform/metric-status: proposed` annotation until ratified, OPS-2) |
 
 ### 13.2 Scaling characteristics
 

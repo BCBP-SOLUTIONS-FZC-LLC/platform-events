@@ -100,7 +100,7 @@ The handler return value is the only signal the consumer uses to decide retry-or
 |---|---|---|---|
 | **Transient** | DB connection timeout, downstream HTTP 503, network blip, lock contention | `error` | Message left visible; SQS retries after visibility timeout; moves to DLQ after `MaxReceiveCount` |
 | **Permanent** | Payload fails business validation, unknown `event_type` your handler cannot process, schema version too new to parse | `nil` + log at `WARN`/`ERROR` | Message deleted immediately; no retry; no DLQ pressure |
-| **Programming error** | Nil pointer, index out of range, type assertion failure | `error` (let the panic recover do it) | Message retried; surfaced in `events_consumed_total{status=error}`; investigate immediately |
+| **Programming error** | Nil pointer, index out of range, type assertion failure | `error` (let the panic recover do it) | Message retried; surfaced in `platform_messages_failed_total{reason="handler_panic"}`; investigate immediately |
 | **Unknown / unexpected** | Error from a dependency you haven't classified | `error` | Retry by default; safe to escalate to DLQ if unresolved |
 
 > ⚠️ **Misclassifying permanent errors as transient is the most common handler mistake.** If a malformed payload is returned as an `error`, SQS retries it `MaxReceiveCount` times, then pushes it to the DLQ — where it will sit indefinitely, consuming DLQ space and alerting on-call with a metric that can never self-heal. Return `nil` (and log) for any message that cannot succeed on retry regardless of how many times it is delivered.
@@ -226,7 +226,7 @@ The lookup is cached per source queue for `DLQConfig.CacheTTL` (default 15 min; 
 
 Standard attributes override caller values of the same name. SQS allows 10 attributes per message, so callers get at most 6 (5 when `ConsumerName` is set). Excess caller attributes are **dropped** before validation (so a dropped attribute cannot fail the send), lowest priority first (kept first: `TenantID`, `EventID`, `Source`, `Subject`, `traceparent`, `tracestate`, `baggage`, then lexical order) and logged at WARN; set `DLQConfig.StrictAttributes` to reject with `ErrDLQInvalidMessage` instead. A FIFO DLQ (`.fifo`) gets `MessageGroupId` set to the envelope ID (a SHA-256 of the body when it is not an envelope or the ID is not a valid FIFO identifier) and a `MessageDeduplicationId` unique per forward, so forwarding the same event twice (two queues sharing a DLQ, a redrive that fails again) never deduplicates a dead-letter away.
 
-Each forward emits an `sqs.dlq_forward` span (`SpanKindProducer`), counts the message once in `platform_dlq_messages_total{operation="consume",reason}` (legacy `events_dlq_forwarded_total`), and times its SQS calls in `platform_dependency_request_seconds`.
+Each forward emits an `sqs.dlq_forward` span (`SpanKindProducer`), counts the message once in `platform_dlq_messages_total{operation="consume",reason}`, and times its SQS calls in `platform_dependency_request_seconds`.
 
 **Wiring:**
 

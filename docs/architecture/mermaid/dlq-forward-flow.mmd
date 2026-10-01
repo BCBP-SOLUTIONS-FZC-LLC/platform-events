@@ -39,11 +39,11 @@ sequenceDiagram
     SQS -->>- SQSAdp: MessageId or error
 
     alt success
-        SQSAdp ->> SQSAdp: events_dlq_forwarded_total{status=success}.Inc() · WARN log
+        SQSAdp ->> SQSAdp: platform_dlq_messages_total{operation=consume,reason}.Inc() · WARN log
     else throttling · service unavailable · network timeout
-        SQSAdp ->> SQSAdp: ErrDLQSendFailed + ErrRetryable · events_dlq_forwarded_total{status=error}.Inc()
+        SQSAdp ->> SQSAdp: ErrDLQSendFailed + ErrRetryable · platform_dependency_request_seconds{sqs,send_message,outcome=error}
     else permanent error (access denied · KMS · invalid parameter)
-        SQSAdp ->> SQSAdp: ErrDLQSendFailed · events_dlq_forwarded_total{status=error}.Inc()
+        SQSAdp ->> SQSAdp: ErrDLQSendFailed · platform_dependency_request_seconds{sqs,send_message,outcome=error}
     end
 
     SQSAdp -->>- DLQPub: nil or *DLQError

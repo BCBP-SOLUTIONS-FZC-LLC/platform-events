@@ -20,7 +20,7 @@ The platform's shared **event-driven messaging library** — the single sanction
 | `DLQPublisher` — forwarding a failed message to the queue's already-configured SQS DLQ | Reading, replaying or redriving the SQS DLQ; creating DLQs |
 | `Codec` hook + decode-only `GlueDecodeCodec` | A schema-registry client or SDK (services implement `Codec` against their own registry) |
 | HMAC-SHA256 `Sign` / `Verify` helpers | Key storage and rotation (Secrets Manager / SSM) |
-| Tier 1 `platform_*` Prometheus metrics (Enterprise Platform Observability Standard; legacy `events_*` / `outbox_*` / `sqs_*` in parallel) and OTel spans | Metric/trace exporters and providers (initialised by the consuming service) |
+| Tier 1 `platform_*` Prometheus metrics only (Enterprise Platform Observability Standard) and OTel spans | Metric/trace exporters and providers (initialised by the consuming service) |
 
 Consuming services never import `github.com/aws/aws-sdk-go-v2/service/sns` or `.../sqs` — depguard rules in service repos forbid it. Every transport operation a service needs is a `platform-events` API; if one is missing, it is added here rather than worked around in the service.
 
@@ -74,7 +74,7 @@ Import `pkg/events`, `pkg/outbox`, `pkg/inbox` and `pkg/config`. Never import `i
 | `TraceIDFromContext(ctx)` | Envelope `TraceID` inside a handler |
 | `Codec`, `NoopCodec`, `GlueDecodeCodec` | Schema-registry hook; decode-only Glue header stripper |
 | `Sign`, `Verify`, `SignEnvelope`, `VerifyEnvelope` | HMAC-SHA256, constant-time verify |
-| `InitMetrics(MetricsIdentity, registerer, ...MetricsOption)` | Register the Tier 1 `platform_*` metrics (required `domain`/`service`/`environment` labels injected centrally) plus the legacy metrics during the compatibility period; options `WithoutLegacyMetrics()`, `WithEventTypeLimit(n)`, `WithEventTypes(...)`; `MetricsRegistry()`. `Init` / `InitWithRegisterer` are deprecated (legacy only) |
+| `InitMetrics(MetricsIdentity, registerer, ...MetricsOption)` | Register the Tier 1 `platform_*` metrics — the only metrics platform-events emits — with the mandatory `domain`/`service`/`environment` identity injected centrally; options `WithEventTypeLimit(n)`, `WithEventTypes(...)`; `MetricsRegistry()` |
 
 ### `pkg/events` — dead-letter forwarding
 
@@ -155,7 +155,7 @@ if err := dlq.SendToDLQ(ctx, queueURL, body, nil, reason); err != nil {
 | `TopicARN` must be an SNS ARN | `NewSNSPublisher` rejects empty values and anything without an `arn:aws:sns:` / `arn:aws-cn:sns:` / `arn:aws-us-gov:sns:` prefix |
 | `VisibilityTimeout` ≤ 12 h | `NewSQSConsumer` rejects larger values (SQS hard limit) |
 | Outbox payload ≤ 240 KB | `outbox.Enqueue` rejects larger envelopes (the SNS limit is 256 KB) and NUL characters anywhere (Postgres `jsonb` cannot store `\u0000`) |
-| Malformed message bodies are not retried | Counted as `platform_messages_failed_total{reason="malformed"}` (legacy `events_consumed_total{status="malformed"}`); forwarded verbatim to the queue's DLQ with `WithDLQForwarding`, otherwise deleted immediately |
+| Malformed message bodies are not retried | Counted as `platform_messages_failed_total{reason="malformed"}`; forwarded verbatim to the queue's DLQ with `WithDLQForwarding`, otherwise deleted immediately |
 | `WithMaxReceiveCount(n)` must be **lower** than the queue's `RedrivePolicy` `maxReceiveCount` | Otherwise SQS moves the message before the dead-letter handler runs — see [Forwarding to the SQS DLQ](docs/guides/consuming.md#forwarding-to-the-sqs-dlq) |
 | DLQ forwards carry authoritative metadata | `DLQReason`, `OriginalQueue`, `FailedAt`, `ConsumerName` override caller values; `DLQReason` capped at 1 KiB |
 | `last_error` is bounded | Truncated to 512 chars in `outbox_events` / `outbox_dead_letters` |
@@ -184,7 +184,7 @@ platform-events/
 │       ├── sns/                       # SNS publisher, batch split (10 entries / 256 KiB), failure classification
 │       ├── sqs/                       # SQS consumer loop, DLQ publisher (RedrivePolicy resolution + cache), queue-depth sampler
 │       ├── outboxstore/               # Postgres outbox store (platform-pgcommon only)
-│       └── metrics/                   # Tier 1 platform_* + legacy metrics; registry.go = Platform Observability Registry entry
+│       └── metrics/                   # Tier 1 platform_* metrics; registry.go = Platform Observability Registry entry
 ├── docs/
 │   ├── architecture/mermaid/          # 13 × .mmd diagram sources (embedded in ARCHITECTURE.md)
 │   ├── guides/                        # Detailed how-to guides (linked throughout this README)
@@ -536,17 +536,17 @@ Read by `pkg/config` (`LoadSNS` / `LoadSQS` / `LoadOutbox`; database settings vi
 platform-events implements the **Enterprise Platform Observability Standard**. As a cross-domain platform library, all of its metrics are Tier 1 `platform_*`. Call `events.InitMetrics` once at startup, with the same registerer and identity you pass to platform-pgcommon's `pgmetrics.InitWithIdentity`:
 
 ```go
-warnings, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "event-consumer", Version: buildVersion}, registry)
-// err: invalid identity / legacy registration failure. warnings: a platform_* metric the
+warnings, err := events.InitMetrics(events.MetricsIdentity{Domain: "iam", Service: "event-consumer", Environment: "prod"}, registry)
+// err: invalid (or missing) identity — nothing registered. warnings: a platform_* metric the
 // registry refused (e.g. an existing platform_retry_total with other labels) — disabled, not fatal.
 ```
 
 - **Consume (Canonical):** `platform_messages_received_total{queue}`, `platform_messages_processed_total{queue,event_type}`, `platform_messages_failed_total{queue,event_type,reason}`, `platform_retry_total{operation,event_type}`, `platform_dlq_messages_total{operation,event_type,reason}`. Each delivery is received once and ends processed, failed or dead-lettered, and a dead-lettered message is counted once whoever forwarded it.
-- **Proposed** (shadow-emitted until ratified): `platform_queue_depth` / `platform_dlq_depth` (opt-in: `WithQueueDepthMetrics`, the only way services can get SQS depth into Prometheus), `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}` (SNS, SQS and codec calls), `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
-- **Legacy** (Deprecated, emitted in parallel until `WithoutLegacyMetrics()`): `events_*`, `outbox_*`, `sqs_*`, `platform_events_build_info`.
+- **Proposed** (emitted; awaiting governance ratification — the reference alerts on them carry `metric_status: proposed`): `platform_queue_depth` / `platform_dlq_depth` (opt-in: `WithQueueDepthMetrics`, the only way services can get SQS depth into Prometheus), `platform_duplicate_messages_total`, `platform_dependency_request_seconds{dependency,operation,outcome}` (SNS, SQS and codec calls), `platform_event_propagation_seconds`, `platform_messages_published_total`, `platform_message_processing_duration_seconds`, `platform_outbox_{pending,leased}_events`, `platform_outbox_publish_attempts_total`, `platform_outbox_errors_total`, `platform_outbox_dead_letter_operations_total`, `platform_telemetry_label_overflow_total`, `platform_library_info`.
+- **No legacy metrics.** The pre-standard `events_*` / `outbox_*` / `sqs_*` names were removed without a compatibility period, since no release emitting them was ever deployed; the [CHANGELOG](CHANGELOG.md) maps each to its successor.
 - **Required labels** `domain`, `service`, `environment` on every Tier 1 metric; `queue` / `topic` are names, never URLs or ARNs; `tenant_id`, `event_id` and other unbounded labels are prohibited.
 
-Registry, label vocabulary and ratification packets: [docs/observability/metrics-registry.md](docs/observability/metrics-registry.md) (generated). Model, wiring and migration: [docs/observability/README.md](docs/observability/README.md). Reference rules, SLO and alerts: [`monitoring/prometheus/`](monitoring/prometheus/), with [runbook](docs/observability/runbook.md). Reference dashboard: [`monitoring/grafana/`](monitoring/grafana/). Reference autoscaling: [`monitoring/kubernetes/`](monitoring/kubernetes/). CI enforces all of it (`make metrics-lint`, `make rules-check`).
+Registry, label vocabulary and ratification packets: [docs/observability/metrics-registry.md](docs/observability/metrics-registry.md) (generated). Model and wiring: [docs/observability/README.md](docs/observability/README.md). Reference rules, SLO and alerts: [`monitoring/prometheus/`](monitoring/prometheus/), with [runbook](docs/observability/runbook.md). Reference dashboard: [`monitoring/grafana/`](monitoring/grafana/). Reference autoscaling: [`monitoring/kubernetes/`](monitoring/kubernetes/). CI enforces all of it (`make metrics-lint`, `make rules-check`).
 
 ### Tracing and logs
 

@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -150,12 +149,12 @@ func TestOutboxStore_MarkFailed_MovesToDeadLetter(t *testing.T) {
 	store, pool, cleanup := setupOutboxTest(ctx, t)
 	defer cleanup()
 
-	// Initialise metrics against an isolated registry so we can assert the
-	// dead-letter counter increments when a record moves to the dead-letter table.
-	metrics.InitWithRegisterer("outboxstore-dl-test", "v0.0.0", prometheus.NewRegistry())
+	// Initialise the Tier 1 metrics against an isolated registry so we can assert
+	// the dead-letter counter increments when a record moves to the dead-letter table.
+	fixtures.InitPlatformMetrics(t)
 	// WithLabelValues materializes the series at 0 so ToFloat64 has exactly one
 	// series to read. "invoice.settled" matches the event type used by makeRecord below.
-	dlCounter := metrics.OutboxDeadLettersTotal.WithLabelValues("invoice.settled")
+	dlCounter := metrics.CurrentPlatform().DLQMessages.WithLabelValues("outbox_publish", "invoice.settled", "max_attempts")
 	before := testutil.ToFloat64(dlCounter)
 
 	rec := makeRecord("invoice.settled")
@@ -170,7 +169,7 @@ func TestOutboxStore_MarkFailed_MovesToDeadLetter(t *testing.T) {
 
 	// The dead-letter counter must have incremented by exactly one.
 	assert.InDelta(t, before+1, testutil.ToFloat64(dlCounter), 0.001,
-		"outbox_dead_letters_total should increment when a record is dead-lettered")
+		"platform_dlq_messages_total{operation=\"outbox_publish\",reason=\"max_attempts\"} should increment when a record is dead-lettered")
 
 	// Record should NOT be in outbox_events.
 	var count int

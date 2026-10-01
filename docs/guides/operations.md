@@ -15,7 +15,7 @@ The SQS receive loop is gated by `WithConcurrency(n)` (default: `1`). Each recei
 | Signal | Where | What it means |
 |--------|-------|----------------|
 | `ApproximateNumberOfMessages` rising | CloudWatch / SQS console | Handlers are slower than the publish rate |
-| `events_consume_duration_seconds` p99 > `SQS_VISIBILITY_TIMEOUT` | Prometheus | Visibility extensions are firing; handler is at risk of double-delivery |
+| `platform_message_processing_duration_seconds` p99 > `SQS_VISIBILITY_TIMEOUT` | Prometheus | Visibility extensions are firing; handler is at risk of double-delivery |
 | `platform_messages_failed_total{reason="handler_error"}` rising | Prometheus | Handlers are failing and leaving messages to re-enter the queue |
 
 **Tuning order:**
@@ -33,16 +33,16 @@ The outbox runner publishes `OUTBOX_BATCH_SIZE` records per poll cycle. If the r
 
 | Signal | Where | What it means |
 |--------|-------|----------------|
-| `outbox_pending_total` sustained > 0 | Prometheus | Runner is behind; enqueue rate > publish rate |
-| `outbox_pending_total` growing monotonically | Prometheus | Runner is falling further behind each cycle |
-| `outbox_attempts_total` / `outbox_published_total` ratio rising | Prometheus | SNS publish failures retrying; may be a downstream SNS quota issue |
+| `platform_outbox_pending_events` sustained > 0 | Prometheus | Runner is behind; enqueue rate > publish rate |
+| `platform_outbox_pending_events` growing monotonically | Prometheus | Runner is falling further behind each cycle |
+| `platform_outbox_publish_attempts_total{outcome="error"}` / `platform_outbox_publish_attempts_total` ratio rising | Prometheus | SNS publish failures retrying; may be a downstream SNS quota issue |
 
 **Tuning order:**
 
 1. **Decrease `OUTBOX_POLL_INTERVAL`** — shorter sleep between cycles; the runner catches up faster. Default is `5s`; `1s` is reasonable under sustained load.
 2. **Increase `OUTBOX_BATCH_SIZE`** — more records per cycle. Each batch is one `SELECT FOR UPDATE SKIP LOCKED` + N `sns:Publish` calls; keep it below `100` to avoid long-held Postgres locks.
 3. **Scale runner pods horizontally** — `SKIP LOCKED` ensures multiple runners claim disjoint batches with no coordination. This is the right lever once a single pod is SNS-throughput-bound (each `Publish` call is a network round trip).
-4. **Check SNS publish errors** — `outbox_attempts_total - outbox_published_total` counts retries. A rising gap usually indicates SNS throttling or network issues, not a runner configuration problem.
+4. **Check SNS publish errors** — `platform_outbox_publish_attempts_total{outcome="error"}` counts failed attempts (left for retry: `platform_retry_total{operation="outbox_publish"}`). A rising rate usually indicates SNS throttling or network issues, not a runner configuration problem.
 
 > **Do not increase `OUTBOX_BATCH_SIZE` before scaling pods.** A larger batch holds a Postgres lock for longer, blocking other writers on the same table. Horizontal scaling is almost always preferable.
 
@@ -69,7 +69,7 @@ Both?
 
 ## Recommended production defaults
 
-The library ships conservative defaults that are safe for low-traffic workloads. For production services under real load, start with these values and adjust based on your `outbox_pending_total` and `ApproximateNumberOfMessages` metrics.
+The library ships conservative defaults that are safe for low-traffic workloads. For production services under real load, start with these values and adjust based on your `platform_outbox_pending_events` and `ApproximateNumberOfMessages` metrics.
 
 ### SQS Consumer
 
@@ -127,10 +127,10 @@ if err != nil {
 
 | Metric | Alert threshold | Action |
 |---|---|---|
-| `outbox_pending_total` | > 500 sustained for 5 min | Lower `OUTBOX_POLL_INTERVAL`; add runner pods |
+| `platform_outbox_pending_events` | > 500 sustained for 5 min | Lower `OUTBOX_POLL_INTERVAL`; add runner pods |
 | `ApproximateNumberOfMessages` (CloudWatch) | > 1000 sustained | Raise `SQS_CONCURRENCY`; add consumer pods |
 | `platform_messages_failed_total{reason="handler_error"}` | > 1% error rate | Inspect handler errors; check DLQ depth |
-| `outbox_published_total{status="failed"}` / total | > 1% | Check SNS reachability; inspect `outbox_dead_letters` |
+| `platform_outbox_publish_attempts_total{outcome="error"}` / total | > 1% | Check SNS reachability; inspect `outbox_dead_letters` |
 | `platform_messages_failed_total{reason="dead_letter_error"}` | > 0 | Check the source queue's `RedrivePolicy` and DLQ IAM permissions |
 
 
@@ -168,7 +168,7 @@ Use this before declaring a service's event integration production-ready. Each i
 
 - [ ] Handler entry logs bind `event_id`, `event_type`, `trace_id`, `tenant_id` via `logger.With(...)` ([Logging correlation](observability.md#logging-correlation))
 - [ ] OTel provider initialised via `gincommon.InitTracingFromEnv()` before the first `consumer.Start` or `publisher.Publish` call ([OpenTelemetry](observability.md#opentelemetry))
-- [ ] Alerts configured on `outbox_pending_total`, `platform_messages_failed_total{reason="handler_error"}`, and SQS `ApproximateNumberOfMessages` ([Recommended production defaults — what to monitor on day one](#recommended-production-defaults))
+- [ ] Alerts configured on `platform_outbox_pending_events`, `platform_messages_failed_total{reason="handler_error"}`, and SQS `ApproximateNumberOfMessages` ([Recommended production defaults — what to monitor on day one](#recommended-production-defaults))
 - [ ] SQS DLQ depth alert configured at the queue level (CloudWatch) — the library does not alert on DLQ growth
 - [ ] Alert on `platform_messages_failed_total{reason="dead_letter_error"}` > 0 — a failing DLQ forward means poison messages are cycling on the source queue
 

@@ -10,8 +10,8 @@ package metrics_test
 //
 //   - registry compliance: every emitted metric has an entry and every entry
 //     is emitted (no undocumented or stale metrics)
-//   - namespace classification: platform_* ⇔ Tier 1; other names only as a
-//     Deprecated legacy metric with a registered Tier 1 successor
+//   - namespace classification: platform_* ⇔ Tier 1, and nothing else is
+//     emitted (the pre-standard legacy names were removed, not deprecated)
 //   - naming: snake_case; Tier 1 counters end _total, histograms _seconds,
 //     gauges borrow neither; no library, service or domain name encoded in a
 //     Tier 1 name
@@ -19,13 +19,15 @@ package metrics_test
 //     the identity's values, injected centrally
 //   - label vocabulary: only required + approved labels, no prohibited label,
 //     every value in its approved set or bound
-//   - ratification packets complete; Supersedes ↔ SupersededBy consistent
+//   - ratification packets complete
 //
 // It inspects registered collectors, not source text, so it cannot be fooled
 // by formatting and covers every collector however it is built.
 
 import (
+	"bytes"
 	"errors"
+	"os"
 	"regexp"
 	"runtime/debug"
 	"slices"
@@ -38,6 +40,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -45,7 +48,7 @@ import (
 	"github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/pkg/events"
 )
 
-var testIdentity = events.MetricsIdentity{Domain: "iam", Service: "event-consumer", Environment: "prod", Version: "v1.2.3"}
+var testIdentity = events.MetricsIdentity{Domain: "iam", Service: "event-consumer", Environment: "prod"}
 
 const (
 	testQueueURL = "https://sqs.us-east-1.amazonaws.com/123456789012/orders"
@@ -95,15 +98,14 @@ func exerciseAll() {
 			internalmetrics.ObserveDependency(dep, op, boom, time.Millisecond)
 		}
 	}
-	internalmetrics.RecordPublish(testTopicARN, et, "success", 0.01)
-	internalmetrics.RecordPublish(testTopicARN, et, "error", 0)
+	for _, o := range internalmetrics.OutcomeValues {
+		internalmetrics.IncPublished(testTopicARN, et, o)
+		internalmetrics.IncOutboxPublishAttempt(et, o)
+	}
 	internalmetrics.SetOutboxPending(3)
 	internalmetrics.SetOutboxPending(-1)
 	internalmetrics.SetOutboxLeased(1)
 	internalmetrics.RecordOutboxLeasedCountError()
-	internalmetrics.RecordOutboxAttempt(et)
-	internalmetrics.RecordOutboxPublished(et, "success")
-	internalmetrics.RecordOutboxPublished(et, "error")
 	internalmetrics.RecordOutboxDeadLetter(et)
 	internalmetrics.RecordOutboxDeadLettersReprocessed(1)
 	internalmetrics.RecordOutboxDeadLettersDiscarded(1)
@@ -111,15 +113,6 @@ func exerciseAll() {
 	internalmetrics.RecordOutboxUnmarshalError()
 	internalmetrics.RecordOutboxMarkPublishedError()
 	internalmetrics.SanitizeEventType(strings.Repeat("x", 200))
-	// Legacy-only recording paths.
-	internalmetrics.RecordConsume(testQueueURL, et, "success", 0.01)
-	internalmetrics.RecordCodecEncode(testTopicARN, et, "success", 0.01)
-	internalmetrics.RecordCodecDecode(testQueueURL, et, "success", 0.01)
-	internalmetrics.RecordSQSReceiveError(testQueueURL)
-	internalmetrics.RecordSQSDeleteError(testQueueURL)
-	internalmetrics.RecordSQSVisibilityError(testQueueURL)
-	internalmetrics.RecordInboxDuplicate("orders-consumer")
-	internalmetrics.RecordDLQForward(testQueueURL, et, "success")
 }
 
 // gatherAll registers everything platform-events can emit, exercises it and
@@ -169,7 +162,7 @@ func TestStandard_EveryEmittedMetricConforms(t *testing.T) {
 			switch entry.Tier {
 			case internalmetrics.TierPlatform:
 				require.True(t, strings.HasPrefix(name, "platform_"), "a Tier 1 metric must be named platform_*")
-				assert.NotEqual(t, internalmetrics.StatusDeprecated, entry.Status)
+				assert.Contains(t, []internalmetrics.RegistryStatus{internalmetrics.StatusCanonical, internalmetrics.StatusProposed}, entry.Status)
 				switch entry.Type {
 				case internalmetrics.TypeCounter:
 					assert.True(t, strings.HasSuffix(name, "_total"), "counters MUST end in _total")
@@ -183,14 +176,6 @@ func TestStandard_EveryEmittedMetricConforms(t *testing.T) {
 				for _, forbidden := range []string{"events_", testIdentity.Service, strings.ReplaceAll(testIdentity.Service, "-", "_"), testIdentity.Domain + "_"} {
 					assert.False(t, strings.HasPrefix(rest, forbidden) || strings.Contains(rest, "_"+forbidden),
 						"never encode a library, service or domain name (%q) into a platform_* metric", forbidden)
-				}
-			case internalmetrics.TierLegacy:
-				assert.Equal(t, internalmetrics.StatusDeprecated, entry.Status, "a non-tier legacy name may only exist as a Deprecated metric")
-				require.NotEmpty(t, entry.SupersededBy)
-				for _, succ := range entry.SupersededBy {
-					se, ok := internalmetrics.Lookup(succ)
-					require.True(t, ok, "successor %s must be registered", succ)
-					assert.Equal(t, internalmetrics.TierPlatform, se.Tier)
 				}
 			default:
 				t.Fatalf("namespace classification: %s has tier %q", name, entry.Tier)
@@ -260,20 +245,8 @@ func TestStandard_RatificationPacketsComplete(t *testing.T) {
 		for _, l := range append(slices.Clone(e.RequiredLabels), e.ApprovedLabels...) {
 			assert.NotContains(t, internalmetrics.ProhibitedLabels, l, "%s: prohibited label %s", e.Name, l)
 		}
-		for _, prev := range e.Supersedes {
-			pe, ok := internalmetrics.Lookup(prev)
-			require.True(t, ok, "%s supersedes unknown metric %s", e.Name, prev)
-			assert.Contains(t, pe.SupersededBy, e.Name, "%s ↔ %s must reference each other", prev, e.Name)
-		}
-		for _, next := range e.SupersededBy {
-			ne, ok := internalmetrics.Lookup(next)
-			require.True(t, ok, "%s is superseded by unknown metric %s", e.Name, next)
-			assert.Contains(t, ne.Supersedes, e.Name, "%s ↔ %s must reference each other", e.Name, next)
-		}
-		if e.Tier != internalmetrics.TierPlatform {
-			assert.NotEmpty(t, e.Sunset, "%s: Deprecated metrics need a sunset", e.Name)
-			continue
-		}
+		assert.Equal(t, internalmetrics.TierPlatform, e.Tier, "%s: only Tier 1 metrics are registered", e.Name)
+		assert.True(t, strings.HasPrefix(e.Name, "platform_"), "%s: Tier 1 names are platform_*", e.Name)
 		assert.Equal(t, internalmetrics.PlatformRequiredLabels, e.RequiredLabels, "%s: Tier 1 required labels", e.Name)
 		assert.NotEmpty(t, e.Cardinality, e.Name)
 		assert.NotEmpty(t, e.AggregationNotes, e.Name)
@@ -286,15 +259,70 @@ func TestStandard_RatificationPacketsComplete(t *testing.T) {
 	}
 }
 
-func TestStandard_WithoutLegacyMetricsEmitsOnlyTier1(t *testing.T) {
-	families := gatherAll(t, events.WithoutLegacyMetrics())
+// removedLegacyMetrics are the pre-standard names platform-events emitted
+// before the cutover (status "removed" in the central registry). None may be
+// registered or emitted again.
+var removedLegacyMetrics = []string{
+	"platform_events_build_info",
+	"events_published_total", "events_publish_duration_seconds",
+	"events_consumed_total", "events_consume_duration_seconds",
+	"events_codec_encode_total", "events_codec_encode_duration_seconds",
+	"events_codec_decode_total", "events_codec_decode_duration_seconds",
+	"outbox_pending_total", "outbox_leased_total", "outbox_published_total", "outbox_attempts_total",
+	"outbox_dead_letters_total", "outbox_dead_letters_reprocessed_total", "outbox_dead_letters_discarded_total",
+	"sqs_receive_errors_total", "sqs_delete_errors_total", "sqs_visibility_extension_errors_total",
+	"outbox_poll_errors_total", "outbox_unmarshal_errors_total", "outbox_mark_published_errors_total",
+	"events_inbox_duplicates_total", "events_dlq_forwarded_total", "events_oversized_event_type_label_total",
+}
+
+// TestStandard_NoLegacyFamiliesEmitted: only Tier 1 platform_* families are
+// emitted — no removed legacy name, and nothing outside the platform_ prefix.
+func TestStandard_NoLegacyFamiliesEmitted(t *testing.T) {
+	families := gatherAll(t)
 	for name := range families {
+		assert.True(t, strings.HasPrefix(name, "platform_"), "%s: only platform_* metrics may be emitted", name)
 		e, _ := internalmetrics.Lookup(name)
-		assert.Equal(t, internalmetrics.TierPlatform, e.Tier, "legacy metric %s emitted after WithoutLegacyMetrics", name)
+		assert.Equal(t, internalmetrics.TierPlatform, e.Tier, name)
 	}
-	assert.Nil(t, internalmetrics.EventsPublishedTotal, "legacy vars are cleared")
-	// Restore the package-wide legacy set other tests rely on.
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
+	for _, legacy := range removedLegacyMetrics {
+		assert.NotContains(t, families, legacy, "removed legacy metric %s is emitted", legacy)
+		_, registered := internalmetrics.Lookup(legacy)
+		assert.False(t, registered, "removed legacy metric %s is still in the registry", legacy)
+	}
+}
+
+// TestStandard_RecordingBeforeInitIsNoOp: without InitMetrics nothing is
+// registered and every recording call is a safe no-op.
+func TestStandard_RecordingBeforeInitIsNoOp(t *testing.T) {
+	isolatePlatform(t)
+	internalmetrics.ReplacePlatform(nil)
+	assert.NotPanics(t, exerciseAll)
+	assert.False(t, internalmetrics.HasOutboxPendingMetric())
+	assert.False(t, internalmetrics.HasOutboxLeasedMetric())
+	assert.False(t, internalmetrics.HasOutboxBlockedMetric())
+	assert.False(t, internalmetrics.HasOutboxOldestAgeMetric())
+}
+
+// TestStandard_ExportScrape writes the exposition of gatherAll (every
+// family, every approved value) to $METRICS_SCRAPE_OUT, for validating with
+// the central registry's linter: metricslint check <file>.
+func TestStandard_ExportScrape(t *testing.T) {
+	out := os.Getenv("METRICS_SCRAPE_OUT")
+	if out == "" {
+		t.Skip("set METRICS_SCRAPE_OUT to export a scrape")
+	}
+	families := gatherAll(t)
+	names := make([]string, 0, len(families))
+	for name := range families {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var buf bytes.Buffer
+	for _, name := range names {
+		_, err := expfmt.MetricFamilyToText(&buf, families[name])
+		require.NoError(t, err)
+	}
+	require.NoError(t, os.WriteFile(out, buf.Bytes(), 0o600)) //nolint:gosec // test-only output path chosen by the developer
 }
 
 func TestStandard_IdentityValidation(t *testing.T) {
@@ -330,14 +358,14 @@ func TestStandard_EnvironmentAndIdentityHelpers(t *testing.T) {
 	t.Setenv("ENVIRONMENT", "")
 	t.Setenv("APP_NAME", " Order-Service ")
 	assert.Equal(t, "dev", events.MetricsEnvironmentFromEnv())
-	assert.Equal(t, events.MetricsIdentity{Domain: "billing", Service: "order-service", Environment: "dev", Version: "v1"},
-		events.MetricsIdentityFromEnv("billing", "", "v1"))
-	assert.Equal(t, "explicit", events.MetricsIdentityFromEnv("billing", "explicit", "v1").Service)
+	assert.Equal(t, events.MetricsIdentity{Domain: "billing", Service: "order-service", Environment: "dev"},
+		events.MetricsIdentityFromEnv("billing", ""))
+	assert.Equal(t, "explicit", events.MetricsIdentityFromEnv("billing", "explicit").Service)
 	t.Setenv("APP_ENV", "PROD")
 	assert.Equal(t, "prod", events.MetricsEnvironmentFromEnv())
 
 	id := events.MetricsIdentityFromLabels(map[string]string{"domain": "iam", "service": "svc", "environment": "dev", "version": "v1", "extra": "x"})
-	assert.Equal(t, events.MetricsIdentity{Domain: "iam", Service: "svc", Environment: "dev", Version: "v1"}, id)
+	assert.Equal(t, events.MetricsIdentity{Domain: "iam", Service: "svc", Environment: "dev"}, id, "version and other keys are ignored")
 }
 
 // TestStandard_ConflictingSharedNameIsFailSoft: IAM services already register
@@ -365,7 +393,6 @@ func TestStandard_ConflictingSharedNameIsFailSoft(t *testing.T) {
 	assert.Nil(t, p.DependencyRequests)
 	assert.NotNil(t, p.MessagesProcessed, "the other platform metrics still register")
 	assert.NotPanics(t, exerciseAll)
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }
 
 // TestStandard_RegistererInjectedLabelsAppliedOnce: a registerer that already
@@ -414,7 +441,6 @@ func TestStandard_RegistererInjectedLabelsAppliedOnce(t *testing.T) {
 				}
 			}
 			assert.Positive(t, platformSeen)
-			internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 		})
 	}
 }
@@ -425,7 +451,7 @@ func TestStandard_RegistererInjectedLabelsAppliedOnce(t *testing.T) {
 func TestStandard_LabelStaticCountersStartAtZero(t *testing.T) {
 	isolatePlatform(t)
 	reg := prometheus.NewRegistry()
-	_, err := events.InitMetrics(testIdentity, reg, events.WithoutLegacyMetrics())
+	_, err := events.InitMetrics(testIdentity, reg)
 	require.NoError(t, err)
 	internalmetrics.InitQueue(testQueueURL)
 
@@ -449,40 +475,13 @@ func TestStandard_LabelStaticCountersStartAtZero(t *testing.T) {
 		}
 	}
 	assert.Equal(t, want, got)
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
-}
-
-// TestStandard_LegacyRegistrationFailureIsAnError: unlike a Tier 1 metric, a
-// legacy metric that can't register is an error and nothing changes.
-func TestStandard_LegacyRegistrationFailureIsAnError(t *testing.T) {
-	isolatePlatform(t)
-	before := internalmetrics.CurrentPlatform()
-	legacyBefore := internalmetrics.EventsPublishedTotal
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(prometheus.NewCounterVec(prometheus.CounterOpts{Name: "events_published_total", Help: "clash"}, []string{"other"}))
-	_, err := events.InitMetrics(testIdentity, reg)
-	require.Error(t, err)
-	assert.Same(t, before, internalmetrics.CurrentPlatform(), "a failed init must not replace the active set")
-	assert.Same(t, legacyBefore, internalmetrics.EventsPublishedTotal)
-
-	// Nothing is left on the registerer either: the legacy collectors that
-	// did register are removed, so they are absent rather than exported at 0.
-	mfs, err := reg.Gather()
-	require.NoError(t, err)
-	for _, mf := range mfs {
-		assert.Equal(t, "events_published_total", mf.GetName(), "only the caller's own collector may remain")
-	}
-
-	// A retry without legacy metrics succeeds on the same registerer.
-	_, err = events.InitMetrics(testIdentity, reg, events.WithoutLegacyMetrics())
-	require.NoError(t, err)
 }
 
 func TestStandard_NilRegistererUsesDefault(t *testing.T) {
 	isolatePlatform(t)
 	id := testIdentity
 	id.Service = "nil-registerer-probe"
-	_, err := events.InitMetrics(id, nil, events.WithoutLegacyMetrics())
+	_, err := events.InitMetrics(id, nil)
 	require.NoError(t, err)
 	mfs, err := prometheus.DefaultGatherer.Gather()
 	require.NoError(t, err)
@@ -493,7 +492,6 @@ func TestStandard_NilRegistererUsesDefault(t *testing.T) {
 		}
 	}
 	assert.True(t, found, "registered on prometheus.DefaultRegisterer")
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }
 
 // TestWrapCollisionMessagePinned pins the client_golang error text the
@@ -521,7 +519,7 @@ func TestStandard_LabelValueHelpers(t *testing.T) {
 func TestStandard_PropagationClampsSkewAndIgnoresZero(t *testing.T) {
 	isolatePlatform(t)
 	reg := prometheus.NewRegistry()
-	_, err := events.InitMetrics(testIdentity, reg, events.WithoutLegacyMetrics())
+	_, err := events.InitMetrics(testIdentity, reg)
 	require.NoError(t, err)
 	now := time.Now()
 	internalmetrics.ObservePropagation(testQueueURL, "a.b.c", now.Add(time.Minute), now) // producer clock ahead
@@ -536,7 +534,6 @@ func TestStandard_PropagationClampsSkewAndIgnoresZero(t *testing.T) {
 			assert.Zero(t, h.GetSampleSum(), "negative skew clamped to 0")
 		}
 	}
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }
 
 func TestStandard_LibraryVersionFrom(t *testing.T) {
@@ -576,31 +573,6 @@ func TestStandard_ReinitOnSameRegistryReusesCollectors(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, warnings)
 	assert.Same(t, first, internalmetrics.CurrentPlatform().MessagesReceived)
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
-}
-
-func TestStandard_LegacyInitPanicsOnConflict(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	reg.MustRegister(prometheus.NewCounterVec(prometheus.CounterOpts{Name: "events_published_total", Help: "clash"}, []string{"other"}))
-	assert.Panics(t, func() { internalmetrics.InitWithRegisterer("svc", "v1", reg) })
-}
-
-// TestStandard_LegacyInitDoesNotDisableTier1: a leftover events.Init (old
-// bootstrap, shared helper) after InitMetrics must not switch the Tier 1
-// metrics off.
-func TestStandard_LegacyInitDoesNotDisableTier1(t *testing.T) {
-	isolatePlatform(t)
-	reg := prometheus.NewRegistry()
-	_, err := events.InitMetrics(testIdentity, reg)
-	require.NoError(t, err)
-	p := internalmetrics.CurrentPlatform()
-	require.NotNil(t, p)
-
-	events.Init("legacy-helper", "v0") //nolint:staticcheck // exercises the deprecated API
-	assert.Same(t, p, internalmetrics.CurrentPlatform(), "Init must be a no-op once InitMetrics ran")
-	internalmetrics.IncProcessed(testQueueURL, "iam.user.created")
-	assert.InDelta(t, 1, testutil.ToFloat64(p.MessagesProcessed.WithLabelValues("orders", "iam.user.created")), 0)
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }
 
 // TestStandard_EventTypeCardinalityCap: the byte cap alone does not bound
@@ -609,7 +581,7 @@ func TestStandard_EventTypeCardinalityCap(t *testing.T) {
 	isolatePlatform(t)
 	t.Cleanup(func() { internalmetrics.SetEventTypeLimit(0) })
 	reg := prometheus.NewRegistry()
-	_, err := events.InitMetrics(testIdentity, reg, events.WithEventTypeLimit(3), events.WithoutLegacyMetrics())
+	_, err := events.InitMetrics(testIdentity, reg, events.WithEventTypeLimit(3))
 	require.NoError(t, err)
 	p := internalmetrics.CurrentPlatform()
 
@@ -623,7 +595,6 @@ func TestStandard_EventTypeCardinalityCap(t *testing.T) {
 
 	assert.Equal(t, internalmetrics.EventTypeUnknown, internalmetrics.SanitizeEventType(""))
 	assert.Equal(t, internalmetrics.EventTypeOversized, internalmetrics.SanitizeEventType(strings.Repeat("x", 129)))
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }
 
 // TestStandard_InvalidUTF8EventType_DoesNotPanic: Prometheus panics on label
@@ -639,9 +610,8 @@ func TestStandard_InvalidUTF8EventType_DoesNotPanic(t *testing.T) {
 	assert.Equal(t, "iam.user.\uFFFDcreated", got)
 	assert.NotPanics(t, func() {
 		internalmetrics.IncProcessed(testQueueURL, bad)
-		internalmetrics.RecordPublish(testTopicARN, bad, "error", 0.01)
+		internalmetrics.IncPublished(testTopicARN, bad, "error")
 	})
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }
 
 // TestStandard_InvalidIdentity_LeavesEventTypeCapUnchanged: a failed
@@ -650,14 +620,13 @@ func TestStandard_InvalidUTF8EventType_DoesNotPanic(t *testing.T) {
 func TestStandard_InvalidIdentity_LeavesEventTypeCapUnchanged(t *testing.T) {
 	isolatePlatform(t)
 	t.Cleanup(func() { internalmetrics.SetEventTypeLimit(0) })
-	_, err := events.InitMetrics(testIdentity, prometheus.NewRegistry(), events.WithEventTypeLimit(1), events.WithoutLegacyMetrics())
+	_, err := events.InitMetrics(testIdentity, prometheus.NewRegistry(), events.WithEventTypeLimit(1))
 	require.NoError(t, err)
 	assert.Equal(t, "a.b.first", internalmetrics.SanitizeEventType("a.b.first"))
 
 	_, err = events.InitMetrics(events.MetricsIdentity{}, prometheus.NewRegistry(), events.WithEventTypeLimit(100))
 	require.Error(t, err)
 	assert.Equal(t, internalmetrics.EventTypeOther, internalmetrics.SanitizeEventType("a.b.second"), "cap still 1, a.b.first still admitted")
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }
 
 // TestStandard_LabelLessCountersExportedAtZero: a counter without variable
@@ -674,10 +643,9 @@ func TestStandard_LabelLessCountersExportedAtZero(t *testing.T) {
 	for _, f := range families {
 		exported[f.GetName()] = len(f.GetMetric()) > 0
 	}
-	for _, name := range []string{"outbox_mark_published_errors_total", "events_oversized_event_type_label_total", "outbox_poll_errors_total", "outbox_unmarshal_errors_total"} {
+	for _, name := range []string{"platform_outbox_errors_total", "platform_outbox_dead_letter_operations_total", "platform_telemetry_label_overflow_total", "platform_library_info"} {
 		assert.True(t, exported[name], "%s exported at 0", name)
 	}
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }
 
 // WithEventTypes keeps known types labelled even after unknown values have
@@ -686,7 +654,7 @@ func TestStandard_WithEventTypes_KnownTypesAlwaysAdmitted(t *testing.T) {
 	isolatePlatform(t)
 	t.Cleanup(func() { internalmetrics.SetEventTypeLimit(0) })
 	_, err := events.InitMetrics(testIdentity, prometheus.NewRegistry(),
-		events.WithEventTypes("iam.user.created", "iam.user.deleted"), events.WithEventTypeLimit(3), events.WithoutLegacyMetrics())
+		events.WithEventTypes("iam.user.created", "iam.user.deleted"), events.WithEventTypeLimit(3))
 	require.NoError(t, err)
 	assert.Equal(t, "junk.one", internalmetrics.SanitizeEventType("junk.one"), "one free slot")
 	assert.Equal(t, internalmetrics.EventTypeOther, internalmetrics.SanitizeEventType("junk.two"))
@@ -696,5 +664,4 @@ func TestStandard_WithEventTypes_KnownTypesAlwaysAdmitted(t *testing.T) {
 	internalmetrics.SetEventTypes(1, []string{"a.b.one", "a.b.two", "", strings.Repeat("x", 200)})
 	assert.Equal(t, "a.b.two", internalmetrics.SanitizeEventType("a.b.two"))
 	assert.Equal(t, internalmetrics.EventTypeOther, internalmetrics.SanitizeEventType("a.b.three"))
-	internalmetrics.InitWithRegisterer("metrics-unit", "test", prometheus.NewRegistry())
 }

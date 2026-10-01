@@ -30,10 +30,9 @@ func main() {
 	if buildVersion == "" {
 		buildVersion = version
 	}
-	// Tier 1 platform_* metrics (Enterprise Platform Observability Standard)
-	// plus the legacy metrics for the compatibility period. The reference CLI
-	// belongs to no business domain, so it reports domain="platform".
-	metricsID := events.MetricsIdentityFromEnv("platform", strings.ToLower(appName), buildVersion)
+	// Tier 1 platform_* metrics (Enterprise Platform Observability Standard),
+	// the only metrics platform-events emits. The reference CLI belongs to no business domain, so it reports domain="platform".
+	metricsID := events.MetricsIdentityFromEnv("platform", strings.ToLower(appName))
 	warnings, err := events.InitMetrics(metricsID, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "platform-events: metrics disabled: %v\n", err)
@@ -111,7 +110,7 @@ func main() {
 	fmt.Fprintln(os.Stdout, "\n=== Production wiring reminders ===")
 	reminders := []string{
 		"outbox.ApplySchema(ctx, migrateRunner) on startup",
-		"events.InitMetrics(events.MetricsIdentity{Domain, Service, Version}, registry) once at startup (done by this CLI) — same registerer and identity as pgmetrics.InitWithIdentity",
+		"events.InitMetrics(events.MetricsIdentity{Domain, Service, Environment}, registry) once at startup (done by this CLI) — same registerer and identity as pgmetrics.InitWithIdentity",
 		"gincommon.InitTracingFromEnv() before first Publish/Start",
 		"SNS→SQS subscription MUST use RawMessageDelivery=true",
 		"outbox.Runner.Ready() before marking the pod ready",

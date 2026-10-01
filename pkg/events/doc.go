@@ -41,9 +41,8 @@
 // Call [InitMetrics] once at service startup. It registers the Tier 1
 // platform_* metrics of the Enterprise Platform Observability Standard, with
 // the required domain/service/environment labels injected centrally from a
-// [MetricsIdentity], and — during the compatibility period, unless
-// [WithoutLegacyMetrics] is given — the Deprecated pre-standard metrics in
-// parallel. [MetricsRegistry] lists every metric with its tier, status and
-// label vocabulary; see docs/observability in the repository. [Init] and
-// [InitWithRegisterer] register the legacy metrics only and are deprecated.
+// [MetricsIdentity] (mandatory). These are the only metrics platform-events
+// emits; the pre-standard events_* / outbox_* / sqs_* names were removed.
+// [MetricsRegistry] lists every metric with its tier, status and label
+// vocabulary; see docs/observability in the repository.
 package events

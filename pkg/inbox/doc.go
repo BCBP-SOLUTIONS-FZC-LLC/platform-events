@@ -21,8 +21,7 @@
 // # Semantics
 //
 // [Handler] checks the ledger first (a duplicate is acknowledged without
-// calling the handler, and counted in platform_duplicate_messages_total /
-// events_inbox_duplicates_total), calls the handler, and records the ID ONLY
+// calling the handler, and counted in platform_duplicate_messages_total), calls the handler, and records the ID ONLY
 // after the handler returns nil. The check, the handler and the record are
 // separate transactions, so a crash mid-handler, a failed record, or two
 // copies handled concurrently can each run the handler again — it must still

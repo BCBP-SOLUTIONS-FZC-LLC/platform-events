@@ -2,22 +2,18 @@
 // Enterprise Platform Observability Standard (see registry.go for the tiering
 // and every metric's ratification packet).
 //
-// Two families are emitted from the same recording calls:
-//
-//   - Tier 1 platform_*: carry the required {domain, service, environment}
-//     const labels, injected centrally from an Identity (rule 8). Registered
-//     only by InitWithIdentity; a platform metric that cannot be registered
-//     is disabled with a RegistrationWarning instead of failing (fail-soft).
-//   - Legacy events_* / outbox_* / sqs_* (Deprecated): the pre-standard
-//     names, unchanged, emitted in parallel for the compatibility period.
-//     Registered by Init / InitWithRegisterer, and by InitWithIdentity unless
-//     legacy metrics are disabled.
+// Only Tier 1 platform_* metrics are emitted. They carry the required
+// {domain, service, environment} const labels, injected centrally from a
+// mandatory Identity (rule 8), and are registered by InitWithIdentity; a
+// platform metric that cannot be registered is disabled with a
+// RegistrationWarning instead of failing (fail-soft). The pre-standard
+// events_* / outbox_* / sqs_* names were removed without a compatibility
+// period (no release carrying them was ever deployed).
 //
 // Every Record/Observe function is safe before initialisation (no-op).
 package metrics
 
 import (
-	"errors"
 	"math"
 	"strings"
 	"sync"
@@ -26,49 +22,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
-)
-
-// Legacy metric variables (Deprecated), installed by Init, InitWithRegisterer
-// or InitWithIdentity; nil when legacy metrics are not registered.
-var (
-	EventsPublishedTotal              *prometheus.CounterVec
-	EventsPublishDuration             *prometheus.HistogramVec
-	EventsConsumedTotal               *prometheus.CounterVec
-	EventsConsumeDuration             *prometheus.HistogramVec
-	CodecEncodeTotal                  *prometheus.CounterVec
-	CodecEncodeDuration               *prometheus.HistogramVec
-	CodecDecodeTotal                  *prometheus.CounterVec
-	CodecDecodeDuration               *prometheus.HistogramVec
-	OutboxPendingTotal                *prometheus.GaugeVec
-	OutboxPublishedTotal              *prometheus.CounterVec
-	OutboxAttemptsTotal               *prometheus.CounterVec
-	OutboxDeadLettersTotal            *prometheus.CounterVec
-	OutboxDeadLettersReprocessedTotal *prometheus.CounterVec
-	OutboxDeadLettersDiscardedTotal   *prometheus.CounterVec
-	OutboxLeasedTotal                 *prometheus.GaugeVec
-
-	// SQS-level infrastructure error counters.
-	SQSReceiveErrorsTotal    *prometheus.CounterVec
-	SQSDeleteErrorsTotal     *prometheus.CounterVec
-	SQSVisibilityErrorsTotal *prometheus.CounterVec
-
-	// InboxDuplicatesTotal counts redeliveries the inbox ledger filtered.
-	InboxDuplicatesTotal *prometheus.CounterVec
-
-	// DLQForwardedTotal counts messages forwarded to a source queue's DLQ.
-	DLQForwardedTotal *prometheus.CounterVec
-
-	// Outbox infrastructure error counters.
-	OutboxPollErrorsTotal          *prometheus.CounterVec
-	OutboxUnmarshalErrorsTotal     *prometheus.CounterVec
-	OutboxMarkPublishedErrorsTotal *prometheus.CounterVec
-
-	// OversizedEventTypeLabelTotal counts event_type values replaced with
-	// "__oversized__".
-	OversizedEventTypeLabelTotal *prometheus.CounterVec
-
-	initOnce  sync.Once
-	metricsMu sync.RWMutex // guards the legacy vars against concurrent re-initialisation
 )
 
 // Platform holds the Tier 1 platform_* collectors. A nil field means that
@@ -125,8 +78,6 @@ var (
 	dependencyBuckets  = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30}
 	processingBuckets  = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 120}
 	propagationBuckets = []float64{.01, .05, .1, .25, .5, 1, 2.5, 5, 10, 30, 60, 300, 900, 3600}
-	legacyBuckets      = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10}
-	legacyShortBuckets = []float64{.005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5}
 )
 
 // maxEventTypeLabelLen is the maximum byte length of an event_type label value.
@@ -184,9 +135,7 @@ func SetEventTypes(limit int, known []string) {
 // value, invalid UTF-8 replaced with U+FFFD, "__oversized__" for one over 128
 // bytes, and "__other__" once the
 // process has already admitted its limit of distinct values (default 200).
-// Every replacement is counted in platform_telemetry_label_overflow_total
-// (and the legacy events_oversized_event_type_label_total for oversized ones),
-// so a misconfigured or adversarial producer cannot explode cardinality.
+// Every replacement is counted in platform_telemetry_label_overflow_total, so a misconfigured or adversarial producer cannot explode cardinality.
 func SanitizeEventType(s string) string {
 	if s == "" {
 		return EventTypeUnknown
@@ -197,7 +146,7 @@ func SanitizeEventType(s string) string {
 		s = strings.ToValidUTF8(s, "\uFFFD")
 	}
 	if len(s) > maxEventTypeLabelLen {
-		recordLabelOverflow(true)
+		recordLabelOverflow()
 		return EventTypeOversized
 	}
 	eventTypes.RLock()
@@ -212,22 +161,14 @@ func SanitizeEventType(s string) string {
 		return s
 	}
 	if len(eventTypes.seen) >= eventTypes.limit {
-		recordLabelOverflow(false)
+		recordLabelOverflow()
 		return EventTypeOther
 	}
 	eventTypes.seen[s] = struct{}{}
 	return s
 }
 
-func recordLabelOverflow(oversized bool) {
-	if oversized {
-		metricsMu.RLock()
-		c := OversizedEventTypeLabelTotal
-		metricsMu.RUnlock()
-		if c != nil {
-			c.WithLabelValues().Inc()
-		}
-	}
+func recordLabelOverflow() {
 	if p := platform.Load(); p != nil && p.LabelOverflow != nil {
 		p.LabelOverflow.WithLabelValues("event_type").Inc()
 	}
@@ -256,96 +197,17 @@ func TopicName(topicARN string) string {
 
 // ── Initialisation ───────────────────────────────────────────────────────
 
-// Init registers the legacy metrics using the default registerer. Panics if
-// serviceName is empty. Idempotent — only the first call registers.
-//
-// A no-op once InitWithIdentity has installed the Tier 1 set: a leftover
-// legacy Init (an old bootstrap or shared helper) must never silently disable
-// the platform_* metrics, and InitWithIdentity already registered the legacy
-// metrics when they are wanted.
-func Init(serviceName, buildVersion string) {
-	if serviceName == "" {
-		panic("platform-events: metrics.Init requires a non-empty serviceName")
-	}
-	if platform.Load() != nil {
-		return
-	}
-	initOnce.Do(func() {
-		installLegacyOrPanic(serviceName, buildVersion, prometheus.DefaultRegisterer)
-	})
-}
-
-// InitWithRegisterer registers the legacy metrics on reg, bypassing the
-// sync.Once guard. Panics if serviceName is empty. It is the test-isolation
-// reset: it clears any Tier 1 set, making the process legacy-only. Production
-// code uses InitWithIdentity.
-func InitWithRegisterer(serviceName, buildVersion string, reg prometheus.Registerer) {
-	if serviceName == "" {
-		panic("platform-events: metrics.InitWithRegisterer requires a non-empty serviceName")
-	}
-	installLegacyOrPanic(serviceName, buildVersion, reg)
-	platform.Store(nil)
-}
-
-func installLegacyOrPanic(serviceName, buildVersion string, reg prometheus.Registerer) {
-	l, err := registerLegacy(newRegistrar(reg), serviceName, buildVersion)
-	if err != nil {
-		panic(err)
-	}
-	l.install()
-}
-
 // InitWithIdentity registers the Tier 1 platform metrics with id's const
-// labels and — unless legacy is false — the legacy metrics in parallel, and
-// makes them the active set. It returns an error, changing nothing, for an
-// invalid identity or a legacy registration failure. A platform metric that
-// cannot be registered is returned as a warning and disabled.
-func InitWithIdentity(id Identity, reg prometheus.Registerer, legacy bool) ([]RegistrationWarning, error) {
+// labels on reg and makes them the active set. The identity is mandatory: an
+// invalid one returns an error and changes nothing. A platform metric that
+// cannot be registered is returned as a warning and disabled (fail-soft).
+func InitWithIdentity(id Identity, reg prometheus.Registerer) ([]RegistrationWarning, error) {
 	if err := id.Validate(); err != nil {
 		return nil, err
 	}
-	r := newRegistrar(reg)
-	var l *legacySet
-	if legacy {
-		var err error
-		if l, err = registerLegacy(r, id.Service, id.Version); err != nil {
-			return nil, err
-		}
-	}
-	p, warnings := registerPlatform(r, id)
-	l.install() // nil → clears the legacy vars
+	p, warnings := registerPlatform(newRegistrar(reg), id)
 	platform.Store(p)
 	return warnings, nil
-}
-
-// legacySet is one registered generation of the legacy metrics.
-type legacySet struct {
-	publishedTotal, consumedTotal, codecEncodeTotal, codecDecodeTotal                             *prometheus.CounterVec
-	publishDuration, consumeDuration, codecEncodeDuration, codecDecodeDuration                    *prometheus.HistogramVec
-	outboxPending, outboxLeased                                                                   *prometheus.GaugeVec
-	outboxPublished, outboxAttempts, outboxDeadLetters, outboxReprocessed, outboxDiscarded        *prometheus.CounterVec
-	sqsReceiveErrors, sqsDeleteErrors, sqsVisibilityErrors, inboxDuplicates, dlqForwarded         *prometheus.CounterVec
-	outboxPollErrors, outboxUnmarshalErrors, outboxMarkPublishedErrors, oversizedEventTypeCounter *prometheus.CounterVec
-}
-
-// install makes l the active legacy set; a nil l clears it.
-func (l *legacySet) install() {
-	if l == nil {
-		l = &legacySet{}
-	}
-	metricsMu.Lock()
-	defer metricsMu.Unlock()
-	EventsPublishedTotal, EventsPublishDuration = l.publishedTotal, l.publishDuration
-	EventsConsumedTotal, EventsConsumeDuration = l.consumedTotal, l.consumeDuration
-	CodecEncodeTotal, CodecEncodeDuration = l.codecEncodeTotal, l.codecEncodeDuration
-	CodecDecodeTotal, CodecDecodeDuration = l.codecDecodeTotal, l.codecDecodeDuration
-	OutboxPendingTotal, OutboxLeasedTotal = l.outboxPending, l.outboxLeased
-	OutboxPublishedTotal, OutboxAttemptsTotal, OutboxDeadLettersTotal = l.outboxPublished, l.outboxAttempts, l.outboxDeadLetters
-	OutboxDeadLettersReprocessedTotal, OutboxDeadLettersDiscardedTotal = l.outboxReprocessed, l.outboxDiscarded
-	SQSReceiveErrorsTotal, SQSDeleteErrorsTotal, SQSVisibilityErrorsTotal = l.sqsReceiveErrors, l.sqsDeleteErrors, l.sqsVisibilityErrors
-	InboxDuplicatesTotal, DLQForwardedTotal = l.inboxDuplicates, l.dlqForwarded
-	OutboxPollErrorsTotal, OutboxUnmarshalErrorsTotal, OutboxMarkPublishedErrorsTotal = l.outboxPollErrors, l.outboxUnmarshalErrors, l.outboxMarkPublishedErrors
-	OversizedEventTypeLabelTotal = l.oversizedEventTypeCounter
 }
 
 // precreate exports a counter without variable labels at 0 as soon as it is
@@ -355,85 +217,6 @@ func precreate(c *prometheus.CounterVec, labels []string) {
 	if c != nil && len(labels) == 0 {
 		c.WithLabelValues()
 	}
-}
-
-const deprecatedHelp = " Deprecated: superseded by a platform_* metric (see docs/observability/metrics-registry.md)."
-
-func registerLegacy(r *registrar, serviceName, buildVersion string) (*legacySet, error) {
-	constLabels := prometheus.Labels{LabelService: serviceName}
-	droppable := []string{LabelService}
-	var errs []error
-	mark := len(r.added)
-	counter := func(name, help string, labels ...string) *prometheus.CounterVec {
-		c, err := register(r, constLabels, droppable, func(cl prometheus.Labels) *prometheus.CounterVec {
-			return prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help + deprecatedHelp, ConstLabels: cl}, labels)
-		})
-		errs = append(errs, err)
-		precreate(c, labels)
-		return c
-	}
-	histogram := func(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
-		h, err := register(r, constLabels, droppable, func(cl prometheus.Labels) *prometheus.HistogramVec {
-			return prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: name, Help: help + deprecatedHelp, ConstLabels: cl, Buckets: buckets}, labels)
-		})
-		errs = append(errs, err)
-		return h
-	}
-	gauge := func(name, help string) *prometheus.GaugeVec {
-		g, err := register(r, constLabels, droppable, func(cl prometheus.Labels) *prometheus.GaugeVec {
-			return prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: name, Help: help + deprecatedHelp, ConstLabels: cl}, nil)
-		})
-		errs = append(errs, err)
-		return g
-	}
-
-	// Build info: service is a const label like on every legacy metric (so a
-	// registerer injecting service applies it once); version is variable.
-	// The exposed series is unchanged: {service, version} = 1.
-	buildInfo, err := register(r, constLabels, droppable, func(cl prometheus.Labels) *prometheus.GaugeVec {
-		return prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name:        "platform_events_build_info",
-			Help:        "Build information for the platform-events library." + deprecatedHelp,
-			ConstLabels: cl,
-		}, []string{LabelVersion})
-	})
-	errs = append(errs, err)
-
-	l := &legacySet{
-		publishedTotal:            counter("events_published_total", "Total number of events published.", "topic", "event_type", "status"),
-		publishDuration:           histogram("events_publish_duration_seconds", "Duration of event publish operations in seconds.", legacyBuckets, "topic", "event_type"),
-		consumedTotal:             counter("events_consumed_total", "Total number of events consumed.", "queue", "event_type", "status"),
-		consumeDuration:           histogram("events_consume_duration_seconds", "Duration of event handler invocations in seconds.", legacyBuckets, "queue", "event_type"),
-		codecEncodeTotal:          counter("events_codec_encode_total", "Total Codec.Encode invocations by outcome.", "topic", "event_type", "status"),
-		codecEncodeDuration:       histogram("events_codec_encode_duration_seconds", "Duration of Codec.Encode calls in seconds.", legacyShortBuckets, "topic", "event_type"),
-		codecDecodeTotal:          counter("events_codec_decode_total", "Total Codec.Decode invocations by outcome.", "queue", "event_type", "status"),
-		codecDecodeDuration:       histogram("events_codec_decode_duration_seconds", "Duration of Codec.Decode calls in seconds.", legacyShortBuckets, "queue", "event_type"),
-		outboxPending:             gauge("outbox_pending_total", "Number of pending (unpublished) outbox records. -1 indicates a stale/error reading."),
-		outboxPublished:           counter("outbox_published_total", "Total outbox records published, by event type and status.", "event_type", "status"),
-		outboxAttempts:            counter("outbox_attempts_total", "Total outbox publish attempts, by event type.", "event_type"),
-		outboxDeadLetters:         counter("outbox_dead_letters_total", "Total outbox records moved to outbox_dead_letters.", "event_type"),
-		outboxReprocessed:         counter("outbox_dead_letters_reprocessed_total", "Total dead-letter records moved back to outbox_events for retry."),
-		outboxDiscarded:           counter("outbox_dead_letters_discarded_total", "Total dead-letter records permanently deleted."),
-		outboxLeased:              gauge("outbox_leased_total", "Number of outbox records currently leased by a runner."),
-		sqsReceiveErrors:          counter("sqs_receive_errors_total", "Total SQS ReceiveMessage failures.", "queue"),
-		sqsDeleteErrors:           counter("sqs_delete_errors_total", "Total SQS DeleteMessage failures.", "queue"),
-		sqsVisibilityErrors:       counter("sqs_visibility_extension_errors_total", "Total SQS ChangeMessageVisibility failures.", "queue"),
-		outboxPollErrors:          counter("outbox_poll_errors_total", "Total outbox poll cycle failures."),
-		outboxUnmarshalErrors:     counter("outbox_unmarshal_errors_total", "Total outbox records whose envelope could not be unmarshalled."),
-		outboxMarkPublishedErrors: counter("outbox_mark_published_errors_total", "Total MarkPublished failures after a successful publish (potential duplicate delivery)."),
-		inboxDuplicates:           counter("events_inbox_duplicates_total", "Total redelivered messages acknowledged by the inbox ledger without handling.", "consumer"),
-		dlqForwarded:              counter("events_dlq_forwarded_total", "Total messages forwarded to a source queue's dead-letter queue, by outcome.", "queue", "event_type", "status"),
-		oversizedEventTypeCounter: counter("events_oversized_event_type_label_total", "Total event_type values replaced with __oversized__."),
-	}
-	if err := errors.Join(errs...); err != nil {
-		// Leave nothing behind: collectors registered here would otherwise
-		// stay exported at zero (reading "healthy" rather than absent) after
-		// the caller sees the error — e.g. and retries WithoutLegacyMetrics.
-		r.rollback(mark)
-		return nil, err
-	}
-	buildInfo.WithLabelValues(buildVersion).Set(1)
-	return l, nil
 }
 
 func registerPlatform(r *registrar, id Identity) (*Platform, []RegistrationWarning) {
@@ -640,88 +423,20 @@ func ObserveDependency(dependency, operation string, err error, d time.Duration)
 	}
 }
 
-// ── Legacy recording (also feeds the Tier 1 metric where the mapping is 1:1) ─
+// ── Producer and outbox recording ────────────────────────────────────────
 
-// RecordPublish counts one publish attempt of one event (legacy counter and
-// duration, and platform_messages_published_total). status is "success" or
-// "error"; topic is the topic ARN.
-func RecordPublish(topic, eventType, status string, durSeconds float64) {
-	et := SanitizeEventType(eventType)
+// IncPublished counts one event a producer attempted to publish to topicARN
+// (platform_messages_published_total); outcome is "success" or "error".
+func IncPublished(topicARN, eventType, outcome string) {
 	if p := platform.Load(); p != nil && p.MessagesPublished != nil {
-		p.MessagesPublished.WithLabelValues(TopicName(topic), et, status).Inc()
-	}
-	metricsMu.RLock()
-	pt, pd := EventsPublishedTotal, EventsPublishDuration
-	metricsMu.RUnlock()
-	if pt != nil {
-		pt.WithLabelValues(topic, et, status).Inc()
-	}
-	if pd != nil {
-		pd.WithLabelValues(topic, et).Observe(durSeconds)
+		p.MessagesPublished.WithLabelValues(TopicName(topicARN), SanitizeEventType(eventType), outcome).Inc()
 	}
 }
 
-// RecordConsume increments the legacy consume counter and duration.
-func RecordConsume(queue, eventType, status string, durSeconds float64) {
-	metricsMu.RLock()
-	ct, cd := EventsConsumedTotal, EventsConsumeDuration
-	metricsMu.RUnlock()
-	if ct == nil && cd == nil {
-		return
-	}
-	et := SanitizeEventType(eventType)
-	if ct != nil {
-		ct.WithLabelValues(queue, et, status).Inc()
-	}
-	if cd != nil {
-		cd.WithLabelValues(queue, et).Observe(durSeconds)
-	}
-}
-
-// RecordCodecEncode increments the legacy codec-encode counter and duration.
-func RecordCodecEncode(topic, eventType, status string, durSeconds float64) {
-	metricsMu.RLock()
-	ct, cd := CodecEncodeTotal, CodecEncodeDuration
-	metricsMu.RUnlock()
-	if ct == nil && cd == nil {
-		return
-	}
-	et := SanitizeEventType(eventType)
-	if ct != nil {
-		ct.WithLabelValues(topic, et, status).Inc()
-	}
-	if cd != nil {
-		cd.WithLabelValues(topic, et).Observe(durSeconds)
-	}
-}
-
-// RecordCodecDecode increments the legacy codec-decode counter and duration.
-func RecordCodecDecode(queue, eventType, status string, durSeconds float64) {
-	metricsMu.RLock()
-	ct, cd := CodecDecodeTotal, CodecDecodeDuration
-	metricsMu.RUnlock()
-	if ct == nil && cd == nil {
-		return
-	}
-	et := SanitizeEventType(eventType)
-	if ct != nil {
-		ct.WithLabelValues(queue, et, status).Inc()
-	}
-	if cd != nil {
-		cd.WithLabelValues(queue, et).Observe(durSeconds)
-	}
-}
-
-// SetOutboxPending updates the pending-outbox gauges. n = -1 signals a failed
-// count query: the legacy gauge is set to -1, the Tier 1 gauge keeps its last
-// value and platform_outbox_errors_total{operation="pending_count"} counts it.
+// SetOutboxPending updates platform_outbox_pending_events. n = -1 signals a
+// failed count query: the gauge keeps its last value and
+// platform_outbox_errors_total{operation="pending_count"} counts it.
 func SetOutboxPending(n float64) {
-	metricsMu.RLock()
-	g := OutboxPendingTotal
-	metricsMu.RUnlock()
-	if g != nil {
-		g.WithLabelValues().Set(n)
-	}
 	p := platform.Load()
 	if p == nil {
 		return
@@ -735,14 +450,8 @@ func SetOutboxPending(n float64) {
 	}
 }
 
-// SetOutboxLeased updates the leased-outbox gauges.
+// SetOutboxLeased updates platform_outbox_leased_events.
 func SetOutboxLeased(n float64) {
-	metricsMu.RLock()
-	g := OutboxLeasedTotal
-	metricsMu.RUnlock()
-	if g != nil {
-		g.WithLabelValues().Set(n)
-	}
 	if p := platform.Load(); p != nil && p.OutboxLeased != nil {
 		p.OutboxLeased.WithLabelValues().Set(n)
 	}
@@ -764,9 +473,7 @@ func SetOutboxOldestPendingAge(age time.Duration) {
 		return
 	}
 	if age < 0 {
-		if p.OutboxErrors != nil {
-			p.OutboxErrors.WithLabelValues("oldest_pending").Inc()
-		}
+		incOutboxError(p, "oldest_pending")
 		return
 	}
 	if p.OutboxOldestAge != nil {
@@ -783,9 +490,7 @@ func SetOutboxBlocked(n float64) {
 		return
 	}
 	if n < 0 {
-		if p.OutboxErrors != nil {
-			p.OutboxErrors.WithLabelValues("blocked_count").Inc()
-		}
+		incOutboxError(p, "blocked_count")
 		return
 	}
 	if p.OutboxBlocked != nil {
@@ -814,45 +519,33 @@ func HasOutboxOldestAgeMetric() bool {
 	return p != nil && p.OutboxOldestAge != nil
 }
 
-// HasOutboxPendingMetric reports whether any pending-outbox gauge is
+// HasOutboxPendingMetric reports whether the pending-outbox gauge is
 // registered, so the runner can skip the count query otherwise.
 func HasOutboxPendingMetric() bool {
-	metricsMu.RLock()
-	g := OutboxPendingTotal
-	metricsMu.RUnlock()
 	p := platform.Load()
-	return g != nil || (p != nil && p.OutboxPending != nil)
+	return p != nil && p.OutboxPending != nil
 }
 
-// HasOutboxLeasedMetric reports whether any leased-outbox gauge is registered.
+// HasOutboxLeasedMetric reports whether the leased-outbox gauge is registered.
 func HasOutboxLeasedMetric() bool {
-	metricsMu.RLock()
-	g := OutboxLeasedTotal
-	metricsMu.RUnlock()
 	p := platform.Load()
-	return g != nil || (p != nil && p.OutboxLeased != nil)
+	return p != nil && p.OutboxLeased != nil
 }
 
 // RecordOutboxDeadLettersReprocessed counts n dead-letter records moved back
 // to outbox_events.
 func RecordOutboxDeadLettersReprocessed(n int) {
-	recordDeadLetterOperation("reprocess", float64(n), func() *prometheus.CounterVec { return OutboxDeadLettersReprocessedTotal })
+	recordDeadLetterOperation("reprocess", float64(n))
 }
 
 // RecordOutboxDeadLettersDiscarded counts n dead-letter records deleted.
 func RecordOutboxDeadLettersDiscarded(n int64) {
-	recordDeadLetterOperation("discard", float64(n), func() *prometheus.CounterVec { return OutboxDeadLettersDiscardedTotal })
+	recordDeadLetterOperation("discard", float64(n))
 }
 
-func recordDeadLetterOperation(op string, n float64, legacy func() *prometheus.CounterVec) {
+func recordDeadLetterOperation(op string, n float64) {
 	if n <= 0 {
 		return
-	}
-	metricsMu.RLock()
-	c := legacy()
-	metricsMu.RUnlock()
-	if c != nil {
-		c.WithLabelValues().Add(n)
 	}
 	if p := platform.Load(); p != nil && p.OutboxDLOperations != nil {
 		p.OutboxDLOperations.WithLabelValues(op).Add(n)
@@ -862,79 +555,19 @@ func recordDeadLetterOperation(op string, n float64, legacy func() *prometheus.C
 // RecordOutboxDeadLetter counts one outbox record moved to
 // outbox_dead_letters after exhausting its attempts.
 func RecordOutboxDeadLetter(eventType string) {
-	metricsMu.RLock()
-	c := OutboxDeadLettersTotal
-	metricsMu.RUnlock()
-	if c != nil {
-		c.WithLabelValues(SanitizeEventType(eventType)).Inc()
-	}
 	IncDLQ("outbox_publish", eventType, "max_attempts")
 }
 
-// RecordOutboxAttempt increments the legacy per-record attempt counter (the
-// Tier 1 attempt counter is fed by RecordOutboxPublished, which knows the outcome).
-func RecordOutboxAttempt(eventType string) {
-	metricsMu.RLock()
-	c := OutboxAttemptsTotal
-	metricsMu.RUnlock()
-	if c != nil {
-		c.WithLabelValues(SanitizeEventType(eventType)).Inc()
-	}
-}
-
-// RecordOutboxPublished counts one outbox publish attempt by status
-// ("success" or "error").
-func RecordOutboxPublished(eventType, status string) {
-	metricsMu.RLock()
-	c := OutboxPublishedTotal
-	metricsMu.RUnlock()
-	et := SanitizeEventType(eventType)
-	if c != nil {
-		c.WithLabelValues(et, status).Inc()
-	}
+// IncOutboxPublishAttempt counts one outbox publish attempt
+// (platform_outbox_publish_attempts_total); outcome is "success" or "error".
+func IncOutboxPublishAttempt(eventType, outcome string) {
 	if p := platform.Load(); p != nil && p.OutboxAttempts != nil {
-		p.OutboxAttempts.WithLabelValues(et, status).Inc()
+		p.OutboxAttempts.WithLabelValues(SanitizeEventType(eventType), outcome).Inc()
 	}
-}
-
-// RecordInboxDuplicate increments the legacy inbox duplicate counter.
-func RecordInboxDuplicate(consumer string) {
-	metricsMu.RLock()
-	c := InboxDuplicatesTotal
-	metricsMu.RUnlock()
-	if c != nil {
-		c.WithLabelValues(consumer).Inc()
-	}
-}
-
-// RecordDLQForward increments the legacy DLQ forward counter.
-func RecordDLQForward(queue, eventType, status string) {
-	metricsMu.RLock()
-	c := DLQForwardedTotal
-	metricsMu.RUnlock()
-	if c != nil {
-		c.WithLabelValues(queue, SanitizeEventType(eventType), status).Inc()
-	}
-}
-
-// RecordSQSReceiveError increments the legacy ReceiveMessage error counter.
-func RecordSQSReceiveError(queue string) {
-	incLegacy(func() *prometheus.CounterVec { return SQSReceiveErrorsTotal }, queue)
-}
-
-// RecordSQSDeleteError increments the legacy DeleteMessage error counter.
-func RecordSQSDeleteError(queue string) {
-	incLegacy(func() *prometheus.CounterVec { return SQSDeleteErrorsTotal }, queue)
-}
-
-// RecordSQSVisibilityError increments the legacy ChangeMessageVisibility error counter.
-func RecordSQSVisibilityError(queue string) {
-	incLegacy(func() *prometheus.CounterVec { return SQSVisibilityErrorsTotal }, queue)
 }
 
 // RecordOutboxPollError counts a failed outbox poll cycle.
 func RecordOutboxPollError() {
-	incLegacy(func() *prometheus.CounterVec { return OutboxPollErrorsTotal })
 	if p := platform.Load(); p != nil {
 		incOutboxError(p, "poll")
 	}
@@ -942,7 +575,6 @@ func RecordOutboxPollError() {
 
 // RecordOutboxUnmarshalError counts a stored envelope that failed to unmarshal.
 func RecordOutboxUnmarshalError() {
-	incLegacy(func() *prometheus.CounterVec { return OutboxUnmarshalErrorsTotal })
 	if p := platform.Load(); p != nil {
 		incOutboxError(p, "unmarshal")
 	}
@@ -951,7 +583,6 @@ func RecordOutboxUnmarshalError() {
 // RecordOutboxMarkPublishedError counts a MarkPublished failure after a
 // successful publish (the event will be delivered again).
 func RecordOutboxMarkPublishedError() {
-	incLegacy(func() *prometheus.CounterVec { return OutboxMarkPublishedErrorsTotal })
 	if p := platform.Load(); p != nil {
 		incOutboxError(p, "mark_published")
 	}
@@ -960,14 +591,5 @@ func RecordOutboxMarkPublishedError() {
 func incOutboxError(p *Platform, op string) {
 	if p.OutboxErrors != nil {
 		p.OutboxErrors.WithLabelValues(op).Inc()
-	}
-}
-
-func incLegacy(get func() *prometheus.CounterVec, labels ...string) {
-	metricsMu.RLock()
-	c := get()
-	metricsMu.RUnlock()
-	if c != nil {
-		c.WithLabelValues(labels...).Inc()
 	}
 }

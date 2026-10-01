@@ -13,8 +13,8 @@ flowchart TD
 
     DISCARD["Step 2b — Permanent discard\nrunner.DiscardDeadLetters(ctx, DLQFilter{...}, limit)\n⚠️ irreversible — always ListDeadLetters first"]
 
-    REPLAY --> REQUEUE["Records moved back to outbox_events\nattempts reset to 0\noutbox_dead_letters_reprocessed_total++\nPicked up by runner on next poll cycle"]
-    DISCARD --> GONE["Records permanently deleted\noutbox_dead_letters_discarded_total++"]
+    REPLAY --> REQUEUE["Records moved back to outbox_events\nattempts reset to 0\nplatform_outbox_dead_letter_operations_total{operation=reprocess}++\nPicked up by runner on next poll cycle"]
+    DISCARD --> GONE["Records permanently deleted\nplatform_outbox_dead_letter_operations_total{operation=discard}++"]
 
     REQUEUE --> RUNNER["Outbox Runner resumes normal\npoll cycle → Publisher.Publish → SNS"]
     RUNNER -- success --> DONE([Event delivered])

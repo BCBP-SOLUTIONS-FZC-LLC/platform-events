@@ -22,7 +22,7 @@ func main() {
     // 1. Register the Tier 1 platform_* metrics (Enterprise Platform Observability
     //    Standard) once — same registerer and identity as pgmetrics.InitWithIdentity.
     //    Environment defaults to APP_ENV / ENVIRONMENT / "dev"; service to APP_NAME.
-    id := events.MetricsIdentityFromEnv("iam", "", os.Getenv("BUILD_VERSION"))
+    id := events.MetricsIdentityFromEnv("iam", "")
     metricWarnings, err := events.InitMetrics(id, prometheus.DefaultRegisterer)
     if err != nil {
         log.Fatal(err)

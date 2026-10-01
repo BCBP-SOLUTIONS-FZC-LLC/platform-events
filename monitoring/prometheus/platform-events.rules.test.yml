@@ -114,20 +114,28 @@ tests:
               description: "Messages were moved to dead-letter storage in the last 15 minutes and need investigation or replay."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsmessagesdeadlettered"
 
-  # Outbox backlog above 1000 for 15 minutes; a stale (-1) reading alerts separately.
+  # Outbox backlog above 1000 for 15 minutes; a failing pending-count query
+  # (gauge frozen at its last value) alerts separately.
   - interval: 1m
     input_series:
-      - series: 'outbox_pending_total{service="orders"}'
+      - series: 'platform_outbox_pending_events{domain="billing",service="orders",environment="prod"}'
         values: '1500x30'
-      - series: 'outbox_pending_total{service="billing"}'
-        values: '-1x30'
+      - series: 'platform_outbox_pending_events{domain="billing",service="invoices",environment="prod"}'
+        values: '10x30'
+      - series: 'platform_outbox_errors_total{domain="billing",service="invoices",environment="prod",operation="pending_count"}'
+        values: '0+4x30'
+      - series: 'platform_outbox_errors_total{domain="billing",service="orders",environment="prod",operation="pending_count"}'
+        values: '0x30'
     alert_rule_test:
       - eval_time: 20m
         alertname: PlatformEventsOutboxBacklog
         exp_alerts:
           - exp_labels:
               severity: warning
+              metric_status: proposed
+              domain: billing
               service: orders
+              environment: prod
             exp_annotations:
               summary: "orders has over 1000 unpublished outbox events"
               description: "The transactional outbox backlog has stayed above 1000 events for 15 minutes; event delivery is lagging."
@@ -137,18 +145,21 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
-              service: billing
+              metric_status: proposed
+              domain: billing
+              service: invoices
+              environment: prod
             exp_annotations:
-              summary: "billing cannot read its outbox backlog"
-              description: "The outbox pending-count query has failed for 10 minutes, so the backlog alert is blind."
+              summary: "invoices cannot read its outbox backlog"
+              description: "The outbox pending-count query has been failing for 10 minutes; platform_outbox_pending_events is frozen at its last value, so the backlog alert is blind."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxpendingunknown"
 
-  # 10% publish errors for 10 minutes.
+  # 10% publish errors for 10 minutes; topic is the topic name.
   - interval: 1m
     input_series:
-      - series: 'events_published_total{service="orders",topic="arn:aws:sns:us-east-1:123:orders",event_type="orders.order.placed",status="success"}'
+      - series: 'platform_messages_published_total{domain="billing",service="orders",environment="prod",topic="orders",event_type="orders.order.placed",outcome="success"}'
         values: '0+90x30'
-      - series: 'events_published_total{service="orders",topic="arn:aws:sns:us-east-1:123:orders",event_type="orders.order.placed",status="error"}'
+      - series: 'platform_messages_published_total{domain="billing",service="orders",environment="prod",topic="orders",event_type="orders.order.placed",outcome="error"}'
         values: '0+10x30'
     alert_rule_test:
       - eval_time: 25m
@@ -156,10 +167,13 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
+              metric_status: proposed
+              domain: billing
               service: orders
-              topic: "arn:aws:sns:us-east-1:123:orders"
+              environment: prod
+              topic: orders
             exp_annotations:
-              summary: "orders fails over 5% of publishes"
+              summary: "orders fails over 5% of publishes to orders"
               description: "More than 5% of publishes have failed for 10 minutes."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventspublisherrors"
 
@@ -177,23 +191,98 @@ tests:
         alertname: PlatformEventsConsumerStalled
         exp_alerts: []
 
-  # The first mark_published failure after a restart alerts (label-less legacy
-  # counter pre-created at 0 at init).
+  # The first mark_published failure after a restart alerts (the per-operation
+  # outbox error counters are pre-created at 0 at init); other operations do not.
   - interval: 1m
     input_series:
-      - series: 'outbox_mark_published_errors_total{service="billing"}'
+      - series: 'platform_outbox_errors_total{domain="billing",service="orders",environment="prod",operation="mark_published"}'
         values: '0 0 0 1 1 1'
+      - series: 'platform_outbox_errors_total{domain="billing",service="orders",environment="prod",operation="unmarshal"}'
+        values: '0 0 0 3 3 3'
     alert_rule_test:
       - eval_time: 5m
         alertname: PlatformEventsOutboxDuplicateDeliveryRisk
         exp_alerts:
           - exp_labels:
               severity: warning
-              service: billing
+              metric_status: proposed
+              domain: billing
+              service: orders
+              environment: prod
             exp_annotations:
-              summary: "billing published outbox events it could not mark as published"
+              summary: "orders published outbox events it could not mark as published"
               description: "Those events will be delivered again; consumers must be idempotent (inbox dedup)."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxduplicatedeliveryrisk"
+      - eval_time: 5m
+        alertname: PlatformEventsOutboxPollFailing
+        exp_alerts: []
+
+  # Poll cycles failing for 10 minutes.
+  - interval: 1m
+    input_series:
+      - series: 'platform_outbox_errors_total{domain="billing",service="orders",environment="prod",operation="poll"}'
+        values: '0+4x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PlatformEventsOutboxPollFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              metric_status: proposed
+              domain: billing
+              service: orders
+              environment: prod
+            exp_annotations:
+              summary: "orders's outbox runner cannot claim events"
+              description: "Outbox poll cycles have kept failing for 10 minutes (at least one failure in every 5-minute window); outbox events may not be delivered."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxpollfailing"
+
+  # SQS ReceiveMessage failing for 10 minutes; errors on other SQS operations
+  # and successful receives do not count.
+  - interval: 1m
+    input_series:
+      - series: 'platform_dependency_request_seconds_count{domain="iam",service="event-consumer",environment="prod",dependency="sqs",operation="receive_message",outcome="error"}'
+        values: '0+2x30'
+      - series: 'platform_dependency_request_seconds_count{domain="iam",service="healthy-consumer",environment="prod",dependency="sqs",operation="receive_message",outcome="success"}'
+        values: '0+3x30'
+      - series: 'platform_dependency_request_seconds_count{domain="iam",service="healthy-consumer",environment="prod",dependency="sqs",operation="delete_message",outcome="error"}'
+        values: '0+1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PlatformEventsSQSReceiveFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              metric_status: proposed
+              domain: iam
+              service: event-consumer
+              environment: prod
+            exp_annotations:
+              summary: "event-consumer cannot receive from SQS"
+              description: "ReceiveMessage has been failing for 10 minutes (credentials, IAM, network or a deleted queue)."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventssqsreceivefailing"
+
+  # The first event_type overflow after a restart alerts (the counter is
+  # pre-created at 0 at init).
+  - interval: 1m
+    input_series:
+      - series: 'platform_telemetry_label_overflow_total{domain="iam",service="event-consumer",environment="prod",label="event_type"}'
+        values: '0 0 0 2 2 2'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PlatformEventsEventTypeLabelOverflow
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              metric_status: proposed
+              domain: iam
+              service: event-consumer
+              environment: prod
+              label: event_type
+            exp_annotations:
+              summary: "event-consumer replaced event_type values that exceeded their cardinality bound"
+              description: "A producer sends event types over 128 bytes (recorded as __oversized__) or more distinct event types than the per-process limit (recorded as __other__)."
+              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventseventtypelabeloverflow"
 
   # Dead-lettering on one queue does not hide a stall on another.
   - interval: 1m
@@ -233,12 +322,13 @@ tests:
         alertname: PlatformEventsMessagesDeadLettered
         exp_alerts: []
 
-  # Poll errors for 10 minutes page; namespaces stay separate.
+  # Poll errors for 10 minutes page; environments stay separate (one
+  # Prometheus scraping prod and staging must not mix them).
   - interval: 1m
     input_series:
-      - series: 'outbox_poll_errors_total{service="orders",namespace="prod"}'
+      - series: 'platform_outbox_errors_total{domain="billing",service="orders",environment="prod",operation="poll"}'
         values: '0+1x30'
-      - series: 'outbox_poll_errors_total{service="orders",namespace="staging"}'
+      - series: 'platform_outbox_errors_total{domain="billing",service="orders",environment="staging",operation="poll"}'
         values: '0x30'
     alert_rule_test:
       - eval_time: 20m
@@ -246,44 +336,11 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: critical
+              metric_status: proposed
+              domain: billing
               service: orders
-              namespace: prod
+              environment: prod
             exp_annotations:
               summary: "orders's outbox runner cannot claim events"
               description: "Outbox poll cycles have kept failing for 10 minutes (at least one failure in every 5-minute window); outbox events may not be delivered."
               runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoutboxpollfailing"
-
-  # SQS receive failures for 10 minutes.
-  - interval: 1m
-    input_series:
-      - series: 'sqs_receive_errors_total{service="worker",queue="orders"}'
-        values: '0+2x30'
-    alert_rule_test:
-      - eval_time: 20m
-        alertname: PlatformEventsSQSReceiveFailing
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              service: worker
-              queue: orders
-            exp_annotations:
-              summary: "worker cannot receive from SQS"
-              description: "ReceiveMessage has been failing for 10 minutes (credentials, IAM, network or a deleted queue)."
-              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventssqsreceivefailing"
-
-  # One oversized event_type in the last hour raises an info alert.
-  - interval: 1m
-    input_series:
-      - series: 'events_oversized_event_type_label_total{service="worker"}'
-        values: '0 0 0 1 1 1'
-    alert_rule_test:
-      - eval_time: 5m
-        alertname: PlatformEventsOversizedEventType
-        exp_alerts:
-          - exp_labels:
-              severity: info
-              service: worker
-            exp_annotations:
-              summary: "worker saw event_type values over 128 bytes"
-              description: "A producer is sending event types outside the registry's naming convention; they are counted as __oversized__."
-              runbook_url: "https://github.com/BCBP-SOLUTIONS-FZC-LLC/platform-events/blob/main/docs/observability/runbook.md#platformeventsoversizedeventtype"

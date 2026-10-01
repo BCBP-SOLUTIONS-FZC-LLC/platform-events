@@ -47,17 +47,14 @@ func renderInventory() string {
 	w("     Regenerate: make metrics-doc -->\n\n")
 	w("platform-events' entry in the Platform Observability Registry (Enterprise Platform Observability Standard). ")
 	w("CI checks every registered collector against these records (`make metrics-lint`), so this inventory is exactly what a service using the library exposes. ")
-	w("See [README](README.md) for the tier model, wiring and migration plan.\n\n")
+	w("platform-events emits only these Tier 1 `platform_*` metrics; the pre-standard names were removed without a compatibility period (see the CHANGELOG for the old → new mapping). ")
+	w("See [README](README.md) for the tier model and wiring.\n\n")
 
 	w("## Summary\n\n")
-	w("| Metric | Type | Tier | Status | Labels | Replaces / replaced by |\n|---|---|---|---|---|---|\n")
+	w("| Metric | Type | Tier | Status | Labels |\n|---|---|---|---|---|\n")
 	for _, e := range entries {
-		rel := e.Supersedes
-		if e.Status == events.MetricStatusDeprecated {
-			rel = e.SupersededBy
-		}
-		w("| %s | %s | %s | %s | %s | %s |\n", code(e.Name), e.Type, e.Tier, e.Status,
-			codeList(append(append([]string{}, e.RequiredLabels...), e.ApprovedLabels...)), codeList(rel))
+		w("| %s | %s | %s | %s | %s |\n", code(e.Name), e.Type, e.Tier, e.Status,
+			codeList(append(append([]string{}, e.RequiredLabels...), e.ApprovedLabels...)))
 	}
 
 	w("\n## Label vocabulary\n\n")
@@ -87,9 +84,6 @@ func renderInventory() string {
 	w("| `outcome` | approved | %s |\n", codeList(internalmetrics.OutcomeValues))
 	w("| `label` | requested | %s |\n", codeList(internalmetrics.OverflowLabelValues))
 	w("| `library` / `library_version` | requested | %s; %s |\n", codeList(internalmetrics.LibraryValues), internalmetrics.LibraryVersionLabelRule)
-	w("| `version` | legacy only | the service's build version (`platform_events_build_info`); never on Tier 1 metrics |\n")
-	w("| `status` | legacy only | `success`, `error`, `malformed`, `noop`, `dlq_success`, `dlq_error` (split into `outcome` / `reason` on Tier 1) |\n")
-	w("| `consumer` | legacy only | inbox consumer name (replaced by `queue` on Tier 1) |\n")
 	prohibited := append([]string{}, internalmetrics.ProhibitedLabels...)
 	sort.Strings(prohibited)
 	w("\n**Prohibited on every metric** (high cardinality / sensitive): %s.\n", codeList(prohibited))
@@ -118,18 +112,10 @@ func renderInventory() string {
 			}
 			w("- **Cardinality:** %s\n", e.Cardinality)
 			w("- **Aggregation:** %s\n", e.AggregationNotes)
-			w("- **Supersedes:** %s\n", codeList(e.Supersedes))
 			w("- **Governance notes:** %s\n\n", e.GovernanceNotes)
 		}
 	}
 
-	w("## Deprecated (compatibility period)\n\n")
-	w("| Metric | Successor | Sunset |\n|---|---|---|\n")
-	for _, e := range entries {
-		if e.Status == events.MetricStatusDeprecated {
-			w("| %s | %s | %s |\n", code(e.Name), codeList(e.SupersededBy), e.Sunset)
-		}
-	}
 	return b.String()
 }
 

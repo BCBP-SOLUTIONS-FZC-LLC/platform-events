@@ -45,7 +45,10 @@ func env(id string) events.Envelope[json.RawMessage] {
 }
 
 func TestHandler_ProcessesThenDedups(t *testing.T) {
-	metrics.InitWithRegisterer("inbox-test", "v1", prometheus.NewRegistry())
+	prev := metrics.CurrentPlatform()
+	t.Cleanup(func() { metrics.ReplacePlatform(prev) })
+	_, err := metrics.InitWithIdentity(metrics.Identity{Domain: "iam", Service: "svc", Environment: "test"}, prometheus.NewRegistry())
+	require.NoError(t, err)
 	ledger, calls := newLedger(), 0
 	h := inbox.Handler(ledger, func(context.Context, events.Envelope[json.RawMessage]) error { calls++; return nil })
 	id := uuid.NewString()
@@ -54,7 +57,7 @@ func TestHandler_ProcessesThenDedups(t *testing.T) {
 	require.NoError(t, h(context.Background(), env(id)))
 	assert.Equal(t, 1, calls, "a redelivery must not reach the handler")
 	assert.Equal(t, 1, ledger.marks)
-	assert.Equal(t, 1.0, testutil.ToFloat64(metrics.InboxDuplicatesTotal.WithLabelValues("test_consumer")))
+	assert.InDelta(t, 1, testutil.ToFloat64(metrics.CurrentPlatform().DuplicateMessages.WithLabelValues("unknown", "T")), 0)
 }
 
 func TestHandler_FailureNotRecorded(t *testing.T) {
@@ -102,9 +105,8 @@ func TestHandler_PlatformDuplicateMetric(t *testing.T) {
 	prev := metrics.CurrentPlatform()
 	t.Cleanup(func() { metrics.ReplacePlatform(prev) })
 	reg := prometheus.NewRegistry()
-	_, err := metrics.InitWithIdentity(metrics.Identity{Domain: "iam", Service: "svc", Environment: "test"}, reg, false)
+	_, err := metrics.InitWithIdentity(metrics.Identity{Domain: "iam", Service: "svc", Environment: "test"}, reg)
 	require.NoError(t, err)
-	t.Cleanup(func() { metrics.InitWithRegisterer("inbox-test", "v1", prometheus.NewRegistry()) })
 
 	ledger := newLedger()
 	h := inbox.Handler(ledger, func(context.Context, events.Envelope[json.RawMessage]) error { return nil })
